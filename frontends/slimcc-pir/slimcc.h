@@ -7,7 +7,6 @@
 #define _XOPEN_SOURCE 700
 #include <assert.h>
 #include <errno.h>
-#include <glob.h>
 #include <inttypes.h>
 #include <libgen.h>
 #include <limits.h>
@@ -89,9 +88,6 @@
 # if SLIMCC_HAS_BUILTIN(__builtin_popcountll)
 #  define Pop64(x) __builtin_popcountll((uint64_t)(x))
 # endif
-# if SLIMCC_HAS_BUILTIN(__builtin_ctzll)
-#  define Ctz64(x) __builtin_ctzll((uint64_t)(x))
-# endif
 # if SLIMCC_HAS_BUILTIN(__builtin_clzll)
 #  define Clz64(x) __builtin_clzll((uint64_t)(x))
 # endif
@@ -102,9 +98,6 @@
 #  include <stdbit.h>
 #  ifndef Pop64
 #   define Pop64(x) (int)stdc_count_ones((uint64_t)(x))
-#  endif
-#  ifndef Ctz64
-#   define Ctz64(x) (int)stdc_trailing_zeros((uint64_t)(x))
 #  endif
 #  ifndef Clz64
 #   define Clz64(x) (int)stdc_leading_zeros((uint64_t)(x))
@@ -119,13 +112,6 @@ static inline int _pop64_impl(uint64_t v) {
   for (; v; cnt++)
     v &= v - 1;
   return cnt;
-}
-#endif
-
-#ifndef Ctz64
-# define Ctz64(x) _ctz64_impl(x)
-static inline int _ctz64_impl(uint64_t v) {
-  return Pop64((v & -v) - 1);
 }
 #endif
 
@@ -186,7 +172,6 @@ typedef struct Relocation Relocation;
 typedef struct LocalLabel LocalLabel;
 typedef struct EnumVal EnumVal;
 typedef union FPVal FPVal;
-typedef struct AsmContext AsmContext;
 typedef struct FuncObj FuncObj;
 typedef struct SlashDelta SlashDelta;
 
@@ -239,7 +224,6 @@ void hashmap_put(HashMap *map, const char *key, void *val);
 void hashmap_put2(HashMap *map, const char *key, int keylen, void *val);
 void hashmap_delete(HashMap *map, const char *key);
 void hashmap_delete2(HashMap *map, const char *key, int keylen);
-void hashmap_test(void);
 
 // Represents a deleted hash entry
 #define TOMBSTONE ((void *)-1)
@@ -272,7 +256,6 @@ typedef enum {
   TK_IDENT,   // Identifiers
   TK_KEYWORD, // Keywords
   TK_STR,     // String literals
-  TK_ASM_STR,
   TK_CHAR_LIT, // Character literals
   TK_CHAR_LIT_PPEV = TK_CHAR_LIT + 1,
   TK_PP_NUM, // Preprocessing numbers
@@ -511,12 +494,8 @@ struct Obj {
   int alt_align;
 
   // Local variable
-  int ofs;
   const char *ptr;
   Obj *param_next;
-  bool pass_by_stack;
-  bool is_zero_sized_arg;
-  int stack_offset;
   Node *arg_expr;
   Obj *vptr;
 
@@ -527,12 +506,9 @@ struct Obj {
   bool is_static_lvar;
   Obj *static_lvars;
   char *alias_name;
-  char *visibility;
   char *asm_name;
 
   // Global variable
-  bool is_common;
-  bool is_nocommon;
   char *section_name;
   char *init_data;
   Relocation *rel;
@@ -544,15 +520,10 @@ struct Obj {
   bool export_fn;
   bool is_gnu_inline;
   bool is_always_inline;
-  bool is_naked;
   bool is_noreturn;
   bool returns_twice;
   bool dont_reuse_stk;
   bool dealloc_vla;
-  bool is_ctor;
-  bool is_dtor;
-  uint16_t ctor_prior;
-  uint16_t dtor_prior;
   Node *body;
   FuncObj *output; // backend defined output object
 };
@@ -560,7 +531,6 @@ struct Obj {
 struct Relocation {
   Relocation *next;
   int offset;
-  Node *label;
   Obj *var;
   int64_t addend;
 };
@@ -578,36 +548,6 @@ struct DeferStmt {
   Obj *vla;
   Node *cleanup_fn;
   Node *stmt;
-};
-
-typedef enum {
-  ASMOP_NULL = 0,
-  ASMOP_NUM,
-  ASMOP_SYMBOLIC,
-  ASMOP_MEM,
-  ASMOP_REG,
-  ASMOP_FLAG,
-} AsmOpKind;
-
-typedef struct AsmParam AsmParam;
-struct AsmParam {
-  AsmParam *next;
-  AsmOpKind kind;
-  Token *name;
-  Token *constraint;
-  char *flag;
-  AsmParam *match;
-  Node *arg;
-  Obj *ptr;
-  Obj *var;
-  int64_t val;
-  uint64_t reg_constraint;
-  int label_id;
-  int reg;
-  int var_asm_reg;
-  bool is_mem_inreg;
-  bool is_early_clobber;
-  bool is_clobbered_x87;
 };
 
 // AST node
@@ -654,10 +594,7 @@ typedef enum {
   ND_BREAK,
   ND_CONT,
   ND_GOTO,      // "goto"
-  ND_GOTO_EXPR, // "goto" labels-as-values
-  ND_ASM_GOTO,
   ND_LABEL,     // Labeled statement
-  ND_LABEL_VAL, // [GNU] Labels-as-values
   ND_FUNCALL,   // Function call
   ND_EXPR_STMT, // Expression statement
   ND_STMT_EXPR, // Statement expression
@@ -665,7 +602,6 @@ typedef enum {
   ND_NUM,       // Integer
   ND_CAST,      // Type cast
   ND_INIT_SEQ,
-  ND_ASM,      // "asm"
   ND_CAS,      // Atomic compare-and-swap
   ND_EXCH,     // Atomic exchange
   ND_VA_START, // "va_start"
@@ -677,8 +613,6 @@ typedef enum {
   ND_ARITH_ASSIGN,
   ND_POST_INCDEC,
   ND_CKD_ARITH,
-  ND_FRAME_ADDR,
-  ND_RTN_ADDR,
   ND_THREAD_FENCE,
   ND_UNREACHABLE,
   ND_UNKNOWN,
@@ -782,7 +716,6 @@ struct Node {
     Node *expr;
     Obj *rtn_buf;
     Obj *args;
-    Obj *alloca_args;
   } call;
 
   // Atomic compare-and-swap
@@ -791,16 +724,6 @@ struct Node {
     Node *old_val;
     Node *new_val;
   } cas;
-
-  // GNU inline assembly
-  struct {
-    Token *str_tok;
-    AsmParam *outputs;
-    AsmParam *inputs;
-    Token *clobbers;
-    AsmParam *labels;
-    AsmContext *ctx; // backend defined
-  } gasm;
   ANON_UNION_END
 };
 
@@ -838,7 +761,6 @@ bool is_const_expr(Node *node, int64_t *val);
 bool is_const_expr_strict(Node *node, int64_t *val);
 bool is_const_fp(Node *node, FPVal *fval);
 bool is_const_zero_bitint(Node *node);
-Obj *eval_var_opt(Node *node, int *ofs, bool let_array, bool let_atomic);
 bool equal_tok(Token *a, Token *b);
 Obj *get_symbol_var(const char *);
 Type *vla_cond_result_len(Type *ty1, Type *ty2, Type *base, Node **cond, Obj **cond_var);
@@ -847,7 +769,6 @@ Type *vla_cond_result_len(Type *ty1, Type *ty2, Type *base, Node **cond, Obj **c
 // bitint.c
 //
 
-int32_t eval_bitint_first_set(int32_t bits, BitBuf *op);
 bool eval_bitint_to_bool(int32_t bits, BitBuf *op);
 void eval_bitint_sign_ext(int32_t bits, BitBuf *op, int32_t bits2, bool is_unsigned);
 void eval_bitint_neg(int32_t bits, BitBuf *op);
@@ -922,7 +843,6 @@ typedef enum {
   TY_UNION,
   TY_BITINT,
   TY_AUTO,
-  TY_ASM,
 } TypeKind;
 
 typedef enum {
@@ -1079,14 +999,11 @@ void _add_type(Node *node);
   } while (0)
 
 //
-// codegen.c
+// codegen_pir.c
 //
 
 int codegen(Obj *prog, FILE *out);
-void prepare_funcall(Node *node, Scope *scope);
-void prepare_inline_asm(Node *node);
 int64_t align_to(int64_t n, int64_t align);
-bool va_arg_need_copy(Type *ty);
 bool bitint_rtn_need_copy(size_t width);
 void emit_text(Obj *fn);
 
@@ -1101,14 +1018,14 @@ bool is_ident2(uint32_t c);
 int display_width(const char *p, int len);
 
 //
-// platform.c
+// platform/macos-arm64-pir.c
 //
 
 void platform_init_driver(void);
 void platform_init_cc1(void);
 void platform_stdinc_paths(StringArray *paths);
 void platform_search_dirs(StringArray *paths);
-void run_assembler(StringArray *as_args, const char *input, const char *output);
+void run_assembler(const char *input, const char *output);
 void run_linker(StringArray *paths, StringArray *args, const char *output);
 
 //
@@ -1117,35 +1034,13 @@ void run_linker(StringArray *paths, StringArray *args, const char *output);
 
 typedef enum { STD_C89, STD_C94, STD_C99, STD_C11, STD_C17, STD_C23, STD_C2Y } StdVer;
 
-typedef enum {
-  LT_RELO,
-  LT_SHARED,
-  LT_DYNAMIC,
-  LT_STATIC_PIE,
-  LT_STATIC,
-  LT_PIE,
-} LinkType;
-
 NORETURN void cleanup_exit(int status);
 bool file_exists(const char *path);
 bool in_sysincl_path(int idx);
 bool ignore_missing_dep(const char *path, const char *filename, Token *tok);
 void add_dep_file(const char *path, bool is_sys);
-char *find_dir_w_file(const char *pattern);
 void run_subprocess(const char **argv);
 void add_include_path(StringArray *arr, const char *s);
-
-LinkType link_type_gnustyle(void);
-void ldarg_gnu_base(StringArray *arr, const char *output);
-void ldarg_gnu_linktype(StringArray *arr, LinkType lt, const char *ldso_path);
-void ldarg_gnu_crtbegin(StringArray *arr, LinkType lt, const char *gcc_libpath);
-void ldarg_gnu_inputs(StringArray *arr, StringArray *paths, StringArray *args);
-void ldarg_gnu_lc_lgcc(StringArray *arr, LinkType lt, bool has_libgcc);
-void ldarg_gnu_crtend(StringArray *arr, LinkType lt, const char *gcc_libpath);
-void run_assembler_gnustyle(StringArray *as_args, const char *input, const char *output);
-void run_linker_gnustyle(StringArray *paths, StringArray *inputs, const char *output,
-                         const char *ldso_path, const char *libpath,
-                         const char *gcclibpath);
 
 extern char *argv0;
 extern StringArray include_paths;
@@ -1154,20 +1049,9 @@ extern StringArray display_files;
 extern bool opt_E;
 extern bool opt_dM;
 extern bool opt_P;
-extern int opt_fpic;
-extern int opt_fpie;
-extern bool opt_femulated_tls;
-extern int opt_fn_align;
-extern bool opt_use_plt;
-extern bool opt_fcommon;
-extern bool opt_optimize;
 extern bool opt_reuse_stack;
 extern bool opt_g;
-extern bool opt_func_sections;
-extern bool opt_data_sections;
 extern bool opt_werror;
-extern const char *opt_visibility;
-extern bool opt_cc1_asm_pp;
 extern StdVer opt_std;
 extern bool is_iso_std;
 extern bool opt_fdefer_ts;
@@ -1175,33 +1059,14 @@ extern bool opt_short_enums;
 extern bool opt_gnu_keywords;
 extern bool opt_gnu89_inline;
 extern bool opt_ms_anon_struct;
-extern bool opt_disable_visibility;
 extern bool opt_fake_always_inline;
-
-extern bool opt_pie;
-extern bool opt_nopie;
 extern bool opt_pthread;
-extern bool opt_r;
-extern bool opt_rdynamic;
-extern bool opt_static;
-extern bool opt_static_pie;
-extern bool opt_static_libgcc;
-extern bool opt_shared;
-extern bool opt_s;
-extern bool opt_nostartfiles;
-extern bool opt_nodefaultlibs;
-extern bool opt_nolibc;
-extern const char *default_ld;
 extern const char *default_as;
 extern const char *dumpmachine_str;
 
-#ifdef SLIMCC_PIR
 extern const char *opt_isysroot;
 extern const char *opt_pirc;
 extern const char *opt_pir_target;
 extern int opt_pir_opt_level;
-extern bool opt_emit_pir;
-extern bool opt_fwrapv;
-#endif
 
 #endif

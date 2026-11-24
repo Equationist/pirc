@@ -13,6 +13,6 @@ All original copyright notices and license terms are preserved intact.
 
 ## PIR Backend Adaptation
 
-- `codegen_pir.c` replaces `codegen.c` when built via `Makefile.pir` (`-DSLIMCC_PIR -DBOOTSTRAP_NO_LDOUBLE`), walking `slimcc`'s AST (`Obj`, `Node`, `Type`, `Member`) and emitting portable PIR v0.3.0 HIR text.
+- `codegen_pir.c` walks `slimcc`'s AST (`Obj`, `Node`, `Type`, `Member`) and emits portable PIR v0.3.0 HIR text (built via `Makefile.pir` with `-DBOOTSTRAP_NO_LDOUBLE`).
 - `platform/macos-arm64-pir.c` configures `aarch64-apple-darwin` target macros, macOS SDK include discovery, `pirc` lowering/codegen invocation, and native linking.
 - Build with `make -f Makefile.pir` (or from repo root: `make slimcc-pir`).

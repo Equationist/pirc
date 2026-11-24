@@ -6,7 +6,7 @@
 
 CC       ?= cc
 CFLAGS   ?= -O2 -g
-PIRFLAGS := -DSLIMCC_PIR -DBOOTSTRAP_NO_LDOUBLE -Wno-switch
+PIRFLAGS := -DBOOTSTRAP_NO_LDOUBLE -Wno-switch
 
 SRCS := alloc.c bitint.c codegen_pir.c hashmap.c main.c parse.c \
         platform/macos-arm64-pir.c preprocess.c strings.c tokenize.c type.c unicode.c

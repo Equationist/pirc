@@ -132,22 +132,8 @@ int64_t align_to(int64_t n, int64_t align) {
   return (n + align - 1) / align * align;
 }
 
-bool va_arg_need_copy(Type *ty) {
-  (void)ty;
-  return false;
-}
-
 bool bitint_rtn_need_copy(size_t width) {
   return width > 64;
-}
-
-void prepare_funcall(Node *node, Scope *scope) {
-  (void)node;
-  (void)scope;
-}
-
-void prepare_inline_asm(Node *node) {
-  error_tok(node->tok, "inline assembly is not supported by PIR backend");
 }
 
 /* =========================================================================
@@ -2162,11 +2148,6 @@ static PirVal gen_expr(Node *node) {
     return v;
   }
 
-  case ND_LABEL_VAL:
-  case ND_FRAME_ADDR:
-  case ND_RTN_ADDR:
-    error_tok(node->tok, "GNU extension (labels-as-values / frame/return address) not supported by PIR backend");
-
   default:
     error_tok(node->tok, "unsupported expression kind %d in PIR backend", (int)node->kind);
   }
@@ -2418,13 +2399,6 @@ static void gen_stmt(Node *node) {
     gen_defr(node);
     emit_jmp_id("lbl", get_lbl_id(node->jmp.target));
     return;
-
-  case ND_GOTO_EXPR:
-    error_tok(node->tok, "computed goto is not supported by PIR backend");
-
-  case ND_ASM:
-  case ND_ASM_GOTO:
-    error_tok(node->tok, "inline assembly is not supported by PIR backend");
 
   case ND_RETURN: {
     if (!node->m.lhs) {
@@ -2718,9 +2692,6 @@ static void emit_extern_decl(SBuf *sb, Obj *var) {
 }
 
 static void emit_global_def(SBuf *sb, Obj *var) {
-  if (var->ty->kind == TY_ASM)
-    error("top-level inline assembly is not supported by PIR backend");
-
   int64_t sz = var->ty->size > 0 ? var->ty->size : 1;
   int32_t al = var->alt_align ? var->alt_align : (var->ty->align > 0 ? var->ty->align : 1);
   int32_t p2 = 1;
@@ -2757,8 +2728,6 @@ static void emit_global_def(SBuf *sb, Obj *var) {
       if (!first)
         sb_printf(sb, ", ");
       first = false;
-      if (rel->label)
-        error("label address relocation in global initializer not supported by PIR backend");
       sb_printf(sb, "ptr ");
       sb_emit_sym(sb, pir_sym_name(rel->var));
       if (rel->addend > 0)

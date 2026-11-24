@@ -1,6 +1,6 @@
 #include "slimcc.h"
 
-int32_t eval_bitint_first_set(int32_t bits, BitBuf *op) {
+static int32_t eval_bitint_first_set(int32_t bits, BitBuf *op) {
   int32_t idx = (bits - 1) / 64;
 
   int clr_shft = 63 - (bits - 1) % 64;
@@ -12,23 +12,6 @@ int32_t eval_bitint_first_set(int32_t bits, BitBuf *op) {
         if (0 > (int64_t)((&op->as64)[idx] << shft))
           return (64 - shft) + idx * 64;
   return 0;
-}
-
-bool eval_bitint_overflow(int32_t bits, BitBuf *src, int32_t chk_bits, bool is_unsigned) {
-  int32_t idx = (chk_bits - 1) / 64;
-  int shft = (chk_bits - 1) % 64;
-
-  int64_t chk = (int64_t)(&src->as64)[idx++] >> shft;
-  if (chk != 0)
-    if (is_unsigned || chk != -1)
-      return true;
-
-  int32_t top = (bits - 1) / 64;
-  while (idx <= top)
-    if ((&src->as64)[idx++] != chk)
-      return true;
-
-  return false;
 }
 
 bool eval_bitint_to_bool(int32_t bits, BitBuf *op) {

@@ -1025,13 +1025,10 @@ void _add_type(Node *node) {
       add_type(n);
     break;
   case ND_ALLOCA:
-  case ND_ALLOCA_ZINIT: {
+  case ND_ALLOCA_ZINIT:
     add_type(node->m.lhs);
-  }
-  case ND_LABEL_VAL: {
     node->ty = pointer_to(ty_void);
     return;
-  }
   case ND_CAS:
     add_type(node->cas.addr);
     add_type(node->cas.old_val);

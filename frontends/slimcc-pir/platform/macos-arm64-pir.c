@@ -69,7 +69,6 @@ static const char *resolve_sdkroot(void) {
 void platform_init_driver(void) {
   dumpmachine_str = "aarch64-apple-darwin";
   default_as = resolve_pirc();
-  default_ld = "cc";
 }
 
 void platform_init_cc1(void) {
@@ -121,8 +120,7 @@ void platform_search_dirs(StringArray *paths) {
   strarray_push(paths, "/usr/lib");
 }
 
-void run_assembler(StringArray *as_args, const char *input, const char *output) {
-  (void)as_args;
+void run_assembler(const char *input, const char *output) {
   StringArray arr = {0};
   strarray_push(&arr, resolve_pirc());
   strarray_push(&arr, "--target");

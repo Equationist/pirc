@@ -37,22 +37,14 @@ typedef struct {
   StorageClass strg : 16;
   bool is_weak;
   bool is_packed;
-  bool is_common;
-  bool is_nocommon;
   bool is_gnu_inline;
   bool is_always_inline;
-  bool is_naked;
   bool is_noreturn;
   bool is_returns_twice;
   bool is_used;
-  bool is_ctor;
-  bool is_dtor;
-  uint16_t ctor_prior;
-  uint16_t dtor_prior;
   Obj *cleanup_fn;
   char *alias;
   char *section;
-  char *visibility;
   int align;
 } VarAttr;
 
@@ -135,7 +127,6 @@ typedef enum {
 
 typedef struct {
   EvalKind kind;
-  Node *label;
   Obj *var;
   int deref_cnt;
   EvalVarSpec vspec;
@@ -474,19 +465,17 @@ Node *new_cast(Node *expr, Type *ty) {
     error_tok(expr->tok, "invalid cast");
 
   Node tmp_node = {.kind = ND_CAST, .tok = expr->tok, .m.lhs = expr, .ty = ty};
-  if (opt_optimize) {
-    int64_t val = 0;
-    if (is_integer(ty) && is_const_expr_strict(&tmp_node, &val)) {
-      expr->kind = ND_NUM;
-      expr->num.val = val;
-      expr->ty = ty;
-      return expr;
-    }
+  int64_t val = 0;
+  if (is_integer(ty) && is_const_expr_strict(&tmp_node, &val)) {
+    expr->kind = ND_NUM;
+    expr->num.val = val;
+    expr->ty = ty;
+    return expr;
+  }
 
-    if (is_redundant_cast(expr, ty)) {
-      expr->ty = ty;
-      return expr;
-    }
+  if (is_redundant_cast(expr, ty)) {
+    expr->ty = ty;
+    return expr;
   }
   Node *node = arena_malloc(&ast_arena, sizeof(Node));
   *node = tmp_node;
@@ -830,14 +819,6 @@ static void pragma_pack(Token **rest, Token *tok) {
   internal_error();
 }
 
-static bool get_attr_val(Token *tok, int64_t *val) {
-  if (tok->kind == TK_LPAREN) {
-    *val = const_expr(&tok, tok);
-    return true;
-  }
-  return false;
-}
-
 static void attr_aligned(Token *loc, TokenKind kind, int *align) {
   for (Token *tok = loc->attr_next; tok; tok = tok->attr_next) {
     if (tok->kind != kind)
@@ -866,31 +847,6 @@ static void attr_cleanup(Token *loc, TokenKind kind, Obj **fn) {
         error_tok(tok, "cleanup function not found");
       *fn = sc->var;
       return;
-    }
-  }
-}
-
-static void apply_cdtor_attr(const char *attr_name, Token *tok, bool *is_cdtor,
-                             uint16_t *priority, uint16_t pri, bool apply) {
-  if (apply) {
-    if (*is_cdtor && *priority != pri)
-      error_tok(tok, "%s priority conflict", attr_name);
-    *is_cdtor = true;
-    *priority = pri;
-  }
-}
-
-static void cdtor_attr(Token *loc, TokenKind kind, const char *name, bool *is_cdtor,
-                       uint16_t *priority) {
-  for (Token *tok = loc->attr_next; tok; tok = tok->attr_next) {
-    if (tok->kind != kind)
-      continue;
-    if (equal_ext(tok, name)) {
-      uint16_t pri = 0;
-      int64_t val;
-      if (get_attr_val(tok->next, &val))
-        pri = MIN(val, 65535L) + 1;
-      apply_cdtor_attr(name, tok, is_cdtor, priority, pri, true);
     }
   }
 }
@@ -930,19 +886,13 @@ static void tyspec_attr(Token *tok, VarAttr *attr, TokenKind kind) {
   attr_cleanup(tok, kind, &attr->cleanup_fn);
   bool_attr(tok, kind, "weak", &attr->is_weak);
   bool_attr(tok, kind, "packed", &attr->is_packed);
-  bool_attr(tok, kind, "common", &attr->is_common);
-  bool_attr(tok, kind, "nocommon", &attr->is_nocommon);
   bool_attr(tok, kind, "gnu_inline", &attr->is_gnu_inline);
   bool_attr(tok, kind, "always_inline", &attr->is_always_inline);
-  bool_attr(tok, kind, "naked", &attr->is_naked);
   bool_attr(tok, kind, "noreturn", &attr->is_noreturn);
   bool_attr(tok, kind, "returns_twice", &attr->is_returns_twice);
   bool_attr(tok, kind, "used", &attr->is_used);
-  cdtor_attr(tok, kind, "constructor", &attr->is_ctor, &attr->ctor_prior);
-  cdtor_attr(tok, kind, "destructor", &attr->is_dtor, &attr->dtor_prior);
   str_attr(tok, kind, "alias", &attr->alias);
   str_attr(tok, kind, "section", &attr->section);
-  str_attr(tok, kind, "visibility", &attr->visibility);
 }
 
 #define DeclAttr(Fn, ...)                    \
@@ -964,9 +914,6 @@ static void symbol_attr(Token *name, Token *tok, VarAttr *attr, Obj *var) {
   apply_str_attr("section", name, &var->section_name, attr->section);
   DeclAttr(str_attr, "section", &var->section_name);
 
-  apply_str_attr("visibility", name, &var->visibility, attr->visibility);
-  DeclAttr(str_attr, "visibility", &var->visibility);
-
   var->is_used |= attr->is_used;
   DeclAttr(bool_attr, "used", &var->is_used);
 
@@ -975,32 +922,9 @@ static void symbol_attr(Token *name, Token *tok, VarAttr *attr, Obj *var) {
 
   if (var->is_weak && var->is_static)
     error_tok(name, "weak declaration cannot be `static`");
-
-  var->is_common |= attr->is_common;
-  DeclAttr(bool_attr, "common", &var->is_common);
-
-  var->is_nocommon |= attr->is_nocommon;
-  DeclAttr(bool_attr, "nocommon", &var->is_nocommon);
-
-  if (var->is_common && var->is_nocommon)
-    error_tok(name, "conflict of attribute common/nocommon");
 }
 
 static void func_attr(Token *name, Token *tok, VarAttr *attr, Obj *fn) {
-  apply_cdtor_attr("constructor", name, &fn->is_ctor, &fn->ctor_prior, attr->ctor_prior,
-                   attr->is_ctor);
-  DeclAttr(cdtor_attr, "constructor", &fn->is_ctor, &fn->ctor_prior);
-
-  apply_cdtor_attr("destructor", name, &fn->is_dtor, &fn->dtor_prior, attr->dtor_prior,
-                   attr->is_dtor);
-  DeclAttr(cdtor_attr, "destructor", &fn->is_dtor, &fn->dtor_prior);
-
-  if (fn->is_ctor || fn->is_dtor)
-    fn->is_used = true;
-
-  fn->is_naked |= attr->is_naked;
-  DeclAttr(bool_attr, "naked", &fn->is_naked);
-
   fn->is_noreturn |= attr->is_noreturn;
   DeclAttr(bool_attr, "noreturn", &fn->is_noreturn);
 
@@ -1036,7 +960,6 @@ static void cleanup_attr(Token *name, Token *tok, VarAttr *attr, Obj *var) {
 
     n->call.args = alloc_ast_var(arg->ty);
     n->call.args->arg_expr = arg;
-    prepare_funcall(n, scope);
 
     DeferStmt *defr2 = new_defr(DF_CLEANUP_FN);
     defr2->cleanup_fn = n;
@@ -2611,7 +2534,7 @@ static Node *lvar_initializer(Token **rest, Token *tok, Obj *var, bool try_promo
 
   free_initializers(&init);
 
-  if (opt_optimize && (init.kind == INIT_EXPR || init.kind == INIT_TOK))
+  if (init.kind == INIT_EXPR || init.kind == INIT_TOK)
     return head.next;
 
   Node *node = new_node(ND_INIT_SEQ, tok);
@@ -2678,7 +2601,6 @@ static void write_gvar_data(Relocation **cur, Initializer *init, char *buf, int 
             Relocation *rel = arena_calloc(fnctx ? &ast_arena : &cc1_arena,
                                            sizeof(Relocation));
             rel->offset = pos + offset;
-            rel->label = srel->label;
             rel->var = srel->var;
             rel->addend = srel->addend;
             (*cur) = (*cur)->next = rel;
@@ -2696,10 +2618,9 @@ static void write_gvar_data(Relocation **cur, Initializer *init, char *buf, int 
     if (is_integer(init->ty) || init->ty->kind == TY_PTR || init->ty->kind == TY_NULLPTR) {
       EvalContext ctx = {.kind = (init->ty->size != ty_nullptr->size) ? EV_CONST : ev_kind};
       int64_t val = eval2(node, &ctx);
-      if (ctx.label || ctx.var) {
+      if (ctx.var) {
         Relocation *rel = arena_calloc(fnctx ? &ast_arena : &cc1_arena, sizeof(Relocation));
         rel->offset = offset;
-        rel->label = ctx.label;
         rel->var = ctx.var;
         rel->addend = val;
         (*cur) = (*cur)->next = rel;
@@ -2912,103 +2833,6 @@ static void eval_static_assert(Token **rest, Token *tok) {
   *rest = skip_tk(tok, TK_RPAREN);
 }
 
-static AsmParam *asm_params(Token **rest, Token *tok) {
-  AsmParam head = {0};
-  AsmParam *cur = &head;
-
-  while (tok->kind != TK_COLON && tok->kind != TK_COLON2 && tok->kind != TK_RPAREN) {
-    if (cur != &head)
-      tok = skip_tk(tok, TK_COMMA);
-
-    cur = cur->next = arena_calloc(&ast_arena, sizeof(AsmParam));
-
-    if (consume_tk(&tok, tok, TK_LBRACK)) {
-      cur->name = tok;
-      tok = skip_tk(tok->next, TK_RBRACK);
-    }
-    cur->constraint = str_tok(&tok, tok);
-    cur->arg = expression(&tok, skip_tk(tok, TK_LPAREN));
-    add_type(cur->arg);
-    tok = skip_tk(tok, TK_RPAREN);
-  }
-  *rest = tok;
-  return head.next;
-}
-
-static Token *asm_clobbers(Token **rest, Token *tok) {
-  Token *first = NULL;
-
-  while (tok->kind != TK_COLON && tok->kind != TK_COLON2 && tok->kind != TK_RPAREN) {
-    if (!first) {
-      first = str_tok(&tok, tok);
-      continue;
-    }
-    tok = skip_tk(tok, TK_COMMA);
-    str_tok(&tok, tok);
-  }
-  *rest = tok;
-  return first;
-}
-
-static AsmParam *asm_labels(Token **rest, Token *tok) {
-  AsmParam head = {0};
-  AsmParam *cur = &head;
-
-  while (tok->kind != TK_RPAREN) {
-    if (cur != &head)
-      tok = skip_tk(tok, TK_COMMA);
-
-    Node *node = new_node(ND_ASM_GOTO, ident_tok(&tok, tok));
-    push_goto(node);
-
-    cur = cur->next = arena_calloc(&ast_arena, sizeof(AsmParam));
-    cur->arg = node;
-  }
-  *rest = tok;
-  return head.next;
-}
-
-static Node *asm_stmt(Token **rest, Token *tok) {
-  Node *node = new_node(ND_ASM, tok);
-  tok = tok->next;
-  bool is_asm_goto = false;
-
-  for (;; tok = tok->next) {
-    if (tok->kind == TK_inline || tok->kind == TK_volatile)
-      continue;
-
-    if (tok->kind == TK_goto) {
-      is_asm_goto = true;
-      continue;
-    }
-    break;
-  }
-  node->gasm.str_tok = str_tok(&tok, skip_tk(tok, TK_LPAREN));
-
-  for (int colons = 0;;) {
-    if (tok->kind == TK_COLON)
-      colons += 1;
-    else if (tok->kind == TK_COLON2)
-      colons += 2;
-    else
-      break;
-
-    switch (colons) {
-    case 1: node->gasm.outputs = asm_params(&tok, tok->next); continue;
-    case 2: node->gasm.inputs = asm_params(&tok, tok->next); continue;
-    case 3: node->gasm.clobbers = asm_clobbers(&tok, tok->next); continue;
-    case 4:
-      if (is_asm_goto) {
-        node->gasm.labels = asm_labels(&tok, tok->next);
-        continue;
-      }
-    }
-    break;
-  }
-  *rest = skip_tk(tok, TK_RPAREN);
-  return node;
-}
-
 static LocalLabel *find_local_label(Scope *sc, Token *tok) {
   for (LocalLabel *ll = sc->labels; ll; ll = ll->next)
     if (equal_tok(ll->name, tok))
@@ -3056,33 +2880,31 @@ static void case_range(Token **rest, Token *tok, Node *sw, Node *case_node) {
   *rest = skip_tk(tok, TK_COLON);
 
   // Merge adjacent ranges
-  if (opt_optimize) {
-    CaseRange *lo_adj = NULL;
-    CaseRange *hi_adj = NULL;
-    for (CaseRange *cr = sw->ctrl.sw_cases; cr; cr = cr->next) {
-      if (cr->label != case_node)
-        break;
-      if (less_eq(ty, cr->hi, lo) && (uint64_t)cr->hi + 1 == lo)
-        lo_adj = cr;
-      else if (less_eq(ty, hi, cr->lo) && (uint64_t)hi + 1 == cr->lo)
-        hi_adj = cr;
-    }
+  CaseRange *lo_adj = NULL;
+  CaseRange *hi_adj = NULL;
+  for (CaseRange *cr = sw->ctrl.sw_cases; cr; cr = cr->next) {
+    if (cr->label != case_node)
+      break;
+    if (less_eq(ty, cr->hi, lo) && (uint64_t)cr->hi + 1 == lo)
+      lo_adj = cr;
+    else if (less_eq(ty, hi, cr->lo) && (uint64_t)hi + 1 == cr->lo)
+      hi_adj = cr;
+  }
 
-    if (lo_adj && hi_adj) {
-      if (lo_adj->next)
-        hi_adj->lo = lo_adj->lo, *lo_adj = *lo_adj->next;
-      else
-        lo_adj->hi = hi_adj->hi, *hi_adj = *hi_adj->next;
-      return;
-    }
-    if (lo_adj) {
-      lo_adj->hi = hi;
-      return;
-    }
-    if (hi_adj) {
-      hi_adj->lo = lo;
-      return;
-    }
+  if (lo_adj && hi_adj) {
+    if (lo_adj->next)
+      hi_adj->lo = lo_adj->lo, *lo_adj = *lo_adj->next;
+    else
+      lo_adj->hi = hi_adj->hi, *hi_adj = *hi_adj->next;
+    return;
+  }
+  if (lo_adj) {
+    lo_adj->hi = hi;
+    return;
+  }
+  if (hi_adj) {
+    hi_adj->lo = lo;
+    return;
   }
 
   CaseRange *cr = arena_malloc(&ast_arena, sizeof(CaseRange));
@@ -3327,29 +3149,12 @@ static Node *stmt(Token **rest, Token *tok, Token *label_list) {
     return leave_stmt_scope(dfr, node);
   }
 
-  if (tok->kind == TK_asm) {
-    Node *node = asm_stmt(&tok, tok);
-
-    enter_tmp_scope();
-    prepare_inline_asm(node);
-    leave_scope();
-
-    *rest = skip_tk(tok, TK_SEMI);
-    return node;
-  }
+  if (tok->kind == TK_asm)
+    error_tok(tok, "inline assembly is not supported by PIR backend");
 
   if (tok->kind == TK_goto) {
-    if (tok->next->kind == TK_MUL) {
-      // [GNU] `goto *ptr` jumps to the address specified by `ptr`.
-      Node *node = new_node(ND_GOTO_EXPR, tok);
-      Node *expr = expression(&tok, tok->next->next);
-      add_type(expr);
-      if (expr->ty->kind != TY_PTR)
-        error_tok(node->tok, "expected pointer");
-      node->m.lhs = expr;
-      *rest = skip_tk(tok, TK_SEMI);
-      return node;
-    }
+    if (tok->next->kind == TK_MUL)
+      error_tok(tok, "computed goto is not supported by PIR backend");
     Node *node = new_node(ND_GOTO, ident_tok(&tok, tok->next));
     push_goto(node);
 
@@ -3542,15 +3347,6 @@ static Obj *eval_var(Node *node, int *ofs, bool let_volatile) {
   EvalVarSpec vkind = EV_ARRAY | EV_ATOMIC;
   if (let_volatile)
     vkind |= EV_VOLATILE;
-  return eval_var_ofs(node, ofs, vkind);
-}
-
-Obj *eval_var_opt(Node *node, int *ofs, bool let_subarray, bool let_atomic) {
-  EvalVarSpec vkind = 0;
-  if (let_subarray)
-    vkind |= EV_ARRAY;
-  if (let_atomic)
-    vkind |= EV_ATOMIC;
   return eval_var_ofs(node, ofs, vkind);
 }
 
@@ -3866,13 +3662,6 @@ static int64_t eval2(Node *node, EvalContext *ctx) {
   }
 
   if (ctx->kind == EV_LABEL) {
-    if (node->kind == ND_LABEL_VAL) {
-      if (!ctx->label && !(fnctx && fnctx->defr_ctx)) {
-        ctx->label = node;
-        return 0;
-      }
-      return eval_error(node);
-    }
     if (!ctx->var) {
       int ofs;
       Obj *var = NULL;
@@ -4426,8 +4215,7 @@ static Node *arith_assign_addsub(NodeKind kind, Node *lhs, Node *rhs, Token *tok
 }
 
 static Node *new_inc_dec(Node *lhs, Token *tok, int addend) {
-  if (opt_optimize &&
-      !(lhs->ty->qual & Q_ATOMIC) &&
+  if (!(lhs->ty->qual & Q_ATOMIC) &&
       lhs->ty->kind != TY_BOOL &&
       !is_bitfield(lhs) &&
       !is_flonum(lhs->ty)) {
@@ -4828,16 +4616,8 @@ static Node *unary(Token **rest, Token *tok) {
   }
 
   // [GNU] labels-as-values
-  if (tok->kind == TK_AND2) {
-    if (!fnctx)
-      error_tok(tok, "lable-as-value not in a function");
-
-    Node *node = new_node(ND_LABEL_VAL, ident_tok(rest, tok->next));
-    push_goto(node);
-
-    fnctx->dont_dealloc_vla = true;
-    return node;
-  }
+  if (tok->kind == TK_AND2)
+    error_tok(tok, "labels-as-values is not supported by PIR backend");
 
   if (tok->kind == TK_alignof) {
     Type *ty;
@@ -5383,7 +5163,6 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
   node->call.args = head.param_next;
   node->is_nonlval = true;
 
-  prepare_funcall(node, scope);
   leave_scope();
 
   // If a function returns a struct, it is caller's responsibility
@@ -5548,28 +5327,9 @@ static Node *builtin_functions(Token **rest, Token *tok) {
     return node;
   }
 
-  if (equal(tok, "__builtin_frame_address")) {
-    Node *node = new_node(ND_FRAME_ADDR, tok);
-    node->ty = pointer_to(ty_void);
-    node->num.val = const_expr(&tok, skip_tk(tok->next, TK_LPAREN));
-    *rest = skip_tk(tok, TK_RPAREN);
-    return node;
-  }
-
-  if (equal(tok, "__builtin_return_address")) {
-    Node *node = new_node(ND_RTN_ADDR, tok);
-    node->ty = pointer_to(ty_void);
-    node->num.val = const_expr(&tok, skip_tk(tok->next, TK_LPAREN));
-    *rest = skip_tk(tok, TK_RPAREN);
-    return node;
-  }
-
-  if (equal(tok, "__builtin_extract_return_addr")) {
-    tok = skip_tk(tok->next, TK_LPAREN);
-    Node *node = assign(&tok, tok);
-    *rest = skip_tk(tok, TK_RPAREN);
-    return node;
-  }
+  if (equal(tok, "__builtin_frame_address") ||
+      equal(tok, "__builtin_return_address"))
+    error_tok(tok, "%.*s is not supported by PIR backend", tok->len, tok->loc);
 
   if (equal(tok, "__builtin_atomic_chk")) {
     tok = skip_tk(tok->next, TK_LPAREN);
@@ -5719,9 +5479,6 @@ static Node *builtin_functions(Token **rest, Token *tok) {
     VarAttr attr = {0};
     Type *ty = typename2(&tok, tok, &attr);
     *rest = skip_tk(tok, TK_RPAREN);
-
-    if (va_arg_need_copy(ty))
-      node->m.var = new_lvar(ty);
 
     node->ty = pointer_to(ty);
     node = new_unary(ND_DEREF, node, tok);
@@ -5936,15 +5693,6 @@ static Node *parse_typedef(Token **rest, Token *tok, Type *basety, VarAttr *attr
 
 static void set_goto(Node *node, Node *dest) {
   node->jmp.target = dest;
-
-  switch (node->kind) {
-  case ND_ASM_GOTO:
-    if (node->dfr_from != dest->dfr_from)
-      error_tok(node->tok, "asm goto with defer not supported");
-  case ND_LABEL_VAL: {
-    return;
-  }
-  }
 
   if (!dest->dfr_from)
     return;
@@ -6373,14 +6121,8 @@ Obj *parse(Token *tok) {
     if (consume_tk(&tok, tok, TK_SEMI))
       continue;
 
-    if (tok->kind == TK_asm) {
-      static Type ty = {.kind = TY_ASM};
-      Obj *obj = new_gvar(NULL, &ty);
-      obj->asm_name = str_tok(&tok, skip_tk(tok->next, TK_LPAREN))->str;
-      obj->is_definition = true;
-      tok = skip_tk(tok, TK_RPAREN);
-      continue;
-    }
+    if (tok->kind == TK_asm)
+      error_tok(tok, "top-level inline assembly is not supported by PIR backend");
 
     arena_on(&ast_arena);
 

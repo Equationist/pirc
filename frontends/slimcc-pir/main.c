@@ -3,8 +3,6 @@
 typedef enum {
   FILE_NONE = 0,
   FILE_C,
-  FILE_ASM,
-  FILE_PP_ASM,
   FILE_LDARG,
 } FileType;
 
@@ -22,20 +20,11 @@ typedef struct {
 StringArray include_paths;
 StringArray iquote_paths;
 StringArray display_files;
-bool opt_fcommon;
-int opt_fpic;
-int opt_fpie;
-bool opt_femulated_tls;
-int opt_fn_align = 1;
-bool opt_use_plt = true;
-bool opt_optimize = true;
+static int opt_fpic;
+static int opt_fpie;
 bool opt_reuse_stack = true;
 bool opt_g;
-bool opt_func_sections;
-bool opt_data_sections;
 bool opt_werror;
-bool opt_cc1_asm_pp;
-const char *opt_visibility;
 StdVer opt_std = STD_C17;
 bool is_iso_std;
 bool opt_fdefer_ts;
@@ -43,7 +32,6 @@ bool opt_short_enums;
 bool opt_gnu_keywords;
 bool opt_gnu89_inline;
 bool opt_ms_anon_struct;
-bool opt_disable_visibility;
 bool opt_fake_always_inline;
 
 static StringArray opt_imacros;
@@ -60,35 +48,16 @@ static bool opt_S;
 static bool opt_c;
 static bool opt_verbose;
 static bool opt_verbose_noop;
-static bool opt_pipe;
 static bool nofork;
 
-bool opt_pie;
-bool opt_nopie;
 bool opt_pthread;
-bool opt_r;
-bool opt_rdynamic;
-bool opt_static;
-bool opt_static_pie;
-bool opt_static_libgcc;
-bool opt_shared;
-bool opt_s;
-bool opt_nostartfiles;
-bool opt_nodefaultlibs;
-bool opt_nolibc;
-const char *default_ld = "ld";
-const char *default_as = "as";
+const char *default_as = "pirc";
 const char *dumpmachine_str;
-#ifdef SLIMCC_PIR
 const char *opt_isysroot;
 const char *opt_pirc;
 const char *opt_pir_target = "aarch64-apple-darwin";
 int opt_pir_opt_level = 2;
-bool opt_emit_pir;
-bool opt_fwrapv;
-#endif
-static const char *opt_use_ld;
-static const char *opt_use_as;
+static bool opt_emit_pir;
 static const char *opt_MF;
 static const char *opt_MT;
 static const char *opt_o;
@@ -98,14 +67,13 @@ static StringArray sysincl_paths;
 static StringArray dep_files;
 static StringArray tmpfiles;
 static const char *tmp_folder;
-static StringArray as_args;
 static MacroChangeArr macrodefs;
 static int incl_cnt;
 
 static bool is_fork_child;
 char *argv0;
 
-static void cc1(const char *input_file, const char *output, bool is_asm_pp);
+static void cc1(const char *input_file, const char *output);
 
 #if defined(USE_ASAN)
 __attribute__((visibility("default"))) const char *__asan_default_options(void) {
@@ -178,10 +146,6 @@ void add_include_path(StringArray *arr, const char *path) {
 static FileType parse_opt_x(const char *s) {
   if (!strcmp(s, "c"))
     return FILE_C;
-  if (!strcmp(s, "assembler"))
-    return FILE_ASM;
-  if (!strcmp(s, "assembler-with-cpp"))
-    return FILE_PP_ASM;
   if (!strcmp(s, "none"))
     return FILE_NONE;
   error("<command line>: unknown argument for -x: %s", s);
@@ -249,30 +213,26 @@ static void macrochange_push(MacroChangeArr *arr, const char *arg, bool is_def) 
   m->is_def = is_def;
 }
 
-static void cli_macros(bool is_asm_pp) {
-  if (is_asm_pp) {
-    define_macro("__ASSEMBLER__", "1");
-  } else {
-    if (is_iso_std)
-      define_macro("__STRICT_ANSI__", "1");
+static void cli_macros(void) {
+  if (is_iso_std)
+    define_macro("__STRICT_ANSI__", "1");
 
-    switch (opt_std) {
-    case STD_C94: define_macro("__STDC_VERSION__", "199409L"); break;
-    case STD_C99: define_macro("__STDC_VERSION__", "199901L"); break;
-    case STD_C11: define_macro("__STDC_VERSION__", "201112L"); break;
-    case STD_C17: define_macro("__STDC_VERSION__", "201710L"); break;
-    case STD_C23: define_macro("__STDC_VERSION__", "202311L"); break;
-    case STD_C2Y: define_macro("__STDC_VERSION__", "202400L"); break;
-    }
-
-    if (opt_std >= STD_C99)
-      define_macro("__GNUC_STDC_INLINE__", "1");
-
-    define_macro("__STDC_UTF_16__", "1");
-    define_macro("__STDC_UTF_32__", "1");
-
-    define_macro("__STDC_DEFER_TS25755__", opt_fdefer_ts ? "2" : "1");
+  switch (opt_std) {
+  case STD_C94: define_macro("__STDC_VERSION__", "199409L"); break;
+  case STD_C99: define_macro("__STDC_VERSION__", "199901L"); break;
+  case STD_C11: define_macro("__STDC_VERSION__", "201112L"); break;
+  case STD_C17: define_macro("__STDC_VERSION__", "201710L"); break;
+  case STD_C23: define_macro("__STDC_VERSION__", "202311L"); break;
+  case STD_C2Y: define_macro("__STDC_VERSION__", "202400L"); break;
   }
+
+  if (opt_std >= STD_C99)
+    define_macro("__GNUC_STDC_INLINE__", "1");
+
+  define_macro("__STDC_UTF_16__", "1");
+  define_macro("__STDC_UTF_32__", "1");
+
+  define_macro("__STDC_DEFER_TS25755__", opt_fdefer_ts ? "2" : "1");
 
   if (opt_pthread)
     define_macro("_REENTRANT", "1");
@@ -432,11 +392,6 @@ static int parse_args(int argc, char **argv, StringArray *input_args) {
       exit(0);
     }
 
-    if (!strcmp(argv[i], "-hashmap-test")) {
-      hashmap_test();
-      exit(0);
-    }
-
     if (take_arg_s(argv, &i, &arg, "-o")) {
       opt_o = arg;
       continue;
@@ -522,10 +477,8 @@ static int parse_args(int argc, char **argv, StringArray *input_args) {
       continue;
     }
 
-    if (startswith(argv[i], &arg, "-Wa,")) {
-      comma_arg(arg, &as_args);
+    if (startswith(argv[i], &arg, "-Wa,"))
       continue;
-    }
 
     if (startswith(argv[i], &arg, "-Wl,")) {
       strarray_push(input_args, argv[i]);
@@ -547,10 +500,8 @@ static int parse_args(int argc, char **argv, StringArray *input_args) {
       continue;
     }
 
-    if (!strcmp(argv[i], "-s")) {
-      opt_s = true;
+    if (!strcmp(argv[i], "-s"))
       continue;
-    }
 
     if (!strcmp(argv[i], "-M")) {
       opt_M = true;
@@ -622,35 +573,22 @@ static int parse_args(int argc, char **argv, StringArray *input_args) {
 
     if (startswith(argv[i], &arg, "-O")) {
       switch (*arg) {
-#ifdef SLIMCC_PIR
       case '0':
         opt_pir_opt_level = 0;
         break;
       case '1':
         opt_pir_opt_level = 1;
         break;
-#endif
       case 's':
-      case 'z': {
-        opt_fn_align = 1;
-#ifdef SLIMCC_PIR
-        opt_pir_opt_level = 2;
-#endif
-        break;
-      }
+      case 'z':
       case '2':
       case '3':
-        if (opt_fn_align == 1)
-          opt_fn_align = 16;
-#ifdef SLIMCC_PIR
         opt_pir_opt_level = 2;
-#endif
         break;
       }
       continue;
     }
 
-#ifdef SLIMCC_PIR
     if (!strcmp(argv[i], "--emit-pir")) {
       opt_emit_pir = true;
       continue;
@@ -672,15 +610,6 @@ static int parse_args(int argc, char **argv, StringArray *input_args) {
       opt_pir_target = arg;
       continue;
     }
-    if (!strcmp(argv[i], "-fwrapv")) {
-      opt_fwrapv = true;
-      continue;
-    }
-    if (!strcmp(argv[i], "-fno-wrapv")) {
-      opt_fwrapv = false;
-      continue;
-    }
-#endif
 
     if (!strcmp(argv[i], "-ansi")) {
       set_std(true, "89");
@@ -709,12 +638,7 @@ static int parse_args(int argc, char **argv, StringArray *input_args) {
     if (startswith(argv[i], &arg, "-f")) {
       bool b = !startswith(arg, &arg, "no-");
 
-      if (set_bool(arg, b, "common", &opt_fcommon) ||
-          set_bool(arg, b, "plt", &opt_use_plt) ||
-          set_bool(arg, b, "function-sections", &opt_func_sections) ||
-          set_bool(arg, b, "data-sections", &opt_data_sections) ||
-          set_bool(arg, b, "emulated-tls", &opt_femulated_tls) ||
-          set_bool(arg, b, "short-enums", &opt_short_enums) ||
+      if (set_bool(arg, b, "short-enums", &opt_short_enums) ||
           set_bool(arg, b, "gnu89-inline", &opt_gnu89_inline))
         continue;
 
@@ -726,22 +650,6 @@ static int parse_args(int argc, char **argv, StringArray *input_args) {
         opt_gnu_keywords = b;
         has_gnu_keywords_option = true;
         continue;
-      }
-
-      if (!strncmp(arg, "align-functions", 15)) {
-        arg += 15;
-        if (*arg == '\0') {
-          opt_fn_align = b ? 16 : 1;
-          continue;
-        }
-        if (b && *arg == '=') {
-          char *end;
-          if (!(opt_fn_align = strtoul(arg + 1, &end, 10)))
-            opt_fn_align = 16;
-          if (*end == '\0' && is_pow_of_two(opt_fn_align))
-            continue;
-        }
-        error("unsupported form of '-falign-functions'");
       }
 
       if (!strcmp(arg, "pic")) {
@@ -761,8 +669,15 @@ static int parse_args(int argc, char **argv, StringArray *input_args) {
         continue;
       }
 
-      // These options are ignored for now.
-      if (!strcmp(arg, "strict-aliasing") ||
+      // These options are ignored for PIR output.
+      if (!strcmp(arg, "common") ||
+          !strcmp(arg, "plt") ||
+          !strcmp(arg, "function-sections") ||
+          !strcmp(arg, "data-sections") ||
+          !strcmp(arg, "emulated-tls") ||
+          !strcmp(arg, "wrapv") ||
+          !strncmp(arg, "align-functions", 15) ||
+          !strcmp(arg, "strict-aliasing") ||
           !strcmp(arg, "strict-overflow") ||
           !strcmp(arg, "unroll-loops") ||
           !strcmp(arg, "omit-frame-pointer"))
@@ -782,46 +697,32 @@ static int parse_args(int argc, char **argv, StringArray *input_args) {
           continue;
         }
 
-        if (set_true(arg, "disable-visibility", &opt_disable_visibility))
-          continue;
         if (set_true(arg, "fake-always-inline", &opt_fake_always_inline))
           continue;
 
-        if (startswith(arg, &opt_visibility, "visibility=") ||
-            startswith(arg, &opt_use_as, "use-as="))
+        if (!strcmp(arg, "disable-visibility") ||
+            startswith(arg, &arg, "visibility="))
           continue;
-
-        if (startswith(arg, &arg, "use-ld=")) {
-          if (!strcmp(arg, "lld")) {
-            opt_use_ld = "ld.lld";
-            continue;
-          }
-          opt_use_ld = arg;
-          continue;
-        }
       }
     }
 
     if (argv[i][0] == '-') {
       arg = (argv[i][1] == '-') ? &argv[i][2] : &argv[i][1];
 
-      if (set_true(arg, "r", &opt_r) ||
-          set_true(arg, "rdynamic", &opt_rdynamic) ||
-          set_true(arg, "static", &opt_static) ||
-          set_true(arg, "static-pie", &opt_static_pie) ||
-          set_true(arg, "static-libgcc", &opt_static_libgcc) ||
-          set_true(arg, "shared", &opt_shared) ||
-          set_true(arg, "pie", &opt_pie) ||
-          set_true(arg, "nopie", &opt_nopie) ||
-          set_true(arg, "pthread", &opt_pthread) ||
-          set_true(arg, "pipe", &opt_pipe))
+      if (set_true(arg, "pthread", &opt_pthread))
         continue;
 
-      if (!strcmp(arg, "no-pie")) {
-        opt_pie = false;
-        opt_nopie = true;
+      if (!strcmp(arg, "r") ||
+          !strcmp(arg, "rdynamic") ||
+          !strcmp(arg, "static") ||
+          !strcmp(arg, "static-pie") ||
+          !strcmp(arg, "static-libgcc") ||
+          !strcmp(arg, "shared") ||
+          !strcmp(arg, "pie") ||
+          !strcmp(arg, "nopie") ||
+          !strcmp(arg, "no-pie") ||
+          !strcmp(arg, "pipe"))
         continue;
-      }
     }
 
     if (!strcmp(argv[i], "-nostdinc")) {
@@ -829,15 +730,11 @@ static int parse_args(int argc, char **argv, StringArray *input_args) {
       continue;
     }
 
-    if (set_true(argv[i], "-nostartfiles", &opt_nostartfiles) ||
-        set_true(argv[i], "-nodefaultlibs", &opt_nodefaultlibs) ||
-        set_true(argv[i], "-nolibc", &opt_nolibc))
+    if (!strcmp(argv[i], "-nostartfiles") ||
+        !strcmp(argv[i], "-nodefaultlibs") ||
+        !strcmp(argv[i], "-nolibc") ||
+        !strcmp(argv[i], "-nostdlib"))
       continue;
-
-    if (!strcmp(argv[i], "-nostdlib")) {
-      opt_nostartfiles = opt_nodefaultlibs = true;
-      continue;
-    }
 
     if (set_bool(argv[i], true, "-Werror", &opt_werror) ||
         set_bool(argv[i], false, "-Wno-error", &opt_werror))
@@ -883,19 +780,13 @@ static int parse_args(int argc, char **argv, StringArray *input_args) {
   if (opt_MG && !opt_M)
     error("option -MG must be used with -M or -MM");
 
-  if (opt_disable_visibility && opt_visibility)
-    error("-fvisibility disabled with -fdisable-visibility");
-
   if (!has_gnu_keywords_option)
     opt_gnu_keywords = !is_iso_std;
 
   if (opt_B) {
     char *as_b = format("%s/%s", opt_B, default_as);
-    char *ld_b = format("%s/%s", opt_B, default_ld);
     if (file_exists(as_b))
       default_as = as_b;
-    if (file_exists(ld_b))
-      default_ld = ld_b;
   }
 
   build_incl_paths(opt_B, opt_nostdinc, &isystem, &idirafter);
@@ -940,19 +831,6 @@ void cleanup_exit(int status) {
   if (tmp_folder)
     rmdir(tmp_folder);
 
-#if defined(CHECK_MEMUSE)
-  {
-    int64_t accum = 0;
-    struct rusage stat;
-    getrusage(RUSAGE_SELF, &stat);
-    accum += stat.ru_maxrss;
-    getrusage(RUSAGE_CHILDREN, &stat);
-    accum += stat.ru_maxrss;
-    if (accum > 5000 * 1024)
-      status = 5;
-  }
-#endif
-
   exit(status);
 }
 
@@ -966,13 +844,6 @@ static char *create_tmpfile(void) {
   char *path = format("%s/%" PRIi64, tmp_folder, i++);
 
   strarray_push(&tmpfiles, path);
-  return path;
-}
-
-static char *create_pipefile(void) {
-  char *path = create_tmpfile();
-  if (mkfifo(path, (S_IRUSR | S_IWUSR)) == -1)
-    error("mkfifo failed: %s", strerror(errno));
   return path;
 }
 
@@ -998,53 +869,42 @@ void run_subprocess(const char **argv) {
   }
 }
 
-static int fork_cc1(const char *input, const char *output, bool is_asm_pp) {
+static int fork_cc1(const char *input, const char *output) {
   pid_t id = fork();
   if (id == 0) {
     is_fork_child = true;
-    cc1(input, output, is_asm_pp);
+    cc1(input, output);
     _exit(0);
   }
   return id;
 }
 
-static void run_cc1(const char *input, const char *output, bool is_asm_pp) {
+static void run_cc1(const char *input, const char *output) {
   if (opt_verbose_noop)
     return;
 
   if (nofork) {
-    cc1(input, output, is_asm_pp);
+    cc1(input, output);
     return;
   }
 
-  int id = fork_cc1(input, output, is_asm_pp);
+  int id = fork_cc1(input, output);
 
   int status;
   if (waitpid(id, &status, 0) <= 0 || status != 0)
     cleanup_exit(1);
 }
 
-static void run_cc1_as(const char *input, const char *output, bool is_asm_pp) {
+static void run_cc1_as(const char *input, const char *output) {
   if (opt_verbose_noop) {
     char *tmp = create_tmpfile();
-    run_assembler(&as_args, tmp, output);
-    return;
-  }
-
-  if (opt_pipe) {
-    char *tmp = create_pipefile();
-    int id = fork_cc1(input, tmp, is_asm_pp);
-    run_assembler(&as_args, tmp, output);
-
-    int status;
-    if (waitpid(id, &status, 0) <= 0 || status != 0)
-      cleanup_exit(1);
+    run_assembler(tmp, output);
     return;
   }
 
   char *tmp = create_tmpfile();
-  run_cc1(input, tmp, is_asm_pp);
-  run_assembler(&as_args, tmp, output);
+  run_cc1(input, tmp);
+  run_assembler(tmp, output);
 }
 
 static void print_linemarker(FILE *out, Token *tok) {
@@ -1178,16 +1038,13 @@ static void print_dependencies(const char *input, FILE *out) {
       fprintf(out, "%s:\n", quote_makefile(skip_dot_slash(dep_files.data[i])));
 }
 
-static void cc1(const char *input, const char *output, bool is_asm_pp) {
-  if (is_asm_pp)
-    opt_E = opt_cc1_asm_pp = true;
-
+static void cc1(const char *input, const char *output) {
   arena_on(&cc1_arena);
   arena_on(&pp_arena);
 
   init_macros();
   platform_init_cc1();
-  cli_macros(is_asm_pp);
+  cli_macros();
 
   FILE *out = open_file(output);
 
@@ -1234,212 +1091,9 @@ static void cc1(const char *input, const char *output, bool is_asm_pp) {
   arena_off(&cc1_arena);
 }
 
-void run_assembler_gnustyle(StringArray *args, const char *input, const char *output) {
-  StringArray arr = {0};
-
-  strarray_push(&arr, opt_use_as ? opt_use_as : default_as);
-  strarray_push(&arr, input);
-  strarray_push(&arr, "-o");
-  strarray_push(&arr, output);
-  strarray_push(&arr, "--fatal-warnings");
-
-  for (int i = 0; i < args->len; i++)
-    strarray_push(&arr, args->data[i]);
-
-  strarray_push(&arr, NULL);
-
-  run_subprocess(arr.data);
-}
-
-static char *find_file(const char *pattern) {
-  char *path = NULL;
-  glob_t buf = {0};
-  glob(pattern, 0, NULL, &buf);
-  if (buf.gl_pathc > 0)
-    path = strdup(buf.gl_pathv[buf.gl_pathc - 1]);
-  globfree(&buf);
-  return path;
-}
-
-char *find_dir_w_file(const char *pattern) {
-  static char *path;
-  if (!path) {
-    path = find_file(pattern);
-    if (!path)
-      return NULL;
-    path = dirname(path);
-  }
-  return path;
-}
-
 bool file_exists(const char *path) {
   struct stat st;
   return !stat(path, &st);
-}
-
-LinkType link_type_gnustyle(void) {
-  if (opt_r)
-    return LT_RELO;
-  if (opt_shared)
-    return LT_SHARED;
-  if (opt_static_pie)
-    return LT_STATIC_PIE;
-  if (opt_static)
-    return LT_STATIC;
-  if (opt_pie)
-    return LT_PIE;
-  return LT_DYNAMIC;
-}
-
-void ldarg_gnu_base(StringArray *arr, const char *output) {
-  strarray_push(arr, opt_use_ld ? opt_use_ld : default_ld);
-  strarray_push(arr, "-o");
-  strarray_push(arr, output);
-  strarray_push(arr, "-m");
-  strarray_push(arr, "elf_x86_64");
-  strarray_push(arr, "--eh-frame-hdr");
-
-  if (opt_s)
-    strarray_push(arr, "-s");
-}
-
-void ldarg_gnu_linktype(StringArray *arr, LinkType lt, const char *ldso_path) {
-  switch (lt) {
-  case LT_RELO:       strarray_push(arr, "-r"); break;
-  case LT_SHARED:     strarray_push(arr, "-shared"); break;
-  case LT_STATIC:     strarray_push(arr, "-static"); break;
-  case LT_STATIC_PIE: strarray_push(arr, "-static");
-  case LT_PIE:        strarray_push(arr, "-pie"); break;
-  }
-
-  switch (lt) {
-  case LT_STATIC_PIE: {
-    strarray_push(arr, "-no-dynamic-linker");
-    break;
-  }
-  case LT_DYNAMIC:
-  case LT_SHARED:
-  case LT_PIE:
-    if (ldso_path) {
-      if (opt_rdynamic)
-        strarray_push(arr, "--export-dynamic");
-
-      strarray_push(arr, "-dynamic-linker");
-      strarray_push(arr, ldso_path);
-    }
-  }
-}
-
-void ldarg_gnu_crtbegin(StringArray *arr, LinkType lt, const char *gcc_libpath) {
-  if (gcc_libpath) {
-    switch (lt) {
-    case LT_STATIC_PIE:
-    case LT_SHARED:
-    case LT_PIE:        strarray_push(arr, format("%s/crtbeginS.o", gcc_libpath)); break;
-    case LT_STATIC:     strarray_push(arr, format("%s/crtbeginT.o", gcc_libpath)); break;
-    case LT_DYNAMIC:    strarray_push(arr, format("%s/crtbegin.o", gcc_libpath)); break;
-    }
-  }
-}
-
-void ldarg_gnu_inputs(StringArray *arr, StringArray *paths, StringArray *args) {
-  for (int i = 0; i < paths->len; i++) {
-    strarray_push(arr, "-L");
-    strarray_push(arr, paths->data[i]);
-  }
-
-  for (int i = 0; i < args->len; i++)
-    strarray_push(arr, args->data[i]);
-}
-
-static void link_libgcc(StringArray *arr, bool has_libgcc, bool is_static) {
-  if (!has_libgcc)
-    return;
-  strarray_push(arr, "-lgcc");
-
-  if (is_static) {
-    strarray_push(arr, "-lgcc_eh");
-  } else {
-    strarray_push(arr, "--push-state");
-    strarray_push(arr, "--as-needed");
-    strarray_push(arr, "-lgcc_s");
-    strarray_push(arr, "--pop-state");
-  }
-}
-
-static void link_libc(StringArray *arr) {
-  if (opt_pthread)
-    strarray_push(arr, "-lpthread");
-  if (!opt_nolibc) {
-    strarray_push(arr, "-lc");
-    strarray_push(arr, "--push-state");
-    strarray_push(arr, "--as-needed");
-    strarray_push(arr, "-lm");
-    strarray_push(arr, "--pop-state");
-  }
-}
-
-void ldarg_gnu_lc_lgcc(StringArray *arr, LinkType lt, bool has_libgcc) {
-  if (lt == LT_STATIC_PIE || lt == LT_STATIC) {
-    strarray_push(arr, "--start-group");
-    link_libgcc(arr, has_libgcc, true);
-    link_libc(arr);
-    strarray_push(arr, "--end-group");
-  } else {
-    link_libgcc(arr, has_libgcc, opt_static_libgcc);
-    link_libc(arr);
-    link_libgcc(arr, has_libgcc, opt_static_libgcc);
-  }
-}
-
-void ldarg_gnu_crtend(StringArray *arr, LinkType lt, const char *gcc_libpath) {
-  if (gcc_libpath) {
-    switch (lt) {
-    case LT_STATIC_PIE:
-    case LT_SHARED:
-    case LT_PIE:        strarray_push(arr, format("%s/crtendS.o", gcc_libpath)); break;
-    case LT_STATIC:
-    case LT_DYNAMIC:    strarray_push(arr, format("%s/crtend.o", gcc_libpath)); break;
-    }
-  }
-}
-
-void run_linker_gnustyle(StringArray *paths, StringArray *args, const char *output,
-                         const char *ldso_path, const char *libpath,
-                         const char *gcc_libpath) {
-  StringArray arr = {0};
-
-  ldarg_gnu_base(&arr, output);
-
-  LinkType lt = link_type_gnustyle();
-
-  ldarg_gnu_linktype(&arr, lt, ldso_path);
-
-  if (!opt_nostartfiles && lt != LT_RELO) {
-    switch (lt) {
-    case LT_STATIC_PIE: strarray_push(&arr, format("%s/rcrt1.o", libpath)); break;
-    case LT_PIE:        strarray_push(&arr, format("%s/Scrt1.o", libpath)); break;
-    case LT_STATIC:
-    case LT_DYNAMIC:    strarray_push(&arr, format("%s/crt1.o", libpath)); break;
-    }
-    strarray_push(&arr, format("%s/crti.o", libpath));
-
-    ldarg_gnu_crtbegin(&arr, lt, gcc_libpath);
-  }
-
-  ldarg_gnu_inputs(&arr, paths, args);
-
-  if (!opt_nostartfiles && lt != LT_RELO) {
-    ldarg_gnu_lc_lgcc(&arr, lt, gcc_libpath);
-
-    ldarg_gnu_crtend(&arr, lt, gcc_libpath);
-
-    strarray_push(&arr, format("%s/crtn.o", libpath));
-  }
-
-  strarray_push(&arr, NULL);
-
-  run_subprocess(arr.data);
 }
 
 static FileType get_file_type(const char *filename) {
@@ -1448,8 +1102,6 @@ static FileType get_file_type(const char *filename) {
     switch (p[1]) {
     case 'c':
     case 'i': return FILE_C;
-    case 's': return FILE_ASM;
-    case 'S': return FILE_PP_ASM;
     case 'h':
       if (opt_E)
         return FILE_C;
@@ -1515,54 +1167,20 @@ int main(int argc, char **argv) {
       continue;
     }
 
-    if (type == FILE_ASM) {
-      if (opt_M || opt_E || opt_S)
-        continue;
-
-      if (opt_c) {
-        run_assembler(&as_args, input, opt_o ? opt_o : replace_extn(input, ".o"));
-        continue;
-      }
-      char *tmp = create_tmpfile();
-      run_assembler(&as_args, input, tmp);
-      strarray_push(&ld_args, tmp);
-      continue;
-    }
-
-    if (type == FILE_PP_ASM) {
-      if (opt_M) {
-        run_cc1(input, print_dep_outpath(input), true);
-        continue;
-      }
-      if (opt_E || opt_S) {
-        run_cc1(input, (opt_o ? opt_o : "-"), true);
-        continue;
-      }
-      if (opt_c) {
-        run_cc1_as(input, (opt_o ? opt_o : replace_extn(input, ".o")), true);
-        continue;
-      }
-      char *tmp = create_tmpfile();
-      run_cc1_as(input, tmp, true);
-      strarray_push(&ld_args, tmp);
-      continue;
-    }
-
     if (opt_M) {
-      run_cc1(input, print_dep_outpath(input), false);
+      run_cc1(input, print_dep_outpath(input));
       continue;
     }
     if (opt_E) {
-      run_cc1(input, (opt_o ? opt_o : "-"), false);
+      run_cc1(input, (opt_o ? opt_o : "-"));
       continue;
     }
     if (opt_S) {
-#ifdef SLIMCC_PIR
       if (opt_emit_pir) {
-        run_cc1(input, (opt_o ? opt_o : replace_extn(input, ".pir")), false);
+        run_cc1(input, (opt_o ? opt_o : replace_extn(input, ".pir")));
       } else {
         char *tmp = create_tmpfile();
-        run_cc1(input, tmp, false);
+        run_cc1(input, tmp);
         /* Invoke pirc -S to translate PIR -> target assembly */
         StringArray pargs = {0};
         strarray_push(&pargs, opt_pirc ? opt_pirc : default_as);
@@ -1576,23 +1194,18 @@ int main(int argc, char **argv) {
         strarray_push(&pargs, NULL);
         run_subprocess(pargs.data);
       }
-#else
-      run_cc1(input, (opt_o ? opt_o : replace_extn(input, ".s")), false);
-#endif
       continue;
     }
-#ifdef SLIMCC_PIR
     if (opt_emit_pir) {
-      run_cc1(input, (opt_o ? opt_o : replace_extn(input, ".pir")), false);
+      run_cc1(input, (opt_o ? opt_o : replace_extn(input, ".pir")));
       continue;
     }
-#endif
     if (opt_c) {
-      run_cc1_as(input, (opt_o ? opt_o : replace_extn(input, ".o")), false);
+      run_cc1_as(input, (opt_o ? opt_o : replace_extn(input, ".o")));
       continue;
     }
     char *tmp = create_tmpfile();
-    run_cc1_as(input, tmp, false);
+    run_cc1_as(input, tmp);
     strarray_push(&ld_args, tmp);
     continue;
   }

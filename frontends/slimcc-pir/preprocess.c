@@ -666,7 +666,6 @@ static char *join_tokens(Token *tok, Token *end, bool is_stringize) {
       switch (t->kind) {
       case TK_STR:
       case TK_CHAR_LIT:
-      case TK_ASM_STR:
       case TK_INVALID:
         for (int i = 0; i < t->len; i++) {
           if (t->loc[i] == '\\' || t->loc[i] == '"')
@@ -692,7 +691,6 @@ static char *join_tokens(Token *tok, Token *end, bool is_stringize) {
       switch (t->kind) {
       case TK_STR:
       case TK_CHAR_LIT:
-      case TK_ASM_STR:
       case TK_INVALID:
         for (int i = 0; i < t->len; i++) {
           if (t->loc[i] == '\\' || t->loc[i] == '"')
@@ -748,11 +746,8 @@ static Token *paste(Token *lhs, Token *rhs) {
   Token *tok = tokenize_buf(buf, lhs, NULL);
   align_token(tok, lhs);
 
-  if (tok->next->kind != TK_EOF) {
-    if (opt_cc1_asm_pp)
-      return lhs->next = tok->next;
+  if (tok->next->kind != TK_EOF)
     error_tok(lhs, "pasting forms '%s', an invalid token", buf);
-  }
   if (tok->origin == lhs)
     tok->origin = copy_token(lhs);
 
@@ -1112,7 +1107,7 @@ static char *read_filename(Token **rest, Token *tok, const char **dir) {
   }
 
   char *filename = NULL;
-  if (tok->kind == TK_STR || tok->kind == TK_ASM_STR) {
+  if (tok->kind == TK_STR) {
     // Pattern 1: #include "foo.h"
     // A double-quoted filename for #include is a special kind of
     // token, and we don't want to interpret any escape sequences in it.
@@ -1274,7 +1269,7 @@ static void read_line_marker(Token **rest, Token *tok) {
   if (tok->kind == TK_EOF)
     return;
 
-  if (tok->kind != TK_STR && tok->kind != TK_ASM_STR)
+  if (tok->kind != TK_STR)
     error_tok(tok, "filename expected");
 
   start->file->display_file_no = add_display_file(tok->str);
@@ -1493,7 +1488,7 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
     return tok;
   }
 
-  if (tok->kind == TK_PP_NUM && !opt_cc1_asm_pp) {
+  if (tok->kind == TK_PP_NUM) {
     read_line_marker(&tok, tok);
     return tok;
   }
@@ -1520,9 +1515,6 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
       }
       return pass_line(cur, start);
     }
-
-    if (opt_cc1_asm_pp)
-      return pass_line(cur, start);
   }
 
   // `#`-only line is legal. It's called a null directive.
@@ -1685,7 +1677,7 @@ static Token *pragma_macro(Token *start) {
       continue;
     }
     case 1:
-      if (tok->kind != TK_STR && tok->kind != TK_ASM_STR)
+      if (tok->kind != TK_STR)
         error_tok(tok, "expected string literal");
       str_tok = tok;
       tok = tok->next;
@@ -1770,13 +1762,10 @@ static Token *has_builtin_macro(Token *start) {
                 equal(tok, "__builtin_constant_p") ||
                 equal(tok, "__builtin_expect") ||
                 equal(tok, "__builtin_expect_with_probability") ||
-                equal(tok, "__builtin_extract_return_addr") ||
-                equal(tok, "__builtin_frame_address") ||
                 equal(tok, "__builtin_offsetof") ||
                 equal(tok, "__builtin_add_overflow") ||
                 equal(tok, "__builtin_sub_overflow") ||
                 equal(tok, "__builtin_mul_overflow") ||
-                equal(tok, "__builtin_return_address") ||
                 equal(tok, "__builtin_types_compatible_p") ||
                 equal(tok, "__builtin_unreachable") ||
                 equal(tok, "__builtin_c23_va_start") ||
@@ -1802,10 +1791,7 @@ static Token *has_extension_macro(Token *start) {
                 equal(tok, "c_thread_local") ||
                 equal(tok, "cxx_binary_literals") ||
                 equal(tok, "c_fixed_enum") ||
-                equal(tok, "c_countof") ||
-                equal(tok, "gnu_asm") ||
-                equal(tok, "gnu_asm_goto_with_outputs") ||
-                equal(tok, "gnu_asm_goto_with_outputs_full");
+                equal(tok, "c_countof");
 
   tok = skip_tk(tok->next, TK_RPAREN);
   pop_macro_lock_until(start, tok);
@@ -1824,11 +1810,7 @@ void init_macros(void) {
   define_macro("__STDC_NO_COMPLEX__", "1");
 
   define_macro("__C99_MACRO_WITH_VA_ARGS", "1");
-#ifdef SLIMCC_PIR
   define_macro("__USER_LABEL_PREFIX__", "_");
-#else
-  define_macro("__USER_LABEL_PREFIX__", "");
-#endif
 
   define_macro("__unix", "1");
   define_macro("__unix__", "1");
@@ -1840,7 +1822,6 @@ void init_macros(void) {
   define_macro("__CHAR_BIT__", "8");
   define_macro("__BITINT_MAXWIDTH__", "65535");
 
-#ifdef SLIMCC_PIR
   define_macro("__aarch64__", "1");
   define_macro("__arm64__", "1");
   define_macro("__arm64", "1");
@@ -1849,12 +1830,6 @@ void init_macros(void) {
   define_macro("__LITTLE_ENDIAN__", "1");
   define_macro("__AARCH64EL__", "1");
   define_macro("__SLIMCC_PIR__", "1");
-#else
-  define_macro("__amd64", "1");
-  define_macro("__amd64__", "1");
-  define_macro("__x86_64", "1");
-  define_macro("__x86_64__", "1");
-#endif
 
   add_builtin("__DATE__", date_macro, true);
   add_builtin("__TIME__", time_macro, true);
@@ -1984,12 +1959,7 @@ static bool is_gnu_attr(Token *tok) {
     PutAttr("alias");
     PutAttr("aligned");
     PutAttr("cleanup");
-    PutAttr("common");
-    PutAttr("nocommon");
-    PutAttr("constructor");
-    PutAttr("destructor");
     PutAttr("gnu_inline");
-    PutAttr("naked");
     PutAttr("noreturn");
     PutAttr("packed");
     PutAttr("returns_twice");
@@ -1997,8 +1967,6 @@ static bool is_gnu_attr(Token *tok) {
     PutAttr("used");
     PutAttr("weak");
 
-    if (!opt_disable_visibility)
-      PutAttr("visibility");
     if (opt_fake_always_inline)
       PutAttr("always_inline");
   }
@@ -2204,28 +2172,12 @@ Token *preprocess(const char *file, StringArray *incls, StringArray *imacros) {
 Token *prepare_parse(Token *tok) {
   {
     Token *cur;
-#ifdef SLIMCC_PIR
     Token *head = tokenize(new_file("slimcc_builtins",
                                     "typedef char *__builtin_va_list;"
                                     "typedef struct { unsigned long long __lo, __hi; } __attribute__((aligned(16))) __uint128_t;"
                                     "typedef struct { unsigned long long __lo, __hi; } __attribute__((aligned(16))) __int128_t;"),
                            NULL, &cur);
-#else
-    Token *head = tokenize(new_file("slimcc_builtins", "typedef struct {"
-                                                       "  unsigned int gp_offset;"
-                                                       "  unsigned int fp_offset;"
-                                                       "  void *overflow_arg_area;"
-                                                       "  void *reg_save_area;"
-                                                       "} __builtin_va_list[1];"),
-                           NULL, &cur);
-#endif
 
-    const char *path = search_include_paths("bitint_builtins", NULL);
-    if (path) {
-      Token *end;
-      cur->next = tokenize_file(path, NULL, &end);
-      cur = end;
-    }
     for (Token *t = head; t; t = t->next)
       finalize_tok2(t, t);
 
