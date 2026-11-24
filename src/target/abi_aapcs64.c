@@ -1,0 +1,180 @@
+/*
+ * Copyright (c) 2026 Ummon Karpe
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "target/abi.h"
+
+#include <string.h>
+
+#include "lower/lower.h"
+
+typedef struct {
+    bool     valid;
+    bool     has_base;
+    PirType  base_ty;
+    uint32_t count;
+} HfaWalk;
+
+static bool is_hfa_leaf(PirType ty) {
+    if (ty.kind == PIR_TYPE_SCALAR) {
+        return ty.u.scalar == PIR_SCALAR_F32 || ty.u.scalar == PIR_SCALAR_F64;
+    }
+    if (ty.kind == PIR_TYPE_VECTOR) {
+        uint16_t b = pir_vec_bits(ty.u.vec);
+        return b == 64u || b == 128u;
+    }
+    return false;
+}
+
+static void walk_hfa(const PirModule *mod, const PirTargetSpec *target,
+                     PirType ty, uint64_t base_off, HfaWalk *w) {
+    if (!w->valid) return;
+    if (ty.kind != PIR_TYPE_NAMED_AGG) {
+        if (!is_hfa_leaf(ty)) { w->valid = false; return; }
+        PirTypeLayout ly = pir_type_layout(mod, target, ty);
+        if (ly.align > 1u && (base_off % ly.align) != 0u) { w->valid = false; return; }
+        if (!w->has_base) {
+            w->has_base = true;
+            w->base_ty  = ty;
+        } else if (!pir_type_eq(w->base_ty, ty)) {
+            w->valid = false;
+            return;
+        }
+        w->count++;
+        if (w->count > 4u) w->valid = false;
+        return;
+    }
+    const PirAggDef *agg = &mod->agg_types.data[ty.u.agg_id];
+    if (agg->kind == PIR_AGG_PACKED_STRUCT) {
+        w->valid = false;
+        return;
+    }
+    if (agg->kind == PIR_AGG_ARRAY) {
+        PirTypeLayout el = pir_type_layout(mod, target, agg->elem_type);
+        for (uint64_t i = 0u; i < agg->array_len && w->valid; ++i) {
+            walk_hfa(mod, target, agg->elem_type, base_off + i * el.size, w);
+        }
+    } else if (agg->kind == PIR_AGG_UNION) {
+        /* Union is HFA only if all members are identical HFA type; simplify: non-HFA. */
+        w->valid = false;
+    } else {
+        for (uint32_t i = 0u; i < agg->field_count && w->valid; ++i) {
+            uint64_t foff = pir_field_offset(mod, target, ty.u.agg_id, i);
+            walk_hfa(mod, target, agg->fields[i], base_off + foff, w);
+        }
+    }
+}
+
+static void classify_aapcs64_agg(const PirModule *mod, const PirTargetSpec *target,
+                                 PirType agg_ty, PirAbiArgInfo *out) {
+    memset(out, 0, sizeof(*out));
+    PirTypeLayout ly = pir_type_layout(mod, target, agg_ty);
+    if (ly.size == 0u) {
+        out->kind    = PIR_ABI_INDIRECT;
+        out->gp_used = 1u;
+        return;
+    }
+
+    HfaWalk hw = { true, false, pir_type_scalar(PIR_SCALAR_VOID), 0u };
+    walk_hfa(mod, target, agg_ty, 0u, &hw);
+    if (hw.valid && hw.has_base && hw.count >= 1u && hw.count <= 4u) {
+        PirTypeLayout bl = pir_type_layout(mod, target, hw.base_ty);
+        if (ly.size == bl.size * hw.count) {
+            out->kind      = PIR_ABI_DIRECT;
+            out->reg_count = hw.count;
+            out->fp_used   = hw.count;
+            for (uint32_t i = 0u; i < hw.count; ++i) {
+                out->regs[i] = hw.base_ty;
+            }
+            return;
+        }
+    }
+
+    if (ly.size <= 16u) {
+        uint32_t nregs = (ly.size <= 8u) ? 1u : 2u;
+        out->kind      = PIR_ABI_DIRECT;
+        out->reg_count = nregs;
+        out->gp_used   = nregs;
+        for (uint32_t i = 0u; i < nregs; ++i) {
+            out->regs[i] = pir_type_scalar(PIR_SCALAR_I64);
+        }
+        return;
+    }
+
+    out->kind    = PIR_ABI_INDIRECT;
+    out->gp_used = 1u;
+}
+
+bool pir_abi_aapcs64_param(const PirModule *mod, const PirTargetSpec *target,
+                           const PirParamDecl *pd, PirAbiRegState *st, PirAbiArgInfo *out) {
+    memset(out, 0, sizeof(*out));
+    if (pd->abi_kind == PIR_PARAM_BYVAL) {
+        classify_aapcs64_agg(mod, target, pd->abi_type, out);
+        PirTypeLayout ly = pir_type_layout(mod, target, pd->abi_type);
+        if (out->kind == PIR_ABI_DIRECT) {
+            if (out->fp_used > 0u) {
+                if (st->fp_used + out->fp_used > 8u) {
+                    /* AAPCS64 all-or-nothing spill: consume remaining FP regs and pass by value on stack. */
+                    out->pad_fp_before = 8u - st->fp_used;
+                    st->fp_used = 8u;
+                    out->stack_align = (target->os == PIR_OS_MACOS)
+                                       ? ly.align : (ly.align > 8u ? ly.align : 8u);
+                } else {
+                    st->fp_used += out->fp_used;
+                }
+            } else {
+                if (st->gp_used + out->gp_used > 8u) {
+                    /* AAPCS64 all-or-nothing spill: consume remaining GP regs and pass by value on stack. */
+                    out->pad_gp_before = 8u - st->gp_used;
+                    st->gp_used = 8u;
+                    out->stack_align = (ly.align > 8u) ? ly.align : 8u;
+                } else {
+                    st->gp_used += out->gp_used;
+                }
+            }
+        } else {
+            if (st->gp_used < 8u) st->gp_used++;
+        }
+        return true;
+    }
+
+    out->kind      = PIR_ABI_DIRECT;
+    out->reg_count = 1u;
+    out->regs[0]   = pd->type;
+    if (pd->type.kind == PIR_TYPE_SCALAR && pd->type.u.scalar == PIR_SCALAR_I128) {
+        /* Linux AAPCS64 requires even GP register pairing (x0:x1, x2:x3, ...);
+         * Darwin ARM64 does NOT insert odd-register padding. */
+        if (target->os != PIR_OS_MACOS && (st->gp_used & 1u) != 0u && st->gp_used < 8u) {
+            out->pad_gp_before++;
+            st->gp_used++;
+        }
+        out->gp_used = 2u;
+        if (st->gp_used + 2u <= 8u) {
+            st->gp_used += 2u;
+        } else {
+            if (st->gp_used < 8u) {
+                out->pad_gp_before += 8u - st->gp_used;
+                st->gp_used = 8u;
+            }
+            out->stack_align = 16u;
+        }
+    } else if (pir_type_is_float(pd->type) || pd->type.kind == PIR_TYPE_VECTOR) {
+        out->fp_used = 1u;
+        if (st->fp_used < 8u) st->fp_used++;
+    } else {
+        out->gp_used = 1u;
+        if (st->gp_used < 8u) st->gp_used++;
+    }
+    return true;
+}
+
+bool pir_abi_aapcs64_retbuf(const PirModule *mod, const PirTargetSpec *target,
+                            PirType agg_ty, PirAbiArgInfo *out) {
+    classify_aapcs64_agg(mod, target, agg_ty, out);
+    if (out->kind == PIR_ABI_INDIRECT) {
+        out->gp_used = 0u; /* ARM64 sret uses x8, not x0..x7 */
+        out->fp_used = 0u;
+    }
+    return true;
+}

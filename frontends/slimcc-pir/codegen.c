@@ -1,0 +1,5631 @@
+#include "slimcc.h"
+
+#define GP_MAX 6
+#define FP_MAX 8
+
+#define GP_SLOTS 6
+#define FP_SLOTS 6
+
+#define STRBUF_SZ 192
+#define STRBUF_SZ2 208
+
+typedef enum {
+  REGSZ_8 = 0,
+  REGSZ_16,
+  REGSZ_32,
+  REGSZ_64,
+} RegSz;
+
+typedef enum {
+  REG_X64_NULL = 0,
+  REG_X64_AX,
+  REG_X64_CX,
+  REG_X64_DX,
+  REG_X64_SI,
+  REG_X64_DI,
+  REG_X64_R8,
+  REG_X64_R9,
+  REG_X64_R10,
+  REG_X64_R11,
+  REG_X64_R12,
+  REG_X64_R13,
+  REG_X64_R14,
+  REG_X64_R15,
+  REG_X64_BX,
+  REG_X64_BP,
+  REG_X64_SP,
+  REG_X64_XMM0,
+  REG_X64_XMM1,
+  REG_X64_XMM2,
+  REG_X64_XMM3,
+  REG_X64_XMM4,
+  REG_X64_XMM5,
+  REG_X64_XMM6,
+  REG_X64_XMM7,
+  REG_X64_XMM8,
+  REG_X64_XMM9,
+  REG_X64_XMM10,
+  REG_X64_XMM11,
+  REG_X64_XMM12,
+  REG_X64_XMM13,
+  REG_X64_XMM14,
+  REG_X64_XMM15,
+  REG_X64_X87_ST0,
+  REG_X64_X87_ST1,
+  REG_X64_X87_ST2,
+  REG_X64_X87_ST3,
+  REG_X64_X87_ST4,
+  REG_X64_X87_ST5,
+  REG_X64_X87_ST6,
+  REG_X64_X87_ST7,
+  REG_X64_END
+} Reg;
+
+static const char *const regs[REG_X64_XMM0][4] = {
+  [REG_X64_NULL] = {"null", "null", "null", "null"},
+  [REG_X64_SP] = {"%spl", "%sp", "%esp", "%rsp"},
+  [REG_X64_BP] = {"%bpl", "%bp", "%ebp", "%rbp"},
+  [REG_X64_AX] = {"%al", "%ax", "%eax", "%rax"},
+  [REG_X64_BX] = {"%bl", "%bx", "%ebx", "%rbx"},
+  [REG_X64_CX] = {"%cl", "%cx", "%ecx", "%rcx"},
+  [REG_X64_DX] = {"%dl", "%dx", "%edx", "%rdx"},
+  [REG_X64_SI] = {"%sil", "%si", "%esi", "%rsi"},
+  [REG_X64_DI] = {"%dil", "%di", "%edi", "%rdi"},
+  [REG_X64_R8] = {"%r8b", "%r8w", "%r8d", "%r8"},
+  [REG_X64_R9] = {"%r9b", "%r9w", "%r9d", "%r9"},
+  [REG_X64_R10] = {"%r10b", "%r10w", "%r10d", "%r10"},
+  [REG_X64_R11] = {"%r11b", "%r11w", "%r11d", "%r11"},
+  [REG_X64_R12] = {"%r12b", "%r12w", "%r12d", "%r12"},
+  [REG_X64_R13] = {"%r13b", "%r13w", "%r13d", "%r13"},
+  [REG_X64_R14] = {"%r14b", "%r14w", "%r14d", "%r14"},
+  [REG_X64_R15] = {"%r15b", "%r15w", "%r15d", "%r15"},
+};
+
+static FILE *output_file;
+
+static const char *const argreg32[] = {"%edi", "%esi", "%edx", "%ecx", "%r8d", "%r9d"};
+static const char *const argreg64[] = {"%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"};
+
+static const Reg argreg[] = {REG_X64_DI, REG_X64_SI, REG_X64_DX,
+                             REG_X64_CX, REG_X64_R8, REG_X64_R9};
+
+static const char *const tmpreg32[] = {"%edi", "%esi", "%r8d", "%r9d", "%r10d", "%r11d"};
+static const char *const tmpreg64[] = {"%rdi", "%rsi", "%r8", "%r9", "%r10", "%r11"};
+
+static const char rip[] = "%rip";
+static const char rbp[] = "%rbp";
+static const char rbx[] = "%rbx";
+
+static Obj *codegen_fn;
+static const char *lvar_ptr;
+static int va_gp_start;
+static int va_fp_start;
+static int va_st_start;
+static int vla_base_ofs;
+static int rtn_ptr_ofs;
+static int lvar_stk_sz;
+static int peak_stk_usage;
+static int tmpbuf_sz;
+static int64_t rtn_label;
+static HashMap *ext_refs;
+static bool *debug_file_used;
+static int *debug_file_id;
+static StringArray debug_files;
+
+static struct {
+  bool in[REG_X64_END];
+  bool out[REG_X64_END];
+} asm_use;
+
+#define ASMOP_BUFSZ 32
+static int asm_ops_cnt;
+static AsmParam *asm_ops[ASMOP_BUFSZ];
+
+static struct {
+  const char *rbp;
+  const char *rbx;
+} asm_alt_ptr;
+
+typedef enum {
+  SL_GP,
+  SL_FP,
+  SL_ST,
+} SlotKind;
+
+typedef struct {
+  SlotKind kind;
+  int gp_depth;
+  int fp_depth;
+  int st_depth;
+  int st_ofs;
+  const char *push_reg;
+  long loc;
+} Slot;
+
+static struct {
+  Slot *data;
+  int32_t capacity;
+  int32_t depth;
+} tmp_stack;
+
+struct AsmContext {
+  Reg output_tmp1;
+  Reg output_tmp2;
+  Reg frame_ptr1;
+  Reg frame_ptr2;
+  uint32_t clobber_mask;
+};
+
+struct FuncObj {
+  char *buf;
+  size_t buflen;
+  Obj **refs;
+  int32_t ref_cnt;
+  int32_t ref_capacity;
+};
+
+static void load_s(Type *ty, const char *sofs, const char *sptr);
+static void store_gp2(const char *const *r, int sz, int dofs, const char *dptr);
+
+static void gen_asm(Node *node);
+static void gen_expr(Node *node);
+static void gen_stmt(Node *node);
+static bool gen_block_stmt(Node *node, bool is_reach);
+static bool gen_if_stmt(Node *node, bool is_reach);
+static void gen_void_expr(Node *node);
+static bool gen_void_expr2(Node *node);
+static bool gen_reachable_stmt(Node *node);
+static bool gen_unreachable_stmt(Node *node);
+static bool gen_expr_opt(Node *node);
+static bool gen_addr_opt(Node *node);
+static bool gen_addr_opt2(Node *node, int64_t *ofs);
+static bool gen_cmp_opt_gp(Node *node, NodeKind *kind);
+static bool gen_load_opt_gp(Node *node, Reg r);
+static Node *bool_expr_opt(Node *node, bool *flip, bool *is_void);
+static void gen_mem_copy(const char *sofs, const char *sptr, const char *dofs,
+                         const char *dptr, int sz);
+static void load_val2(Type *ty, int64_t val, const char *gp32, const char *gp64);
+
+static void imm_add(const char *op, const char *tmp, int64_t val);
+static void imm_sub(const char *op, const char *tmp, int64_t val);
+static void imm_and(const char *op, const char *tmp, int64_t val);
+static void imm_cmp(const char *op, const char *tmp, int64_t val);
+static const char *arith_ins(NodeKind kind);
+static void imm_tmpl(const char *ins, const char *op, int64_t val);
+
+static bool is_asm_symbolic_arg(Node *node);
+
+#define Prints(str) fprintf(output_file, str)
+#define Printsts(str) fprintf(output_file, "\t" str)
+#define Printssn(str) fprintf(output_file, str "\n")
+#define Printstn(str) fprintf(output_file, "\t" str "\n")
+
+#define Printf(str, ...) fprintf(output_file, str, __VA_ARGS__)
+#define Printfts(str, ...) fprintf(output_file, "\t" str, __VA_ARGS__)
+#define Printfsn(str, ...) fprintf(output_file, str "\n", __VA_ARGS__)
+#define Printftn(str, ...) fprintf(output_file, "\t" str "\n", __VA_ARGS__)
+
+static long resrvln(void) {
+  long loc = ftell(output_file) + 1;
+  fprintf(output_file, "\t                                                      \n");
+  return loc;
+}
+
+FMTCHK(1, 3)
+static void insrtln(const char *fmt, long loc, ...) {
+  long cur_loc = ftell(output_file);
+  fseek(output_file, loc, SEEK_SET);
+
+  va_list ap;
+  va_start(ap, loc);
+  vfprintf(output_file, fmt, ap);
+  va_end(ap);
+
+  fseek(output_file, cur_loc, SEEK_SET);
+}
+
+static void push_ref(Obj *var) {
+  HashEntry *ent = hashmap_get_or_insert(ext_refs, var->name, strlen(var->name));
+  if (ent->val)
+    return;
+  ent->val = (void *)1;
+
+  FuncObj *fn = codegen_fn->output;
+  if (fn->ref_cnt == fn->ref_capacity)
+    GrowArr(fn->refs, &fn->ref_capacity);
+
+  fn->refs[fn->ref_cnt++] = var;
+}
+
+static const char *get_symbol(Obj *var) {
+  if (codegen_fn && codegen_fn != var) {
+    if (var->is_static_lvar)
+      var->is_live = true;
+    else if (!var->is_definition ||
+             var->is_static ||
+             (var->is_always_inline && opt_fake_always_inline))
+      push_ref(var);
+  }
+  return var->asm_name ? var->asm_name : var->name;
+}
+
+static const char *asm_name(Obj *var) {
+  return var->asm_name ? var->asm_name : var->name;
+}
+
+static int get_align(Obj *var) {
+  if (var->alt_align)
+    return var->alt_align;
+  if (var->ty->kind == TY_ARRAY && var->ty->size >= 16)
+    return MAX(16, var->ty->align);
+  return var->ty->align;
+}
+
+static int reg_copy_sz(int rem) {
+  if (rem >= 8)
+    return 8;
+  if (rem >= 4)
+    return 4;
+  if (rem >= 2)
+    return 2;
+  return 1;
+}
+
+static int64_t count(void) {
+  static int64_t i = 1;
+  return i++;
+}
+
+static void name_labels(Node *n) {
+  for (; n; n = n->lbl.next)
+    n->lbl.id = count();
+}
+
+static const char *tmpbuf(int sz) {
+  tmpbuf_sz = MAX(tmpbuf_sz, sz);
+  return "__BUF";
+}
+
+static bool is_gp_ty(Type *ty) {
+  return is_integer(ty) || ty->kind == TY_PTR || ty->kind == TY_NULLPTR;
+}
+
+static bool is_scalar(Type *ty) {
+  return is_gp_ty(ty) || is_flonum(ty) || ty->kind == TY_BITINT;
+}
+
+static bool in_imm_range(int64_t val) {
+  return val == (int32_t)val;
+}
+
+static bool use_rip(Obj *var) {
+  if (var->is_static || !(opt_fpie || opt_fpic))
+    return true;
+
+  if (opt_fpie) {
+    if (var->ty->kind == TY_FUNC)
+      return var->is_definition && var->export_fn;
+    return var->is_definition || !var->is_weak;
+  }
+  const char *vis = var->visibility ? var->visibility : opt_visibility;
+  if (vis && (!strcmp(vis, "hidden"))) {
+    if (var->ty->kind == TY_FUNC)
+      return var->is_definition && var->export_fn;
+    return var->is_definition || (!var->is_weak && var->visibility);
+  }
+  return false;
+}
+
+static Node *skip_gp_cast(Node *node) {
+  while (node->kind == ND_CAST &&
+         node->ty->size == node->m.lhs->ty->size &&
+         node->ty->kind != TY_BOOL &&
+         is_gp_ty(node->ty) &&
+         is_gp_ty(node->m.lhs->ty))
+    node = node->m.lhs;
+
+  return node;
+}
+
+static bool eval_memop(Node *node, char *ofs, const char **ptr, bool let_array,
+                       bool let_atomic) {
+  int offset;
+  Obj *var = eval_var_opt(node, &offset, let_array, let_atomic);
+  if (var) {
+    if (var->kind == OBJ_LOCAL) {
+      snprintf(ofs, STRBUF_SZ, "%d", offset + var->ofs);
+      *ptr = var->ptr;
+      return true;
+    }
+    if (var->kind == OBJ_GLOBAL && use_rip(var)) {
+      if (offset)
+        snprintf(ofs, STRBUF_SZ, "%d+\"%s\"", offset, get_symbol(var));
+      else
+        snprintf(ofs, STRBUF_SZ, "\"%s\"", get_symbol(var));
+      *ptr = rip;
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool is_memop_ptr(Node *node, char *ofs, const char **ptr) {
+  node = skip_gp_cast(node);
+
+  if (node->kind == ND_ADDR)
+    return eval_memop(node->m.lhs, ofs, ptr, true, true);
+
+  if (node->kind == ND_CAST && node->ty->kind == TY_PTR)
+    node = node->m.lhs;
+  if (node->ty->kind == TY_ARRAY || node->ty->kind == TY_FUNC)
+    return eval_memop(node, ofs, ptr, true, true);
+
+  return false;
+}
+
+static bool is_memop(Node *node, char *ofs, const char **ptr, bool let_atomic) {
+  node = skip_gp_cast(node);
+
+  if (is_bitfield(node))
+    return false;
+  return eval_memop(node, ofs, ptr, false, let_atomic);
+}
+
+static bool has_memop(Node *node) {
+  char ofs[STRBUF_SZ];
+  const char *ptr;
+  return is_memop(node, ofs, &ptr, true);
+}
+
+static bool is_int_to_int_cast(Node *node) {
+  return node->kind == ND_CAST && is_integer(node->ty) && is_integer(node->m.lhs->ty);
+}
+
+static bool has_defr(Node *node) {
+  return node->dfr_from != node->dfr_dest;
+}
+
+static bool is_plain_asm(Node *node) {
+  return !node->gasm.outputs &&
+         !node->gasm.inputs &&
+         !node->gasm.clobbers &&
+         !node->gasm.labels;
+}
+
+static bool is_direct_fncall(Node *fn_expr) {
+  return fn_expr->kind == ND_VAR && fn_expr->m.var->ty->kind == TY_FUNC;
+}
+
+static RegSz bitwidth_to_regsz(int bits) {
+  switch (bits) {
+  case 64: return REGSZ_64;
+  case 32: return REGSZ_32;
+  case 16: return REGSZ_16;
+  case 8:  return REGSZ_8;
+  }
+  internal_error();
+}
+
+static Type *bitwidth_to_ty(int width, bool is_unsigned) {
+  switch (width) {
+  case 64: return is_unsigned ? ty_ullong : ty_llong;
+  case 32: return is_unsigned ? ty_uint : ty_int;
+  case 16: return is_unsigned ? ty_ushort : ty_short;
+  case 8:  return is_unsigned ? ty_uchar : ty_char;
+  }
+  return NULL;
+}
+
+static int32_t ovf_headroom(Type *ty, NodeKind kind) {
+  int32_t bits = bit_size(ty);
+
+  if (kind == ND_MUL)
+    return bits * 2 + ty->is_unsigned;
+  return bits + 1 + ty->is_unsigned;
+}
+
+static int write_size(Type *ty) {
+  if (ty->kind == TY_LDOUBLE)
+    return 10;
+  if (ty->is_flexible && ty->origin)
+    return ty->origin->size;
+  return ty->size;
+}
+
+static int64_t limit_imm(int64_t val, int sz) {
+  switch (sz) {
+  case 4: return (int32_t)val;
+  case 2: return (int16_t)val;
+  case 1: return (int8_t)val;
+  }
+  return val;
+}
+
+static const char *size_suffix(int sz) {
+  switch (sz) {
+  case 8: return "q";
+  case 4: return "l";
+  case 2: return "w";
+  case 1: return "b";
+  }
+  internal_error();
+}
+
+static void clobber_all_regs(void) {
+  for (int i = 0; i < tmp_stack.depth; i++)
+    tmp_stack.data[i].kind = SL_ST;
+}
+
+static void clobber_gp(int i) {
+  if (tmp_stack.depth > 0) {
+    Slot *sl = &tmp_stack.data[tmp_stack.depth - 1];
+    sl->gp_depth = MAX(sl->gp_depth, i);
+  }
+}
+
+static Slot *push_tmpstack(SlotKind kind) {
+  if (tmp_stack.depth == tmp_stack.capacity)
+    GrowArr(tmp_stack.data, &tmp_stack.capacity);
+
+  long loc = resrvln();
+  Slot *sl = &tmp_stack.data[tmp_stack.depth++];
+  *sl = (Slot){.kind = kind, .loc = loc};
+  return sl;
+}
+
+static Slot *pop_tmpstack(int sz) {
+  tmp_stack.depth--;
+
+  Slot *sl = &tmp_stack.data[tmp_stack.depth];
+  if ((sl->kind == SL_GP && sl->gp_depth >= GP_SLOTS) ||
+      (sl->kind == SL_FP && sl->fp_depth >= FP_SLOTS))
+    sl->kind = SL_ST;
+
+  if (tmp_stack.depth > 0) {
+    Slot *sl2 = &tmp_stack.data[tmp_stack.depth - 1];
+    int gp_depth = sl->gp_depth + (sl->kind == SL_GP);
+    int fp_depth = sl->fp_depth + (sl->kind == SL_FP);
+    int st_depth = sl->st_depth + (sl->kind == SL_ST) * sz;
+    sl2->gp_depth = MAX(sl2->gp_depth, gp_depth);
+    sl2->fp_depth = MAX(sl2->fp_depth, fp_depth);
+    sl2->st_depth = MAX(sl2->st_depth, st_depth);
+  }
+
+  if (sl->kind == SL_ST) {
+    if (!opt_reuse_stack || codegen_fn->dont_reuse_stk) {
+      peak_stk_usage += sz * 8;
+      sl->st_ofs = -peak_stk_usage;
+    } else {
+      int bottom = lvar_stk_sz + (sl->st_depth + sz) * 8;
+      peak_stk_usage = MAX(peak_stk_usage, bottom);
+      sl->st_ofs = -bottom;
+    }
+  }
+  return sl;
+}
+
+static void push(void) {
+  push_tmpstack(SL_GP);
+}
+
+static void push_from(const char *reg) {
+  Slot *sl = push_tmpstack(SL_GP);
+  sl->push_reg = reg;
+}
+
+static const char *pop_gp(bool is_r64, const char *dest_reg, bool must_be_dest) {
+  Slot *sl = pop_tmpstack(1);
+  const char *push_reg;
+  if (sl->push_reg)
+    push_reg = sl->push_reg;
+  else
+    push_reg = is_r64 ? "%rax" : "%eax";
+
+  if (sl->kind == SL_GP) {
+    const char *pop_reg = (is_r64 ? tmpreg64 : tmpreg32)[sl->gp_depth];
+    insrtln("mov %s, %s", sl->loc, push_reg, pop_reg);
+    if (!must_be_dest)
+      return pop_reg;
+    Printftn("mov %s, %s", pop_reg, dest_reg);
+    return dest_reg;
+  }
+  insrtln("mov %s, %d(%s)", sl->loc, push_reg, sl->st_ofs, lvar_ptr);
+  Printftn("mov %d(%s), %s", sl->st_ofs, lvar_ptr, dest_reg);
+  return dest_reg;
+}
+
+static const char *pop_inreg2(bool is_r64, const char *fallback_reg) {
+  return pop_gp(is_r64, fallback_reg, false);
+}
+
+static const char *pop_inreg(const char *fallback_reg) {
+  return pop_inreg2(true, fallback_reg);
+}
+
+static void pop2(bool is_r64, const char *arg) {
+  pop_gp(is_r64, arg, true);
+}
+
+static void pop(const char *arg) {
+  pop2(true, arg);
+}
+
+static void pushf(void) {
+  push_tmpstack(SL_FP);
+}
+
+static int pop_fp(bool is_xmm64, int dest_reg, bool must_be_dest) {
+  Slot *sl = pop_tmpstack(1);
+
+  if (sl->kind == SL_FP) {
+    int pop_reg = sl->fp_depth + 2;
+    insrtln("movaps %%xmm0, %%xmm%d", sl->loc, pop_reg);
+    if (!must_be_dest)
+      return pop_reg;
+    Printftn("movaps %%xmm%d, %%xmm%d", pop_reg, dest_reg);
+    return dest_reg;
+  }
+  const char *mv = is_xmm64 ? "movsd" : "movss";
+  insrtln("%s %%xmm0, %d(%s)", sl->loc, mv, sl->st_ofs, lvar_ptr);
+  Printftn("%s %d(%s), %%xmm%d", mv, sl->st_ofs, lvar_ptr, dest_reg);
+  return dest_reg;
+}
+
+static int popf_inreg(bool is_xmm64, int reg) {
+  return pop_fp(is_xmm64, reg, false);
+}
+
+static int popf(int reg) {
+  return pop_fp(true, reg, true);
+}
+
+static void push_x87(void) {
+  push_tmpstack(SL_ST);
+}
+
+static bool pop_x87(void) {
+  Slot *sl = pop_tmpstack(2);
+  insrtln("fldt %s(%s); fstpt %d(%s)", sl->loc, tmpbuf(10), lvar_ptr, sl->st_ofs, lvar_ptr);
+  Printftn("fldt %d(%s); fstpt %s(%s)", sl->st_ofs, lvar_ptr, tmpbuf(10), lvar_ptr);
+  return true;
+}
+
+static void push_bitint(int sz) {
+  for (int ofs = align_to(sz, 8) - 8; ofs >= 0; ofs -= 8)
+    push_tmpstack(SL_ST);
+}
+
+static int pop_bitint(int sz) {
+  int pos = 0;
+  for (int ofs = align_to(sz, 8) - 8; ofs >= 0; ofs -= 8) {
+    Slot *sl = pop_tmpstack(1);
+    pos = sl->st_ofs;
+    insrtln("mov %d+%s(%s), %%rdx; mov %%rdx, %d(%s)", sl->loc, ofs, tmpbuf(sz), lvar_ptr,
+            sl->st_ofs, lvar_ptr);
+  }
+  return pos;
+}
+
+static void push_by_ty(Type *ty) {
+  switch (ty->kind) {
+  case TY_VOID:    return;
+  case TY_LDOUBLE: push_x87(); return;
+  case TY_DOUBLE:
+  case TY_FLOAT:   pushf(); return;
+  case TY_BITINT:  push_bitint(ty->size); return;
+  default:         push(); return;
+  }
+}
+
+static void pop_by_ty(Type *ty) {
+  switch (ty->kind) {
+  case TY_VOID:    return;
+  case TY_LDOUBLE: pop_x87(); return;
+  case TY_DOUBLE:
+  case TY_FLOAT:   popf(0); return;
+  case TY_BITINT: {
+    int pos = pop_bitint(ty->size);
+    char sofs_buf[STRBUF_SZ];
+    snprintf(sofs_buf, STRBUF_SZ, "%d", pos);
+    gen_mem_copy(sofs_buf, lvar_ptr, tmpbuf(ty->size), lvar_ptr, ty->size);
+    return;
+  }
+  default: pop("%rax"); return;
+  }
+}
+
+static void cast_extend_int32(Type *ty, const char *from, const char *to) {
+  const char *insn = ty->is_unsigned ? "movz" : "movs";
+  switch (ty->size) {
+  case 1: Printftn("%sbl %s, %s", insn, from, to); return;
+  case 2: Printftn("%swl %s, %s", insn, from, to); return;
+  case 4: Printftn("movl %s, %s", from, to); return;
+  }
+  internal_error();
+}
+
+static void load_extend_int(Type *ty, const char *ofs, const char *ptr, const char *reg) {
+  const char *insn = ty->is_unsigned ? "movz" : "movs";
+  switch (ty->size) {
+  case 1: Printftn("%sbl %s(%s), %s", insn, ofs, ptr, reg); return;
+  case 2: Printftn("%swl %s(%s), %s", insn, ofs, ptr, reg); return;
+  case 4: Printftn("movl %s(%s), %s", ofs, ptr, reg); return;
+  case 8: Printftn("mov %s(%s), %s", ofs, ptr, reg); return;
+  }
+  internal_error();
+}
+
+static void load_extend_int64(Type *ty, const char *ofs, const char *ptr, const char *reg) {
+  switch (ty->size) {
+  case 4: Printftn("movslq %s(%s), %s", ofs, ptr, reg); return;
+  case 2: Printftn("movswq %s(%s), %s", ofs, ptr, reg); return;
+  case 1: Printftn("movsbq %s(%s), %s", ofs, ptr, reg); return;
+  }
+  internal_error();
+}
+
+// Round up `n` to the nearest multiple of `align`. For instance,
+// align_to(5, 8) returns 8 and align_to(11, 8) returns 16.
+int64_t align_to(int64_t n, int64_t align) {
+  if (!align)
+    internal_error();
+  return (n + align - 1) / align * align;
+}
+
+static const char *reg_dx(int sz) {
+  switch (sz) {
+  case 1: return "%dl";
+  case 2: return "%dx";
+  case 4: return "%edx";
+  case 8: return "%rdx";
+  }
+  internal_error();
+}
+
+static const char *reg_ax(int sz) {
+  switch (sz) {
+  case 1: return "%al";
+  case 2: return "%ax";
+  case 4: return "%eax";
+  case 8: return "%rax";
+  }
+  internal_error();
+}
+
+static const char *regop_ax(Type *ty) {
+  switch (ty->size) {
+  case 1:
+  case 2:
+  case 4: return "%eax";
+  case 8: return "%rax";
+  }
+  internal_error();
+}
+
+static void gen_mem_copy(const char *sofs, const char *sptr, const char *dofs,
+                         const char *dptr, int sz) {
+  for (int i = 0; i < sz;) {
+    int rem = sz - i;
+    if (rem >= 16) {
+      Printftn("movups %d+%s(%s), %%xmm0", i, sofs, sptr);
+      Printftn("movups %%xmm0, %d+%s(%s)", i, dofs, dptr);
+      i += 16;
+      continue;
+    }
+    int p2 = reg_copy_sz(rem);
+    Printftn("mov %d+%s(%s), %s", i, sofs, sptr, reg_dx(p2));
+    Printftn("mov %s, %d+%s(%s)", reg_dx(p2), i, dofs, dptr);
+    i += p2;
+  }
+}
+
+static void gen_mem_zero(int dofs, const char *dptr, int sz) {
+  if (sz <= 0)
+    return;
+
+  if (sz >= 16) {
+    Printstn("xorps %%xmm0, %%xmm0");
+    for (int i = 0; i < sz;) {
+      if (sz < i + 16)
+        i = sz - 16;
+      Printftn("movups %%xmm0, %d(%s)", i + dofs, dptr);
+      i += 16;
+    }
+    return;
+  }
+
+  Printstn("xor %%eax, %%eax");
+  for (int i = 0; i < sz;) {
+    int rem = sz - i;
+    int p2 = reg_copy_sz(rem);
+    Printftn("mov %s, %d(%s)", reg_ax(p2), i + dofs, dptr);
+    i += p2;
+  }
+}
+
+static bool is_fp_arith(Node *node) {
+  switch (node->kind) {
+  case ND_ADD:
+  case ND_SUB:
+  case ND_MUL:
+  case ND_DIV:
+  case ND_NEG: return true;
+  }
+  return false;
+}
+
+static bool is_int_arith(Node *node) {
+  switch (node->kind) {
+  case ND_ADD:
+  case ND_SUB:
+  case ND_MUL:
+  case ND_DIV:
+  case ND_REM:
+  case ND_NEG:
+  case ND_BITNOT:
+  case ND_BITAND:
+  case ND_BITOR:
+  case ND_BITXOR:
+  case ND_SHL:
+  case ND_SHR:
+  case ND_SAR:    return true;
+  }
+  return false;
+}
+
+static bool is_cmp(Node *node) {
+  switch (node->kind) {
+  case ND_EQ:
+  case ND_NE:
+  case ND_LT:
+  case ND_LE:
+  case ND_GT:
+  case ND_GE: return true;
+  }
+  return false;
+}
+
+static void flip_cmp(NodeKind *kind, bool flip) {
+  if (!flip)
+    return;
+  switch (*kind) {
+  case ND_EQ: *kind = ND_NE; return;
+  case ND_NE: *kind = ND_EQ; return;
+  case ND_LT: *kind = ND_GE; return;
+  case ND_LE: *kind = ND_GT; return;
+  case ND_GT: *kind = ND_LE; return;
+  case ND_GE: *kind = ND_LT; return;
+  }
+  internal_error();
+}
+
+static const char *cmp_cc(NodeKind kind, bool is_unsigned) {
+  switch (kind) {
+  case ND_EQ: return "e";
+  case ND_NE: return "ne";
+  case ND_LT: return is_unsigned ? "b" : "l";
+  case ND_LE: return is_unsigned ? "be" : "le";
+  case ND_GT: return is_unsigned ? "a" : "g";
+  case ND_GE: return is_unsigned ? "ae" : "ge";
+  }
+  internal_error();
+}
+
+static void gen_cmp_setcc(NodeKind kind, bool is_unsigned) {
+  Printftn("set%s %%al", cmp_cc(kind, is_unsigned));
+  Printstn("movzbl %%al, %%eax");
+}
+
+static void gen_bitint_builtin_call2(const char *fn) {
+  static HashMap map;
+  HashEntry *ent = hashmap_get_or_insert(&map, fn, strlen(fn));
+  Obj *var = ent->val;
+  if (!var) {
+    var = ent->val = get_symbol_var(fn);
+    if (!var)
+      error("missing builtin function %s", fn);
+  }
+  push_ref(var);
+  Printftn("call %s", fn);
+  clobber_all_regs();
+}
+
+static void gen_bitint_builtin_call(NodeKind kind) {
+  static const char *const fn[] = {
+    [ND_NEG] = "__slimcc_bitint_neg",       [ND_BITNOT] = "__slimcc_bitint_bitnot",
+    [ND_BITAND] = "__slimcc_bitint_bitand", [ND_BITOR] = "__slimcc_bitint_bitor",
+    [ND_BITXOR] = "__slimcc_bitint_bitxor", [ND_SHL] = "__slimcc_bitint_shl",
+    [ND_SHR] = "__slimcc_bitint_shr",       [ND_SAR] = "__slimcc_bitint_shr",
+    [ND_ADD] = "__slimcc_bitint_add",       [ND_SUB] = "__slimcc_bitint_sub",
+    [ND_MUL] = "__slimcc_bitint_mul",       [ND_DIV] = "__slimcc_bitint_div",
+    [ND_REM] = "__slimcc_bitint_div",
+  };
+  gen_bitint_builtin_call2(fn[kind]);
+}
+
+static void gen_bitfield_load(Node *node) {
+  Member *mem = node->m.member;
+
+  if (mem->ty->kind == TY_BITINT) {
+    Printftn("mov %%rax, %s", argreg64[1]);
+    Printftn("movl $%" PRIi32 ", %s", (int32_t)mem->ty->bit_cnt, argreg32[0]);
+    Printftn("lea %s(%s), %s", tmpbuf(mem->ty->size), lvar_ptr, argreg64[2]);
+    load_val2(ty_int, mem->bit_width, argreg32[3], NULL);
+    load_val2(ty_int, mem->bit_offset, argreg32[4], NULL);
+    load_val2(ty_int, mem->ty->is_unsigned, argreg32[5], NULL);
+    gen_bitint_builtin_call2("__slimcc_bitint_bitfield_load");
+    Printstn("mov %%rax, %%rcx");
+    return;
+  }
+
+  if (mem->is_aligned_bitfield) {
+    int p2bits = next_pow_of_two(mem->bit_offset + mem->bit_width);
+    load_s(bitwidth_to_ty(p2bits, mem->ty->is_unsigned), "0", "%rax");
+
+    if (mem->bit_width == p2bits)
+      return;
+
+    int lshft = 64 - mem->bit_width - mem->bit_offset;
+    int rshft = 64 - mem->bit_width;
+    if (lshft)
+      Printftn("shl $%d, %%rax", lshft);
+    Printftn("%s $%d, %%rax", mem->ty->is_unsigned ? "shr" : "sar", rshft);
+    return;
+  }
+  Printstn("movq %%rax, %%rdx");
+
+  int pofs = bitfield_footprint(mem) - 1;
+  for (int start = pofs; pofs >= !!mem->bit_offset; pofs--) {
+    if (pofs != start)
+      Printstn("shlq $8, %%rax");
+    Printftn("movb %d(%%rdx), %%al", pofs);
+  }
+  if (mem->bit_offset) {
+    Printftn("shlq $%d, %%rax", 8 - mem->bit_offset);
+    Printstn("movb (%%rdx), %%dl");
+    Printftn("shrb $%d, %%dl", mem->bit_offset);
+    Printstn("orb %%dl, %%al");
+  }
+  if (mem->bit_width < 64) {
+    int shft = 64 - mem->bit_width;
+    Printftn("shl $%d, %%rax", shft);
+    Printftn("%s $%d, %%rax", mem->ty->is_unsigned ? "shr" : "sar", shft);
+  }
+}
+
+static void gen_bitfield_store2(const char *ptr, Reg r_val, Reg r_tmp, Member *mem) {
+  if (mem->is_aligned_bitfield) {
+    int p2bits = next_pow_of_two(mem->bit_offset + mem->bit_width);
+    RegSz rsz = bitwidth_to_regsz(p2bits);
+    const char *tmp = regs[r_tmp][rsz];
+    const char *val = regs[r_val][rsz];
+
+    if (mem->bit_width == p2bits) {
+      Printftn("mov %s, (%s)", val, ptr);
+      return;
+    }
+    uint64_t msk = (((uint64_t)1 << mem->bit_width) - 1) << mem->bit_offset;
+    msk = (int64_t)(~msk << (64 - p2bits)) >> (64 - p2bits);
+
+    load_val2(bitwidth_to_ty(p2bits, false), msk, regs[r_tmp][REGSZ_32],
+              regs[r_tmp][REGSZ_64]);
+
+    Printftn("and %s, (%s)", tmp, ptr);
+    Printftn("mov %s, %s", val, tmp);
+
+    int lshft = p2bits - mem->bit_width;
+    int rshft = p2bits - mem->bit_width - mem->bit_offset;
+    if (lshft)
+      Printftn("shl $%d, %s", lshft, tmp);
+    if (rshft)
+      Printftn("shr $%d, %s", rshft, tmp);
+    Printftn("or %s, (%s)", tmp, ptr);
+    return;
+  }
+  const char *valb = regs[r_val][REGSZ_8];
+  const char *valq = regs[r_val][REGSZ_64];
+  const char *tmpb = regs[r_tmp][REGSZ_8];
+  const char *tmpq = regs[r_tmp][REGSZ_64];
+
+  int rem = mem->bit_offset + mem->bit_width;
+  int pofs = 0;
+  if (mem->bit_offset) {
+    Printftn("shlb $%d, (%s)", 8 - mem->bit_offset, ptr);
+    Printftn("shrb $%d, (%s)", 8 - mem->bit_offset, ptr);
+    Printftn("movb %s, %s", valb, tmpb);
+    Printftn("shlb $%d, %s", mem->bit_offset, tmpb);
+    Printftn("orb %s, (%s)", tmpb, ptr);
+    Printftn("movq %s, %s", valq, tmpq);
+    Printftn("shrq $%d, %s", 8 - mem->bit_offset, tmpq);
+    pofs++;
+    rem -= 8;
+  } else {
+    Printftn("mov %s, %s", valq, tmpq);
+  }
+
+  for (int start = rem; rem > 0; rem -= 8, pofs++) {
+    if (rem != start)
+      Printftn("shrq $8, %s", tmpq);
+
+    if (rem >= 8) {
+      Printftn("movb %s, %d(%s)", tmpb, pofs, ptr);
+      continue;
+    }
+    Printftn("shrb $%d, %d(%s)", rem, pofs, ptr);
+    Printftn("shlb $%d, %d(%s)", rem, pofs, ptr);
+    Printftn("andb $%d, %s", (1 << rem) - 1, tmpb);
+    Printftn("orb %s, %d(%s)", tmpb, pofs, ptr);
+    return;
+  }
+}
+
+static void gen_bitfield_store(Node *node, bool is_void) {
+  Member *mem = node->m.member;
+
+  if (mem->ty->kind == TY_BITINT) {
+    pop(argreg64[2]);
+    Printftn("movl $%" PRIi32 ", %s", (int32_t)mem->ty->bit_cnt, argreg32[0]);
+    Printftn("lea %s(%s), %s", tmpbuf(mem->ty->size), lvar_ptr, argreg64[1]);
+    load_val2(ty_int, mem->bit_width, argreg32[3], NULL);
+    load_val2(ty_int, mem->bit_offset, argreg32[4], NULL);
+    gen_bitint_builtin_call2("__slimcc_bitint_bitfield_save");
+    if (!is_void) {
+      Printftn("lea %s(%s), %s", tmpbuf(mem->ty->size), lvar_ptr, argreg64[1]);
+      Printftn("movl $%" PRIi32 ", %s", (int32_t)mem->bit_width, argreg32[0]);
+      Printftn("movl $%" PRIi32 ", %s", (int32_t)mem->ty->bit_cnt, argreg32[2]);
+      load_val2(ty_int, mem->ty->is_unsigned, argreg32[3], NULL);
+      gen_bitint_builtin_call2("__slimcc_bitint_sign_ext");
+    }
+    return;
+  }
+
+  const char *ptr = pop_inreg(tmpreg64[0]);
+  gen_bitfield_store2(ptr, REG_X64_AX, REG_X64_DX, mem);
+
+  if (!is_void && mem->bit_width < 64) {
+    int shft = 64 - mem->bit_width;
+    Printftn("shl $%d, %%rax", shft);
+    Printftn("%s $%d, %%rax", mem->ty->is_unsigned ? "shr" : "sar", shft);
+  }
+}
+
+static void gen_addr(Node *node) {
+  if (opt_optimize && gen_addr_opt(node))
+    return;
+
+  switch (node->kind) {
+  case ND_VAR:
+    if (node->m.var->kind == OBJ_INDIR) {
+      Printftn("mov %d(%s), %%rax", node->m.var->vptr->ofs, node->m.var->vptr->ptr);
+      return;
+    }
+
+    // Local variable
+    if (node->m.var->kind == OBJ_LOCAL) {
+      Printftn("lea %d(%s), %%rax", node->m.var->ofs, node->m.var->ptr);
+      return;
+    }
+
+    // Thread-local variable
+    if (node->m.var->kind == OBJ_TLS) {
+      if (opt_femulated_tls) {
+        clobber_all_regs();
+        Printftn("movq \"__emutls_v.%s\"@GOTPCREL(%%rip), %%rdi", get_symbol(node->m.var));
+        if (opt_use_plt)
+          Printstn("call __emutls_get_address@PLT");
+        else
+          Printstn("call *__emutls_get_address@GOTPCREL(%%rip)");
+        return;
+      }
+      if (opt_fpic) {
+        clobber_all_regs();
+        Printftn(".byte 0x66; lea \"%s\"@tlsgd(%%rip), %%rdi", get_symbol(node->m.var));
+        if (opt_use_plt)
+          Printstn(".value 0x6666; rex64; call __tls_get_addr@PLT");
+        else
+          Printstn(".byte 0x66; rex64; call *__tls_get_addr@GOTPCREL(%%rip)");
+        return;
+      }
+
+      Printstn("mov %%fs:0, %%rax");
+      if (node->m.var->is_definition)
+        Printftn("add $\"%s\"@tpoff, %%rax", get_symbol(node->m.var));
+      else
+        Printftn("add \"%s\"@gottpoff(%%rip), %%rax", get_symbol(node->m.var));
+      return;
+    }
+
+    // Function or global variable
+    if (!(opt_fpic || opt_fpie))
+      Printftn("movl $\"%s\", %%eax", get_symbol(node->m.var));
+    else if (use_rip(node->m.var))
+      Printftn("leaq \"%s\"(%%rip), %%rax", get_symbol(node->m.var));
+    else
+      Printftn("movq \"%s\"@GOTPCREL(%%rip), %%rax", get_symbol(node->m.var));
+    return;
+  case ND_DEREF: {
+    gen_expr(node->m.lhs);
+    return;
+  }
+  case ND_CHAIN:
+  case ND_COMMA:
+    gen_void_expr(node->m.lhs);
+    gen_addr(node->m.rhs);
+    return;
+  case ND_MEMBER:
+    gen_addr(node->m.lhs);
+    imm_add("%rax", "%rdx", node->m.member->offset);
+    return;
+  case ND_ASSIGN:
+  case ND_COND:
+  case ND_CAST:
+  case ND_FUNCALL:
+  case ND_STMT_EXPR:
+    if (node->ty->kind == TY_STRUCT || node->ty->kind == TY_UNION) {
+      gen_expr(node);
+      return;
+    }
+  }
+
+  error_tok(node->tok, "not an lvalue");
+}
+
+static void load_s(Type *ty, const char *sofs, const char *sptr) {
+  switch (ty->kind) {
+  case TY_FLOAT:   Printftn("movss %s(%s), %%xmm0", sofs, sptr); return;
+  case TY_DOUBLE:  Printftn("movsd %s(%s), %%xmm0", sofs, sptr); return;
+  case TY_LDOUBLE: gen_mem_copy(sofs, sptr, tmpbuf(10), lvar_ptr, 10); return;
+  case TY_BITINT:  gen_mem_copy(sofs, sptr, tmpbuf(ty->size), lvar_ptr, ty->size); return;
+  }
+
+  load_extend_int(ty, sofs, sptr, regop_ax(ty));
+}
+
+static void imm_load(Type *ty, int64_t ofs) {
+  if (ofs && in_imm_range(ofs)) {
+    char ofs_buf[STRBUF_SZ];
+    snprintf(ofs_buf, STRBUF_SZ, "%" PRIi64, ofs);
+    load_s(ty, ofs_buf, "%rax");
+  } else {
+    imm_add("%rax", "%rdx", ofs);
+    load_s(ty, "0", "%rax");
+  }
+}
+
+static void load(Node *node) {
+  if (is_scalar(node->ty)) {
+    if (is_bitfield(node)) {
+      gen_bitfield_load(node);
+      return;
+    }
+    load_s(node->ty, "0", "%rax");
+    return;
+  }
+
+  switch (node->ty->kind) {
+  case TY_ARRAY:
+  case TY_STRUCT:
+  case TY_UNION:
+  case TY_FUNC:
+  case TY_VLA:    return;
+  }
+  internal_error();
+}
+
+static void store_s(Type *ty, const char *dofs, const char *dptr) {
+  switch (ty->kind) {
+  case TY_ARRAY:
+  case TY_STRUCT:
+  case TY_UNION:   gen_mem_copy("0", "%rax", dofs, dptr, write_size(ty)); return;
+  case TY_FLOAT:   Printftn("movss %%xmm0, %s(%s)", dofs, dptr); return;
+  case TY_DOUBLE:  Printftn("movsd %%xmm0, %s(%s)", dofs, dptr); return;
+  case TY_LDOUBLE: gen_mem_copy(tmpbuf(10), lvar_ptr, dofs, dptr, 10); return;
+  case TY_BITINT:  gen_mem_copy(tmpbuf(ty->size), lvar_ptr, dofs, dptr, ty->size); return;
+  }
+
+  Printftn("mov %s, %s(%s)", reg_ax(ty->size), dofs, dptr);
+}
+
+static void store(Node *node, bool is_void) {
+  if (is_bitfield(node)) {
+    gen_bitfield_store(node, is_void);
+    return;
+  }
+  const char *reg = pop_inreg(tmpreg64[0]);
+  store_s(node->ty, "0", reg);
+}
+
+static void load_val2(Type *ty, int64_t val, const char *gp32, const char *gp64) {
+  if (val == 0) {
+    Printftn("xor %s, %s", gp32, gp32);
+    return;
+  }
+  if (val == (uint32_t)val) {
+    Printftn("movl $%" PRIi64 ", %s", val, gp32);
+    return;
+  }
+  if (val == (int32_t)val) {
+    if (ty->size == 8)
+      Printftn("movq $%" PRIi64 ", %s", val, gp64);
+    else
+      Printftn("movl $%" PRIi64 ", %s", val, gp32);
+    return;
+  }
+  Printftn("movabsq $%" PRIi64 ", %s", val, gp64);
+}
+
+static void load_val(Type *ty, int64_t val) {
+  load_val2(ty, val, "%eax", "%rax");
+}
+
+static void load_f32_f64(Type *ty, FPVal *fval, int reg) {
+  if (!memcmp(&fval, &(int64_t){0}, ty->size)) {
+    Printftn("xorps %%xmm%d, %%xmm%d", reg, reg);
+    return;
+  }
+  if (ty->kind == TY_FLOAT) {
+    Printftn("movl $%" PRIi32 ", %%eax", fval->chunk32[0]);
+    Printftn("movd %%eax, %%xmm%d", reg);
+  } else {
+    Printftn("movq $%" PRIu64 ", %%rax", fval->chunk[0]);
+    Printftn("movq %%rax, %%xmm%d", reg);
+  }
+}
+
+static void load_fval2(Type *ty, FPVal *fval) {
+  if (ty->kind == TY_FLOAT || ty->kind == TY_DOUBLE) {
+    load_f32_f64(ty, fval, 0);
+    return;
+  }
+
+  Printftn("movl $%" PRIi32 ", %s(%s)", fval->chunk32[0], tmpbuf(10), lvar_ptr);
+  Printftn("movl $%" PRIi32 ", 4+%s(%s)", fval->chunk32[1], tmpbuf(10), lvar_ptr);
+  Printftn("movw $%" PRIu16 ", 8+%s(%s)", (uint16_t)fval->chunk32[2], tmpbuf(10), lvar_ptr);
+}
+
+static void load_fval(Node *node) {
+  FPVal fval = {0};
+  eval_fp(node, &fval);
+  load_fval2(node->ty, &fval);
+}
+
+static void load_bitint_val(Type *ty, BitBuf *buf) {
+  char memop[STRBUF_SZ];
+  int32_t cnt = (ty->bit_cnt + 63) / 64;
+  for (int32_t i = 0; i < cnt; i++) {
+    snprintf(memop, STRBUF_SZ, "%" PRIi32 "+%s(%s)", i * 8, tmpbuf(ty->size), lvar_ptr);
+    imm_tmpl("movq", memop, (&buf->as64)[i]);
+  }
+}
+
+static void gen_cmp_zero(Node *node, NodeKind kind) {
+  if (node->ty->kind == TY_BITINT) {
+    gen_expr(node);
+
+    Printftn("movl $%" PRIi32 ", %s", (int32_t)node->ty->bit_cnt, argreg32[0]);
+    Printftn("lea %s(%s), %s", tmpbuf(node->ty->size), lvar_ptr, argreg64[1]);
+    gen_bitint_builtin_call2("__slimcc_bitint_to_bool");
+    if (kind == ND_EQ)
+      Printstn("xor $1, %%al");
+    return;
+  }
+  Node zero = {.kind = ND_NUM, .ty = node->ty, .tok = node->tok};
+  Node expr = {.kind = kind, .m.lhs = node, .m.rhs = &zero, .tok = node->tok};
+  add_type(&expr);
+  gen_expr(&expr);
+}
+
+static void gen_var_assign(Obj *var, Node *expr) {
+  Node var_node = {.kind = ND_VAR, .m.var = var, .tok = expr->tok};
+  Node node = {.kind = ND_ASSIGN, .m.lhs = &var_node, .m.rhs = expr, .tok = expr->tok};
+  add_type(&node);
+  gen_void_expr(&node);
+}
+
+static void gen_expr_null_lhs(NodeKind kind, Type *ty, Node *rhs) {
+  Node null = {.kind = ND_NULL_EXPR, .ty = ty, .tok = rhs->tok};
+  Node expr = {.kind = kind, .m.lhs = &null, .m.rhs = rhs, .tok = rhs->tok};
+  add_type(&expr);
+  gen_expr(new_cast(&expr, ty));
+}
+
+static void gen_cast_to_bitint(int32_t width, Node *node) {
+  Node expr = *node;
+  gen_expr(new_cast(&expr, new_bitint(width, node->tok)));
+}
+
+enum { I8, I16, I32, I64, U8, U16, U32, U64, F32, F64, F80 };
+
+static int getTypeId(Type *ty) {
+  switch (ty->kind) {
+  case TY_PCHAR:
+  case TY_CHAR:     return ty->is_unsigned ? U8 : I8;
+  case TY_SHORT:    return ty->is_unsigned ? U16 : I16;
+  case TY_INT:      return ty->is_unsigned ? U32 : I32;
+  case TY_LONG:
+  case TY_LONGLONG: return ty->is_unsigned ? U64 : I64;
+  case TY_FLOAT:    return F32;
+  case TY_DOUBLE:   return F64;
+  case TY_LDOUBLE:  return F80;
+  }
+  return U64;
+}
+
+static const char i32i8[] = "movsbl %al, %eax";
+static const char i32u8[] = "movzbl %al, %eax";
+static const char i32i16[] = "movswl %ax, %eax";
+static const char i32u16[] = "movzwl %ax, %eax";
+static const char i32f32[] = "cvtsi2ssl %eax, %xmm0";
+static const char i32i64[] = "movslq %eax, %rax";
+static const char i32f64[] = "cvtsi2sdl %eax, %xmm0";
+
+static const char u32f32[] = "mov %eax, %eax; cvtsi2ssq %rax, %xmm0";
+static const char u32i64[] = "mov %eax, %eax";
+static const char u32f64[] = "mov %eax, %eax; cvtsi2sdq %rax, %xmm0";
+
+static const char i64f32[] = "cvtsi2ssq %rax, %xmm0";
+static const char i64f64[] = "cvtsi2sdq %rax, %xmm0";
+
+static const char u64f32[] = "test %rax,%rax; js 1f; cvtsi2ss %rax,%xmm0; jmp 2f; "
+                             "1: mov %rax,%rdx; and $1,%eax; shr $1, %rdx; "
+                             "or %rax,%rdx; cvtsi2ss %rdx,%xmm0; addss %xmm0,%xmm0; 2:";
+static const char u64f64[] = "test %rax,%rax; js 1f; cvtsi2sd %rax,%xmm0; jmp 2f; "
+                             "1: mov %rax,%rdx; and $1,%eax; shr $1, %rdx; "
+                             "or %rax,%rdx; cvtsi2sd %rdx,%xmm0; addsd %xmm0,%xmm0; 2:";
+
+static const char f32i8[] = "cvttss2sil %xmm0, %eax; movsbl %al, %eax";
+static const char f32u8[] = "cvttss2sil %xmm0, %eax; movzbl %al, %eax";
+static const char f32i16[] = "cvttss2sil %xmm0, %eax; movswl %ax, %eax";
+static const char f32u16[] = "cvttss2sil %xmm0, %eax; movzwl %ax, %eax";
+static const char f32i32[] = "cvttss2sil %xmm0, %eax";
+static const char f32u32[] = "cvttss2siq %xmm0, %rax";
+static const char f32i64[] = "cvttss2siq %xmm0, %rax";
+static const char f32u64[] =
+  "movl $0x5F000000, %eax; movd %eax, %xmm1; comiss %xmm0, %xmm1; "
+  "setbe %al; ja 1f; subss %xmm1, %xmm0; 1: "
+  "cvttss2siq %xmm0, %rdx; shlq $63, %rax; orq %rdx, %rax";
+static const char f32f64[] = "cvtss2sd %xmm0, %xmm0";
+
+static const char f64i8[] = "cvttsd2sil %xmm0, %eax; movsbl %al, %eax";
+static const char f64u8[] = "cvttsd2sil %xmm0, %eax; movzbl %al, %eax";
+static const char f64i16[] = "cvttsd2sil %xmm0, %eax; movswl %ax, %eax";
+static const char f64u16[] = "cvttsd2sil %xmm0, %eax; movzwl %ax, %eax";
+static const char f64i32[] = "cvttsd2sil %xmm0, %eax";
+static const char f64u32[] = "cvttsd2siq %xmm0, %rax";
+static const char f64i64[] = "cvttsd2siq %xmm0, %rax";
+static const char f64u64[] =
+  "mov $0x43e0000000000000, %rax; movq %rax, %xmm1; comisd %xmm0, %xmm1; "
+  "setbe %al; ja 1f; subsd %xmm1, %xmm0; 1: "
+  "cvttsd2siq %xmm0, %rdx; shlq $63, %rax; orq %rdx, %rax";
+static const char f64f32[] = "cvtsd2ss %xmm0, %xmm0";
+
+static const char *const cast_table[][10] = {
+  // clang-format off
+  // i8   i16     i32     i64     u8     u16     u32     u64     f32     f64
+  {NULL,  NULL,   NULL,   i32i64, i32u8, i32u16, NULL,   i32i64, i32f32, i32f64}, // i8
+  {i32i8, NULL,   NULL,   i32i64, i32u8, i32u16, NULL,   i32i64, i32f32, i32f64}, // i16
+  {i32i8, i32i16, NULL,   i32i64, i32u8, i32u16, NULL,   i32i64, i32f32, i32f64}, // i32
+  {i32i8, i32i16, NULL,   NULL,   i32u8, i32u16, NULL,   NULL,   i64f32, i64f64}, // i64
+
+  {i32i8, NULL,   NULL,   i32i64, NULL,  NULL,   NULL,   i32i64, i32f32, i32f64}, // u8
+  {i32i8, i32i16, NULL,   i32i64, i32u8, NULL,   NULL,   i32i64, i32f32, i32f64}, // u16
+  {i32i8, i32i16, NULL,   u32i64, i32u8, i32u16, NULL,   u32i64, u32f32, u32f64}, // u32
+  {i32i8, i32i16, NULL,   NULL,   i32u8, i32u16, NULL,   NULL,   u64f32, u64f64}, // u64
+
+  {f32i8, f32i16, f32i32, f32i64, f32u8, f32u16, f32u32, f32u64, NULL,   f32f64}, // f32
+  {f64i8, f64i16, f64i32, f64i64, f64u8, f64u16, f64u32, f64u64, f64f32, NULL  }  // f64
+  // clang-format on
+};
+
+static void gen_cast_f80_to_int(const char *buf, const char *ins, const char *mv,
+                                const char *dst) {
+  Printftn("fnstcw 8+%s", buf);
+  Printftn("fnstcw 10+%s", buf);
+  Printftn("orb $12, 11+%s", buf);
+  Printftn("fldcw 10+%s", buf);
+
+  Printftn("%s %s", ins, buf);
+  Printftn("%s %s, %s", mv, buf, dst);
+
+  Printftn("fldcw 8+%s", buf);
+}
+
+static void gen_cast_from_f80(int to_ty) {
+  char buf[STRBUF_SZ];
+  snprintf(buf, STRBUF_SZ, "%s(%s)", tmpbuf(16), lvar_ptr);
+
+  Printftn("fldt %s", buf);
+
+  switch (to_ty) {
+  case I8:  gen_cast_f80_to_int(buf, "fistps", "movsbl", "%eax"); return;
+  case U8:  gen_cast_f80_to_int(buf, "fistps", "movzbl", "%eax"); return;
+  case I16: gen_cast_f80_to_int(buf, "fistps", "movswl", "%eax"); return;
+  case U16: gen_cast_f80_to_int(buf, "fistpl", "movzwl", "%eax"); return;
+  case I32: gen_cast_f80_to_int(buf, "fistpl", "movl", "%eax"); return;
+  case U32: gen_cast_f80_to_int(buf, "fistpll", "movl", "%eax"); return;
+  case I64: gen_cast_f80_to_int(buf, "fistpll", "movq", "%rax"); return;
+  case U64:
+    Printftn("fnstcw 8+%s", buf);
+    Printftn("fnstcw 10+%s", buf);
+    Printftn("orb $12, 11+%s", buf);
+    Printftn("fldcw 10+%s", buf);
+
+    Printftn("movl $0x5f000000, 12+%s", buf);
+    Printftn("flds 12+%s", buf);
+    Printstn("fcomi; setbe %%al; ja 1f");
+    Printstn("fsubrp; jmp 2f; 1: fstp %%st; 2:");
+    Printftn("fistpll %s; shlq $63, %%rax; orq %s, %%rax", buf, buf);
+
+    Printftn("fldcw 8+%s", buf);
+    return;
+  case F32: Printftn("fstps %s; movss %s, %%xmm0", buf, buf); return;
+  case F64: Printftn("fstpl %s; movsd %s, %%xmm0", buf, buf); return;
+  default:  internal_error();
+  }
+}
+
+static void gen_cast_to_f80(int from_ty) {
+  char buf[STRBUF_SZ];
+  snprintf(buf, STRBUF_SZ, "%s(%s)", tmpbuf(16), lvar_ptr);
+
+  switch (from_ty) {
+  case I8:
+  case U8:
+  case I16:
+  case U16:
+  case I32: Printftn("movl %%eax, %s; fildl %s", buf, buf); break;
+  case U32: Printstn("movl %%eax, %%eax");
+  case I64: Printftn("movq %%rax, %s; fildll %s", buf, buf); break;
+  case U64:
+    Printftn("movq %%rax, %s", buf);
+    Printftn("fildll %s", buf);
+    Printstn("test %%rax, %%rax");
+    Printstn("jns 1f");
+    Printftn("movl $0x5F800000, %s", buf);
+    Printftn("fadds %s", buf);
+    Printstn("1:");
+    break;
+  case F32: Printftn("movss %%xmm0, %s; flds %s", buf, buf); break;
+  case F64: Printftn("movsd %%xmm0, %s; fldl %s", buf, buf); break;
+  default:  internal_error();
+  }
+
+  Printftn("fstpt %s", buf);
+}
+
+static void gen_cast(Node *node) {
+  if (node->ty->kind == TY_BOOL) {
+    gen_cmp_zero(node->m.lhs, ND_NE);
+    return;
+  }
+  gen_expr(node->m.lhs);
+
+  Type *from_ty = node->m.lhs->ty;
+  Type *to_ty = node->ty;
+
+  if (to_ty->kind == TY_VOID)
+    return;
+
+  if (to_ty->kind == TY_BITINT) {
+    int64_t from_sz;
+    if (from_ty->kind == TY_BITINT) {
+      if (from_ty->bit_cnt >= to_ty->bit_cnt)
+        return;
+      from_sz = from_ty->bit_cnt;
+    } else if (is_gp_ty(from_ty)) {
+      Printftn("mov %%rax, %s(%s)", tmpbuf(to_ty->size), lvar_ptr);
+      if (from_ty->size * 8 >= to_ty->bit_cnt)
+        return;
+      from_sz = from_ty->size * 8;
+    } else {
+      error_tok(node->tok, "Unimplemented cast to _BitInt");
+    }
+    Printftn("lea %s(%s), %s", tmpbuf(to_ty->size), lvar_ptr, argreg64[1]);
+    Printftn("movl $%" PRIi32 ", %s", (int32_t)from_sz, argreg32[0]);
+    Printftn("movl $%" PRIi32 ", %s", (int32_t)to_ty->bit_cnt, argreg32[2]);
+    load_val2(ty_int, from_ty->is_unsigned, argreg32[3], NULL);
+    gen_bitint_builtin_call2("__slimcc_bitint_sign_ext");
+    return;
+  }
+
+  if (from_ty->kind == TY_BITINT) {
+    if (!is_gp_ty(to_ty))
+      error_tok(node->tok, "Unimplemented cast from _BitInt");
+    Printftn("mov %s(%s), %%rax", tmpbuf(to_ty->size), lvar_ptr);
+    int64_t shft = 64 - from_ty->bit_cnt;
+    if (shft > 0) {
+      Printftn("shl $%d, %%rax", (int)shft);
+      if (from_ty->is_unsigned)
+        Printftn("shr $%d, %%rax", (int)shft);
+      else
+        Printftn("sar $%d, %%rax", (int)shft);
+    }
+    return;
+  }
+
+  int t1 = getTypeId(from_ty);
+  int t2 = getTypeId(to_ty);
+
+  if (t2 == F80) {
+    if (t1 == F80)
+      return;
+    gen_cast_to_f80(t1);
+    return;
+  }
+
+  if (t1 == F80) {
+    gen_cast_from_f80(t2);
+    return;
+  }
+
+  if (cast_table[t1][t2])
+    Printftn("%s", cast_table[t1][t2]);
+}
+
+typedef enum {
+  CLASS_NO,
+  CLASS_INT,
+  CLASS_SSE,
+  CLASS_X87,
+  CLASS_MEM,
+} ArgClass;
+
+static ArgClass calc_class(ArgClass a, ArgClass b) {
+  if (a == b)
+    return a;
+  if (a == CLASS_NO || b == CLASS_NO)
+    return a == CLASS_NO ? b : a;
+  if (a == CLASS_MEM || b == CLASS_MEM)
+    return CLASS_MEM;
+  if (a == CLASS_X87 || b == CLASS_X87)
+    return CLASS_MEM;
+  if (a == CLASS_INT || b == CLASS_INT)
+    return CLASS_INT;
+  return CLASS_SSE;
+}
+
+static ArgClass get_class(Type *ty, int lo, int hi, int offset, ArgClass ac) {
+  if (ty->kind == TY_STRUCT || ty->kind == TY_UNION) {
+    for (Member *mem = ty->members; mem_iter(&mem); mem = mem->next) {
+      int ofs = offset + mem->offset;
+      if ((ofs + mem->ty->size) <= lo)
+        continue;
+      if (ofs >= hi)
+        break;
+      ac = get_class(mem->ty, lo, hi, ofs, ac);
+    }
+    return ac;
+  }
+
+  if (ty->kind == TY_ARRAY) {
+    for (int i = 0; i < ty->array_len; i++) {
+      int ofs = offset + ty->base->size * i;
+      if ((ofs + ty->base->size) <= lo)
+        continue;
+      if (ofs >= hi)
+        break;
+      ac = get_class(ty->base, lo, hi, ofs, ac);
+    }
+    return ac;
+  }
+
+  switch (ty->kind) {
+  case TY_FLOAT:
+  case TY_DOUBLE:  return calc_class(ac, CLASS_SSE);
+  case TY_LDOUBLE: return calc_class(ac, CLASS_X87);
+  }
+  return calc_class(ac, CLASS_INT);
+}
+
+static bool is_fp_class_lo(Type *ty) {
+  return get_class(ty, 0, 8, 0, CLASS_NO) == CLASS_SSE;
+}
+
+static bool is_fp_class_hi(Type *ty) {
+  return get_class(ty, 8, 16, 0, CLASS_NO) == CLASS_SSE;
+}
+
+static bool is_x87_class(Type *ty) {
+  if (ty->size != 16)
+    return false;
+  return get_class(ty, 0, 16, 0, CLASS_NO) == CLASS_X87;
+}
+
+static bool is_mem_class(Type *ty) {
+  if (ty->size > 16)
+    return true;
+  return get_class(ty, 0, 16, 0, CLASS_NO) == CLASS_MEM;
+}
+
+static bool is_by_reg_agg(Type *ty) {
+  if (ty->size > 16)
+    return false;
+  switch (get_class(ty, 0, 16, 0, CLASS_NO)) {
+  case CLASS_X87:
+  case CLASS_MEM: return false;
+  }
+  return true;
+}
+
+bool va_arg_need_copy(Type *ty) {
+  if (ty->size > 8 && ty->size <= 16)
+    return is_fp_class_lo(ty) || is_fp_class_hi(ty);
+  return false;
+}
+
+bool bitint_rtn_need_copy(size_t width) {
+  return width > 128;
+}
+
+static int calling_convention(Obj *var, int *gp_count, int *fp_count, int *stack_align) {
+  int stack = 0;
+  int max_align = 16;
+  int gp = *gp_count, fp = *fp_count;
+  for (; var; var = var->param_next) {
+    Type *ty = var->ty;
+
+    switch (ty->kind) {
+    case TY_STRUCT:
+    case TY_UNION:
+      if (ty->size == 0) {
+        var->is_zero_sized_arg = true;
+        continue;
+      }
+    case TY_BITINT:
+      if (is_by_reg_agg(ty)) {
+        int fp_inc = is_fp_class_lo(ty) + (ty->size > 8 && is_fp_class_hi(ty));
+        int gp_inc = !is_fp_class_lo(ty) + (ty->size > 8 && !is_fp_class_hi(ty));
+
+        if ((!fp_inc || (fp + fp_inc <= FP_MAX)) && (!gp_inc || (gp + gp_inc <= GP_MAX))) {
+          fp += fp_inc;
+          gp += gp_inc;
+          continue;
+        }
+      }
+      break;
+    case TY_FLOAT:
+    case TY_DOUBLE:
+      if (fp++ < FP_MAX)
+        continue;
+      break;
+    case TY_LDOUBLE: {
+      break;
+    }
+    default:
+      if (gp++ < GP_MAX)
+        continue;
+    }
+    var->pass_by_stack = true;
+
+    if (ty->align > 8) {
+      stack = align_to(stack, ty->align);
+      max_align = MAX(max_align, ty->align);
+    }
+    var->stack_offset = stack;
+    stack += align_to(ty->size, 8);
+  }
+  *gp_count = MIN(gp, GP_MAX);
+  *fp_count = MIN(fp, FP_MAX);
+  if (stack_align)
+    *stack_align = max_align;
+
+  return stack;
+}
+
+static void copy_ret_buffer(Obj *var) {
+  Type *ty = var->ty;
+  int gp = 0, fp = 0;
+
+  for (int ofs = 0; ofs < ty->size; ofs += 8) {
+    int chunk_sz = MIN(8, ty->size - ofs);
+
+    if ((ofs == 0) ? is_fp_class_lo(ty) : is_fp_class_hi(ty)) {
+      if (chunk_sz == 4)
+        Printftn("movss %%xmm%d, %d(%s)", fp, ofs + var->ofs, var->ptr);
+      else
+        Printftn("movsd %%xmm%d, %d(%s)", fp, ofs + var->ofs, var->ptr);
+      fp++;
+      continue;
+    }
+    store_gp2(regs[gp == 0 ? REG_X64_AX : REG_X64_DX], chunk_sz, ofs + var->ofs, var->ptr);
+    gp++;
+  }
+}
+
+static void copy_struct_reg(void) {
+  Type *ty = codegen_fn->ty->return_ty;
+  int gp = 0, fp = 0;
+  const char *sptr = "%rax";
+
+  if (is_x87_class(ty)) {
+    Printftn("fldt (%s)", sptr);
+    return;
+  }
+  for (int ofs = 0; ofs < ty->size; ofs += 8) {
+    if ((ofs == 0) ? is_fp_class_lo(ty) : is_fp_class_hi(ty)) {
+      int chunk_sz = MIN(8, ty->size - ofs);
+      if (chunk_sz == 4)
+        Printftn("movss %d(%s), %%xmm%d", ofs, sptr, fp);
+      else
+        Printftn("movsd %d(%s), %%xmm%d", ofs, sptr, fp);
+      fp++;
+      continue;
+    }
+    if (gp == 0) {
+      sptr = "%rcx";
+      Printstn("mov %%rax, %%rcx");
+      Printftn("mov %d(%%rcx), %%rax", ofs);
+    } else {
+      Printftn("mov %d(%%rcx), %%rdx", ofs);
+    }
+    gp++;
+  }
+}
+
+static void copy_struct_mem(void) {
+  Type *ty = codegen_fn->ty->return_ty;
+
+  Printftn("mov -%d(%s), %%rcx", rtn_ptr_ofs, lvar_ptr);
+  gen_mem_copy("0", "%rax", "0", "%rcx", ty->size);
+  Printstn("mov %%rcx, %%rax");
+}
+
+static void gen_vaarg_reg_copy(Type *ty, Obj *var) {
+  int gp_inc = !is_fp_class_lo(ty) + !is_fp_class_hi(ty);
+  if (gp_inc) {
+    Printftn("cmpl $%d, (%%rax)", 48 - gp_inc * 8);
+    Printstn("ja 1f");
+  }
+  int fp_inc = is_fp_class_lo(ty) + is_fp_class_hi(ty);
+  Printftn("cmpl $%d, 4(%%rax)", 176 - fp_inc * 16);
+  Printstn("ja 1f");
+
+  for (int ofs = 0; ofs < ty->size; ofs += 8) {
+    if ((ofs == 0) ? is_fp_class_lo(ty) : is_fp_class_hi(ty)) {
+      Printstn("movl 4(%%rax), %%ecx");  // fp_offset
+      Printstn("addq 16(%%rax), %%rcx"); // reg_save_area
+      Printstn("addq $16, 4(%%rax)");
+    } else {
+      Printstn("movl (%%rax), %%ecx");   // gp_offset
+      Printstn("addq 16(%%rax), %%rcx"); // reg_save_area
+      Printstn("addq $8, (%%rax)");
+    }
+    char dofs[STRBUF_SZ];
+    snprintf(dofs, STRBUF_SZ, "%d", ofs + var->ofs);
+    gen_mem_copy("0", "%rcx", dofs, var->ptr, MIN(8, ty->size - ofs));
+  }
+  Printftn("lea %d(%s), %%rdx", var->ofs, var->ptr);
+  return;
+}
+
+static void builtin_alloca(Node *node) {
+  Printstn("mov %%rsp, %%rcx");
+  Printstn("sub %%rax, %%rsp");
+
+  int align = node->m.var ? MAX(node->m.var->alt_align, 16) : 16;
+  Printftn("and $-%d, %%rsp", align);
+  Printstn("sub %%rsp, %%rcx");
+
+  if (node->kind == ND_ALLOCA_ZINIT) {
+    Printstn("xorps %%xmm0, %%xmm0");
+    Printstn("2:");
+    Printstn("sub $16, %%rcx");
+    Printstn("js 1f");
+    Printstn("movaps %%xmm0, (%%rsp, %%rcx)");
+  } else {
+    Printstn("2:");
+    Printstn("sub $4096, %%rcx");
+    Printstn("js 1f");
+    Printstn("orb $0, (%%rsp, %%rcx)");
+  }
+  Printstn("jmp 2b");
+  Printstn("1:");
+
+  if (node->m.var)
+    Printftn("mov %%rsp, %d(%s)", node->m.var->vptr->ofs, node->m.var->vptr->ptr);
+  else
+    Printstn("mov %%rsp, %%rax");
+}
+
+static void gen_defr(Node *node) {
+  DeferStmt *defr = node->dfr_from;
+  DeferStmt *end = node->dfr_dest;
+
+  while (defr != end) {
+    if (defr->kind == DF_VLA_DEALLOC) {
+      while (defr->next != end && defr->next->kind == DF_VLA_DEALLOC)
+        defr = defr->next;
+
+      if (!codegen_fn->dealloc_vla) {
+        defr = defr->next;
+        continue;
+      }
+
+      Obj *vla = defr->next ? defr->next->vla : NULL;
+      if (vla)
+        Printftn("mov %d(%s), %%rsp", vla->ofs, vla->ptr);
+      else
+        Printftn("mov -%d(%s), %%rsp", vla_base_ofs, lvar_ptr);
+
+      defr = defr->next;
+      continue;
+    }
+    if (defr->kind == DF_CLEANUP_FN) {
+      gen_void_expr(defr->cleanup_fn);
+      defr = defr->next;
+      continue;
+    }
+    if (defr->kind == DF_DEFER_STMT) {
+      gen_stmt(defr->stmt);
+      defr = defr->next;
+      continue;
+    }
+    internal_error();
+  }
+}
+
+static void print_loc(Token *tok) {
+  static int file_no, line_no, id;
+
+  if (file_no == tok->display_file_no && line_no == tok->display_line_no)
+    return;
+
+  line_no = tok->display_line_no;
+
+  if (file_no != tok->display_file_no) {
+    file_no = tok->display_file_no;
+    if (!debug_file_used[file_no]) {
+      debug_file_used[file_no] = true;
+      debug_file_id[file_no] = id++;
+      strarray_push(&debug_files, display_files.data[file_no]);
+    }
+  }
+  Printftn(".loc %d %d", debug_file_id[file_no], line_no);
+}
+
+static void place_reg_arg(Type *ty, const char *ofs, const char *ptr, int *gp, int *fp) {
+  switch (ty->kind) {
+  case TY_BITINT:
+  case TY_STRUCT:
+  case TY_UNION:
+    if (is_fp_class_lo(ty))
+      Printftn("movsd %s(%s), %%xmm%d", ofs, ptr, (*fp)++);
+    else
+      Printftn("mov %s(%s), %s", ofs, ptr, argreg64[(*gp)++]);
+
+    if (ty->size > 8) {
+      if (is_fp_class_hi(ty))
+        Printftn("movsd 8+%s(%s), %%xmm%d", ofs, ptr, (*fp)++);
+      else
+        Printftn("mov 8+%s(%s), %s", ofs, ptr, argreg64[(*gp)++]);
+    }
+    return;
+  case TY_FLOAT:  Printftn("movss %s(%s), %%xmm%d", ofs, ptr, (*fp)++); return;
+  case TY_DOUBLE: Printftn("movsd %s(%s), %%xmm%d", ofs, ptr, (*fp)++); return;
+  }
+
+  if (ty->size <= 4)
+    load_extend_int(ty, ofs, ptr, argreg32[(*gp)++]);
+  else
+    load_extend_int(ty, ofs, ptr, argreg64[(*gp)++]);
+}
+
+// Pass-by-stack or non-trivial args that need spilling
+static void gen_funcall_stack_args(Obj *var) {
+  for (; var; var = var->param_next) {
+    if (var->is_zero_sized_arg)
+      gen_void_expr(var->arg_expr);
+    else if (var->ptr)
+      gen_var_assign(var, var->arg_expr);
+  }
+}
+
+// Logic should be in sync with prepare_funcall()
+static void gen_funcall_args(Node *node) {
+  bool rtn_by_stk = is_mem_class(node->ty);
+  int gp = rtn_by_stk, fp = 0;
+
+  int reg_arg_cnt = 0;
+  for (Obj *var = node->call.args; var; var = var->param_next) {
+    if (var->pass_by_stack || var->is_zero_sized_arg)
+      continue;
+
+    char ofs[STRBUF_SZ];
+    const char *ptr;
+
+    if (opt_optimize) {
+      Node *arg_expr = var->arg_expr;
+      reg_arg_cnt++;
+
+      int64_t val;
+      if (is_gp_ty(arg_expr->ty) && is_const_expr(arg_expr, &val)) {
+        load_val2(arg_expr->ty, val, argreg32[gp], argreg64[gp]);
+        gp++;
+        continue;
+      }
+      FPVal fval = {0};
+      if (is_flonum(arg_expr->ty) && is_const_fp(arg_expr, &fval)) {
+        load_f32_f64(arg_expr->ty, &fval, fp++);
+        continue;
+      }
+      if (gen_load_opt_gp(arg_expr, (gp < 6 ? argreg[gp] : REG_X64_NULL))) {
+        gp++;
+        continue;
+      }
+      if ((is_gp_ty(arg_expr->ty) || is_flonum(arg_expr->ty)) &&
+          is_memop(arg_expr, ofs, &ptr, true)) {
+        place_reg_arg(arg_expr->ty, ofs, ptr, &gp, &fp);
+        continue;
+      }
+
+      if (reg_arg_cnt == 1 && is_scalar(arg_expr->ty)) {
+        gen_expr(arg_expr);
+        if (is_gp_ty(arg_expr->ty))
+          Printftn("mov %%rax, %s", argreg64[gp++]);
+        else if (is_flonum(arg_expr->ty))
+          fp++;
+        else if (arg_expr->ty->kind == TY_BITINT)
+          place_reg_arg(arg_expr->ty, tmpbuf(arg_expr->ty->size), lvar_ptr, &gp, &fp);
+        else
+          internal_error();
+        continue;
+      }
+    }
+    snprintf(ofs, STRBUF_SZ, "%d", var->ofs);
+    place_reg_arg(var->ty, ofs, var->ptr, &gp, &fp);
+  }
+
+  if (rtn_by_stk)
+    Printftn("lea %d(%s), %%rdi", node->call.rtn_buf->ofs, node->call.rtn_buf->ptr);
+}
+
+static void gen_funcall(Node *node) {
+  bool rtn_by_stk = is_mem_class(node->ty);
+  int gp_count = rtn_by_stk;
+  int fp_count = 0;
+  int arg_stk_align;
+  int arg_stk_size = calling_convention(node->call.args, &gp_count, &fp_count,
+                                        &arg_stk_align);
+  bool use_fn_ptr = !is_direct_fncall(node->call.expr);
+  if (use_fn_ptr) {
+    gen_expr(node->call.expr);
+    push();
+  }
+
+  gen_funcall_stack_args(node->call.alloca_args);
+
+  if (arg_stk_size) {
+    if (arg_stk_align > 16) {
+      if (use_fn_ptr) {
+        const char *reg = pop_inreg(tmpreg64[0]);
+        push_from("%rsp");
+        push_from(reg);
+      } else {
+        push_from("%rsp");
+      }
+      Printftn("sub $%d, %%rsp", arg_stk_size);
+      Printftn("and $-%d, %%rsp", arg_stk_align);
+    } else {
+      Printftn("sub $%" PRIi64 ", %%rsp", align_to(arg_stk_size, 16));
+    }
+  }
+
+  gen_funcall_stack_args(node->call.args);
+  gen_funcall_args(node);
+
+  Type *fnty = get_func_ty(node->call.expr);
+  if (fnty->is_variadic || fnty->is_oldstyle) {
+    if (fp_count)
+      Printftn("movb $%d, %%al", fp_count);
+    else
+      Printstn("xor %%al, %%al");
+  }
+
+  if (use_fn_ptr) {
+    switch (gp_count) {
+    case 0:  break;
+    case 1:  clobber_gp(1); break; // %rdi
+    default: clobber_gp(4); break;
+    }
+    Printftn("call *%s", pop_inreg("%r10"));
+  } else {
+    if (use_rip(node->call.expr->m.var))
+      Printftn("call \"%s\"", get_symbol(node->call.expr->m.var));
+    else if (opt_use_plt)
+      Printftn("call \"%s\"@PLT", get_symbol(node->call.expr->m.var));
+    else
+      Printftn("call *\"%s\"@GOTPCREL(%%rip)", get_symbol(node->call.expr->m.var));
+  }
+
+  clobber_all_regs();
+
+  if (arg_stk_size) {
+    if (arg_stk_align > 16)
+      pop("%rsp");
+    else
+      Printftn("add $%" PRIi64 ", %%rsp", align_to(arg_stk_size, 16));
+  }
+}
+
+static void gen_cond(Node *node, bool jump_cond, const char *jump_label) {
+  if (opt_optimize) {
+    int64_t val;
+    if (is_const_expr(node, &val)) {
+      if (val == jump_cond)
+        Printftn("jmp %s", jump_label);
+      return;
+    }
+
+    bool flip, is_void;
+    Node *expr = bool_expr_opt(node, &flip, &is_void);
+    if (expr) {
+      if (is_void) {
+        gen_void_expr(expr);
+        if (flip == jump_cond)
+          Printftn("jmp %s", jump_label);
+        return;
+      }
+      node = expr;
+      jump_cond ^= flip;
+    }
+
+    if (is_cmp(node) && is_gp_ty(node->m.lhs->ty)) {
+      NodeKind kind = node->kind;
+      if (!gen_cmp_opt_gp(node, &kind)) {
+        gen_expr(node->m.lhs);
+        push();
+        gen_expr(node->m.rhs);
+
+        bool is_r64 = node->m.lhs->ty->size == 8;
+        const char *op = pop_inreg2(is_r64, (is_r64 ? tmpreg64 : tmpreg32)[0]);
+        Printftn("cmp %s, %s", regop_ax(node->m.lhs->ty), op);
+      }
+      flip_cmp(&kind, !jump_cond);
+      const char *ins = cmp_cc(kind, node->m.lhs->ty->is_unsigned);
+      Printftn("j%s %s", ins, jump_label);
+      return;
+    }
+
+    if (node->kind == ND_LOGAND || node->kind == ND_LOGOR) {
+      bool short_cond = (node->kind == ND_LOGOR);
+      if (short_cond == jump_cond) {
+        gen_cond(node->m.lhs, jump_cond, jump_label);
+        gen_cond(node->m.rhs, jump_cond, jump_label);
+        return;
+      }
+      char short_label[STRBUF_SZ];
+      snprintf(short_label, STRBUF_SZ, ".L.short.%" PRIi64, count());
+
+      gen_cond(node->m.lhs, short_cond, short_label);
+      gen_cond(node->m.rhs, short_cond, short_label);
+      Printftn("jmp %s", jump_label);
+      Printfsn("%s:", short_label);
+      return;
+    }
+
+    if (node->kind == ND_CAST &&
+        node->ty->kind == TY_BOOL &&
+        node->m.lhs->ty->kind != TY_BITINT) {
+      Node zero = {.kind = ND_NUM, .ty = node->m.lhs->ty, .tok = node->tok};
+      Node expr = {.kind = ND_NE, .m.lhs = node->m.lhs, .m.rhs = &zero, .tok = node->tok};
+      add_type(&expr);
+      gen_cond(&expr, jump_cond, jump_label);
+      return;
+    }
+  }
+
+  if (node->kind == ND_FUNCALL && node->ty->kind == TY_BOOL)
+    gen_funcall(node);
+  else
+    gen_expr(node);
+  Printstn("test %%al, %%al");
+  Printftn("j%s %s", (jump_cond ? "ne" : "e"), jump_label);
+}
+
+static void gen_logical(Node *node, bool flip) {
+  int64_t c = count();
+  char short_label[STRBUF_SZ];
+  snprintf(short_label, STRBUF_SZ, ".L.short.%" PRIi64, c);
+  bool short_cond = (node->kind == ND_LOGOR);
+
+  gen_cond(node->m.lhs, short_cond, short_label);
+  gen_cond(node->m.rhs, short_cond, short_label);
+
+  static const char set_zero[] = "xor %eax, %eax";
+  static const char set_one[] = "movl $1, %eax";
+
+  short_cond ^= flip;
+  Printftn("%s", short_cond ? set_zero : set_one);
+  Printftn("jmp .L.fall.%" PRIi64, c);
+  Printfsn("%s:", short_label);
+  Printftn("%s", short_cond ? set_one : set_zero);
+  Printfsn(".L.fall.%" PRIi64 ":", c);
+}
+
+static void gen_xmm_arith(Node *node) {
+  if (node->kind == ND_NEG) {
+    gen_expr(node->m.lhs);
+
+    if (node->ty->kind == TY_FLOAT) {
+      Printstn("mov $0x80000000, %%eax");
+      Printstn("movd %%eax, %%xmm1");
+      Printstn("xorps %%xmm1, %%xmm0");
+    } else {
+      Printstn("mov $0x8000000000000000, %%rax");
+      Printstn("movq %%rax, %%xmm1");
+      Printstn("xorpd %%xmm1, %%xmm0");
+    }
+    return;
+  }
+
+  gen_expr(node->m.lhs);
+  pushf();
+  gen_expr(node->m.rhs);
+
+  bool is_xmm64 = node->m.lhs->ty->kind == TY_DOUBLE;
+  int reg = popf_inreg(is_xmm64, 1);
+  const char *sz = is_xmm64 ? "sd" : "ss";
+
+  switch (node->kind) {
+  case ND_ADD: {
+    Printftn("add%s %%xmm%d, %%xmm0", sz, reg);
+    return;
+  }
+  case ND_SUB:
+    Printftn("sub%s %%xmm0, %%xmm%d", sz, reg);
+    Printftn("movaps %%xmm%d, %%xmm0", reg);
+    return;
+  case ND_MUL: {
+    Printftn("mul%s %%xmm%d, %%xmm0", sz, reg);
+    return;
+  }
+  case ND_DIV:
+    Printftn("div%s %%xmm0, %%xmm%d", sz, reg);
+    Printftn("movaps %%xmm%d, %%xmm0", reg);
+    return;
+  case ND_EQ:
+  case ND_NE:
+    Printstn("xor %%eax, %%eax");
+    Printftn("ucomi%s %%xmm%d, %%xmm0", sz, reg);
+
+    if (node->kind == ND_EQ) {
+      Printstn("sete %%al");
+      Printstn("setnp %%dl");
+      Printstn("and %%dl, %%al");
+    } else {
+      Printstn("setne %%al");
+      Printstn("setp %%dl");
+      Printstn("or %%dl, %%al");
+    }
+    return;
+  case ND_LT:
+  case ND_LE:
+  case ND_GT:
+  case ND_GE:
+    Printstn("xor %%eax, %%eax");
+
+    if (node->kind == ND_GT || node->kind == ND_GE)
+      Printftn("comi%s %%xmm0, %%xmm%d", sz, reg);
+    else
+      Printftn("comi%s %%xmm%d, %%xmm0", sz, reg);
+
+    if (node->kind == ND_LT || node->kind == ND_GT)
+      Printstn("seta %%al");
+    else
+      Printstn("setae %%al");
+    return;
+  }
+  internal_error();
+}
+
+static void gen_x87_arith(Node *node) {
+  if (node->kind == ND_NEG) {
+    gen_expr(node->m.lhs);
+    Printftn("fldt %s(%s)", tmpbuf(10), lvar_ptr);
+    Printstn("fchs");
+    Printftn("fstpt %s(%s)", tmpbuf(10), lvar_ptr);
+    return;
+  }
+
+  gen_expr(node->m.lhs);
+  push_x87();
+  gen_expr(node->m.rhs);
+  Printftn("fldt %s(%s)", tmpbuf(10), lvar_ptr);
+  pop_x87();
+  Printftn("fldt %s(%s)", tmpbuf(10), lvar_ptr);
+
+  switch (node->kind) {
+  case ND_ADD:
+    Printstn("faddp");
+    Printftn("fstpt %s(%s)", tmpbuf(10), lvar_ptr);
+    return;
+  case ND_SUB:
+    Printstn("fsubp");
+    Printftn("fstpt %s(%s)", tmpbuf(10), lvar_ptr);
+    return;
+  case ND_MUL:
+    Printstn("fmulp");
+    Printftn("fstpt %s(%s)", tmpbuf(10), lvar_ptr);
+    return;
+  case ND_DIV:
+    Printstn("fdivp");
+    Printftn("fstpt %s(%s)", tmpbuf(10), lvar_ptr);
+    return;
+  case ND_EQ:
+  case ND_NE:
+    Printstn("xor %%eax, %%eax");
+    Printstn("fucomip");
+    Printstn("fstp %%st");
+
+    if (node->kind == ND_EQ) {
+      Printstn("sete %%al");
+      Printstn("setnp %%dl");
+      Printstn("and %%dl, %%al");
+    } else {
+      Printstn("setne %%al");
+      Printstn("setp %%dl");
+      Printstn("or %%dl, %%al");
+    }
+    return;
+  case ND_LT:
+  case ND_LE:
+  case ND_GT:
+  case ND_GE:
+    Printstn("xor %%eax, %%eax");
+
+    if (node->kind == ND_LT || node->kind == ND_LE)
+      Printstn("fxch %%st(1)");
+
+    Printstn("fcomip");
+    Printstn("fstp %%st");
+
+    if (node->kind == ND_LT || node->kind == ND_GT)
+      Printstn("seta %%al");
+    else
+      Printstn("setae %%al");
+    return;
+  }
+  internal_error();
+}
+
+static void gen_bitint_arith(Node *node) {
+  Type *ty = node->m.lhs->ty;
+
+  switch (node->kind) {
+  case ND_NEG:
+  case ND_BITNOT:
+    gen_expr(node->m.lhs);
+
+    Printftn("movl $%" PRIi32 ", %s", (int32_t)ty->bit_cnt, argreg32[0]);
+    Printftn("lea %s(%s), %s", tmpbuf(ty->size), lvar_ptr, argreg64[1]);
+    gen_bitint_builtin_call(node->kind);
+    return;
+  }
+
+  gen_expr(node->m.lhs);
+  push_bitint(ty->size);
+  gen_expr(node->m.rhs);
+
+  Printftn("movl $%" PRIi32 ", %s", (int32_t)ty->bit_cnt, argreg32[0]);
+  Printftn("lea %d(%s), %s", pop_bitint(ty->size), lvar_ptr, argreg64[1]);
+  Printftn("lea %s(%s), %s", tmpbuf(ty->size), lvar_ptr, argreg64[2]);
+
+  switch (node->kind) {
+  case ND_BITAND:
+  case ND_BITOR:
+  case ND_BITXOR:
+  case ND_ADD:
+  case ND_SUB:
+  case ND_MUL: {
+    gen_bitint_builtin_call(node->kind);
+    return;
+  }
+  case ND_DIV:
+  case ND_REM:
+    load_val2(ty_int, ty->is_unsigned, argreg32[3], NULL);
+    load_val2(ty_int, node->kind == ND_DIV, argreg32[4], NULL);
+    gen_bitint_builtin_call(node->kind);
+    return;
+  case ND_SHL:
+  case ND_SHR:
+  case ND_SAR:
+    Printftn("movl %%eax, %s", argreg32[3]);
+    if (node->kind != ND_SHL)
+      load_val2(ty_int, ty->is_unsigned, argreg32[4], NULL);
+    gen_bitint_builtin_call(node->kind);
+    return;
+  case ND_EQ:
+  case ND_NE:
+  case ND_LT:
+  case ND_LE:
+  case ND_GT:
+  case ND_GE: {
+    load_val2(ty_int, ty->is_unsigned, argreg32[3], NULL);
+    gen_bitint_builtin_call2("__slimcc_bitint_cmp");
+
+    NodeKind kind;
+    int val;
+    switch (node->kind) {
+    case ND_EQ: val = 0, kind = ND_EQ; break;
+    case ND_NE: val = 0, kind = ND_NE; break;
+    case ND_LT: val = 1, kind = ND_EQ; break;
+    case ND_LE: val = 2, kind = ND_NE; break;
+    case ND_GT: val = 2, kind = ND_EQ; break;
+    case ND_GE: val = 1, kind = ND_NE; break;
+    default:    internal_error();
+    }
+    imm_cmp("%eax", NULL, val);
+    gen_cmp_setcc(kind, false);
+    return;
+  }
+  }
+  internal_error();
+}
+
+static void gen_gp_arith(Node *node) {
+  switch (node->kind) {
+  case ND_NEG:
+    gen_expr(node->m.lhs);
+    Printftn("neg %s", regop_ax(node->m.lhs->ty));
+    return;
+  case ND_BITNOT:
+    gen_expr(node->m.lhs);
+    Printstn("not %%rax");
+    return;
+  case ND_SHL:
+  case ND_SHR:
+  case ND_SAR:
+    gen_expr(node->m.lhs);
+    push();
+    gen_expr(node->m.rhs);
+    Printstn("mov %%al, %%cl");
+
+    const char *ax = regop_ax(node->ty);
+    pop2((node->ty->size == 8), ax);
+
+    switch (node->kind) {
+    case ND_SHL: Printftn("shl %%cl, %s", ax); break;
+    case ND_SHR: Printftn("shr %%cl, %s", ax); break;
+    case ND_SAR: Printftn("sar %%cl, %s", ax); break;
+    }
+    return;
+  }
+
+  gen_expr(node->m.lhs);
+  push();
+  gen_expr(node->m.rhs);
+
+  bool is_r64 = node->m.lhs->ty->size == 8 || node->m.lhs->ty->base;
+  const char *ax = is_r64 ? "%rax" : "%eax";
+  const char *op = pop_inreg2(is_r64, (is_r64 ? tmpreg64 : tmpreg32)[0]);
+
+  switch (node->kind) {
+  case ND_ADD: {
+    Printftn("add %s, %s", op, ax);
+    return;
+  }
+  case ND_SUB:
+    Printftn("sub %s, %s", ax, op);
+    Printftn("mov %s, %s", op, ax);
+    return;
+  case ND_MUL: {
+    Printftn("imul %s, %s", op, ax);
+    return;
+  }
+  case ND_DIV:
+  case ND_REM:
+    Printftn("xchg %s, %s", op, ax);
+    if (node->ty->is_unsigned) {
+      Printstn("xor %%edx, %%edx");
+      Printftn("div %s", op);
+    } else {
+      if (node->m.lhs->ty->size == 8)
+        Printstn("cqo");
+      else
+        Printstn("cdq");
+      Printftn("idiv %s", op);
+    }
+
+    if (node->kind == ND_REM)
+      Printstn("mov %%rdx, %%rax");
+    return;
+  case ND_BITAND: Printftn("and %s, %s", op, ax); return;
+  case ND_BITOR:  Printftn("or %s, %s", op, ax); return;
+  case ND_BITXOR: Printftn("xor %s, %s", op, ax); return;
+  case ND_EQ:
+  case ND_NE:
+  case ND_LT:
+  case ND_LE:
+  case ND_GT:
+  case ND_GE:
+    Printftn("cmp %s, %s", ax, op);
+    gen_cmp_setcc(node->kind, node->m.lhs->ty->is_unsigned);
+    return;
+  }
+  internal_error();
+}
+
+static void gen_expr2(Node *node, bool is_void) {
+  if (opt_g)
+    print_loc(node->tok);
+
+  if (is_void && !(node->ty->qual & (Q_VOLATILE | Q_ATOMIC)))
+    if (gen_void_expr2(node))
+      return;
+
+  if (opt_optimize && gen_expr_opt(node))
+    return;
+
+  switch (node->kind) {
+  case ND_NULL_EXPR:
+  case ND_UNREACHABLE: {
+    return;
+  }
+  case ND_NUM: {
+    if (node->ty->kind == TY_BITINT)
+      load_bitint_val(node->ty, node->num.bitint_data);
+    else if (is_flonum(node->ty))
+      load_fval(node);
+    else if (is_integer(node->ty) || is_ptr(node->ty))
+      load_val(node->ty, node->num.val);
+    else
+      internal_error();
+    return;
+  }
+  case ND_POS: {
+    gen_expr(node->m.lhs);
+    return;
+  }
+  case ND_VAR:
+    gen_addr(node);
+    load(node);
+    return;
+  case ND_MEMBER: {
+    gen_addr(node);
+    load(node);
+    return;
+  }
+  case ND_DEREF:
+    gen_expr(node->m.lhs);
+    load(node);
+    return;
+  case ND_ADDR: {
+    gen_addr(node->m.lhs);
+    return;
+  }
+  case ND_ASSIGN:
+    gen_addr(node->m.lhs);
+    push();
+    gen_expr(node->m.rhs);
+    store(node->m.lhs, is_void);
+    return;
+  case ND_ARITH_ASSIGN:
+    gen_addr(node->m.lhs);
+    push();
+    load(node->m.lhs);
+    gen_expr_null_lhs(node->arith_kind, node->m.lhs->ty, node->m.rhs);
+    store(node->m.lhs, is_void);
+    return;
+  case ND_POST_INCDEC:
+    gen_addr(node->m.lhs);
+    Printstn("movq %%rax, %%rcx");
+    load(node->m.lhs);
+    push_by_ty(node->m.lhs->ty);
+    push_from("%rcx");
+    gen_expr_null_lhs(ND_ADD, node->m.lhs->ty, node->m.rhs);
+    store(node->m.lhs, true);
+    pop_by_ty(node->m.lhs->ty);
+    return;
+  case ND_CKD_ARITH: {
+    Type *res_ty = node->m.target->ty->base;
+    int32_t chk_bits = res_ty->is_unsigned + bit_size(res_ty);
+    int32_t bits = MAX(chk_bits, res_ty->size * 8);
+    int32_t l_hdr = ovf_headroom(node->m.lhs->ty, node->arith_kind);
+    int32_t r_hdr = ovf_headroom(node->m.rhs->ty, node->arith_kind);
+    bits = MAX(bits, l_hdr);
+    bits = MAX(bits, r_hdr);
+    bits = align_to(bits, 64);
+    int32_t sz = bits / 8;
+
+    gen_expr(node->m.target);
+    push();
+    gen_cast_to_bitint(bits, node->m.lhs);
+    push_bitint(sz);
+    gen_cast_to_bitint(bits, node->m.rhs);
+
+    load_val2(ty_int, bits, argreg32[0], NULL);
+    Printftn("lea %d(%s), %s", pop_bitint(sz), lvar_ptr, argreg64[1]);
+    Printftn("lea %s(%s), %s", tmpbuf(sz), lvar_ptr, argreg64[2]);
+    gen_bitint_builtin_call(node->arith_kind);
+
+    pop("%rax");
+    gen_mem_copy(tmpbuf(sz), lvar_ptr, "0", "%rax", res_ty->size);
+
+    load_val2(ty_int, bits, argreg32[0], NULL);
+    Printftn("lea %s(%s), %s", tmpbuf(sz), lvar_ptr, argreg64[1]);
+    load_val2(ty_int, chk_bits, argreg32[2], NULL);
+    load_val2(ty_int, res_ty->is_unsigned, argreg32[3], NULL);
+    gen_bitint_builtin_call2("__slimcc_bitint_overflow");
+    return;
+  }
+  case ND_STMT_EXPR:
+    name_labels(node->blk.local_labels);
+    for (Node *n = node->blk.body; n != node->blk.result; n = n->next)
+      gen_stmt(n);
+    if (node->blk.result)
+      gen_expr2(node->blk.result->m.lhs, is_void);
+    if (has_defr(node)) {
+      push_by_ty(node->ty);
+      gen_defr(node);
+      pop_by_ty(node->ty);
+    }
+    return;
+  case ND_CHAIN:
+  case ND_COMMA:
+    gen_void_expr(node->m.lhs);
+    gen_expr2(node->m.rhs, is_void);
+    return;
+  case ND_CAST: {
+    gen_cast(node);
+    return;
+  }
+  case ND_INIT_SEQ:
+    gen_mem_zero(node->m.var->ofs, node->m.var->ptr, node->m.var->ty->size);
+    for (Node *n = node->m.lhs; n; n = n->next)
+      gen_void_expr(n);
+    return;
+  case ND_COND: {
+    int64_t c = count();
+    char else_label[STRBUF_SZ];
+    snprintf(else_label, STRBUF_SZ, ".L.else.%" PRIi64, c);
+
+    gen_cond(node->ctrl.cond, false, else_label);
+    gen_expr2(node->ctrl.then, is_void);
+    Printftn("jmp .L.end.%" PRIi64, c);
+    Printfsn("%s:", else_label);
+    gen_expr2(node->ctrl.els, is_void);
+    Printfsn(".L.end.%" PRIi64 ":", c);
+    return;
+  }
+  case ND_NOT:
+    gen_expr(node->m.lhs);
+    Printstn("xor $1, %%al");
+    return;
+  case ND_LOGAND:
+  case ND_LOGOR: {
+    gen_logical(node, false);
+    return;
+  }
+  case ND_FUNCALL:
+    gen_funcall(node);
+
+    if (is_x87_class(node->ty)) {
+      if (is_void) {
+        Printstn("fstp %%st(0)");
+      } else if (node->call.rtn_buf) {
+        Printftn("lea %d(%s), %%rax", node->call.rtn_buf->ofs, node->call.rtn_buf->ptr);
+        Printstn("fstpt (%%rax)");
+      } else {
+        Printftn("fstpt %s(%s)", tmpbuf(10), lvar_ptr);
+      }
+      return;
+    }
+    if (node->ty->kind == TY_BITINT) {
+      if (bitint_rtn_need_copy(node->ty->bit_cnt)) {
+        char sofs[STRBUF_SZ];
+        snprintf(sofs, STRBUF_SZ, "%d", node->call.rtn_buf->ofs);
+        gen_mem_copy(sofs, node->call.rtn_buf->ptr, tmpbuf(node->ty->size), lvar_ptr,
+                     node->ty->size);
+      } else {
+        Printftn("mov %%rax, %s(%s)", tmpbuf(node->ty->size), lvar_ptr);
+        if (node->ty->bit_cnt > 64)
+          Printftn("mov %%rdx, 8+%s(%s)", tmpbuf(node->ty->size), lvar_ptr);
+      }
+      return;
+    }
+    if (!is_void) {
+      if (is_integer(node->ty) && node->ty->size < 4) {
+        cast_extend_int32(node->ty, reg_ax(node->ty->size), "%eax");
+        return;
+      }
+      if (node->call.rtn_buf && !is_mem_class(node->ty)) {
+        copy_ret_buffer(node->call.rtn_buf);
+        Printftn("lea %d(%s), %%rax", node->call.rtn_buf->ofs, node->call.rtn_buf->ptr);
+      }
+    }
+    return;
+  case ND_LABEL_VAL: {
+    Printftn("lea .L.jmp.%" PRIi64 "(%%rip), %%rax", node->jmp.target->lbl.id);
+    return;
+  }
+  case ND_CAS: {
+    gen_expr(node->cas.addr);
+    push();
+    gen_expr(node->cas.old_val);
+    push();
+    gen_expr(node->cas.new_val);
+
+    const char *old = pop_inreg(tmpreg64[0]);
+    const char *addr = pop_inreg(tmpreg64[1]);
+
+    Type *ty = node->cas.addr->ty->base;
+    if (!(is_gp_ty(ty) || ty->kind == TY_FLOAT || ty->kind == TY_DOUBLE))
+      error_tok(node->tok, "unsupported type for atomic CAS");
+
+    const char *ax = reg_ax(ty->size);
+    const char *dx = reg_dx(ty->size);
+
+    switch (ty->kind) {
+    case TY_DOUBLE: Printftn("movq %%xmm0, %s", dx); break;
+    case TY_FLOAT:  Printftn("movd %%xmm0, %s", dx); break;
+    default:        Printftn("mov %s, %s", ax, dx); break;
+    }
+
+    Printftn("mov (%s), %s", old, ax);
+    Printftn("lock cmpxchg %s, (%s)", dx, addr);
+    Printstn("sete %%cl");
+    Printstn("je 1f");
+    Printftn("mov %s, (%s)", ax, old);
+    Printssn("1:");
+    Printstn("movzbl %%cl, %%eax");
+    return;
+  }
+  case ND_EXCH: {
+    gen_expr(node->m.lhs);
+    push();
+    gen_expr(node->m.rhs);
+    const char *reg = pop_inreg(tmpreg64[0]);
+
+    Type *ty = node->ty;
+    if (!(is_gp_ty(ty) || ty->kind == TY_FLOAT || ty->kind == TY_DOUBLE))
+      error_tok(node->tok, "unsupported type for atomic exchange");
+
+    const char *ax = reg_ax(ty->size);
+
+    switch (ty->kind) {
+    case TY_DOUBLE: Printftn("movq %%xmm0, %s", ax); break;
+    case TY_FLOAT:  Printftn("movd %%xmm0, %s", ax); break;
+    }
+
+    Printftn("xchg %s, (%s)", ax, reg);
+
+    if (!is_void) {
+      switch (ty->kind) {
+      case TY_DOUBLE: Printftn("movq %s, %%xmm0", ax); break;
+      case TY_FLOAT:  Printftn("movd %s, %%xmm0", ax); break;
+      }
+    }
+    return;
+  }
+  case ND_THREAD_FENCE: {
+    Printstn("mfence");
+    return;
+  }
+  case ND_ALLOCA:
+  case ND_ALLOCA_ZINIT:
+    gen_expr(node->m.lhs);
+    builtin_alloca(node);
+    return;
+  case ND_FRAME_ADDR:
+    if (!node->num.val) {
+      Printstn("movq %%rbp, %%rax");
+      return;
+    }
+    Printstn("movq (%%rbp), %%rax");
+    for (int64_t i = 1; i < node->num.val; i++)
+      Printstn("movq (%%rax), %%rax");
+    return;
+  case ND_RTN_ADDR:
+    if (!node->num.val) {
+      Printstn("movq 8(%%rbp), %%rax");
+      return;
+    }
+    Printstn("movq (%%rbp), %%rax");
+    for (int64_t i = 1; i < node->num.val; i++)
+      Printstn("movq (%%rax), %%rax");
+    Printstn("movq 8(%%rax), %%rax");
+    return;
+  case ND_VA_START: {
+    gen_expr(node->m.lhs);
+    Printftn("movl $%d, (%%rax)", va_gp_start);
+    Printftn("movl $%d, 4(%%rax)", va_fp_start);
+    Printftn("lea %d(%%rbp), %%rdx", va_st_start);
+    Printstn("movq %%rdx, 8(%%rax)");
+    Printftn("lea -176(%s), %%rdx", lvar_ptr);
+    Printstn("movq %%rdx, 16(%%rax)");
+    return;
+  }
+  case ND_VA_COPY: {
+    gen_expr(node->m.lhs);
+    push();
+    gen_expr(node->m.rhs);
+    const char *reg = pop_inreg(tmpreg64[0]);
+    gen_mem_copy("0", "%rax", "0", reg, 24);
+    return;
+  }
+  case ND_VA_ARG: {
+    gen_expr(node->m.lhs);
+
+    Type *ty = node->ty->base;
+    bool use_reg_save = is_by_reg_agg(ty);
+    if (use_reg_save) {
+      if (va_arg_need_copy(ty)) {
+        // Structs with FP member are split into 8-byte chunks in the
+        // reg save area, we reconstruct the layout with a local copy.
+        gen_vaarg_reg_copy(ty, node->m.var);
+      } else if (is_fp_class_lo(ty)) {
+        Printftn("cmpl $%d, 4(%%rax)", 160);
+        Printstn("ja 1f");
+        Printstn("movl 4(%%rax), %%edx");  // fp_offset
+        Printstn("addq 16(%%rax), %%rdx"); // reg_save_area
+        Printstn("addq $16, 4(%%rax)");
+      } else {
+        int gp_inc = ty->size > 8 ? 2 : 1;
+        Printftn("cmpl $%d, (%%rax)", 48 - gp_inc * 8);
+        Printstn("ja 1f");
+        Printstn("movl (%%rax), %%edx");   // gp_offset
+        Printstn("addq 16(%%rax), %%rdx"); // reg_save_area
+        Printftn("addq $%d, (%%rax)", gp_inc * 8);
+      }
+      Printstn("jmp 2f");
+      Printssn("1:");
+    }
+    Printstn("movq 8(%%rax), %%rdx"); // overflow_arg_area
+    if (ty->align <= 8) {
+      Printftn("addq $%" PRIi64 ", 8(%%rax)", align_to(ty->size, 8));
+    } else {
+      Printftn("addq $%d, %%rdx", ty->align - 1);
+      Printftn("andq $-%d, %%rdx", ty->align);
+      Printftn("lea %" PRIi64 "(%%rdx), %%rcx", align_to(ty->size, 8));
+      Printstn("movq %%rcx, 8(%%rax)");
+    }
+    if (use_reg_save)
+      Printssn("2:");
+    Printstn("mov %%rdx, %%rax");
+    return;
+  }
+  }
+
+  if (is_int_arith(node) || is_cmp(node)) {
+    if (is_gp_ty(node->m.lhs->ty)) {
+      gen_gp_arith(node);
+      return;
+    }
+    if (node->m.lhs->ty->kind == TY_BITINT) {
+      gen_bitint_arith(node);
+      return;
+    }
+  }
+
+  if (is_fp_arith(node) || is_cmp(node)) {
+    switch (node->m.lhs->ty->kind) {
+    case TY_FLOAT:
+    case TY_DOUBLE:  gen_xmm_arith(node); return;
+    case TY_LDOUBLE: gen_x87_arith(node); return;
+    }
+  }
+
+  internal_error();
+}
+
+static void gen_expr(Node *node) {
+  gen_expr2(node, false);
+}
+
+static void gen_void_expr(Node *node) {
+  gen_expr2(node, true);
+}
+
+static void gen_stmt_naked(Node *node) {
+  switch (node->kind) {
+  case ND_NULL_STMT: {
+    return;
+  }
+  case ND_BLOCK:
+    if (has_defr(node))
+      break;
+    for (Node *n = node->blk.body; n; n = n->next)
+      gen_stmt_naked(n);
+    return;
+  case ND_ASM:
+    if (!is_plain_asm(node))
+      break;
+    gen_asm(node);
+    return;
+  }
+  error_tok(node->tok, "unsupported statement in naked function");
+}
+
+static void gen_stmt(Node *node) {
+  if (opt_g)
+    print_loc(node->tok);
+
+  switch (node->kind) {
+  case ND_NULL_STMT: {
+    return;
+  }
+  case ND_IF: {
+    gen_if_stmt(node, true);
+    return;
+  }
+  case ND_FOR: {
+    int64_t c = node->ctrl.id = count();
+    char brk[STRBUF_SZ];
+    snprintf(brk, STRBUF_SZ, ".L.brk.%" PRIi64, c);
+
+    if (node->ctrl.for_init)
+      gen_stmt(node->ctrl.for_init);
+    Printfsn(".L.begin.%" PRIi64 ":", c);
+    if (node->ctrl.cond)
+      gen_cond(node->ctrl.cond, false, brk);
+    gen_stmt(node->ctrl.then);
+    Printfsn(".L.cont.%" PRIi64 ":", c);
+    if (node->ctrl.for_inc)
+      gen_void_expr(node->ctrl.for_inc);
+    gen_defr(node);
+    Printftn("jmp .L.begin.%" PRIi64, c);
+    Printfsn("%s:", brk);
+    return;
+  }
+  case ND_DO: {
+    int64_t c = node->ctrl.id = count();
+    char bg[STRBUF_SZ];
+    snprintf(bg, STRBUF_SZ, ".L.begin.%" PRIi64, c);
+
+    Printfsn("%s:", bg);
+    gen_stmt(node->ctrl.then);
+    Printfsn(".L.cont.%" PRIi64 ":", c);
+    gen_cond(node->ctrl.cond, true, bg);
+    Printfsn(".L.brk.%" PRIi64 ":", c);
+    return;
+  }
+  case ND_SWITCH: {
+    int64_t c = node->ctrl.id = count();
+    gen_expr(node->ctrl.cond);
+
+    const char *ax, *cx, *dx;
+    if (node->ctrl.cond->ty->size == 8)
+      ax = "%rax", cx = "%rcx", dx = "%rdx";
+    else
+      ax = "%eax", cx = "%ecx", dx = "%edx";
+
+    int64_t case_cnt = 1;
+    Node *label = NULL;
+    for (CaseRange *cr = node->ctrl.sw_cases; cr; cr = cr->next) {
+      if (cr->label == node->ctrl.sw_default)
+        continue;
+
+      if (label != cr->label) {
+        label = cr->label;
+        label->cases.id = ++case_cnt;
+      }
+
+      if (cr->hi == cr->lo) {
+        imm_cmp(ax, dx, cr->lo);
+        Printftn("je .L.case.%" PRIi64 ".%" PRIi64, c, case_cnt);
+        continue;
+      }
+      if (cr->lo == 0) {
+        imm_cmp(ax, dx, cr->hi);
+        Printftn("jbe .L.case.%" PRIi64 ".%" PRIi64, c, case_cnt);
+        continue;
+      }
+      Printftn("mov %s, %s", ax, cx);
+      imm_sub(cx, dx, cr->lo);
+      imm_cmp(cx, dx, (uint64_t)cr->hi - cr->lo);
+      Printftn("jbe .L.case.%" PRIi64 ".%" PRIi64, c, case_cnt);
+    }
+
+    if (node->ctrl.sw_default) {
+      Printftn("jmp .L.default.%" PRIi64, c);
+    } else {
+      Printftn("jmp .L.brk.%" PRIi64, c);
+    }
+    gen_stmt(node->ctrl.then);
+    Printfsn(".L.brk.%" PRIi64 ":", c);
+    return;
+  }
+  case ND_BLOCK: {
+    gen_block_stmt(node, true);
+    return;
+  }
+  case ND_BREAK:
+    gen_defr(node);
+    Printftn("jmp .L.brk.%" PRIi64, node->jmp.parent_loop->ctrl.id);
+    return;
+  case ND_CONT:
+    gen_defr(node);
+    Printftn("jmp .L.cont.%" PRIi64, node->jmp.parent_loop->ctrl.id);
+    return;
+  case ND_GOTO:
+    gen_defr(node);
+    Printftn("jmp .L.jmp.%" PRIi64, node->jmp.target->lbl.id);
+    return;
+  case ND_GOTO_EXPR:
+    gen_expr(node->m.lhs);
+    Printstn("jmp *%%rax");
+    return;
+  case ND_DEFAULT:
+    Printfsn(".L.default.%" PRIi64 ":", node->cases.parent_sw->ctrl.id);
+    return;
+  case ND_CASE:
+    Printfsn(".L.case.%" PRIi64 ".%" PRIi64 ":", node->cases.parent_sw->ctrl.id,
+             node->cases.id);
+    return;
+  case ND_LABEL:
+    if (node->lbl.id)
+      Printfsn(".L.jmp.%" PRIi64 ":", node->lbl.id);
+    return;
+  case ND_RETURN: {
+    if (codegen_fn->is_noreturn)
+      error_tok(node->tok, "function is noreturn");
+
+    if (!node->m.lhs) {
+      gen_defr(node);
+      if (is_x87_class(codegen_fn->ty->return_ty))
+        Printstn("fldz");
+      Printftn("jmp .L.rtn.%" PRIi64, rtn_label);
+      return;
+    }
+
+    Type *ty = node->m.lhs->ty;
+
+    if (ty->size <= 0) {
+      gen_defr(node);
+      gen_void_expr(node->m.lhs);
+      Printftn("jmp .L.rtn.%" PRIi64, rtn_label);
+      return;
+    }
+
+    gen_expr(node->m.lhs);
+
+    if (ty->kind == TY_STRUCT || ty->kind == TY_UNION || ty->kind == TY_BITINT) {
+      if (is_mem_class(ty)) {
+        if (ty->kind == TY_BITINT)
+          Printftn("lea %s(%s), %%rax", tmpbuf(ty->size), lvar_ptr);
+        copy_struct_mem();
+        if (has_defr(node)) {
+          push();
+          gen_defr(node);
+          pop("%rax");
+        }
+        Printftn("jmp .L.rtn.%" PRIi64, rtn_label);
+        return;
+      }
+
+      if (ty->kind != TY_BITINT)
+        gen_mem_copy("0", "%rax", tmpbuf(ty->size), lvar_ptr, ty->size);
+      Printftn("lea %s(%s), %%rax", tmpbuf(ty->size), lvar_ptr);
+      if (has_defr(node)) {
+        push_bitint(ty->size);
+        gen_defr(node);
+        Printftn("lea %d(%s), %%rax", pop_bitint(ty->size), lvar_ptr);
+      }
+      copy_struct_reg();
+      Printftn("jmp .L.rtn.%" PRIi64, rtn_label);
+      return;
+    }
+    if (has_defr(node)) {
+      push_by_ty(ty);
+      gen_defr(node);
+      pop_by_ty(ty);
+    }
+    if (ty->kind == TY_LDOUBLE)
+      Printftn("fldt %s(%s)", tmpbuf(10), lvar_ptr);
+    Printftn("jmp .L.rtn.%" PRIi64, rtn_label);
+    return;
+  }
+  case ND_EXPR_STMT: {
+    gen_void_expr(node->m.lhs);
+    return;
+  }
+  case ND_ASM: {
+    gen_asm(node);
+    return;
+  }
+  }
+
+  error_tok(node->tok, "invalid statement");
+}
+
+static void imm_tmpl(const char *ins, const char *op, int64_t val) {
+  if (val == (int32_t)val) {
+    Printftn("%s $%" PRIi64 ", %s", ins, val, op);
+    return;
+  }
+  if (val == (uint32_t)val)
+    Printftn("movl $%" PRIi64 ", %%edx", val);
+  else
+    Printftn("movabsq $%" PRIi64 ", %%rdx", val);
+  Printftn("%s %%rdx, %s", ins, op);
+  return;
+}
+
+static void memop_arith_imm2(Node *lhs, int64_t val, const char *ins_sz) {
+  char ofs[STRBUF_SZ];
+  const char *ptr;
+
+  if (is_memop(lhs, ofs, &ptr, false)) {
+    char memop[STRBUF_SZ2];
+    snprintf(memop, STRBUF_SZ2, "%s(%s)", ofs, ptr);
+    imm_tmpl(ins_sz, memop, limit_imm(val, lhs->ty->size));
+    return;
+  }
+
+  int64_t dofs;
+  if (gen_addr_opt2(lhs, &dofs)) {
+    if (dofs && in_imm_range(dofs)) {
+      snprintf(ofs, STRBUF_SZ, "%" PRIi64 "(%%rax)", dofs);
+      imm_tmpl(ins_sz, ofs, limit_imm(val, lhs->ty->size));
+      return;
+    }
+    imm_add("%rax", "%rdx", dofs);
+  } else {
+    gen_addr(lhs);
+  }
+  imm_tmpl(ins_sz, "(%rax)", limit_imm(val, lhs->ty->size));
+}
+
+static bool memop_arith_imm(Node *lhs, Node *rhs, const char *ins) {
+  int64_t rval;
+  if (is_const_expr(rhs, &rval)) {
+    char ins_sz[STRBUF_SZ];
+    snprintf(ins_sz, STRBUF_SZ, "%s%s", ins, size_suffix(lhs->ty->size));
+
+    memop_arith_imm2(lhs, rval, ins_sz);
+    return true;
+  }
+  return false;
+}
+
+static void memop_arith(Node *lhs, Node *rhs, const char *ins) {
+  char ins_sz[STRBUF_SZ];
+  snprintf(ins_sz, STRBUF_SZ, "%s%s", ins, size_suffix(lhs->ty->size));
+
+  int64_t rval;
+  if (is_const_expr(rhs, &rval)) {
+    memop_arith_imm2(lhs, rval, ins_sz);
+    return;
+  }
+
+  char ofs[STRBUF_SZ];
+  const char *ptr;
+  if (is_memop(lhs, ofs, &ptr, false)) {
+    gen_expr(rhs);
+    Printftn("%s %s, %s(%s)", ins_sz, reg_ax(lhs->ty->size), ofs, ptr);
+    return;
+  }
+
+  gen_addr(lhs);
+  push();
+  gen_expr(rhs);
+  const char *dptr = pop_inreg(tmpreg64[0]);
+  Printftn("%s %s, (%s)", ins_sz, reg_ax(lhs->ty->size), dptr);
+}
+
+static void gen_void_arith_assign(Node *node) {
+  NodeKind arith_kind = node->kind == ND_POST_INCDEC ? ND_ADD : node->arith_kind;
+
+  Node *lhs = node->m.lhs;
+  Node *rhs = node->m.rhs;
+  Type *ty = lhs->ty;
+
+  Node null = {.kind = ND_NULL_EXPR, .ty = ty, .tok = rhs->tok};
+  Node expr = {.kind = arith_kind, .m.lhs = &null, .m.rhs = rhs, .tok = rhs->tok};
+  add_type(&expr);
+
+  if (opt_optimize &&
+      is_gp_ty(ty) &&
+      ty->kind != TY_BOOL &&
+      !is_bitfield(lhs) &&
+      is_gp_ty(rhs->ty)) {
+    switch (arith_kind) {
+    case ND_ADD:
+    case ND_SUB:
+    case ND_BITAND:
+    case ND_BITOR:
+    case ND_BITXOR: {
+      memop_arith(lhs, expr.m.rhs, arith_ins(arith_kind));
+      return;
+    }
+    case ND_SHL:
+    case ND_SHR:
+    case ND_SAR:
+      if (memop_arith_imm(lhs, expr.m.rhs, arith_ins(arith_kind)))
+        return;
+    }
+  }
+  gen_addr(lhs);
+  push();
+  load(lhs);
+  gen_expr(new_cast(&expr, ty));
+  store(lhs, true);
+}
+
+static bool gen_void_assign2(Node *node) {
+  Node *lhs = node->m.lhs;
+  Node *rhs = node->m.rhs;
+
+  if (is_gp_ty(lhs->ty) &&
+      !is_bitfield(lhs) &&
+      !(lhs->ty->qual & Q_ATOMIC) &&
+      memop_arith_imm(lhs, rhs, "mov"))
+    return true;
+
+  char sofs[STRBUF_SZ];
+  const char *sptr;
+  if (is_memop(rhs, sofs, &sptr, true) || (is_int_to_int_cast(rhs) &&
+                                           lhs->ty->size <= rhs->m.lhs->ty->size &&
+                                           lhs->ty->kind != TY_BOOL &&
+                                           is_memop(rhs->m.lhs, sofs, &sptr, true))) {
+    char dofs[STRBUF_SZ];
+    const char *dptr;
+    if (is_memop(lhs, dofs, &dptr, false)) {
+      gen_mem_copy(sofs, sptr, dofs, dptr, write_size(lhs->ty));
+      return true;
+    }
+    if (!is_bitfield(lhs) && !(lhs->ty->qual & Q_ATOMIC)) {
+      gen_addr(lhs);
+      gen_mem_copy(sofs, sptr, "0", "%rax", write_size(lhs->ty));
+      return true;
+    }
+  }
+
+  if (is_memop_ptr(rhs, sofs, &sptr) && sptr == rip && !(opt_fpic || opt_fpie)) {
+    char dofs[STRBUF_SZ];
+    const char *dptr;
+    if (is_memop(lhs, dofs, &dptr, false)) {
+      Printftn("movq $%s, %s(%s)", sofs, dofs, dptr);
+      return true;
+    }
+    if (!is_bitfield(lhs) && !(lhs->ty->qual & Q_ATOMIC)) {
+      gen_addr(lhs);
+      Printftn("movq $%s, (%%rax)", sofs);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static bool gen_void_expr2(Node *node) {
+  switch (node->kind) {
+  case ND_NULL_EXPR:
+  case ND_LABEL_VAL:
+  case ND_VAR:
+  case ND_NUM: {
+    return true;
+  }
+  case ND_POS:
+  case ND_NEG:
+  case ND_MEMBER:
+  case ND_ADDR:
+  case ND_DEREF:
+  case ND_NOT:
+  case ND_BITNOT:
+  case ND_CAST: {
+    gen_void_expr(node->m.lhs);
+    return true;
+  }
+  case ND_ADD:
+  case ND_SUB:
+  case ND_MUL:
+  case ND_DIV:
+  case ND_REM:
+  case ND_BITAND:
+  case ND_BITOR:
+  case ND_BITXOR:
+  case ND_SHL:
+  case ND_SHR:
+  case ND_SAR:
+  case ND_EQ:
+  case ND_NE:
+  case ND_LT:
+  case ND_LE:
+  case ND_GT:
+  case ND_GE:
+    gen_void_expr(node->m.lhs);
+    gen_void_expr(node->m.rhs);
+    return true;
+  case ND_ASSIGN: {
+    return gen_void_assign2(node);
+  }
+  case ND_ARITH_ASSIGN:
+  case ND_POST_INCDEC: {
+    gen_void_arith_assign(node);
+    return true;
+  }
+  }
+  return false;
+}
+
+static const char *arith_ins(NodeKind kind) {
+  const char *ins;
+  switch (kind) {
+  case ND_ADD:    ins = "add"; break;
+  case ND_SUB:    ins = "sub"; break;
+  case ND_MUL:    ins = "imul"; break;
+  case ND_BITAND: ins = "and"; break;
+  case ND_BITOR:  ins = "or"; break;
+  case ND_BITXOR: ins = "xor"; break;
+  case ND_SHL:    ins = "shl"; break;
+  case ND_SHR:    ins = "shr"; break;
+  case ND_SAR:    ins = "sar"; break;
+  default:        internal_error();
+  }
+  return ins;
+}
+
+static const char *farith_ins(NodeKind kind) {
+  switch (kind) {
+  case ND_ADD: return "add";
+  case ND_SUB: return "sub";
+  case ND_MUL: return "mul";
+  case ND_DIV: return "div";
+  }
+  internal_error();
+}
+
+static void imm_arith2(NodeKind kind, const char *op, const char *tmp, int64_t val) {
+  if (in_imm_range(val)) {
+    Printftn("%s $%" PRIi64 ", %s", arith_ins(kind), val, op);
+    return;
+  }
+  Printftn("mov $%" PRIi64 ", %s", val, tmp);
+  Printftn("%s %s, %s", arith_ins(kind), tmp, op);
+  return;
+}
+
+static void imm_add(const char *op, const char *tmp, int64_t val) {
+  switch (val) {
+  case 0:  return;
+  case 1:  Printftn("inc %s", op); return;
+  case -1: Printftn("dec %s", op); return;
+  }
+  imm_arith2(ND_ADD, op, tmp, val);
+}
+
+static void imm_sub(const char *op, const char *tmp, int64_t val) {
+  switch (val) {
+  case 0:  return;
+  case 1:  Printftn("dec %s", op); return;
+  case -1: Printftn("inc %s", op); return;
+  }
+  imm_arith2(ND_SUB, op, tmp, val);
+}
+
+static void imm_and(const char *op, const char *tmp, int64_t val) {
+  switch (val) {
+  case 0:  Printftn("xor %s, %s", op, op); return;
+  case -1: return;
+  }
+  imm_arith2(ND_BITAND, op, tmp, val);
+}
+
+static void imm_cmp(const char *op, const char *tmp, int64_t val) {
+  if (val == 0) {
+    Printftn("test %s, %s", op, op);
+    return;
+  }
+  if (in_imm_range(val)) {
+    Printftn("cmp $%" PRIi64 ", %s", val, op);
+    return;
+  }
+  Printftn("mov $%" PRIi64 ", %s", val, tmp);
+  Printftn("cmp %s, %s", tmp, op);
+}
+
+static bool gen_imm_mul_p2(const char *ax, int p2) {
+  switch (p2) {
+  case 0:  break;
+  case 1:  Printftn("add %s, %s", ax, ax); break;
+  default: Printftn("shl $%d, %s", p2, ax); break;
+  }
+  return true;
+}
+
+static bool imm_mul_opt(const char *ax, const char *dx, int64_t val) {
+  int x = 0, y;
+  bool use_dx = false;
+
+  switch (val) {
+  case 15: x = 4, y = 2; break;
+  case 27: x = 8, y = 2; break;
+  case 25: x = 4, y = 4; break;
+  case 45: x = 8, y = 4; break;
+  case 81: x = 8, y = 8; break;
+  case 7:  x = 2, y = 2, use_dx = true; break;
+  case 11: x = 4, y = 2, use_dx = true; break;
+  case 19: x = 8, y = 2, use_dx = true; break;
+  case 13: x = 2, y = 4, use_dx = true; break;
+  case 21: x = 4, y = 4, use_dx = true; break;
+  case 37: x = 8, y = 4, use_dx = true; break;
+  case 41: x = 4, y = 8, use_dx = true; break;
+  case 73: x = 8, y = 8, use_dx = true; break;
+  }
+  if (x) {
+    Printftn("lea (%%rax, %%rax, %d), %s", x, (use_dx ? dx : ax));
+    Printftn("lea (%%rax, %s, %d), %s", (use_dx ? "%rdx" : "%rax"), y, ax);
+    return true;
+  }
+
+  int p2 = Ctz64(val);
+  switch ((uint64_t)val >> p2) {
+  case 3: x = 2; break;
+  case 5: x = 4; break;
+  case 9: x = 8; break;
+  }
+  if (x) {
+    Printftn("lea (%%rax, %%rax, %d), %s", x, ax);
+    return gen_imm_mul_p2(ax, p2);
+  }
+
+  if (Pop64((uint64_t)val + 1) == 1) {
+    Printftn("mov %s, %s", ax, dx);
+    gen_imm_mul_p2(ax, Ctz64((uint64_t)val + 1));
+    Printftn("sub %s, %s", dx, ax);
+    return true;
+  }
+
+  if (Pop64((uint64_t)val - 1) == 1) {
+    Printftn("mov %s, %s", ax, dx);
+    gen_imm_mul_p2(ax, Ctz64((uint64_t)val - 1));
+    Printftn("add %s, %s", dx, ax);
+    return true;
+  }
+  return false;
+}
+
+static void imm_arith(NodeKind kind, Node *expr, int sz, int64_t val) {
+  const char *ax = reg_ax(sz);
+  const char *dx = reg_dx(sz);
+
+  if ((kind == ND_MUL || kind == ND_BITAND) && val == 0) {
+    gen_void_expr(expr);
+    Printstn("xor %%eax, %%eax");
+    return;
+  }
+
+  if (kind == ND_BITOR && val == -1) {
+    gen_void_expr(expr);
+    Printftn("mov $-1, %s", ax);
+    return;
+  }
+
+  gen_expr(expr);
+
+  switch (kind) {
+  case ND_ADD:    imm_add(ax, dx, val); return;
+  case ND_SUB:    imm_sub(ax, dx, val); return;
+  case ND_BITAND: imm_and(ax, dx, val); return;
+  case ND_BITXOR:
+    if (val == -1) {
+      Printftn("not %s", ax);
+      return;
+    }
+  case ND_BITOR:
+  case ND_SHL:
+  case ND_SHR:
+  case ND_SAR:
+    if (val == 0)
+      return;
+    break;
+  case ND_MUL:
+    switch (val) {
+    case 1:  return;
+    case -1: Printftn("neg %s", ax); return;
+    }
+    if (Pop64(val) == 1) {
+      gen_imm_mul_p2(ax, Ctz64(val));
+      return;
+    }
+    if (imm_mul_opt(ax, dx, val))
+      return;
+    break;
+  }
+  imm_arith2(kind, ax, dx, val);
+  return;
+}
+
+static bool imm_divmod_opt(NodeKind kind, Type *ty, Node *expr, int64_t val) {
+  const char *ax = reg_ax(ty->size);
+  const char *dx = reg_dx(ty->size);
+
+  switch (val) {
+  case 1:
+    if (kind == ND_DIV) {
+      gen_expr(expr);
+      return true;
+    }
+    gen_void_expr(expr);
+    Printstn("xor %%eax, %%eax");
+    return true;
+  case -1:
+    if (!ty->is_unsigned) {
+      if (kind == ND_DIV) {
+        gen_expr(expr);
+        Printftn("neg %s", ax);
+        return true;
+      }
+      gen_void_expr(expr);
+      Printstn("xor %%eax, %%eax");
+      return true;
+    }
+    gen_expr(expr);
+
+    if (kind == ND_DIV) {
+      Printftn("cmp $-1, %s", ax);
+      gen_cmp_setcc(ND_EQ, false);
+      return true;
+    }
+    Printstn("xor %%edx, %%edx");
+    Printftn("cmp $-1, %s", ax);
+    Printftn("cmove %s, %s", dx, ax);
+    return true;
+  case 0: {
+    Printstn("ud2");
+    return true;
+  }
+  }
+
+  if (Pop64(val) == 1) {
+    if (ty->is_unsigned) {
+      gen_expr(expr);
+
+      if (kind == ND_DIV) {
+        Printftn("shr $%d, %s", Ctz64(val), ax);
+        return true;
+      }
+      uint64_t msk = (uint64_t)val - 1;
+      if (msk == UINT32_MAX) {
+        Printstn("movl %%eax, %%eax");
+        return true;
+      }
+      if (msk <= INT32_MAX) {
+        Printftn("and $%d, %%eax", (int)msk);
+        return true;
+      }
+      imm_and(ax, dx, msk);
+      return true;
+    }
+
+    if (val > 1 && val <= ((uint64_t)1 << 30)) {
+      gen_expr(expr);
+
+      if (kind == ND_DIV) {
+        Printftn("lea %" PRIi32 "(%s), %s", (int32_t)((uint64_t)val - 1), ax, dx);
+        Printftn("test %s, %s", ax, ax);
+        Printftn("cmovs %s, %s", dx, ax);
+        Printftn("sar $%d, %s", Ctz64(val), ax);
+        return true;
+      }
+      Printftn("%s", ty->size == 8 ? "cqto" : "cltd");
+      Printftn("shr $%d, %s", (int)(ty->size * 8 - Ctz64(val)), dx);
+      Printftn("add %s, %s", dx, ax);
+      imm_and(ax, NULL, (int32_t)((uint64_t)val - 1));
+      Printftn("sub %s, %s", dx, ax);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static bool gen_cmp_opt_gp2(Node *lhs, Node *rhs) {
+  char ofs[STRBUF_SZ];
+  const char *ptr;
+  int64_t val;
+  if (is_const_expr(rhs, &val)) {
+    if (is_memop(lhs, ofs, &ptr, false)) {
+      char memop[STRBUF_SZ2];
+      snprintf(memop, STRBUF_SZ2, "%s(%s)", ofs, ptr);
+      imm_tmpl(lhs->ty->size == 8 ? "cmpq" : "cmpl", memop, limit_imm(val, lhs->ty->size));
+      return true;
+    }
+    gen_expr(lhs);
+    imm_cmp(regop_ax(lhs->ty), "%rdx", limit_imm(val, lhs->ty->size));
+    return true;
+  }
+
+  if (is_memop(lhs, ofs, &ptr, false)) {
+    gen_expr(rhs);
+    Printftn("cmp %s, %s(%s)", regop_ax(lhs->ty), ofs, ptr);
+    return true;
+  }
+  return false;
+}
+
+static bool gen_cmp_opt_gp(Node *node, NodeKind *kind) {
+  if (gen_cmp_opt_gp2(node->m.lhs, node->m.rhs))
+    return true;
+  if (gen_cmp_opt_gp2(node->m.rhs, node->m.lhs)) {
+    switch (*kind) {
+    case ND_LT: *kind = ND_GT; break;
+    case ND_LE: *kind = ND_GE; break;
+    case ND_GT: *kind = ND_LT; break;
+    case ND_GE: *kind = ND_LE; break;
+    }
+    return true;
+  }
+  return false;
+}
+
+static bool gen_arith_opt_gp2(NodeKind kind, int sz, Node *lhs, Node *rhs, int pass) {
+  int64_t val;
+  char ofs[STRBUF_SZ];
+  const char *ptr;
+  const char *ax = reg_ax(sz);
+
+  switch (pass) {
+  case 0:
+    if (is_const_expr(rhs, &val)) {
+      imm_arith(kind, lhs, sz, limit_imm(val, sz));
+      return true;
+    }
+    break;
+  case 1:
+    if (is_memop(rhs, ofs, &ptr, true)) {
+      gen_expr(lhs);
+      Printftn("%s %s(%s), %s", arith_ins(kind), ofs, ptr, ax);
+      return true;
+    }
+    break;
+  case 2:
+    if (is_int_to_int_cast(rhs) &&
+        is_memop(rhs->m.lhs, ofs, &ptr, true) &&
+        sz <= rhs->m.lhs->ty->size) {
+      gen_expr(lhs);
+      Printftn("%s %s(%s), %s", arith_ins(kind), ofs, ptr, ax);
+      return true;
+    }
+    break;
+  case 3:
+    if (is_int_to_int_cast(rhs) &&
+        is_memop(rhs->m.lhs, ofs, &ptr, true) &&
+        sz > rhs->m.lhs->ty->size) {
+      gen_expr(lhs);
+
+      if (!rhs->m.lhs->ty->is_unsigned && sz == 8)
+        load_extend_int64(rhs->m.lhs->ty, ofs, ptr, "%rdx");
+      else
+        load_extend_int(rhs->m.lhs->ty, ofs, ptr, "%edx");
+
+      Printftn("%s %s, %s", arith_ins(kind), reg_dx(sz), ax);
+      return true;
+    }
+    break;
+  }
+  return false;
+}
+
+static bool gen_arith_opt_gp(Node *node, int sz) {
+  switch (node->kind) {
+  case ND_ADD:
+  case ND_MUL:
+  case ND_BITAND:
+  case ND_BITOR:
+  case ND_BITXOR:
+    for (int pass = 0; pass <= 3; pass++)
+      if (gen_arith_opt_gp2(node->kind, sz, node->m.lhs, node->m.rhs, pass) ||
+          gen_arith_opt_gp2(node->kind, sz, node->m.rhs, node->m.lhs, pass))
+        return true;
+    break;
+  case ND_SUB:
+    for (int pass = 0; pass <= 3; pass++)
+      if (gen_arith_opt_gp2(node->kind, sz, node->m.lhs, node->m.rhs, pass))
+        return true;
+  }
+  return false;
+}
+
+static bool gen_shift_opt_gp(Node *node) {
+  const char *ax = reg_ax(node->ty->size);
+  int64_t val;
+  char ofs[STRBUF_SZ];
+  const char *ptr;
+
+  if (is_const_expr(node->m.rhs, &val)) {
+    imm_arith(node->kind, node->m.lhs, node->ty->size, val);
+    return true;
+  }
+  if (is_memop(node->m.rhs, ofs, &ptr, true)) {
+    gen_expr(node->m.lhs);
+
+    Printftn("movb %s(%s), %%cl", ofs, ptr);
+    Printftn("%s %%cl, %s", arith_ins(node->kind), ax);
+    return true;
+  }
+  return false;
+}
+
+static bool gen_gp_opt(Node *node) {
+  NodeKind kind = node->kind;
+  Node *lhs = node->m.lhs;
+  Node *rhs = node->m.rhs;
+  Type *ty = node->ty;
+
+  switch (kind) {
+  case ND_SHL:
+  case ND_SHR:
+  case ND_SAR: {
+    return gen_shift_opt_gp(node);
+  }
+  case ND_DIV:
+  case ND_REM: {
+    int64_t val;
+    if (is_const_expr(rhs, &val))
+      return imm_divmod_opt(kind, ty, lhs, val);
+    return false;
+  }
+  }
+  if (gen_arith_opt_gp(node, node->ty->size))
+    return true;
+
+  if (is_cmp(node) && is_gp_ty(node->m.lhs->ty) && gen_cmp_opt_gp(node, &kind)) {
+    gen_cmp_setcc(kind, lhs->ty->is_unsigned);
+    return true;
+  }
+  return false;
+}
+
+static bool gen_arith_opt_fp2(NodeKind kind, Node *lhs, Node *rhs, int pass) {
+  char ofs[STRBUF_SZ];
+  const char *ptr;
+  const char *sz = rhs->ty->kind == TY_FLOAT ? "ss" : "sd";
+
+  switch (pass) {
+  case 0: {
+    FPVal fval = {0};
+    if (is_const_fp(rhs, &fval)) {
+      gen_expr(lhs);
+      load_f32_f64(rhs->ty, &fval, 1);
+      Printftn("%s%s %%xmm1, %%xmm0", farith_ins(kind), sz);
+      return true;
+    }
+    break;
+  }
+  case 1:
+    if (is_memop(rhs, ofs, &ptr, true)) {
+      gen_expr(lhs);
+      Printftn("%s%s %s(%s), %%xmm0", farith_ins(kind), sz, ofs, ptr);
+      return true;
+    }
+    break;
+  }
+  return false;
+}
+
+static bool gen_arith_opt_fp(Node *node) {
+  switch (node->kind) {
+  case ND_ADD:
+  case ND_MUL:
+    for (int pass = 0; pass <= 1; pass++)
+      if (gen_arith_opt_fp2(node->kind, node->m.lhs, node->m.rhs, pass) ||
+          gen_arith_opt_fp2(node->kind, node->m.rhs, node->m.lhs, pass))
+        return true;
+    break;
+  case ND_SUB:
+  case ND_DIV:
+    for (int pass = 0; pass <= 1; pass++)
+      if (gen_arith_opt_fp2(node->kind, node->m.lhs, node->m.rhs, pass))
+        return true;
+  }
+  return false;
+}
+
+static bool gen_load_opt_gp(Node *node, Reg r) {
+  char ofs[STRBUF_SZ];
+  const char *ptr;
+  Node *lhs = node->m.lhs;
+  Type *ty = node->ty;
+  bool gen = (r != REG_X64_NULL);
+
+  if (is_memop_ptr(node, ofs, &ptr)) {
+    if (gen) {
+      if (ptr == rip && !(opt_fpic || opt_fpie))
+        Printftn("movl $%s, %s", ofs, regs[r][2]);
+      else
+        Printftn("lea %s(%s), %s", ofs, ptr, regs[r][3]);
+    }
+    return true;
+  }
+
+  if (is_int_to_int_cast(node) && is_memop(lhs, ofs, &ptr, true)) {
+    if (ty->size > lhs->ty->size) {
+      if (!lhs->ty->is_unsigned && ty->size == 8) {
+        if (gen)
+          load_extend_int64(lhs->ty, ofs, ptr, regs[r][3]);
+        return true;
+      }
+      if (!(ty->size == 2 && ty->is_unsigned && !lhs->ty->is_unsigned)) {
+        if (gen)
+          load_extend_int(lhs->ty, ofs, ptr, regs[r][2]);
+        return true;
+      }
+    } else if (ty->kind != TY_BOOL) {
+      if (gen)
+        load_extend_int(ty, ofs, ptr, regs[r][ty->size == 8 ? 3 : 2]);
+      return true;
+    }
+  }
+  return false;
+}
+
+static void gen_deref_opt(Node *node, int64_t *ofs) {
+  int64_t accum = 0;
+  for (;; node = node->m.lhs) {
+    if (node->kind == ND_CAST && node->ty->base && node->m.lhs->ty->base)
+      continue;
+
+    if (node->ty->kind == TY_ARRAY) {
+      if (node->kind == ND_DEREF)
+        continue;
+
+      if (node->kind == ND_MEMBER) {
+        accum += node->m.member->offset;
+        continue;
+      }
+    }
+
+    if (node->ty->kind == TY_PTR) {
+      int64_t val;
+      if (node->kind == ND_ADD && is_const_expr(node->m.rhs, &val)) {
+        accum += val;
+        continue;
+      }
+      if (node->kind == ND_SUB && is_const_expr(node->m.rhs, &val)) {
+        accum -= val;
+        continue;
+      }
+    }
+    break;
+  }
+  *ofs = accum;
+
+  gen_expr(node);
+}
+
+static void gen_member_opt(Node *node, int64_t *ofs) {
+  int64_t accum = 0;
+  do {
+    accum += node->m.member->offset;
+    node = node->m.lhs;
+  } while (node->kind == ND_MEMBER);
+
+  *ofs = accum;
+
+  gen_addr(node);
+}
+
+static Node *bool_expr_opt(Node *node, bool *flip, bool *is_void) {
+  Node *boolexpr = NULL;
+  bool has_not = false;
+  *is_void = false;
+  bool boolexpr_has_not;
+
+  for (;;) {
+    switch (node->kind) {
+    case ND_NOT:
+      has_not = !has_not;
+      node = node->m.lhs;
+      continue;
+    case ND_LOGOR:
+    case ND_LOGAND: {
+      int64_t val;
+      if (is_const_expr(node->m.rhs, &val)) {
+        if (val == (node->kind == ND_LOGAND)) {
+          node = node->m.lhs;
+          continue;
+        }
+        *is_void = true;
+        *flip = (node->kind == ND_LOGOR) ^ has_not;
+        return node->m.lhs;
+      }
+    }
+    case ND_EQ:
+    case ND_NE:
+    case ND_LT:
+    case ND_LE:
+    case ND_GT:
+    case ND_GE: {
+      *flip = has_not;
+      return node;
+    }
+    }
+    if (node->ty->kind == TY_BOOL) {
+      boolexpr = node;
+      boolexpr_has_not = has_not;
+    }
+    if (!(node->kind == ND_CAST && is_gp_ty(node->ty)))
+      break;
+    node = node->m.lhs;
+  }
+  if (boolexpr) {
+    *flip = boolexpr_has_not;
+    return boolexpr;
+  }
+  return NULL;
+}
+
+static bool gen_bool_opt(Node *node) {
+  bool flip, is_void;
+  Node *boolexpr = bool_expr_opt(node, &flip, &is_void);
+  if (!boolexpr || boolexpr == node)
+    return false;
+  node = boolexpr;
+
+  if (is_void) {
+    gen_void_expr(node);
+    if (flip)
+      Printstn("movl $1, %%eax");
+    else
+      Printstn("xor %%eax, %%eax");
+    return true;
+  }
+
+  if (is_cmp(node) && (is_gp_ty(node->m.lhs->ty) || node->m.lhs->ty->kind == TY_BITINT)) {
+    Node n = *node;
+    flip_cmp(&n.kind, flip);
+    gen_expr(&n);
+    return true;
+  }
+  if (node->kind == ND_LOGAND || node->kind == ND_LOGOR) {
+    gen_logical(node, flip);
+    return true;
+  }
+  if (node->kind == ND_CAST && node->ty->kind == TY_BOOL) {
+    gen_cmp_zero(node->m.lhs, flip ? ND_EQ : ND_NE);
+    return true;
+  }
+  gen_expr(node);
+  if (flip)
+    Printstn("xor $1, %%al");
+  return true;
+}
+
+static bool gen_block_stmt(Node *node, bool is_reach) {
+  name_labels(node->blk.local_labels);
+  for (Node *n = node->blk.body; n; n = n->next) {
+    if (is_reach)
+      is_reach = gen_reachable_stmt(n);
+    else
+      is_reach = gen_unreachable_stmt(n);
+  }
+  if (is_reach)
+    gen_defr(node);
+  return is_reach;
+}
+
+static bool gen_skip_unreachable_stmt(Node *node, bool is_reach, const char *lbl) {
+  if (!node)
+    return is_reach;
+  if (!is_reach)
+    return gen_unreachable_stmt(node);
+
+  Printftn("jmp %s", lbl);
+  gen_unreachable_stmt(node);
+  Printfsn("%s:", lbl);
+  return true;
+}
+
+static bool gen_if_stmt_const(Node *node, bool cond, const char *else_label) {
+  if (cond) {
+    bool is_reach = gen_reachable_stmt(node->ctrl.then);
+    return gen_skip_unreachable_stmt(node->ctrl.els, is_reach, else_label);
+  }
+  bool is_reach = node->ctrl.els ? gen_reachable_stmt(node->ctrl.els) : true;
+  return gen_skip_unreachable_stmt(node->ctrl.then, is_reach, else_label);
+}
+
+static bool gen_scaled_idx_load(Type *ty, Node *lhs, Node *mul) {
+  int64_t val;
+  if (is_const_expr(mul, &val)) {
+    int64_t ofs;
+    gen_deref_opt(lhs, &ofs);
+    imm_load(ty, ofs + val);
+    return true;
+  }
+
+  int sz = 0;
+  switch (mul->m.lhs->num.val) {
+  case 1:  sz = 1; break;
+  case 2:  sz = 2; break;
+  case 4:  sz = 4; break;
+  case 8:  sz = 8; break;
+  default: {
+    return false;
+  }
+  }
+
+  const char *ptr;
+  char ofs[STRBUF_SZ];
+  char op[STRBUF_SZ2];
+
+  if (is_memop(lhs, ofs, &ptr, true)) {
+    gen_expr(mul->m.rhs);
+    Printftn("movq %s(%s), %%rdx", ofs, ptr);
+    snprintf(op, STRBUF_SZ2, "(%%rdx, %%rax, %d)", sz);
+  } else if (is_memop_ptr(lhs, ofs, &ptr) && ptr != rip) {
+    gen_expr(mul->m.rhs);
+    snprintf(op, STRBUF_SZ2, "%s(%s, %%rax, %d)", ofs, ptr, sz);
+  } else {
+    gen_expr(lhs);
+    push();
+    gen_expr(mul->m.rhs);
+    const char *reg = pop_inreg(tmpreg64[0]);
+    snprintf(op, STRBUF_SZ2, "(%s, %%rax, %d)", reg, sz);
+  }
+
+  if (ty->size == 8)
+    Printftn("movq %s, %%rax", op);
+  else
+    cast_extend_int32(ty, op, "%eax");
+  return true;
+}
+
+static bool gen_if_stmt(Node *node, bool is_reach) {
+  int64_t c = count();
+  char else_label[STRBUF_SZ];
+  snprintf(else_label, STRBUF_SZ, ".L.else.%" PRIi64, c);
+
+  if (!is_reach) {
+    is_reach = gen_unreachable_stmt(node->ctrl.then);
+    return gen_skip_unreachable_stmt(node->ctrl.els, is_reach, else_label);
+  }
+
+  int64_t val;
+  if (is_const_expr(node->ctrl.cond, &val))
+    return gen_if_stmt_const(node, val, else_label);
+
+  bool flip, is_void;
+  Node *expr = bool_expr_opt(node->ctrl.cond, &flip, &is_void);
+
+  if (is_void) {
+    gen_void_expr(expr);
+    return gen_if_stmt_const(node, flip, else_label);
+  }
+
+  gen_cond(expr, flip, else_label);
+  is_reach = gen_reachable_stmt(node->ctrl.then);
+  if (!node->ctrl.els) {
+    Printfsn("%s:", else_label);
+    return true;
+  }
+
+  if (is_reach)
+    Printftn("jmp .L.end.%" PRIi64, c);
+  Printfsn("%s:", else_label);
+  bool is_reach2 = gen_reachable_stmt(node->ctrl.els);
+  if (is_reach)
+    Printfsn(".L.end.%" PRIi64 ":", c);
+  return is_reach | is_reach2;
+}
+
+static bool gen_reachable_stmt(Node *node) {
+  if (opt_g)
+    print_loc(node->tok);
+
+  switch (node->kind) {
+  case ND_IF: {
+    return gen_if_stmt(node, true);
+  }
+  case ND_BLOCK: {
+    return gen_block_stmt(node, true);
+  }
+  case ND_GOTO:
+  case ND_GOTO_EXPR:
+  case ND_BREAK:
+  case ND_CONT:
+  case ND_RETURN: {
+    gen_stmt(node);
+    return false;
+  }
+  case ND_EXPR_STMT:
+    if (node->m.lhs->kind == ND_UNREACHABLE)
+      return false;
+    if (node->m.lhs->kind == ND_FUNCALL &&
+        is_direct_fncall(node->m.lhs->call.expr) &&
+        node->m.lhs->call.expr->m.var->is_noreturn) {
+      gen_stmt(node);
+      return false;
+    }
+  }
+  gen_stmt(node);
+  return true;
+}
+
+static bool gen_unreachable_stmt(Node *node) {
+  if (opt_g)
+    print_loc(node->tok);
+
+  switch (node->kind) {
+  case ND_IF: {
+    return gen_if_stmt(node, false);
+  }
+  case ND_BLOCK: {
+    return gen_block_stmt(node, false);
+  }
+  case ND_CASE:
+  case ND_DEFAULT:
+  case ND_LABEL: {
+    gen_stmt(node);
+    return true;
+  }
+  case ND_FOR:
+  case ND_DO:
+  case ND_SWITCH:
+    if (node->ctrl.then->no_label)
+      return false;
+    gen_stmt(node);
+    return true;
+  }
+  return false;
+}
+
+static bool gen_expr_opt(Node *node) {
+  NodeKind kind = node->kind;
+  Type *ty = node->ty;
+  Node *lhs = node->m.lhs;
+  Node *rhs = node->m.rhs;
+
+  const char *var_ptr;
+  char var_ofs[STRBUF_SZ];
+
+  {
+    int64_t ival;
+    if (is_gp_ty(ty) && is_const_expr(node, &ival)) {
+      load_val(ty, ival);
+      return true;
+    }
+    FPVal fval = {0};
+    if (is_flonum(ty) && is_const_fp(node, &fval)) {
+      load_fval2(ty, &fval);
+      return true;
+    }
+  }
+
+  if (gen_load_opt_gp(node, REG_X64_AX))
+    return true;
+
+  if (is_scalar(ty) && is_memop(node, var_ofs, &var_ptr, true)) {
+    load_s(ty, var_ofs, var_ptr);
+    return true;
+  }
+
+  if (kind == ND_ASSIGN && is_memop(lhs, var_ofs, &var_ptr, false)) {
+    gen_expr(rhs);
+    store_s(lhs->ty, var_ofs, var_ptr);
+    return true;
+  }
+
+  if (gen_bool_opt(node))
+    return true;
+
+  if (is_gp_ty(ty)) {
+    if (gen_gp_opt(node))
+      return true;
+
+    if (kind == ND_DEREF && lhs->kind == ND_ADD && lhs->m.rhs->kind == ND_MUL) {
+      Node *mul = lhs->m.rhs;
+      if (mul->m.lhs->kind == ND_NUM)
+        if (gen_scaled_idx_load(ty, lhs->m.lhs, mul))
+          return true;
+    }
+  }
+
+  if (is_int_to_int_cast(node)) {
+    if (ty->size == 4 && lhs->ty->size == 8) {
+      if (gen_arith_opt_gp(lhs, ty->size))
+        return true;
+    }
+    if (lhs->kind == ND_VAR && ty->size == 8 && ty->size >= lhs->ty->size) {
+      gen_addr(lhs);
+      if (!lhs->ty->is_unsigned && ty->size > lhs->ty->size)
+        load_extend_int64(lhs->ty, "0", "%rax", "%rax");
+      else
+        load_extend_int(lhs->ty, "0", "%rax", regop_ax(lhs->ty));
+      return true;
+    }
+    if (lhs->kind == ND_DEREF && ty->size == lhs->ty->size && ty->kind != TY_BOOL) {
+      int64_t ofs;
+      gen_deref_opt(lhs->m.lhs, &ofs);
+      imm_load(ty, ofs);
+      return true;
+    }
+  }
+
+  if (ty->kind == TY_FLOAT || ty->kind == TY_DOUBLE)
+    if (gen_arith_opt_fp(node))
+      return true;
+
+  {
+    int64_t cond_val;
+    if (kind == ND_COND && is_const_expr(node->ctrl.cond, &cond_val)) {
+      if (cond_val)
+        gen_expr(node->ctrl.then);
+      else
+        gen_expr(node->ctrl.els);
+      return true;
+    }
+  }
+
+  int64_t ofs;
+  if (gen_addr_opt2(node, &ofs)) {
+    if (is_scalar(node->ty)) {
+      if (is_bitfield(node)) {
+        imm_add("%rax", "%rdx", ofs);
+        gen_bitfield_load(node);
+        return true;
+      }
+      imm_load(node->ty, ofs);
+      return true;
+    }
+    imm_add("%rax", "%rdx", ofs);
+    return true;
+  }
+
+  return false;
+}
+
+static bool gen_addr_opt2(Node *node, int64_t *ofs) {
+  if (node->kind == ND_DEREF) {
+    gen_deref_opt(node->m.lhs, ofs);
+    return true;
+  }
+
+  if (node->kind == ND_MEMBER) {
+    gen_member_opt(node, ofs);
+    return true;
+  }
+
+  return false;
+}
+
+static bool gen_addr_opt(Node *node) {
+  int64_t ofs;
+  if (gen_addr_opt2(node, &ofs)) {
+    imm_add("%rax", "%rdx", ofs);
+    return true;
+  }
+
+  return false;
+}
+
+static int asm_ops_push(AsmParam *ap) {
+  int idx = asm_ops_cnt++;
+  if (idx >= ASMOP_BUFSZ)
+    internal_error();
+  asm_ops[idx] = ap;
+  return idx;
+}
+
+static void asm_fill_ops(Node *node) {
+  asm_ops_cnt = 0;
+  memset(asm_ops, 0, sizeof(asm_ops));
+
+  for (AsmParam *ap = node->gasm.outputs; ap; ap = ap->next)
+    asm_ops_push(ap);
+
+  for (AsmParam *ap = node->gasm.inputs; ap; ap = ap->next)
+    asm_ops_push(ap);
+}
+
+static void asm_fill_ops2(Node *node) {
+  for (AsmParam *ap = node->gasm.outputs; ap; ap = ap->next)
+    if (*ap->constraint->str == '+')
+      asm_ops_push(ap);
+
+  for (AsmParam *ap = node->gasm.labels; ap; ap = ap->next)
+    ap->label_id = asm_ops_push(ap);
+}
+
+static bool is_gp_reg(Reg reg) {
+  return REG_X64_AX <= reg && reg <= REG_X64_SP;
+}
+
+static bool is_xmm_reg(Reg reg) {
+  return REG_X64_XMM0 <= reg && reg <= REG_X64_XMM15;
+}
+
+static bool is_x87_reg(Reg reg) {
+  return REG_X64_X87_ST0 <= reg && reg <= REG_X64_X87_ST7;
+}
+
+static const char *gcc_reg_id(const char *loc, Token *tok) {
+  // FIXED_REGISTERS in gcc/config/i386/i386.h
+  // LLVM call these GCCRegNames
+  static const char *const names[] = {"ax", "dx", "cx", "bx", "si", "di"};
+
+  unsigned long idx = strtoul(loc, NULL, 10);
+  if (idx >= 6)
+    error_tok(tok, "unknown gcc register id");
+  return names[idx];
+}
+
+static Reg ident_gp_reg(const char *loc) {
+  static HashMap map;
+  if (map.capacity == 0) {
+    for (Reg r = REG_X64_NULL; r < REG_X64_END; r++)
+      if (is_gp_reg(r))
+        for (int j = 0; j < 4; j++)
+          hashmap_put(&map, &regs[r][j][1], (void *)(intptr_t)r);
+
+    hashmap_put(&map, "ah", (void *)(intptr_t)REG_X64_AX);
+    hashmap_put(&map, "bh", (void *)(intptr_t)REG_X64_BX);
+    hashmap_put(&map, "ch", (void *)(intptr_t)REG_X64_CX);
+    hashmap_put(&map, "dh", (void *)(intptr_t)REG_X64_DX);
+  }
+  return (intptr_t)hashmap_get(&map, loc);
+}
+
+static Reg ident_reg(const char *str, Token *tok) {
+  if (Isdigit(*str)) {
+    str = gcc_reg_id(str, tok);
+  } else {
+    while (*str == '%')
+      str++;
+  }
+  Reg gpreg = ident_gp_reg(str);
+  if (gpreg)
+    return gpreg;
+
+  if (Inrange(*str, 'x', 'z') && str[1] == 'm' && str[2] == 'm') {
+    str += 3;
+    char *pos;
+    int val = strtoul(str, &pos, 10);
+    if ((pos - str <= 2) && (val <= REG_X64_XMM15 - REG_X64_XMM0) && *pos == '\0')
+      return REG_X64_XMM0 + val;
+  } else if (!strncmp(str, "st", 2)) {
+    str += 2;
+    if (*str == '\0')
+      return REG_X64_X87_ST0;
+    if (*str == '(' && Inrange(str[1], '0', '7') && !strcmp(&str[2], ")"))
+      return REG_X64_X87_ST0 + (str[1] - '0');
+  }
+  error_tok(tok, "unknown register");
+}
+
+static void asm_prepare_clobbers(Token *tok, int *x87_clobber) {
+  if (!tok)
+    return;
+
+  Token *start = tok;
+  for (; tok->kind != TK_COLON && tok->kind != TK_COLON2 && tok->kind != TK_RPAREN;
+       tok = tok->next) {
+    if (tok != start)
+      tok = skip_tk(tok, TK_COMMA);
+
+    if (equal(tok, "\"cc\"") || equal(tok, "\"flags\""))
+      continue;
+    if (equal(tok, "\"memory\""))
+      continue;
+
+    Reg r = ident_reg(tok->str, tok);
+    if (r == REG_X64_SP)
+      continue;
+    if (is_x87_reg(r)) {
+      *x87_clobber = MAX(*x87_clobber, (r - REG_X64_X87_ST0 + 1));
+      continue;
+    }
+    asm_use.in[r] = asm_use.out[r] = true;
+    continue;
+  }
+}
+
+static bool asm_get_use(AsmParam *ap, Reg r, bool is_reg) {
+  if (ap->match && !ap->match->kind && is_reg)
+    return asm_use.in[r] || asm_use.out[r];
+
+  if (ap->constraint->str[0] != '=' && ap->constraint->str[0] != '+')
+    return asm_use.in[r];
+
+  if (ap->constraint->str[0] == '=' && !ap->is_early_clobber && is_reg)
+    return asm_use.out[r];
+
+  return asm_use.in[r] || asm_use.out[r];
+}
+
+static void asm_set_use(AsmParam *ap) {
+  if (ap->match && !ap->match->kind && ap->kind == ASMOP_REG) {
+    ap->match->kind = ASMOP_REG;
+    ap->match->reg = ap->reg;
+    asm_use.in[ap->reg] = asm_use.out[ap->reg] = true;
+    return;
+  }
+  if (ap->constraint->str[0] != '=' && ap->constraint->str[0] != '+') {
+    asm_use.in[ap->reg] = true;
+    return;
+  }
+  if (ap->constraint->str[0] == '=' && !ap->is_early_clobber && ap->kind == ASMOP_REG) {
+    asm_use.out[ap->reg] = true;
+    return;
+  }
+  asm_use.in[ap->reg] = asm_use.out[ap->reg] = true;
+}
+
+static void asm_constraint(AsmParam *ap, bool is_input, int x87_clobber) {
+  static const uint64_t reg_gp = (1ULL << (REG_X64_BP + 1)) - (1ULL << REG_X64_AX);
+  static const uint64_t reg_fp = (1ULL << (REG_X64_XMM15 + 1)) - (1ULL << REG_X64_XMM0);
+  static const uint64_t reg_x87 = (1ULL << (REG_X64_X87_ST7 + 1)) -
+                                  (1ULL << REG_X64_X87_ST0);
+  static const uint64_t reg_free = (1ULL << (REG_X64_R11 + 1)) - (1ULL << REG_X64_AX);
+  static const uint64_t reg_highbyte = 1ULL << REG_X64_AX |
+                                       1ULL << REG_X64_CX |
+                                       1ULL << REG_X64_DX |
+                                       1ULL << REG_X64_BX;
+  static const uint64_t reg_legacy = 1ULL << REG_X64_AX |
+                                     1ULL << REG_X64_CX |
+                                     1ULL << REG_X64_DX |
+                                     1ULL << REG_X64_SI |
+                                     1ULL << REG_X64_DI |
+                                     1ULL << REG_X64_BX |
+                                     1ULL << REG_X64_BP;
+
+  for (; ap; ap = ap->next) {
+    uint64_t reg_msk = 0;
+    int match_idx = -1;
+    bool is_mem = false;
+    bool is_num = false;
+    bool is_symbolic = false;
+    bool is_x87_st0 = false;
+    bool is_x87_st1 = false;
+
+    const char *p = ap->constraint->str;
+    if (is_input) {
+      if (*p == '%')
+        p++;
+    } else {
+      if (!strncmp(p, "=@cc", 4)) {
+        ap->kind = ASMOP_FLAG;
+        ap->flag = arena_strdup(&ast_arena, &p[4]);
+        continue;
+      }
+      if (*p != '=' && *p != '+')
+        error_tok(ap->constraint, "output constraint should start with '=' or '+'");
+      p++;
+    }
+    for (; *p; p++) {
+      switch (*p) {
+      case 'm':
+      case 'o': is_mem = true; continue;
+      case 'r':
+      case 'q': reg_msk |= reg_gp; continue;
+      case 'Q': reg_msk |= reg_highbyte; continue;
+      case 'R': reg_msk |= reg_legacy; continue;
+      case 'U': reg_msk |= reg_free; continue;
+      case 'x':
+      case 'v': reg_msk |= reg_fp; continue;
+      case 'f': reg_msk |= reg_x87; continue;
+      case 'X': reg_msk |= reg_fp;
+      case 'g': reg_msk |= reg_gp, is_mem = is_num = true; continue;
+      case 'a': reg_msk |= 1ULL << REG_X64_AX; continue;
+      case 'b': reg_msk |= 1ULL << REG_X64_BX; continue;
+      case 'c': reg_msk |= 1ULL << REG_X64_CX; continue;
+      case 'd': reg_msk |= 1ULL << REG_X64_DX; continue;
+      case 'S': reg_msk |= 1ULL << REG_X64_SI; continue;
+      case 'D': reg_msk |= 1ULL << REG_X64_DI; continue;
+      case 't': is_x87_st0 = true; continue;
+      case 'u': is_x87_st1 = true; continue;
+      }
+
+      if (is_input) {
+        switch (*p) {
+        case 'i': is_symbolic = true;
+        case 'n':
+        case 'I':
+        case 'J':
+        case 'K':
+        case 'L':
+        case 'M':
+        case 'N':
+        case 'O':
+        case 'P': {
+          is_num = true;
+          continue;
+        }
+        }
+        if (Isdigit(*p)) {
+          char *pos;
+          match_idx = strtoul(p, &pos, 10);
+          if (*pos)
+            error_tok(ap->constraint, "matching constraint not last");
+          break;
+        }
+      } else if (*p == '&') {
+        ap->is_early_clobber = true;
+        continue;
+      }
+      error_tok(ap->constraint, "unknown constraint \"%c\"", *p);
+    }
+
+    if (reg_msk && ap->arg->kind == ND_VAR && ap->arg->m.var->asm_name) {
+      ap->var_asm_reg = ident_reg(ap->arg->m.var->asm_name, ap->arg->tok);
+      reg_msk &= 1ULL << ap->var_asm_reg;
+    }
+    if (ap->match) {
+      if (!ap->match->kind) {
+        uint64_t match_r = reg_msk;
+        if (ap->match->var_asm_reg)
+          match_r &= 1ULL << ap->match->var_asm_reg;
+        if (match_r) {
+          ap->reg_constraint = match_r;
+          // Ensure the input is sorted after the output during asm_assign_operands()
+          ap->match->reg_constraint |= match_r;
+          continue;
+        }
+      }
+      ap->match = NULL;
+    }
+    if (is_num && is_integer(ap->arg->ty) && is_const_expr(ap->arg, &ap->val)) {
+      ap->kind = ASMOP_NUM;
+      continue;
+    }
+    if (is_symbolic && is_asm_symbolic_arg(ap->arg)) {
+      ap->kind = ASMOP_SYMBOLIC;
+      continue;
+    }
+    if (is_mem) {
+      if (has_memop(ap->arg)) {
+        ap->kind = ASMOP_MEM;
+        continue;
+      }
+      ap->is_mem_inreg = true;
+    }
+    if (is_x87_st0 || is_x87_st1) {
+      Reg r = is_x87_st0 ? REG_X64_X87_ST0 : REG_X64_X87_ST1;
+      if (!asm_get_use(ap, r, true)) {
+        ap->is_clobbered_x87 = x87_clobber >= (is_x87_st0 ? 1 : 2);
+        ap->reg = r;
+        ap->kind = ASMOP_REG;
+        asm_set_use(ap);
+        continue;
+      }
+    }
+    if (match_idx >= 0) {
+      if (match_idx >= asm_ops_cnt)
+        error_tok(ap->constraint, "invalid matching constraint");
+
+      AsmParam *matchap = asm_ops[match_idx];
+      if (matchap->match || matchap->constraint->str[0] != '=')
+        error_tok(ap->constraint, "invalid matching operand");
+      matchap->match = ap;
+    }
+    ap->reg_constraint = reg_msk;
+  }
+}
+
+static int asm_assign_operands_presort(AsmParam **sorted) {
+  uint8_t counts[REG_X64_END] = {0};
+
+  for (int i = 0; i < asm_ops_cnt; i++) {
+    AsmParam *ap = asm_ops[i];
+    if (ap->kind || !ap->reg_constraint)
+      continue;
+    counts[Pop64(ap->reg_constraint)]++;
+  }
+
+  for (uint64_t idx = 1; idx < REG_X64_END; idx++)
+    counts[idx] += counts[idx - 1];
+
+  int sorted_cnt = 0;
+  for (int i = asm_ops_cnt; --i >= 0;) {
+    AsmParam *ap = asm_ops[i];
+    if (ap->kind || !ap->reg_constraint)
+      continue;
+    sorted[--counts[Pop64(ap->reg_constraint)]] = ap;
+    sorted_cnt++;
+  }
+  return sorted_cnt;
+}
+
+static void asm_assign_operands(void) {
+  AsmParam *sorted[ASMOP_BUFSZ];
+
+  int sorted_cnt = asm_assign_operands_presort(sorted);
+
+  for (uint64_t i = 0; i < sorted_cnt; i++) {
+    AsmParam *ap = sorted[i];
+    if (ap->kind)
+      continue;
+    for (uint64_t i = 0; i < REG_X64_END; i++) {
+      if ((ap->reg_constraint & (1ULL << i)) && !asm_get_use(ap, i, true)) {
+        ap->reg = i;
+        ap->kind = ASMOP_REG;
+        asm_set_use(ap);
+        break;
+      }
+    }
+  }
+
+  for (int i = 0; i < asm_ops_cnt; i++) {
+    AsmParam *ap = asm_ops[i];
+    if (ap->kind)
+      continue;
+    if (ap->is_mem_inreg) {
+      for (uint64_t i = REG_X64_AX; i <= REG_X64_BP; i++) {
+        if (!asm_get_use(ap, i, false)) {
+          ap->reg = i;
+          ap->kind = ASMOP_MEM;
+          asm_set_use(ap);
+          break;
+        }
+      }
+      if (ap->kind)
+        continue;
+    }
+    error_tok(ap->arg->tok, "out of registers");
+  }
+}
+
+static bool asm_is_goto_with_output(Node *node) {
+  return node->gasm.outputs && node->gasm.labels;
+}
+
+static void asm_prepare_args(Node *node, int *out_tmp) {
+  int tmp_req = 0;
+
+  for (AsmParam *ap = node->gasm.outputs; ap; ap = ap->next) {
+    if (ap->kind == ASMOP_REG)
+      ptr_convert(&ap->arg);
+    if (has_memop(ap->arg))
+      continue;
+
+    if (is_bitfield(ap->arg))
+      tmp_req = MAX(tmp_req, 2);
+    else
+      tmp_req = MAX(tmp_req, 1);
+
+    ap->ptr = new_lvar(pointer_to(ap->arg->ty));
+  }
+  if (asm_is_goto_with_output(node))
+    tmp_req = MAX(tmp_req, 1);
+  *out_tmp = tmp_req;
+
+  for (AsmParam *ap = node->gasm.inputs; ap; ap = ap->next) {
+    if (ap->kind == ASMOP_REG)
+      ptr_convert(&ap->arg);
+    if (has_memop(ap->arg))
+      continue;
+    if (ap->kind == ASMOP_REG)
+      ap->var = new_lvar(ap->arg->ty);
+    else if (ap->kind == ASMOP_MEM)
+      ap->ptr = new_lvar(pointer_to(ap->arg->ty));
+  }
+}
+
+static Reg acquire_gp(bool *use1, bool *use2, Token *tok) {
+  for (Reg r = REG_X64_AX; r <= REG_X64_R15; r++) {
+    if (use1[r] || (use2 && use2[r]))
+      continue;
+    use1[r] = true;
+    if (use2)
+      use2[r] = true;
+    return r;
+  }
+  error_tok(tok, "out of registers");
+}
+
+static Reg acquire_out_tmp(Node *node) {
+  if (node->gasm.ctx->frame_ptr1 && !asm_use.out[REG_X64_BP])
+    return asm_use.out[REG_X64_BP] = true, REG_X64_BP;
+
+  if (node->gasm.ctx->frame_ptr2 && !asm_use.out[REG_X64_BX])
+    return asm_use.out[REG_X64_BX] = true, REG_X64_BX;
+
+  return acquire_gp(asm_use.out, NULL, node->tok);
+}
+
+static void asm_prepare_regs(Node *node, int tmp_cnt) {
+  node->gasm.ctx = arena_calloc(&ast_arena, sizeof(AsmContext));
+
+  if (asm_use.in[REG_X64_BP] || asm_use.out[REG_X64_BP])
+    node->gasm.ctx->frame_ptr1 = acquire_gp(asm_use.in, asm_use.out, node->tok);
+
+  if (asm_use.in[REG_X64_BX] || asm_use.out[REG_X64_BX])
+    node->gasm.ctx->frame_ptr2 = acquire_gp(asm_use.in, asm_use.out, node->tok);
+
+  switch (tmp_cnt) {
+  case 2: node->gasm.ctx->output_tmp2 = acquire_out_tmp(node);
+  case 1: node->gasm.ctx->output_tmp1 = acquire_out_tmp(node);
+  }
+
+  for (Reg r = REG_X64_R12; r <= REG_X64_BP; r++)
+    if (asm_use.in[r] || asm_use.out[r])
+      node->gasm.ctx->clobber_mask |= 1U << r;
+}
+
+void prepare_inline_asm(Node *node) {
+  memset(&asm_use, 0, sizeof(asm_use));
+
+  asm_fill_ops(node);
+
+  int x87_clobber = 0;
+  asm_prepare_clobbers(node->gasm.clobbers, &x87_clobber);
+
+  asm_constraint(node->gasm.inputs, true, x87_clobber);
+  asm_constraint(node->gasm.outputs, false, 0);
+
+  asm_assign_operands();
+
+  int out_tmp;
+  asm_prepare_args(node, &out_tmp);
+
+  asm_prepare_regs(node, out_tmp);
+}
+
+static const char *reg_high_byte(Reg reg) {
+  switch (reg) {
+  case REG_X64_AX: return "%ah";
+  case REG_X64_BX: return "%bh";
+  case REG_X64_CX: return "%ch";
+  case REG_X64_DX: return "%dh";
+  }
+  return regs[reg][0];
+}
+
+static const char *reg_sz(Reg reg, int sz) {
+  if (is_gp_reg(reg)) {
+    switch (sz) {
+    case 1: return regs[reg][0];
+    case 2: return regs[reg][1];
+    case 4: return regs[reg][2];
+    case 8: return regs[reg][3];
+    }
+  }
+  internal_error();
+}
+
+static void asm_gen_operands(void) {
+  for (int i = 0; i < asm_ops_cnt; i++) {
+    AsmParam *ap = asm_ops[i];
+    if (ap->ptr) {
+      Node addr_node = {.kind = ND_ADDR, .m.lhs = ap->arg, .tok = ap->arg->tok};
+      gen_var_assign(ap->ptr, &addr_node);
+      continue;
+    }
+    if (ap->var) {
+      gen_var_assign(ap->var, ap->arg);
+      continue;
+    }
+  }
+}
+
+static const char *alt_ptr(const char *reg) {
+  if (asm_alt_ptr.rbp && reg == rbp)
+    return asm_alt_ptr.rbp;
+  if (asm_alt_ptr.rbx && reg == rbx)
+    return asm_alt_ptr.rbx;
+  return reg;
+}
+
+static void asm_gen_ptr(AsmParam *ap, char *ofs, const char **ptr, Reg tmpreg) {
+  if (is_memop(ap->arg, ofs, ptr, true)) {
+    *ptr = alt_ptr(*ptr);
+    return;
+  }
+  if (ap->ptr) {
+    snprintf(ofs, STRBUF_SZ, "0");
+    *ptr = regs[tmpreg][3];
+    Printftn("movq %d(%s), %s", ap->ptr->ofs, alt_ptr(ap->ptr->ptr), *ptr);
+    return;
+  }
+  if (ap->var) {
+    snprintf(ofs, STRBUF_SZ, "%d", ap->var->ofs);
+    *ptr = alt_ptr(ap->var->ptr);
+    return;
+  }
+  internal_error();
+}
+
+static void asm_reg_input(AsmParam *ap, Reg tmpreg) {
+  char ofs[STRBUF_SZ];
+  const char *ptr = NULL;
+  asm_gen_ptr(ap, ofs, &ptr, tmpreg);
+
+  if (is_gp_reg(ap->reg)) {
+    switch (ap->arg->ty->size) {
+    case 1: Printftn("movb %s(%s), %s", ofs, ptr, regs[ap->reg][0]); return;
+    case 2: Printftn("movw %s(%s), %s", ofs, ptr, regs[ap->reg][1]); return;
+    case 4: Printftn("movl %s(%s), %s", ofs, ptr, regs[ap->reg][2]); return;
+    case 8: Printftn("movq %s(%s), %s", ofs, ptr, regs[ap->reg][3]); return;
+    }
+  }
+  if (is_xmm_reg(ap->reg)) {
+    switch (ap->arg->ty->size) {
+    case 4: Printftn("movss %s(%s), %%xmm%d", ofs, ptr, ap->reg - REG_X64_XMM0); return;
+    case 8: Printftn("movsd %s(%s), %%xmm%d", ofs, ptr, ap->reg - REG_X64_XMM0); return;
+    }
+  }
+  if (is_x87_reg(ap->reg)) {
+    switch (ap->arg->ty->size) {
+    case 4:  Printftn("flds %s(%s)", ofs, ptr); return;
+    case 8:  Printftn("fldl %s(%s)", ofs, ptr); return;
+    case 16: Printftn("fldt %s(%s)", ofs, ptr); return;
+    }
+  }
+  error_tok(ap->arg->tok, "unsupported operand size");
+}
+
+static void asm_reg_output(AsmParam *ap, Reg tmpreg) {
+  char ofs[STRBUF_SZ];
+  const char *ptr = NULL;
+  asm_gen_ptr(ap, ofs, &ptr, tmpreg);
+
+  if (is_gp_reg(ap->reg)) {
+    switch (ap->arg->ty->size) {
+    case 1: Printftn("movb %s, %s(%s)", regs[ap->reg][0], ofs, ptr); return;
+    case 2: Printftn("movw %s, %s(%s)", regs[ap->reg][1], ofs, ptr); return;
+    case 4: Printftn("movl %s, %s(%s)", regs[ap->reg][2], ofs, ptr); return;
+    case 8: Printftn("movq %s, %s(%s)", regs[ap->reg][3], ofs, ptr); return;
+    }
+  }
+  if (is_xmm_reg(ap->reg)) {
+    switch (ap->arg->ty->size) {
+    case 4: Printftn("movss %%xmm%d, %s(%s)", ap->reg - REG_X64_XMM0, ofs, ptr); return;
+    case 8: Printftn("movsd %%xmm%d, %s(%s)", ap->reg - REG_X64_XMM0, ofs, ptr); return;
+    }
+  }
+  if (is_x87_reg(ap->reg)) {
+    switch (ap->arg->ty->size) {
+    case 4:  Printftn("fstps %s(%s)", ofs, ptr); return;
+    case 8:  Printftn("fstpl %s(%s)", ofs, ptr); return;
+    case 16: Printftn("fstpt %s(%s)", ofs, ptr); return;
+    }
+  }
+  error_tok(ap->arg->tok, "unsupported operand size");
+}
+
+static Reg get_input_reg(AsmParam *ap) {
+  if (ap->kind == ASMOP_REG && *ap->constraint->str != '=')
+    return ap->reg;
+  return REG_X64_NULL;
+}
+
+static void asm_xmm_inputs(void) {
+  for (int i = 0; i < asm_ops_cnt; i++) {
+    AsmParam *ap = asm_ops[i];
+    if (is_xmm_reg(get_input_reg(ap)))
+      asm_reg_input(ap, REG_X64_DX);
+  }
+}
+
+static void asm_gp_inputs(void) {
+  for (int i = 0; i < asm_ops_cnt; i++) {
+    AsmParam *ap = asm_ops[i];
+    if (ap->kind == ASMOP_MEM && ap->reg)
+      Printftn("movq %d(%s), %s", ap->ptr->ofs, alt_ptr(ap->ptr->ptr), regs[ap->reg][3]);
+    if (is_gp_reg(get_input_reg(ap)))
+      asm_reg_input(ap, ap->reg);
+  }
+}
+
+static int asm_x87_inputs(void) {
+  AsmParam *sort_buf[8] = {0};
+
+  for (int i = 0; i < asm_ops_cnt; i++) {
+    AsmParam *ap = asm_ops[i];
+    Reg reg = get_input_reg(ap);
+    if (is_x87_reg(reg))
+      sort_buf[reg - REG_X64_X87_ST0] = ap;
+  }
+
+  int cnt = 0;
+  for (int i = 0; i < 8; i++) {
+    AsmParam *ap = sort_buf[7 - i];
+    if (ap) {
+      if (!ap->is_clobbered_x87)
+        cnt++;
+      asm_reg_input(ap, REG_X64_DX);
+    }
+  }
+  return cnt;
+}
+
+static void asm_save_out_flags(Node *node) {
+  Reg freereg = node->gasm.ctx->output_tmp1;
+
+  for (AsmParam *ap = node->gasm.outputs; ap; ap = ap->next) {
+    if (ap->kind == ASMOP_FLAG) {
+      char ofs[STRBUF_SZ];
+      const char *ptr;
+      asm_gen_ptr(ap, ofs, &ptr, freereg);
+      if (ap->arg->ty->size != 1)
+        Printftn("mov%s $0, %s(%s)", size_suffix(ap->arg->ty->size), ofs, ptr);
+      Printftn("set%s %s(%s)", ap->flag, ofs, ptr);
+      continue;
+    }
+  }
+}
+
+static void asm_save_out_x87(Node *node, int in_cnt) {
+  AsmParam *sort_buf[8] = {0};
+  int out_cnt = 0;
+  for (AsmParam *ap = node->gasm.outputs; ap; ap = ap->next) {
+    if (ap->kind == ASMOP_REG) {
+      if (is_x87_reg(ap->reg)) {
+        sort_buf[ap->reg - REG_X64_X87_ST0] = ap;
+        out_cnt++;
+      }
+    }
+  }
+  out_cnt = MAX(out_cnt, in_cnt);
+  for (int i = 0; i < out_cnt; i++) {
+    AsmParam *ap = sort_buf[i];
+    if (ap)
+      asm_reg_output(ap, node->gasm.ctx->output_tmp1);
+    else
+      Printstn("fstp %%st(0)");
+  }
+}
+
+static void asm_save_out_bitfield(AsmParam *ap, Reg r1, Reg r2) {
+  Member *mem = ap->arg->m.member;
+  const char *ptr = regs[r2][3];
+
+  Printftn("movq %d(%s), %s", ap->ptr->ofs, alt_ptr(ap->ptr->ptr), ptr);
+
+  gen_bitfield_store2(ptr, ap->reg, r1, mem);
+  return;
+}
+
+static void asm_save_out(Node *node) {
+  Reg r1 = node->gasm.ctx->output_tmp1;
+  Reg r2 = node->gasm.ctx->output_tmp2;
+
+  for (AsmParam *ap = node->gasm.outputs; ap; ap = ap->next) {
+    if (ap->kind == ASMOP_REG) {
+      if (is_x87_reg(ap->reg))
+        continue;
+      if (is_bitfield(ap->arg)) {
+        asm_save_out_bitfield(ap, r1, r2);
+        continue;
+      }
+      asm_reg_output(ap, r1);
+      continue;
+    }
+  }
+}
+
+static bool named_op(const char **rest, const char *p, Token *tok) {
+  if (tok && !strncmp(p, tok->loc, tok->len) && p[tok->len] == ']') {
+    *rest = &p[tok->len + 1];
+    return true;
+  }
+  return false;
+}
+
+static AsmParam *find_op(const char *p, const char **rest, Token *tok, bool is_label) {
+  if (*p == '[') {
+    for (int i = 0; i < asm_ops_cnt; i++) {
+      AsmParam *op = asm_ops[i];
+      if (is_label) {
+        if (named_op(rest, p + 1, op->arg->tok))
+          return op;
+      } else {
+        if (named_op(rest, p + 1, op->name))
+          return op;
+      }
+    }
+  } else if (Isdigit(*p)) {
+    unsigned long idx = strtoul(p, (char **)rest, 10);
+    if (idx < asm_ops_cnt)
+      return asm_ops[idx];
+  }
+  error_tok(tok, "operand not found");
+}
+
+#define AsmPrintf(str, ...)     \
+  do {                          \
+    if (dialect != 2)           \
+      Printf(str, __VA_ARGS__); \
+  } while (0)
+
+static bool is_asm_symbolic_arg2(Node *node, const char *punct, int dialect) {
+  if (node->kind == ND_VAR && node->m.var->ty->kind == TY_FUNC && use_rip(node->m.var)) {
+    if (punct)
+      AsmPrintf("%s\"%s\"", punct, get_symbol(node->m.var));
+    return true;
+  }
+  char ofs[STRBUF_SZ];
+  const char *ptr;
+  if (node->kind == ND_ADDR && is_memop(node->m.lhs, ofs, &ptr, true) && ptr == rip) {
+    if (punct)
+      AsmPrintf("%s%s", punct, ofs);
+    return true;
+  }
+  return false;
+}
+
+static bool is_asm_symbolic_arg(Node *node) {
+  return is_asm_symbolic_arg2(node, NULL, 0);
+}
+
+static void asm_body(Node *node) {
+  int dialect = 0;
+  const char *p = node->gasm.str_tok->str;
+  for (;;) {
+    size_t spn = strcspn(p, "%{|}");
+    if (spn) {
+      if (dialect != 2)
+        fwrite(p, 1, spn, output_file);
+      p += spn;
+    }
+    if (*p == '\0')
+      break;
+
+    if ((*p == '{' && dialect == 0) || (*p == '|' && dialect == 1)) {
+      dialect++;
+      p++;
+      continue;
+    } else if (*p == '}' && dialect == 2) {
+      dialect = 0;
+      p++;
+      continue;
+    } else if (*p != '%') {
+      error_tok(node->gasm.str_tok, "unknown asm dialect alternative formation");
+    }
+
+    switch (p[1]) {
+    case '%':
+    case '{':
+    case '|':
+    case '}':
+      if (dialect != 2)
+        fputc(p[1], output_file);
+      p += 2;
+      continue;
+    }
+    p++;
+
+    if (*p == 'l' && (p[1] == '[' || Isdigit(p[1]))) {
+      AsmParam *ap = find_op(p + 1, &p, node->gasm.str_tok, true);
+      if (ap->arg->kind != ND_ASM_GOTO)
+        error_tok(ap->arg->tok, "not a label");
+
+      if (node->gasm.outputs)
+        AsmPrintf("%df", ap->label_id);
+      else
+        AsmPrintf(".L.jmp.%" PRIi64, ap->arg->jmp.target->lbl.id);
+      continue;
+    }
+
+    char mod = 0;
+    switch (*p) {
+    case 'h':
+    case 'b':
+    case 'w':
+    case 'k':
+    case 'q':
+    case 'c': {
+      mod = *p;
+      p++;
+    }
+    }
+    if (*p == '[' || Isdigit(*p)) {
+      AsmParam *ap = find_op(p, &p, node->gasm.str_tok, false);
+      const char *punct = (mod == 'c') ? "" : "$";
+
+      switch (ap->kind) {
+      case ASMOP_NUM: {
+        AsmPrintf("%s%" PRIi64, punct, ap->val);
+        continue;
+      }
+      case ASMOP_SYMBOLIC: {
+        if (is_asm_symbolic_arg2(ap->arg, punct, dialect))
+          continue;
+        break;
+      }
+      case ASMOP_MEM: {
+        char ofs[STRBUF_SZ];
+        const char *ptr;
+        if (is_memop(ap->arg, ofs, &ptr, true)) {
+          AsmPrintf("%s(%s)", ofs, alt_ptr(ptr));
+          continue;
+        }
+        if (ap->reg) {
+          AsmPrintf("(%s)", regs[ap->reg][3]);
+          continue;
+        }
+        break;
+      }
+      case ASMOP_REG:
+        if (is_xmm_reg(ap->reg)) {
+          AsmPrintf("%%xmm%d", ap->reg - REG_X64_XMM0);
+          continue;
+        }
+        if (is_x87_reg(ap->reg)) {
+          AsmPrintf("%%st(%d)", ap->reg - REG_X64_X87_ST0);
+          continue;
+        }
+        if (is_gp_reg(ap->reg)) {
+          const char *regname = NULL;
+          switch (mod) {
+          case 'h': regname = reg_high_byte(ap->reg); break;
+          case 'b': regname = regs[ap->reg][0]; break;
+          case 'w': regname = regs[ap->reg][1]; break;
+          case 'k': regname = regs[ap->reg][2]; break;
+          case 'q': regname = regs[ap->reg][3]; break;
+          default:  regname = reg_sz(ap->reg, ap->arg->ty->size); break;
+          }
+          AsmPrintf("%s", regname);
+          continue;
+        }
+      }
+      error_tok(ap->arg->tok, "invalid operand");
+    }
+    error_tok(node->gasm.str_tok, "unknown modifier \"%c\"", *p);
+  }
+  fputc('\n', output_file);
+}
+
+static void asm_push_clobbers(Node *node) {
+  for (Reg r = REG_X64_R12; r <= REG_X64_R15; r++)
+    if (node->gasm.ctx->clobber_mask & (1U << r))
+      push_from(regs[r][3]);
+}
+
+static void asm_pop_clobbers(Node *node) {
+  for (Reg r = REG_X64_R15; r >= REG_X64_R12; r--)
+    if (node->gasm.ctx->clobber_mask & (1U << r))
+      pop(regs[r][3]);
+}
+
+static const char *asm_push_frame_ptr(Node *node) {
+  const char *prev = lvar_ptr;
+
+  if (node->gasm.ctx->frame_ptr1) {
+    asm_alt_ptr.rbp = regs[node->gasm.ctx->frame_ptr1][3];
+    if (lvar_ptr == rbp)
+      lvar_ptr = asm_alt_ptr.rbp;
+    Printftn("movq %%rbp, %s", asm_alt_ptr.rbp);
+  }
+  if (node->gasm.ctx->frame_ptr2) {
+    asm_alt_ptr.rbx = regs[node->gasm.ctx->frame_ptr2][3];
+    if (lvar_ptr == rbx)
+      lvar_ptr = asm_alt_ptr.rbx;
+    Printftn("movq %%rbx, %s", asm_alt_ptr.rbx);
+  }
+
+  if (node->gasm.ctx->frame_ptr1)
+    push_from(rbp);
+  if (node->gasm.ctx->frame_ptr2)
+    push_from(rbx);
+  return prev;
+}
+
+static void asm_pop_frame_ptr(Node *node, const char *prev) {
+  if (node->gasm.ctx->frame_ptr2)
+    pop(rbx);
+  if (node->gasm.ctx->frame_ptr1)
+    pop(rbp);
+  lvar_ptr = prev;
+}
+
+static void gen_asm(Node *node) {
+  if (is_plain_asm(node)) {
+    Printftn("%s", node->gasm.str_tok->str);
+    return;
+  }
+  asm_alt_ptr.rbp = asm_alt_ptr.rbx = NULL;
+  asm_fill_ops(node);
+  asm_gen_operands();
+
+  int x87_depth = asm_x87_inputs();
+  asm_xmm_inputs();
+
+  asm_push_clobbers(node);
+  const char *prev_lvar_ptr = asm_push_frame_ptr(node);
+
+  asm_gp_inputs();
+
+  asm_fill_ops2(node);
+  asm_body(node);
+
+  int fallthrough_label = asm_ops_cnt;
+  int meet_label = asm_ops_cnt + 1;
+
+  if (asm_is_goto_with_output(node)) {
+    const char *tmp_gp = regs[node->gasm.ctx->output_tmp1][3];
+    Printftn("lea %df(%%rip), %s; jmp %df", fallthrough_label, tmp_gp, meet_label);
+
+    for (AsmParam *ap = node->gasm.labels; ap; ap = ap->next) {
+      Printftn("%d:", ap->label_id);
+      Printftn("lea .L.jmp.%" PRIi64 "(%%rip), %s", ap->arg->jmp.target->lbl.id, tmp_gp);
+      Printftn("jmp %df", meet_label);
+    }
+    Printftn("%d:", meet_label);
+    Printftn("push %s", tmp_gp);
+  }
+
+  asm_save_out_flags(node);
+  asm_save_out_x87(node, x87_depth);
+  asm_save_out(node);
+
+  clobber_all_regs();
+  asm_pop_frame_ptr(node, prev_lvar_ptr);
+  asm_pop_clobbers(node);
+
+  if (asm_is_goto_with_output(node)) {
+    Printstn("pop %%rax");
+    Printstn("jmp *%%rax");
+    Printftn("%d:", fallthrough_label);
+  }
+}
+
+static int get_lvar_align(Scope *scp, int32_t align) {
+  for (Obj *var = scp->locals; var; var = var->next) {
+    if (var->pass_by_stack)
+      continue;
+    int32_t a2 = get_align(var);
+    align = MAX(align, a2);
+  }
+  for (Scope *sub = scp->children; sub; sub = sub->sibling_next) {
+    int32_t a2 = get_lvar_align(sub, align);
+    align = MAX(align, a2);
+  }
+  return align;
+}
+
+static int assign_lvar_offsets(Scope *sc, int bottom) {
+  for (Obj *var = sc->locals; var; var = var->next) {
+    if (var->pass_by_stack) {
+      var->ofs = var->stack_offset + 16;
+      var->ptr = rbp;
+      continue;
+    }
+    size_t sz = var->ty->size;
+    bottom += sz ? sz : 1;
+    bottom = align_to(bottom, get_align(var));
+    var->ofs = -bottom;
+    var->ptr = lvar_ptr;
+  }
+
+  int max_depth = bottom;
+  for (Scope *sub = sc->children; sub; sub = sub->sibling_next) {
+    int sub_depth = assign_lvar_offsets(sub, bottom);
+    if (!opt_reuse_stack || codegen_fn->dont_reuse_stk)
+      bottom = max_depth = sub_depth;
+    else
+      max_depth = MAX(max_depth, sub_depth);
+  }
+  return max_depth;
+}
+
+static void emit_symbol2(Obj *var, const char *name, const char *vis) {
+  if (var->is_static)
+    Printftn(".local \"%s\"", name);
+  else if (var->is_weak)
+    Printftn(".weak \"%s\"", name);
+  else
+    Printftn(".globl \"%s\"", name);
+
+  if (vis &&
+      (!strcmp(vis, "hidden") || !strcmp(vis, "internal") || !strcmp(vis, "protected")))
+    Printftn(".%s \"%s\"", vis, name);
+
+  if (var->alias_name)
+    Printftn(".set \"%s\", \"%s\"", name, var->alias_name);
+}
+
+static void emit_symbol(Obj *var, const char *name) {
+  emit_symbol2(var, name, var->visibility ? var->visibility : opt_visibility);
+}
+
+static bool is_rodata_obj(Obj *var) {
+  if (var->is_string_lit)
+    return true;
+  if (!is_const_var(var))
+    return false;
+  if (opt_fpic || opt_fpie) {
+    if (var->rel)
+      return false;
+    if (var->section_name)
+      return !strcmp(var->section_name, ".interp") ||
+             !strncmp(var->section_name, ".note", 5);
+  }
+  return true;
+}
+
+static void emit_data(Obj *var) {
+  int64_t sz = var->ty->size;
+  const char *var_name = get_symbol(var);
+
+  if (var->ty->kind == TY_ARRAY && sz < 0)
+    sz = var->ty->base->size;
+
+  if (opt_femulated_tls && var->kind == OBJ_TLS) {
+    char name_t[STRBUF_SZ], name_v[STRBUF_SZ];
+    snprintf(name_t, STRBUF_SZ, "__emutls_t.%s", var_name);
+    snprintf(name_v, STRBUF_SZ, "__emutls_v.%s", var_name);
+
+    Obj tmp_var = *var;
+    tmp_var.kind = OBJ_GLOBAL;
+    tmp_var.asm_name = tmp_var.alias_name = NULL;
+
+    emit_symbol(&tmp_var, name_v);
+    Printstn(".data");
+    Printftn(".size \"%s\", 32", name_v);
+    Printstn(".align 8");
+    Printfsn("\"%s\":", name_v);
+    Printftn(".quad %" PRIi64, sz);
+    Printftn(".quad %d", get_align(var));
+    Printstn(".quad 0");
+    Printftn(".quad \"%s\"", name_t);
+
+    tmp_var.name = name_t;
+    emit_data(&tmp_var);
+    return;
+  }
+
+  emit_symbol(var, var_name);
+
+  if (!var->init_data &&
+      !var->is_static_lvar &&
+      var->kind != OBJ_TLS &&
+      !(var->is_weak || var->section_name) &&
+      (var->is_common || (!var->is_nocommon && opt_fcommon))) {
+    Printftn(".comm \"%s\", %" PRIi64 ", %d", var_name, sz, get_align(var));
+    return;
+  }
+
+  bool use_bss = !var->init_data;
+  bool use_rodata = is_rodata_obj(var);
+
+  if (var->section_name)
+    Printfts(".section \"%s\"", var->section_name);
+  else if (var->kind == OBJ_TLS)
+    Printfts(".section .%s", use_bss ? "tbss" : "tdata");
+  else if (use_rodata)
+    Printsts(".section .rodata");
+  else if ((opt_fpic || opt_fpie) && var->rel)
+    Printfts(".section .data.rel%s%s", (is_const_var(var) ? ".ro" : ""),
+             (opt_fpie ? ".local" : ""));
+  else
+    Printfts(".section .%s", use_bss ? "bss" : "data");
+
+  if (opt_data_sections && !var->section_name)
+    Printf(".\"%s\"", var_name);
+
+  if (var->kind == OBJ_TLS)
+    Printssn(",\"awT\"");
+  else if (use_rodata)
+    Printssn(",\"a\"");
+  else
+    Printssn(",\"aw\"");
+
+  Printftn(".type \"%s\", @object", var_name);
+  Printftn(".size \"%s\", %" PRIi64, var_name, sz);
+  Printftn(".align %d", get_align(var));
+  Printfsn("\"%s\":", var_name);
+
+  if (sz == 0)
+    return;
+
+  if (!var->init_data) {
+    Printftn(".zero %" PRIi64, sz);
+    return;
+  }
+
+  Relocation *rel = var->rel;
+  for (int pos = 0;;) {
+    int rem = (rel ? rel->offset : sz) - pos;
+
+    while (rem > 0) {
+      int p2 = reg_copy_sz(rem);
+      switch (p2) {
+      case 1: Printftn(".byte %" PRIi8, BUFF_CAST(int8_t, &var->init_data[pos])); break;
+      case 2: Printftn(".word %" PRIi16, BUFF_CAST(int16_t, &var->init_data[pos])); break;
+      case 4: Printftn(".long %" PRIi32, BUFF_CAST(int32_t, &var->init_data[pos])); break;
+      case 8: Printftn(".quad %" PRIi64, BUFF_CAST(int64_t, &var->init_data[pos])); break;
+      }
+      pos += p2;
+      rem -= p2;
+    }
+
+    if (!rel)
+      break;
+
+    if (rel->var)
+      Printftn(".quad \"%s\"+%" PRIi64, get_symbol(rel->var), rel->addend);
+    else
+      Printftn(".quad .L.jmp.%" PRIi64 "+%" PRIi64, rel->label->jmp.target->lbl.id,
+               rel->addend);
+
+    pos += 8;
+    rel = rel->next;
+  }
+}
+
+static void store_fp(int r, int sz, int ofs, const char *ptr) {
+  switch (sz) {
+  case 4: Printftn("movss %%xmm%d, %d(%s)", r, ofs, ptr); return;
+  case 8: Printftn("movsd %%xmm%d, %d(%s)", r, ofs, ptr); return;
+  }
+  internal_error();
+}
+
+static void store_gp2(const char *const *r, int sz, int dofs, const char *dptr) {
+  for (int ofs = 0;;) {
+    int rem = sz - ofs;
+    int p2 = (rem >= 8) ? 8 : (rem >= 4) ? 4 : (rem >= 2) ? 2 : 1;
+    switch (p2) {
+    case 1: Printftn("mov %s, %d(%s)", r[REGSZ_8], ofs + dofs, dptr); break;
+    case 2: Printftn("mov %s, %d(%s)", r[REGSZ_16], ofs + dofs, dptr); break;
+    case 4: Printftn("mov %s, %d(%s)", r[REGSZ_32], ofs + dofs, dptr); break;
+    case 8: Printftn("mov %s, %d(%s)", r[REGSZ_64], ofs + dofs, dptr); break;
+    }
+    ofs += p2;
+    if (ofs >= sz)
+      return;
+    Printftn("shr $%d, %s", p2 * 8, r[REGSZ_64]);
+  }
+}
+
+static void store_gp(int idx, int sz, int ofs, const char *ptr) {
+  store_gp2(regs[argreg[idx]], sz, ofs, ptr);
+}
+
+static void emit_cdtor(const char *sec, uint16_t priority, const char *fn_name) {
+  Printfts(".section .%s", sec);
+  if (priority)
+    Printf(".%" PRIu16, (uint16_t)(priority - 1));
+  Printssn(",\"aw\"");
+  Printstn(".align 8");
+  Printftn(".quad \"%s\"", fn_name);
+}
+
+void emit_text(Obj *fn) {
+  if (!debug_file_used) {
+    debug_file_used = calloc(1, display_files.len * sizeof(bool));
+    debug_file_id = malloc(display_files.len * sizeof(int));
+  }
+  fn->output = calloc(1, sizeof(FuncObj));
+  output_file = open_memstream(&fn->output->buf, &fn->output->buflen);
+
+  const char *fn_name = asm_name(fn);
+
+  if (fn->is_ctor)
+    emit_cdtor("init_array", fn->ctor_prior, fn_name);
+  if (fn->is_dtor)
+    emit_cdtor("fini_array", fn->dtor_prior, fn_name);
+
+  emit_symbol(fn, fn_name);
+
+  if (fn->section_name)
+    Printftn(".section \"%s\",\"ax\",@progbits", fn->section_name);
+  else if (opt_func_sections)
+    Printftn(".section .text.\"%s\",\"ax\",@progbits", fn_name);
+  else
+    Printstn(".text");
+
+  int fnalign = fn->alt_align ? fn->alt_align : opt_fn_align;
+  if (fnalign)
+    Printftn(".align %d", fnalign);
+  Printftn(".type \"%s\", @function", fn_name);
+  Printfsn("\"%s\":", fn_name);
+
+  if (opt_g)
+    print_loc(fn->body->tok);
+
+  if (fn->is_naked) {
+    gen_stmt_naked(fn->body);
+
+    Printftn(".size \"%s\", .-\"%s\"", fn_name, fn_name);
+
+    fclose(output_file);
+    output_file = NULL;
+    return;
+  }
+
+  bool rtn_by_stk = is_mem_class(fn->ty->return_ty);
+  int gp_count = rtn_by_stk;
+  int fp_count = 0;
+  int arg_stk_size = calling_convention(fn->ty->param_list, &gp_count, &fp_count, NULL);
+
+  int lvar_align = get_lvar_align(fn->ty->scopes, 16);
+  lvar_ptr = (lvar_align > 16) ? rbx : rbp;
+  codegen_fn = fn;
+  ext_refs = &(HashMap){0};
+  rtn_label = count();
+
+  // Prologue
+  Printstn("push %%rbp");
+  Printstn("mov %%rsp, %%rbp");
+  if (lvar_align > 16) {
+    Printstn("push %%rbx");
+    Printftn("and $-%d, %%rsp", lvar_align);
+    Printstn("mov %%rsp, %%rbx");
+  }
+
+  long stack_alloc_loc = resrvln();
+
+  lvar_stk_sz = tmpbuf_sz = 0;
+
+  // Save arg registers if function is variadic
+  if (fn->ty->is_variadic) {
+    va_gp_start = gp_count * 8;
+    va_fp_start = fp_count * 16 + 48;
+    va_st_start = arg_stk_size + 16;
+    lvar_stk_sz += 176;
+
+    switch (gp_count) {
+    case 0: Printftn("movq %%rdi, -176(%s)", lvar_ptr);
+    case 1: Printftn("movq %%rsi, -168(%s)", lvar_ptr);
+    case 2: Printftn("movq %%rdx, -160(%s)", lvar_ptr);
+    case 3: Printftn("movq %%rcx, -152(%s)", lvar_ptr);
+    case 4: Printftn("movq %%r8, -144(%s)", lvar_ptr);
+    case 5: Printftn("movq %%r9, -136(%s)", lvar_ptr);
+    }
+    if (fp_count < 8) {
+      Printstn("test %%al, %%al");
+      Printstn("je 1f");
+      switch (fp_count) {
+      case 0: Printftn("movaps %%xmm0, -128(%s)", lvar_ptr);
+      case 1: Printftn("movaps %%xmm1, -112(%s)", lvar_ptr);
+      case 2: Printftn("movaps %%xmm2, -96(%s)", lvar_ptr);
+      case 3: Printftn("movaps %%xmm3, -80(%s)", lvar_ptr);
+      case 4: Printftn("movaps %%xmm4, -64(%s)", lvar_ptr);
+      case 5: Printftn("movaps %%xmm5, -48(%s)", lvar_ptr);
+      case 6: Printftn("movaps %%xmm6, -32(%s)", lvar_ptr);
+      case 7: Printftn("movaps %%xmm7, -16(%s)", lvar_ptr);
+      }
+      Printssn("1:");
+    }
+  }
+
+  if (fn->dealloc_vla) {
+    vla_base_ofs = lvar_stk_sz += 8;
+    Printftn("mov %%rsp, -%d(%s)", vla_base_ofs, lvar_ptr);
+  }
+
+  if (rtn_by_stk) {
+    rtn_ptr_ofs = lvar_stk_sz += 8;
+    Printftn("mov %s, -%d(%s)", argreg64[0], rtn_ptr_ofs, lvar_ptr);
+  }
+
+  lvar_stk_sz = assign_lvar_offsets(fn->ty->scopes, lvar_stk_sz);
+  peak_stk_usage = lvar_stk_sz = align_to(lvar_stk_sz, 8);
+
+  // Save passed-by-register arguments to the stack
+  int gp = rtn_by_stk, fp = 0;
+  for (Obj *var = fn->ty->param_list; var; var = var->param_next) {
+    if (var->pass_by_stack || var->is_zero_sized_arg)
+      continue;
+
+    Type *ty = var->ty;
+
+    switch (ty->kind) {
+    case TY_BITINT:
+    case TY_STRUCT:
+    case TY_UNION:
+      if (is_fp_class_lo(ty))
+        store_fp(fp++, MIN(8, ty->size), var->ofs, var->ptr);
+      else
+        store_gp(gp++, MIN(8, ty->size), var->ofs, var->ptr);
+
+      if (ty->size > 8) {
+        if (is_fp_class_hi(ty))
+          store_fp(fp++, ty->size - 8, var->ofs + 8, var->ptr);
+        else
+          store_gp(gp++, ty->size - 8, var->ofs + 8, var->ptr);
+      }
+      break;
+    case TY_FLOAT:
+    case TY_DOUBLE: store_fp(fp++, ty->size, var->ofs, var->ptr); break;
+    default:        store_gp(gp++, ty->size, var->ofs, var->ptr); break;
+    }
+  }
+
+  // Emit code
+  bool is_reach = gen_reachable_stmt(fn->body);
+
+  if (is_reach) {
+    if (!strcmp(fn->name, "main"))
+      Printstn("xor %%eax, %%eax");
+    else if (is_x87_class(fn->ty->return_ty))
+      Printstn("fldz");
+  }
+
+  // Epilogue
+  if (!(!is_reach && fn->is_noreturn)) {
+    Printfsn(".L.rtn.%" PRIi64 ":", rtn_label);
+    if (lvar_align > 16)
+      Printstn("mov -8(%%rbp), %%rbx");
+    Printstn("leave");
+    Printstn("ret");
+  }
+
+  peak_stk_usage += tmpbuf_sz;
+  if (peak_stk_usage) {
+    if (tmp_stack.depth != 0)
+      internal_error();
+
+    peak_stk_usage = align_to(peak_stk_usage, 16);
+    insrtln(".set __BUF, -%d; sub $%d, %%rsp", stack_alloc_loc, peak_stk_usage,
+            peak_stk_usage);
+  }
+
+  Printftn(".size \"%s\", .-\"%s\"", fn_name, fn_name);
+
+  {
+    Obj head = {.next = fn->static_lvars};
+    bool has_change;
+    do {
+      has_change = false;
+      Obj *cur = &head;
+      for (Obj *var = head.next; var; var = var->next) {
+        if (var->is_live || var->is_used) {
+          emit_data(var);
+          has_change = true;
+          continue;
+        }
+        cur = cur->next = var;
+      }
+      cur->next = NULL;
+    } while (has_change);
+  }
+
+  if (ext_refs->buckets)
+    free(ext_refs->buckets);
+  ext_refs = NULL;
+  codegen_fn = NULL;
+
+  fclose(output_file);
+  output_file = NULL;
+}
+
+// Logic should be in sync with gen_funcall_args()
+void prepare_funcall(Node *node, Scope *scope) {
+  bool rtn_by_stk = is_mem_class(node->ty);
+  calling_convention(node->call.args, &(int){rtn_by_stk}, &(int){0}, NULL);
+
+  if (scope->has_alloca) {
+    Obj head = {0};
+    Obj *cur = &head;
+    for (Obj *var = node->call.args; var; var = var->param_next) {
+      cur = cur->param_next = new_lvar(var->ty);
+      cur->arg_expr = var->arg_expr;
+
+      if (var->is_zero_sized_arg) {
+        cur->is_zero_sized_arg = true;
+        var->arg_expr = new_node(ND_NULL_EXPR, cur->arg_expr->tok);
+      } else {
+        var->arg_expr = new_var_node(cur, cur->arg_expr->tok);
+      }
+      add_type(var->arg_expr);
+    }
+    node->call.alloca_args = head.param_next;
+  }
+
+  int reg_arg_cnt = 0;
+  for (Obj *var = node->call.args; var; var = var->param_next) {
+    var->kind = OBJ_LOCAL;
+    if (var->pass_by_stack) {
+      var->ofs = var->stack_offset;
+      var->ptr = "%rsp";
+      continue;
+    }
+    if (var->is_zero_sized_arg)
+      continue;
+
+    if (opt_optimize) {
+      Node *arg_expr = var->arg_expr;
+      reg_arg_cnt++;
+
+      if (is_gp_ty(arg_expr->ty) && is_const_expr(arg_expr, NULL))
+        continue;
+      if (is_flonum(arg_expr->ty) && is_const_fp(arg_expr, NULL))
+        continue;
+      if (gen_load_opt_gp(arg_expr, REG_X64_NULL))
+        continue;
+      if (is_gp_ty(arg_expr->ty) || is_flonum(arg_expr->ty))
+        if (has_memop(var->arg_expr))
+          continue;
+      if (reg_arg_cnt == 1 && is_scalar(arg_expr->ty))
+        continue;
+    }
+    var->next = scope->locals;
+    scope->locals = var;
+  }
+}
+
+static void peep_redunt_jmp(char *p) {
+  while ((p = strstr(p, "\n\tjmp "))) {
+    char *write_p = p;
+    char *name_p = p + 6;
+    p = strchr(name_p, '\n');
+    size_t write_len = p - write_p;
+    size_t name_len = p - name_p;
+
+    while (*p == '\n') {
+      char *name_p2 = p + 1;
+      size_t ins_len = strcspn(name_p2, ":;#\n");
+      if (name_p2[ins_len] != ':')
+        break;
+      p = name_p2 + ins_len + 1;
+      if (ins_len == name_len && !memcmp(name_p2, name_p, name_len)) {
+        memset(write_p, ' ', write_len);
+        break;
+      }
+    }
+  }
+}
+
+static void mark_live(Obj *var) {
+  if (var->is_live)
+    return;
+  var->is_live = true;
+
+  if (!var->is_definition) {
+    if (var->alias_name) {
+      Obj *alias = get_symbol_var(var->alias_name);
+      if (alias && alias->is_definition)
+        mark_live(alias);
+    }
+    return;
+  }
+
+  if (var->ty->kind == TY_FUNC) {
+    for (int i = 0; i < var->output->ref_cnt; i++)
+      mark_live(var->output->refs[i]);
+  } else {
+    for (Relocation *rel = var->rel; rel; rel = rel->next)
+      if (rel->var)
+        mark_live(rel->var);
+  }
+}
+
+int codegen(Obj *prog, FILE *out) {
+  output_file = out;
+
+  if (opt_g)
+    for (int i = 0; i < debug_files.len; i++)
+      Printftn(".file %d \"%s\"", i, debug_files.data[i]);
+
+  for (Obj *var = prog; var; var = var->next) {
+    if (var->is_definition && var->ty->kind == TY_FUNC && !var->is_static && !var->export_fn) {
+      if (var->is_always_inline && opt_fake_always_inline) {
+        var->is_static = true;
+        char *p = ((FuncObj *)var->output)->buf;
+        if ((p = strstr(p, ".globl ")))
+          memcpy(p, ".local", 6);
+        continue;
+      }
+      var->is_definition = false;
+      var->output = NULL;
+      continue;
+    }
+    if (var->alias_name)
+      var->is_definition = false;
+  }
+
+  for (Obj *var = prog; var; var = var->next)
+    if ((!var->is_static || var->is_used) && (var->is_definition || var->alias_name))
+      mark_live(var);
+
+  for (Obj *var = prog; var; var = var->next) {
+    if (!var->is_definition) {
+      if (var->is_live && (var->alias_name || var->visibility || var->is_weak))
+        emit_symbol2(var, asm_name(var), var->visibility);
+      continue;
+    }
+    if (var->ty->kind == TY_ASM) {
+      Printfsn("%s", var->asm_name);
+      continue;
+    }
+    if (var->ty->kind != TY_ARRAY && var->ty->size < 0)
+      error("object \'%s\' has incomplete type", get_symbol(var));
+    if (!var->is_live)
+      continue;
+    if (var->ty->kind == TY_FUNC) {
+      FuncObj *fn = var->output;
+      peep_redunt_jmp(fn->buf);
+      fwrite(fn->buf, 1, fn->buflen, out);
+      continue;
+    }
+    emit_data(var);
+    continue;
+  }
+  Printstn(".section  .note.GNU-stack,\"\",@progbits");
+  return 0;
+}

@@ -1,0 +1,21 @@
+package SYSTEM is
+
+    type NAME is (PIR_TARGET);
+
+    SYSTEM_NAME   : constant NAME := PIR_TARGET;
+    STORAGE_UNIT  : constant := 8;
+    MEMORY_SIZE   : constant := 2**63-1;
+    MAX_INT	  : constant := 2**63-1;
+    MIN_INT	  : constant := -(2**63);
+    MAX_DIGITS	  : constant := 15;
+    MAX_MANTISSA  : constant := 63;
+    FINE_DELTA	  : constant := 1.0E-9;
+    TICK	  : constant := 1.0E-9;
+
+    subtype PRIORITY is INTEGER range 0 .. 10;
+
+    subtype ADDRESS is STANDARD._ADDRESS;
+
+    package _SYSTEM renames SYSTEM;
+
+end SYSTEM;

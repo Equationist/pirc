@@ -1,0 +1,453 @@
+/*
+ * Copyright (c) 2026 Ummon Karpe
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "opt/opt.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "analysis/alias.h"
+#include "analysis/cfg.h"
+#include "analysis/dom.h"
+#include "lower/lower.h"
+
+typedef struct {
+    uint32_t   blk_inst_idx;
+    PirOperand ptr;
+    PirOperand val;
+    PirType    ty;
+    uint32_t   size;
+    bool       observed;
+} ActiveStore;
+
+typedef struct {
+    PirOperand ptr;
+    PirValueId val;
+    PirType    ty;
+    uint32_t   size;
+} ActiveLoad;
+
+typedef PIR_VEC(ActiveStore) ActiveStoreVec;
+typedef PIR_VEC(ActiveLoad)  ActiveLoadVec;
+
+static bool is_pure_math_call(const PirModule *mod, const PirInst *ins) {
+    if (ins->op != PIR_OP_CALL || ins->operand_count < 1u ||
+        ins->operands[0].kind != PIR_OPER_SYM || !ins->operands[0].u.sym.name) {
+        return false;
+    }
+    bool is_def = (ins->operands[0].u.sym.is_func &&
+                   ins->operands[0].u.sym.id < mod->funcs.len &&
+                   mod->funcs.data[ins->operands[0].u.sym.id].is_defined);
+    if (is_def) return false;
+    const char *cn = ins->operands[0].u.sym.name;
+    return strcmp(cn, "sqrt") == 0 || strcmp(cn, "sqrtf") == 0 ||
+           strcmp(cn, "fabs") == 0 || strcmp(cn, "fabsf") == 0;
+}
+
+static PirValueId resolve_alias(const PirValueId *alias, uint32_t nvals, PirValueId v) {
+    uint32_t guard = 0u;
+    while (v < nvals && alias[v] != PIR_INVALID_ID && guard++ < 1024u) {
+        v = alias[v];
+    }
+    return v;
+}
+
+static void resolve_ops(const PirValueId *alias, uint32_t nvals, PirOperand *ops, uint32_t n) {
+    for (uint32_t i = 0u; i < n; ++i) {
+        if (ops[i].kind == PIR_OPER_VAL) {
+            ops[i].u.val = resolve_alias(alias, nvals, ops[i].u.val);
+        }
+    }
+}
+
+static bool is_mem_barrier(PirOpcode op) {
+    switch (op) {
+        case PIR_OP_CALL:
+        case PIR_OP_CALL_INDIRECT:
+        case PIR_OP_ATOMIC_LOAD:
+        case PIR_OP_ATOMIC_STORE:
+        case PIR_OP_ATOMIC_RMW:
+        case PIR_OP_ATOMIC_CMPXCHG:
+        case PIR_OP_FENCE:
+        case PIR_OP_VA_START:
+        case PIR_OP_VA_ARG:
+        case PIR_OP_VA_ARG_BUF:
+        case PIR_OP_VA_COPY:
+        case PIR_OP_VA_END:
+        case PIR_OP_STACKRESTORE:
+        case PIR_OP_MEMCPY:
+        case PIR_OP_MEMMOVE:
+        case PIR_OP_MEMSET:
+            return true;
+        case PIR_OP_CONST: case PIR_OP_ADDR:
+        case PIR_OP_ADD: case PIR_OP_SUB: case PIR_OP_MUL:
+        case PIR_OP_DIV_S: case PIR_OP_DIV_U: case PIR_OP_REM_S: case PIR_OP_REM_U:
+        case PIR_OP_ADD_OVF_S: case PIR_OP_ADD_OVF_U:
+        case PIR_OP_SUB_OVF_S: case PIR_OP_SUB_OVF_U:
+        case PIR_OP_MUL_OVF_S: case PIR_OP_MUL_OVF_U:
+        case PIR_OP_MUL_WIDE_U: case PIR_OP_MUL_WIDE_S:
+        case PIR_OP_ADD_CARRY: case PIR_OP_SUB_BORROW:
+        case PIR_OP_AND: case PIR_OP_OR: case PIR_OP_XOR:
+        case PIR_OP_SHL: case PIR_OP_SHR: case PIR_OP_SAR:
+        case PIR_OP_CLZ: case PIR_OP_CTZ: case PIR_OP_POPCNT: case PIR_OP_BSWAP:
+        case PIR_OP_FADD: case PIR_OP_FSUB: case PIR_OP_FMUL: case PIR_OP_FDIV: case PIR_OP_FNEG:
+        case PIR_OP_CMP_EQ: case PIR_OP_CMP_NE:
+        case PIR_OP_CMP_LT_S: case PIR_OP_CMP_LT_U: case PIR_OP_CMP_LE_S: case PIR_OP_CMP_LE_U:
+        case PIR_OP_CMP_GT_S: case PIR_OP_CMP_GT_U: case PIR_OP_CMP_GE_S: case PIR_OP_CMP_GE_U:
+        case PIR_OP_FCMP_OEQ: case PIR_OP_FCMP_ONE: case PIR_OP_FCMP_OLT:
+        case PIR_OP_FCMP_OLE: case PIR_OP_FCMP_OGT: case PIR_OP_FCMP_OGE:
+        case PIR_OP_FCMP_UEQ: case PIR_OP_FCMP_UNE: case PIR_OP_FCMP_ULT:
+        case PIR_OP_FCMP_ULE: case PIR_OP_FCMP_UGT: case PIR_OP_FCMP_UGE:
+        case PIR_OP_SELECT:
+        case PIR_OP_ZEXT: case PIR_OP_SEXT: case PIR_OP_TRUNC:
+        case PIR_OP_FPTOSI: case PIR_OP_FPTOUI: case PIR_OP_SITOFP: case PIR_OP_UITOFP:
+        case PIR_OP_FPEXT: case PIR_OP_FPTRUNC: case PIR_OP_BITCAST:
+        case PIR_OP_PTRTOINT: case PIR_OP_INTTOPTR:
+        case PIR_OP_SPLAT: case PIR_OP_EXTRACT: case PIR_OP_INSERT: case PIR_OP_SHUFFLE:
+        case PIR_OP_ALLOCA: case PIR_OP_ALLOCA_PTR: case PIR_OP_ALLOCA_DYN:
+        case PIR_OP_STACKSAVE: case PIR_OP_FIELD_PTR: case PIR_OP_ELEM_PTR:
+        case PIR_OP_PTR_ADD: case PIR_OP_LOAD: case PIR_OP_STORE:
+        case PIR_OP_JMP: case PIR_OP_BR: case PIR_OP_SWITCH:
+        case PIR_OP_INVOKE: case PIR_OP_INVOKE_INDIRECT: case PIR_OP_RESUME:
+        case PIR_OP_RET: case PIR_OP_TRAP: case PIR_OP_UNREACHABLE:
+            return false;
+    }
+    return false;
+}
+
+static bool resolve_const_u64(const PirFunction *fn, PirOperand op, uint64_t *out) {
+    if (op.kind == PIR_OPER_IMM_INT && !op.u.imm_int.is_negative && op.u.imm_int.hi == 0u) {
+        *out = op.u.imm_int.lo;
+        return true;
+    }
+    if (op.kind == PIR_OPER_VAL && op.u.val < fn->values.len) {
+        PirInstId did = fn->values.data[op.u.val].def_inst;
+        if (did != PIR_INVALID_ID && fn->insts.data[did].op == PIR_OP_CONST &&
+            fn->insts.data[did].operand_count == 1u) {
+            PirOperand c = fn->insts.data[did].operands[0];
+            if (c.kind == PIR_OPER_IMM_INT && !c.u.imm_int.is_negative && c.u.imm_int.hi == 0u) {
+                *out = c.u.imm_int.lo;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static PirValueId dse_ptr_add_off(PirModule *mod, PirFunction *fn, PirBlockId b,
+                                  PirInstIdVec *out, PirOperand base, uint64_t off,
+                                  PirType idx_ty, uint32_t line, uint32_t loc) {
+    if (off == 0u && base.kind == PIR_OPER_VAL) return base.u.val;
+    PirInst pa = pir_make_inst(PIR_OP_PTR_ADD, idx_ty, line, loc);
+    pa.flags         = PIR_FLAG_INBOUNDS;
+    pa.operand_count = 2u;
+    pa.operands      = pir_alloc_ops(mod, 2u);
+    pa.operands[0]   = base;
+    pa.operands[1]   = pir_op_imm_i(off, false, idx_ty);
+    pa.results[0]    = pir_fn_new_val(mod, fn, "mcp", pir_type_scalar(PIR_SCALAR_PTR), b, PIR_INVALID_ID, 0u);
+    pir_fn_append_inst(fn, out, pa);
+    return pa.results[0];
+}
+
+/* Inline small constant-size extern @memcpy/@memmove calls (<= 32B) via load-all-then-store-all
+ * unaligned hardware chunks (exact even for overlapping memmove; enables downstream forwarding). */
+static void inline_small_mem_calls(PirModule *mod, PirFunction *fn, const PirTargetSpec *target) {
+    PirType ptr_ty = pir_type_scalar(PIR_SCALAR_PTR);
+    PirType idx_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
+
+    for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
+        bool has_cand = false;
+        const PirBlock *blk0 = &fn->blocks.data[b];
+        for (uint32_t j = 0u; j < blk0->insts.len; ++j) {
+            const PirInst *ins = &fn->insts.data[blk0->insts.data[j]];
+            if (ins->op == PIR_OP_CALL && ins->operand_count == 4u &&
+                ins->operands[0].kind == PIR_OPER_SYM && ins->operands[0].u.sym.name &&
+                (strcmp(ins->operands[0].u.sym.name, "memcpy") == 0 ||
+                 strcmp(ins->operands[0].u.sym.name, "memmove") == 0)) {
+                has_cand = true;
+                break;
+            }
+        }
+        if (!has_cand) continue;
+
+        PirInstIdVec new_insts = {NULL, 0u, 0u};
+        uint32_t n = fn->blocks.data[b].insts.len;
+        for (uint32_t j = 0u; j < n; ++j) {
+            PirInstId iid = fn->blocks.data[b].insts.data[j];
+            PirInst copy = fn->insts.data[iid];
+            uint64_t total = 0u;
+            bool is_mem = (copy.op == PIR_OP_CALL && copy.operand_count == 4u &&
+                           copy.results[1] == PIR_INVALID_ID &&
+                           copy.operands[0].kind == PIR_OPER_SYM && copy.operands[0].u.sym.name &&
+                           (strcmp(copy.operands[0].u.sym.name, "memcpy") == 0 ||
+                            strcmp(copy.operands[0].u.sym.name, "memmove") == 0) &&
+                           copy.operands[1].kind == PIR_OPER_VAL &&
+                           pir_type_eq(copy.operands[1].type, ptr_ty) &&
+                           copy.operands[2].kind == PIR_OPER_VAL &&
+                           pir_type_eq(copy.operands[2].type, ptr_ty) &&
+                           resolve_const_u64(fn, copy.operands[3], &total) &&
+                           total >= 1u && total <= 32u);
+            if (is_mem) {
+                /* Ensure callee is extern (not user-defined in this module). */
+                for (uint32_t fi = 0u; fi < mod->funcs.len; ++fi) {
+                    if (mod->funcs.data[fi].is_defined && mod->funcs.data[fi].name &&
+                        strcmp(mod->funcs.data[fi].name, copy.operands[0].u.sym.name) == 0) {
+                        is_mem = false;
+                        break;
+                    }
+                }
+            }
+            if (!is_mem) {
+                PIR_VEC_PUSH(&new_insts, iid);
+                continue;
+            }
+
+            PirOperand dst = copy.operands[1];
+            PirOperand src = copy.operands[2];
+            PirValueId vals[8];
+            PirScalarType ctys[8];
+            uint64_t offs[8];
+            uint32_t nchunks = 0u;
+            uint64_t off = 0u;
+            while (off < total && nchunks < 8u) {
+                uint64_t rem = total - off;
+                uint32_t csz = (rem >= 8u) ? 8u : (rem >= 4u) ? 4u : (rem >= 2u) ? 2u : 1u;
+                PirScalarType ct = (csz == 8u) ? PIR_SCALAR_I64
+                                 : (csz == 4u) ? PIR_SCALAR_I32
+                                 : (csz == 2u) ? PIR_SCALAR_I16 : PIR_SCALAR_I8;
+                PirValueId sp = dse_ptr_add_off(mod, fn, b, &new_insts, src, off, idx_ty,
+                                                copy.src_line, copy.loc_idx);
+                PirInst ld = pir_make_inst(PIR_OP_LOAD, pir_type_scalar(ct), copy.src_line, copy.loc_idx);
+                ld.align         = 1u;
+                ld.operand_count = 1u;
+                ld.operands      = pir_alloc_ops(mod, 1u);
+                ld.operands[0]   = pir_op_val(sp, ptr_ty);
+                ld.results[0]    = pir_fn_new_val(mod, fn, "mcv", pir_type_scalar(ct), b, PIR_INVALID_ID, 0u);
+                pir_fn_append_inst(fn, &new_insts, ld);
+                vals[nchunks] = ld.results[0];
+                ctys[nchunks] = ct;
+                offs[nchunks] = off;
+                nchunks++;
+                off += csz;
+            }
+            for (uint32_t k = 0u; k < nchunks; ++k) {
+                PirValueId dp = dse_ptr_add_off(mod, fn, b, &new_insts, dst, offs[k], idx_ty,
+                                                copy.src_line, copy.loc_idx);
+                PirInst st = pir_make_inst(PIR_OP_STORE, pir_type_scalar(ctys[k]), copy.src_line, copy.loc_idx);
+                st.align         = 1u;
+                st.operand_count = 2u;
+                st.operands      = pir_alloc_ops(mod, 2u);
+                st.operands[0]   = pir_op_val(vals[k], pir_type_scalar(ctys[k]));
+                st.operands[1]   = pir_op_val(dp, ptr_ty);
+                pir_fn_append_inst(fn, &new_insts, st);
+            }
+            if (copy.results[0] != PIR_INVALID_ID) {
+                pir_fn_replace_val_uses(fn, copy.results[0], dst.u.val);
+            }
+        }
+        PIR_VEC_FREE(&fn->blocks.data[b].insts);
+        fn->blocks.data[b].insts = new_insts;
+    }
+}
+
+typedef struct {
+    PirModule           *mod;
+    PirFunction         *fn;
+    const PirTargetSpec *target;
+    const PirCfg        *cfg;
+    const PirDom        *dom;
+    PirValueId          *alias;
+    uint32_t             nvals;
+} DseCtx;
+
+static void dse_walk_block(DseCtx *ctx, PirBlockId b, const ActiveLoadVec *parent_loads) {
+    PirFunction *fn = ctx->fn;
+    PirBlock *blk = &fn->blocks.data[b];
+    uint32_t n = blk->insts.len;
+
+    ActiveStoreVec active = {NULL, 0u, 0u};
+    ActiveLoadVec  loads  = {NULL, 0u, 0u};
+
+    /* Inherit active loads ONLY when b has a single predecessor (strictly dominated with
+     * zero alternate paths that could clobber memory). */
+    if (parent_loads && parent_loads->len > 0u && ctx->cfg->preds[b].len == 1u) {
+        for (uint32_t k = 0u; k < parent_loads->len; ++k) {
+            PIR_VEC_PUSH(&loads, parent_loads->data[k]);
+        }
+    }
+
+    if (n > 0u) {
+        bool *dead = (bool *)calloc(n, sizeof(bool));
+        if (!dead) abort();
+
+        for (uint32_t j = 0u; j < n; ++j) {
+            PirInst *ins = &fn->insts.data[blk->insts.data[j]];
+            resolve_ops(ctx->alias, ctx->nvals, ins->operands, ins->operand_count);
+
+            if (ins->op == PIR_OP_STORE) {
+                if (ins->flags & PIR_FLAG_VOLATILE) {
+                    active.len = 0u;
+                    loads.len  = 0u;
+                    continue;
+                }
+                uint32_t ssz = pir_type_bits(ins->ty, ctx->target->ptr_bytes) / 8u;
+                uint32_t dst = 0u;
+                for (uint32_t k = 0u; k < active.len; ++k) {
+                    PirAliasResult ar = pir_alias_query(fn, active.data[k].ptr, active.data[k].size,
+                                                        ins->operands[1], ssz);
+                    if (ar == PIR_ALIAS_MUST) {
+                        if (!active.data[k].observed && active.data[k].size == ssz) {
+                            dead[active.data[k].blk_inst_idx] = true;
+                        }
+                    } else if (ar == PIR_ALIAS_MAY) {
+                        /* Partial/unknown overlap: invalidate for forwarding without deleting. */
+                    } else {
+                        active.data[dst++] = active.data[k];
+                    }
+                }
+                active.len = dst;
+
+                uint32_t ldst = 0u;
+                for (uint32_t k = 0u; k < loads.len; ++k) {
+                    PirAliasResult ar = pir_alias_query(fn, loads.data[k].ptr, loads.data[k].size,
+                                                        ins->operands[1], ssz);
+                    if (ar == PIR_ALIAS_NO) {
+                        loads.data[ldst++] = loads.data[k];
+                    }
+                }
+                loads.len = ldst;
+
+                ActiveStore as;
+                as.blk_inst_idx = j;
+                as.ptr          = ins->operands[1];
+                as.val          = ins->operands[0];
+                as.ty           = ins->ty;
+                as.size         = ssz;
+                as.observed     = false;
+                PIR_VEC_PUSH(&active, as);
+            } else if (ins->op == PIR_OP_LOAD) {
+                if (ins->flags & PIR_FLAG_VOLATILE) {
+                    active.len = 0u;
+                    loads.len  = 0u;
+                    continue;
+                }
+                uint32_t lsz = pir_type_bits(ins->ty, ctx->target->ptr_bytes) / 8u;
+                bool forwarded = false;
+                for (uint32_t k = active.len; k > 0u; --k) {
+                    ActiveStore *as = &active.data[k - 1u];
+                    PirAliasResult ar = pir_alias_query(fn, as->ptr, as->size, ins->operands[0], lsz);
+                    if (ar == PIR_ALIAS_MUST && pir_type_eq(as->ty, ins->ty)) {
+                        if (as->val.kind == PIR_OPER_VAL) {
+                            ctx->alias[ins->results[0]] = resolve_alias(ctx->alias, ctx->nvals, as->val.u.val);
+                            dead[j] = true;
+                        } else {
+                            PirOpcode cop = (as->val.kind == PIR_OPER_SYM) ? PIR_OP_ADDR : PIR_OP_CONST;
+                            ins->op            = cop;
+                            ins->flags         = PIR_FLAG_NONE;
+                            ins->align         = 0u;
+                            ins->operands      = pir_alloc_ops(ctx->mod, 1u);
+                            ins->operands[0]   = as->val;
+                            ins->operand_count = 1u;
+                        }
+                        forwarded = true;
+                        break;
+                    }
+                    if (ar != PIR_ALIAS_NO) {
+                        as->observed = true;
+                    }
+                }
+                if (!forwarded) {
+                    for (uint32_t k = loads.len; k > 0u; --k) {
+                        ActiveLoad *al = &loads.data[k - 1u];
+                        PirAliasResult ar = pir_alias_query(fn, al->ptr, al->size, ins->operands[0], lsz);
+                        if (ar == PIR_ALIAS_MUST && pir_type_eq(al->ty, ins->ty)) {
+                            ctx->alias[ins->results[0]] = resolve_alias(ctx->alias, ctx->nvals, al->val);
+                            dead[j] = true;
+                            forwarded = true;
+                            break;
+                        }
+                    }
+                }
+                if (!forwarded) {
+                    for (uint32_t k = 0u; k < active.len; ++k) {
+                        PirAliasResult ar = pir_alias_query(fn, active.data[k].ptr, active.data[k].size,
+                                                            ins->operands[0], lsz);
+                        if (ar != PIR_ALIAS_NO) active.data[k].observed = true;
+                    }
+                    ActiveLoad al;
+                    al.ptr  = ins->operands[0];
+                    al.val  = ins->results[0];
+                    al.ty   = ins->ty;
+                    al.size = lsz;
+                    PIR_VEC_PUSH(&loads, al);
+                }
+            } else if (is_mem_barrier(ins->op) && !is_pure_math_call(ctx->mod, ins)) {
+                active.len = 0u;
+                loads.len  = 0u;
+            }
+        }
+
+        uint32_t out = 0u;
+        for (uint32_t j = 0u; j < n; ++j) {
+            if (!dead[j]) {
+                blk->insts.data[out++] = blk->insts.data[j];
+            }
+        }
+        blk->insts.len = out;
+        free(dead);
+    }
+
+    PIR_VEC_FREE(&active);
+    for (uint32_t ci = 0u; ci < ctx->dom->children[b].len; ++ci) {
+        dse_walk_block(ctx, ctx->dom->children[b].data[ci], &loads);
+    }
+    PIR_VEC_FREE(&loads);
+}
+
+void pir_opt_dse(PirModule *mod, PirFunction *fn, const PirTargetSpec *target) {
+    if (fn->blocks.len == 0u || fn->values.len == 0u) return;
+
+    inline_small_mem_calls(mod, fn, target);
+
+    PirCfg cfg;
+    PirDom dom;
+    pir_cfg_build(&cfg, fn);
+    pir_dom_build(&dom, &cfg);
+
+    uint32_t nvals = fn->values.len;
+    PirValueId *alias = (PirValueId *)malloc(nvals * sizeof(PirValueId));
+    if (!alias) abort();
+    for (uint32_t v = 0u; v < nvals; ++v) alias[v] = PIR_INVALID_ID;
+
+    DseCtx ctx;
+    ctx.mod    = mod;
+    ctx.fn     = fn;
+    ctx.target = target;
+    ctx.cfg    = &cfg;
+    ctx.dom    = &dom;
+    ctx.alias  = alias;
+    ctx.nvals  = nvals;
+
+    dse_walk_block(&ctx, 0u, NULL);
+
+    /* Apply forwarded load aliases across all blocks. */
+    for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
+        const PirBlock *blk = &fn->blocks.data[b];
+        for (uint32_t j = 0u; j < blk->insts.len; ++j) {
+            PirInst *ins = &fn->insts.data[blk->insts.data[j]];
+            resolve_ops(alias, nvals, ins->operands, ins->operand_count);
+            resolve_ops(alias, nvals, ins->targets[0].args, ins->targets[0].arg_count);
+            resolve_ops(alias, nvals, ins->targets[1].args, ins->targets[1].arg_count);
+            for (uint32_t c = 0u; c < ins->switch_case_count; ++c) {
+                resolve_ops(alias, nvals, ins->switch_cases[c].target.args,
+                            ins->switch_cases[c].target.arg_count);
+            }
+        }
+    }
+
+    free(alias);
+    pir_dom_destroy(&dom);
+    pir_cfg_destroy(&cfg);
+}

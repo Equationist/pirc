@@ -1,0 +1,560 @@
+/*
+ * Copyright (c) 2026 Ummon Karpe
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "lower/lower.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+/* Split descriptor: every oversized vector ValueId expands into `count` pieces
+ * (count = 2 for v256 -> 2*v128 when max_simd_bits==128; count = lanes for scalarize). */
+typedef struct {
+    PirType     piece_ty;
+    uint32_t    count;       /* 0 = not split */
+    PirValueId *ids;         /* Arena-allocated array of length `count` */
+} VecSplit;
+
+typedef struct {
+    PirValueId from;
+    PirValueId to;
+} SimdAlias;
+
+static bool needs_split(PirType t, uint16_t max_bits) {
+    return t.kind == PIR_TYPE_VECTOR && pir_vec_bits(t.u.vec) > max_bits;
+}
+
+static PirVecType half_vec_type(PirVecType v) {
+    switch (v) {
+        case PIR_VEC_V32I8:  return PIR_VEC_V16I8;
+        case PIR_VEC_V16I16: return PIR_VEC_V8I16;
+        case PIR_VEC_V8I32:  return PIR_VEC_V4I32;
+        case PIR_VEC_V4I64:  return PIR_VEC_V2I64;
+        case PIR_VEC_V8F32:  return PIR_VEC_V4F32;
+        case PIR_VEC_V4F64:  return PIR_VEC_V2F64;
+        case PIR_VEC_NONE:
+        case PIR_VEC_V8I8:  case PIR_VEC_V4I16: case PIR_VEC_V2I32: case PIR_VEC_V2F32:
+        case PIR_VEC_V16I8: case PIR_VEC_V8I16: case PIR_VEC_V4I32: case PIR_VEC_V2I64:
+        case PIR_VEC_V4F32: case PIR_VEC_V2F64:
+            return PIR_VEC_NONE;
+    }
+    return PIR_VEC_NONE;
+}
+
+static void split_spec(PirVecType v, uint16_t max_bits, PirType *out_piece_ty, uint32_t *out_count) {
+    if (max_bits == 0u) {
+        *out_piece_ty = pir_type_scalar(pir_vec_elem_scalar(v));
+        *out_count    = pir_vec_lanes(v);
+    } else {
+        /* 256-bit -> 2 x 128-bit */
+        *out_piece_ty = pir_type_vec(half_vec_type(v));
+        *out_count    = 2u;
+    }
+}
+
+static uint32_t aligned_offset_align(uint32_t base_align, uint64_t off, uint32_t max_al) {
+    uint32_t al = base_align < max_al ? base_align : max_al;
+    while (al > 1u && (off % al) != 0u) al >>= 1u;
+    return al > 0u ? al : 1u;
+}
+
+static PirValueId emit_padd(PirModule *mod, PirFunction *fn, PirBlockId blk, PirInstIdVec *out,
+                            PirOperand base, uint64_t off, PirType idx_ty,
+                            uint32_t ln, uint32_t lc) {
+    if (off == 0u && base.kind == PIR_OPER_VAL) return base.u.val;
+    PirInst pa = pir_make_inst(PIR_OP_PTR_ADD, idx_ty, ln, lc);
+    pa.flags = PIR_FLAG_INBOUNDS;
+    pa.operand_count = 2u; pa.operands = pir_alloc_ops(mod, 2u);
+    pa.operands[0] = base; pa.operands[1] = pir_op_imm_i(off, false, idx_ty);
+    pa.results[0] = pir_fn_new_val(mod, fn, "vp", pir_type_scalar(PIR_SCALAR_PTR), blk, PIR_INVALID_ID, 0u);
+    pir_fn_append_inst(fn, out, pa);
+    return pa.results[0];
+}
+
+static void expand_branch_target_simd(PirModule *mod, PirBranchTarget *bt,
+                                      const VecSplit *splits, uint32_t orig_vals) {
+    if (bt->arg_count == 0u) return;
+    bool has_any = false;
+    for (uint32_t k = 0u; k < bt->arg_count; ++k) {
+        if (bt->args[k].kind == PIR_OPER_VAL && bt->args[k].u.val < orig_vals &&
+            splits[bt->args[k].u.val].count > 0u) {
+            has_any = true;
+            break;
+        }
+    }
+    if (!has_any) return;
+    PIR_VEC(PirOperand) nargs = {0};
+    for (uint32_t k = 0u; k < bt->arg_count; ++k) {
+        PirOperand a = bt->args[k];
+        if (a.kind == PIR_OPER_VAL && a.u.val < orig_vals && splits[a.u.val].count > 0u) {
+            const VecSplit *sp = &splits[a.u.val];
+            for (uint32_t p = 0u; p < sp->count; ++p) {
+                PIR_VEC_PUSH(&nargs, pir_op_val(sp->ids[p], sp->piece_ty));
+            }
+        } else {
+            PIR_VEC_PUSH(&nargs, a);
+        }
+    }
+    bt->arg_count = nargs.len;
+    bt->args      = pir_alloc_ops(mod, nargs.len);
+    memcpy(bt->args, nargs.data, nargs.len * sizeof(PirOperand));
+    PIR_VEC_FREE(&nargs);
+}
+
+static bool is_cmp_op(PirOpcode op) {
+    return (op >= PIR_OP_CMP_EQ && op <= PIR_OP_CMP_GE_U) ||
+           (op >= PIR_OP_FCMP_OEQ && op <= PIR_OP_FCMP_UGE);
+}
+
+static void legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirFuncId fi) {
+    PirFunction *fn = &mod->funcs.data[fi];
+    if (!fn->is_defined) return;
+    uint16_t max_bits = target->caps.max_simd_bits;
+
+    bool has_oversized = false;
+    for (uint32_t v = 0u; v < fn->values.len; ++v) {
+        if (needs_split(fn->values.data[v].type, max_bits)) { has_oversized = true; break; }
+    }
+    if (!has_oversized) {
+        for (uint32_t i = 0u; i < fn->insts.len; ++i) {
+            if (needs_split(fn->insts.data[i].ty, max_bits)) { has_oversized = true; break; }
+        }
+    }
+    if (!has_oversized) return;
+
+    PirType t8     = pir_type_scalar(PIR_SCALAR_I8);
+    PirType tptr   = pir_type_scalar(PIR_SCALAR_PTR);
+    PirType idx_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
+
+    uint32_t orig_vals = fn->values.len;
+    VecSplit *splits = (VecSplit *)calloc(orig_vals + 1u, sizeof(VecSplit));
+    if (!splits) abort();
+
+    for (uint32_t v = 0u; v < orig_vals; ++v) {
+        PirType vt = fn->values.data[v].type;
+        if (!needs_split(vt, max_bits)) continue;
+        PirType pty;
+        uint32_t cnt = 0u;
+        split_spec(vt.u.vec, max_bits, &pty, &cnt);
+        splits[v].piece_ty = pty;
+        splits[v].count    = cnt;
+        splits[v].ids      = PIR_ARENA_NEW_ARRAY(&mod->arena, PirValueId, cnt);
+        PirBlockId db = fn->values.data[v].def_block;
+        uint32_t   pi = fn->values.data[v].param_index;
+        fn->values.data[v].type = pty;
+        splits[v].ids[0] = v;
+        for (uint32_t p = 1u; p < cnt; ++p) {
+            splits[v].ids[p] = pir_fn_new_val(mod, fn, "vp", pty, db, PIR_INVALID_ID, pi);
+        }
+    }
+
+    /* Expand block params. */
+    for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
+        PirValueIdVec nparams = {0};
+        for (uint32_t k = 0u; k < fn->blocks.data[b].params.len; ++k) {
+            PirValueId pv = fn->blocks.data[b].params.data[k];
+            if (pv < orig_vals && splits[pv].count > 0u) {
+                for (uint32_t p = 0u; p < splits[pv].count; ++p) {
+                    PIR_VEC_PUSH(&nparams, splits[pv].ids[p]);
+                }
+            } else {
+                PIR_VEC_PUSH(&nparams, pv);
+            }
+        }
+        for (uint32_t k = 0u; k < nparams.len; ++k) {
+            fn->values.data[nparams.data[k]].param_index = k;
+        }
+        PIR_VEC_FREE(&fn->blocks.data[b].params);
+        fn->blocks.data[b].params = nparams;
+    }
+
+    /* Expand function params if any are oversized vectors. */
+    bool has_split_fp = false;
+    for (uint32_t i = 0u; i < fn->param_count; ++i) {
+        if (needs_split(fn->params[i].type, max_bits)) { has_split_fp = true; break; }
+    }
+    if (has_split_fp) {
+        PIR_VEC(PirParamDecl) nfp = {0};
+        for (uint32_t i = 0u; i < fn->param_count; ++i) {
+            if (needs_split(fn->params[i].type, max_bits)) {
+                const VecSplit *sp = &splits[fn->params[i].val_id];
+                for (uint32_t p = 0u; p < sp->count; ++p) {
+                    PirParamDecl pd = fn->params[i];
+                    pd.type   = sp->piece_ty;
+                    pd.val_id = sp->ids[p];
+                    pd.name   = fn->values.data[pd.val_id].name;
+                    PIR_VEC_PUSH(&nfp, pd);
+                }
+            } else {
+                PIR_VEC_PUSH(&nfp, fn->params[i]);
+            }
+        }
+        for (uint32_t k = 0u; k < nfp.len; ++k) {
+            if (nfp.data[k].val_id != PIR_INVALID_ID) {
+                fn->values.data[nfp.data[k].val_id].param_index = k;
+            }
+        }
+        fn->param_count = nfp.len;
+        fn->params = PIR_ARENA_NEW_ARRAY(&mod->arena, PirParamDecl, nfp.len);
+        memcpy(fn->params, nfp.data, nfp.len * sizeof(PirParamDecl));
+        PIR_VEC_FREE(&nfp);
+    }
+
+    PIR_VEC(SimdAlias) aliases = {0};
+
+    for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
+        PirInstIdVec new_insts = {0};
+        uint32_t old_len = fn->blocks.data[b].insts.len;
+
+        for (uint32_t j = 0u; j < old_len; ++j) {
+            PirInstId iid = fn->blocks.data[b].insts.data[j];
+            PirInst copy  = fn->insts.data[iid];
+            uint32_t ln = copy.src_line, lc = copy.loc_idx;
+
+            if (copy.op == PIR_OP_JMP || copy.op == PIR_OP_BR || copy.op == PIR_OP_SWITCH) {
+                PirInst *slot = &fn->insts.data[iid];
+                expand_branch_target_simd(mod, &slot->targets[0], splits, orig_vals);
+                if (copy.op == PIR_OP_BR) {
+                    expand_branch_target_simd(mod, &slot->targets[1], splits, orig_vals);
+                } else if (copy.op == PIR_OP_SWITCH) {
+                    for (uint32_t c = 0u; c < slot->switch_case_count; ++c) {
+                        expand_branch_target_simd(mod, &slot->switch_cases[c].target, splits, orig_vals);
+                    }
+                }
+                PIR_VEC_PUSH(&new_insts, iid);
+                continue;
+            }
+
+            /* Check if any operand or primary type needs splitting. */
+            bool op_split = needs_split(copy.ty, max_bits);
+            for (uint32_t k = 0u; k < copy.operand_count && !op_split; ++k) {
+                if (copy.operands[k].kind == PIR_OPER_VAL &&
+                    copy.operands[k].u.val < orig_vals &&
+                    splits[copy.operands[k].u.val].count > 0u) {
+                    op_split = true;
+                }
+            }
+            if (!op_split) {
+                PIR_VEC_PUSH(&new_insts, iid);
+                continue;
+            }
+
+            PirValueId r0 = copy.results[0];
+            const VecSplit *rsp = (r0 != PIR_INVALID_ID && r0 < orig_vals && splits[r0].count > 0u)
+                                  ? &splits[r0] : NULL;
+
+            if (copy.op == PIR_OP_SPLAT) {
+                if (max_bits == 0u) {
+                    /* Scalarized splat: every lane is the scalar operand! */
+                    PirOperand sc = copy.operands[0];
+                    for (uint32_t p = 0u; p < rsp->count; ++p) {
+                        if (sc.kind == PIR_OPER_VAL) {
+                            SimdAlias al = { rsp->ids[p], sc.u.val };
+                            PIR_VEC_PUSH(&aliases, al);
+                        } else {
+                            PirInst c = pir_make_inst(PIR_OP_CONST, rsp->piece_ty, ln, lc);
+                            c.operand_count = 1u; c.operands = pir_alloc_ops(mod, 1u);
+                            c.operands[0] = sc; c.results[0] = rsp->ids[p];
+                            pir_fn_append_inst(fn, &new_insts, c);
+                        }
+                    }
+                } else {
+                    for (uint32_t p = 0u; p < rsp->count; ++p) {
+                        PirInst sp = pir_make_inst(PIR_OP_SPLAT, rsp->piece_ty, ln, lc);
+                        sp.operand_count = 1u; sp.operands = pir_alloc_ops(mod, 1u);
+                        sp.operands[0] = copy.operands[0];
+                        sp.results[0]  = rsp->ids[p];
+                        pir_fn_append_inst(fn, &new_insts, sp);
+                    }
+                }
+            } else if (copy.op == PIR_OP_EXTRACT) {
+                const VecSplit *vsp = &splits[copy.operands[0].u.val];
+                uint64_t idx = copy.imm_u64;
+                if (max_bits == 0u) {
+                    SimdAlias al = { r0, vsp->ids[idx] };
+                    PIR_VEC_PUSH(&aliases, al);
+                } else {
+                    uint32_t half_lanes = pir_vec_lanes(vsp->piece_ty.u.vec);
+                    uint32_t which = (idx < half_lanes) ? 0u : 1u;
+                    uint64_t sub   = (idx < half_lanes) ? idx : (idx - half_lanes);
+                    PirInst ex = pir_make_inst(PIR_OP_EXTRACT, vsp->piece_ty, ln, lc);
+                    ex.imm_u64 = sub;
+                    ex.operand_count = 1u; ex.operands = pir_alloc_ops(mod, 1u);
+                    ex.operands[0] = pir_op_val(vsp->ids[which], vsp->piece_ty);
+                    ex.results[0]  = r0;
+                    pir_fn_append_inst(fn, &new_insts, ex);
+                }
+            } else if (copy.op == PIR_OP_INSERT) {
+                const VecSplit *vsp = &splits[copy.operands[0].u.val];
+                uint64_t idx = copy.imm_u64;
+                if (max_bits == 0u) {
+                    for (uint32_t p = 0u; p < rsp->count; ++p) {
+                        if (p == idx) {
+                            if (copy.operands[1].kind == PIR_OPER_VAL) {
+                                SimdAlias al = { rsp->ids[p], copy.operands[1].u.val };
+                                PIR_VEC_PUSH(&aliases, al);
+                            } else {
+                                PirInst c = pir_make_inst(PIR_OP_CONST, rsp->piece_ty, ln, lc);
+                                c.operand_count = 1u; c.operands = pir_alloc_ops(mod, 1u);
+                                c.operands[0] = copy.operands[1]; c.results[0] = rsp->ids[p];
+                                pir_fn_append_inst(fn, &new_insts, c);
+                            }
+                        } else {
+                            SimdAlias al = { rsp->ids[p], vsp->ids[p] };
+                            PIR_VEC_PUSH(&aliases, al);
+                        }
+                    }
+                } else {
+                    uint32_t half_lanes = pir_vec_lanes(vsp->piece_ty.u.vec);
+                    uint32_t which = (idx < half_lanes) ? 0u : 1u;
+                    uint64_t sub   = (idx < half_lanes) ? idx : (idx - half_lanes);
+                    for (uint32_t p = 0u; p < 2u; ++p) {
+                        if (p == which) {
+                            PirInst ins = pir_make_inst(PIR_OP_INSERT, rsp->piece_ty, ln, lc);
+                            ins.imm_u64 = sub;
+                            ins.operand_count = 2u; ins.operands = pir_alloc_ops(mod, 2u);
+                            ins.operands[0] = pir_op_val(vsp->ids[p], rsp->piece_ty);
+                            ins.operands[1] = copy.operands[1];
+                            ins.results[0]  = rsp->ids[p];
+                            pir_fn_append_inst(fn, &new_insts, ins);
+                        } else {
+                            SimdAlias al = { rsp->ids[p], vsp->ids[p] };
+                            PIR_VEC_PUSH(&aliases, al);
+                        }
+                    }
+                }
+            } else if (copy.op == PIR_OP_SHUFFLE) {
+                const VecSplit *a = &splits[copy.operands[0].u.val];
+                const VecSplit *bv = &splits[copy.operands[1].u.val];
+                uint32_t lanes = pir_vec_lanes(copy.ty.u.vec);
+                if (max_bits == 0u) {
+                    for (uint32_t l = 0u; l < lanes; ++l) {
+                        uint8_t idx = copy.shuffle_mask[l];
+                        PirValueId src_v = (idx < lanes) ? a->ids[idx] : bv->ids[idx - lanes];
+                        SimdAlias al = { rsp->ids[l], src_v };
+                        PIR_VEC_PUSH(&aliases, al);
+                    }
+                } else {
+                    /* Build each 128-bit output half via extract + insert (handles arbitrary cross-half). */
+                    uint32_t h = lanes / 2u;
+                    PirType elem_ty = pir_type_scalar(pir_vec_elem_scalar(copy.ty.u.vec));
+                    PirValueId sources[4] = { a->ids[0], a->ids[1], bv->ids[0], bv->ids[1] };
+                    for (uint32_t half = 0u; half < 2u; ++half) {
+                        PirValueId cur_v = PIR_INVALID_ID;
+                        for (uint32_t l = 0u; l < h; ++l) {
+                            uint8_t idx = copy.shuffle_mask[half * h + l];
+                            uint32_t src_half = idx / h;
+                            uint32_t src_lane = idx % h;
+                            PirInst ex = pir_make_inst(PIR_OP_EXTRACT, rsp->piece_ty, ln, lc);
+                            ex.imm_u64 = src_lane;
+                            ex.operand_count = 1u; ex.operands = pir_alloc_ops(mod, 1u);
+                            ex.operands[0] = pir_op_val(sources[src_half], rsp->piece_ty);
+                            ex.results[0]  = pir_fn_new_val(mod, fn, "sh_e", elem_ty, b, PIR_INVALID_ID, 0u);
+                            pir_fn_append_inst(fn, &new_insts, ex);
+
+                            if (l == 0u) {
+                                PirInst sp = pir_make_inst(PIR_OP_SPLAT, rsp->piece_ty, ln, lc);
+                                sp.operand_count = 1u; sp.operands = pir_alloc_ops(mod, 1u);
+                                sp.operands[0] = pir_op_val(ex.results[0], elem_ty);
+                                sp.results[0]  = (h == 1u) ? rsp->ids[half]
+                                                           : pir_fn_new_val(mod, fn, "sh_v", rsp->piece_ty, b, PIR_INVALID_ID, 0u);
+                                pir_fn_append_inst(fn, &new_insts, sp);
+                                cur_v = sp.results[0];
+                            } else {
+                                PirInst ins = pir_make_inst(PIR_OP_INSERT, rsp->piece_ty, ln, lc);
+                                ins.imm_u64 = l;
+                                ins.operand_count = 2u; ins.operands = pir_alloc_ops(mod, 2u);
+                                ins.operands[0] = pir_op_val(cur_v, rsp->piece_ty);
+                                ins.operands[1] = pir_op_val(ex.results[0], elem_ty);
+                                ins.results[0]  = (l + 1u == h) ? rsp->ids[half]
+                                                                : pir_fn_new_val(mod, fn, "sh_v", rsp->piece_ty, b, PIR_INVALID_ID, 0u);
+                                pir_fn_append_inst(fn, &new_insts, ins);
+                                cur_v = ins.results[0];
+                            }
+                        }
+                    }
+                }
+            } else if (copy.op == PIR_OP_LOAD) {
+                uint32_t piece_bytes = (uint32_t)(pir_type_bits(rsp->piece_ty, target->ptr_bytes) / 8u);
+                for (uint32_t p = 0u; p < rsp->count; ++p) {
+                    uint64_t off = (uint64_t)p * piece_bytes;
+                    PirValueId ptr_p = emit_padd(mod, fn, b, &new_insts, copy.operands[0], off, idx_ty, ln, lc);
+                    PirInst ld = pir_make_inst(PIR_OP_LOAD, rsp->piece_ty, ln, lc);
+                    ld.align = aligned_offset_align(copy.align, off, piece_bytes);
+                    ld.flags = copy.flags;
+                    ld.operand_count = 1u; ld.operands = pir_alloc_ops(mod, 1u);
+                    ld.operands[0] = pir_op_val(ptr_p, tptr);
+                    ld.results[0]  = rsp->ids[p];
+                    pir_fn_append_inst(fn, &new_insts, ld);
+                }
+            } else if (copy.op == PIR_OP_STORE) {
+                const VecSplit *vsp = &splits[copy.operands[0].u.val];
+                uint32_t piece_bytes = (uint32_t)(pir_type_bits(vsp->piece_ty, target->ptr_bytes) / 8u);
+                for (uint32_t p = 0u; p < vsp->count; ++p) {
+                    uint64_t off = (uint64_t)p * piece_bytes;
+                    PirValueId ptr_p = emit_padd(mod, fn, b, &new_insts, copy.operands[1], off, idx_ty, ln, lc);
+                    PirInst st = pir_make_inst(PIR_OP_STORE, vsp->piece_ty, ln, lc);
+                    st.align = aligned_offset_align(copy.align, off, piece_bytes);
+                    st.flags = copy.flags;
+                    st.operand_count = 2u; st.operands = pir_alloc_ops(mod, 2u);
+                    st.operands[0] = pir_op_val(vsp->ids[p], vsp->piece_ty);
+                    st.operands[1] = pir_op_val(ptr_p, tptr);
+                    pir_fn_append_inst(fn, &new_insts, st);
+                }
+            } else if (copy.op == PIR_OP_BITCAST) {
+                PirValueId src_v = copy.operands[0].u.val;
+                const VecSplit *ssp = (src_v < orig_vals && splits[src_v].count > 0u) ? &splits[src_v] : NULL;
+                if (ssp && rsp && ssp->count == rsp->count &&
+                    pir_type_bits(ssp->piece_ty, target->ptr_bytes) ==
+                    pir_type_bits(rsp->piece_ty, target->ptr_bytes)) {
+                    for (uint32_t p = 0u; p < rsp->count; ++p) {
+                        PirInst bc = pir_make_inst(PIR_OP_BITCAST, rsp->piece_ty, ln, lc);
+                        bc.operand_count = 1u; bc.operands = pir_alloc_ops(mod, 1u);
+                        bc.operands[0] = pir_op_val(ssp->ids[p], ssp->piece_ty);
+                        bc.results[0]  = rsp->ids[p];
+                        pir_fn_append_inst(fn, &new_insts, bc);
+                    }
+                } else {
+                    /* General cross-lane-count bitcast via stack slot. */
+                    uint32_t total_bytes = (uint32_t)(pir_type_bits(copy.ty, target->ptr_bytes) / 8u);
+                    PirInst al = pir_make_inst(PIR_OP_ALLOCA_PTR, tptr, ln, lc);
+                    al.imm_u64 = total_bytes; al.align = total_bytes;
+                    al.results[0] = pir_fn_new_val(mod, fn, "vbc", tptr, b, PIR_INVALID_ID, 0u);
+                    pir_fn_append_inst(fn, &new_insts, al);
+                    if (ssp) {
+                        uint32_t pb = (uint32_t)(pir_type_bits(ssp->piece_ty, target->ptr_bytes) / 8u);
+                        for (uint32_t p = 0u; p < ssp->count; ++p) {
+                            PirValueId sp = emit_padd(mod, fn, b, &new_insts, pir_op_val(al.results[0], tptr), (uint64_t)p * pb, idx_ty, ln, lc);
+                            PirInst st = pir_make_inst(PIR_OP_STORE, ssp->piece_ty, ln, lc);
+                            st.align = pb; st.operand_count = 2u; st.operands = pir_alloc_ops(mod, 2u);
+                            st.operands[0] = pir_op_val(ssp->ids[p], ssp->piece_ty);
+                            st.operands[1] = pir_op_val(sp, tptr);
+                            pir_fn_append_inst(fn, &new_insts, st);
+                        }
+                    } else {
+                        PirInst st = pir_make_inst(PIR_OP_STORE, copy.operands[0].type, ln, lc);
+                        st.align = total_bytes; st.operand_count = 2u; st.operands = pir_alloc_ops(mod, 2u);
+                        st.operands[0] = copy.operands[0];
+                        st.operands[1] = pir_op_val(al.results[0], tptr);
+                        pir_fn_append_inst(fn, &new_insts, st);
+                    }
+                    if (rsp) {
+                        uint32_t pb = (uint32_t)(pir_type_bits(rsp->piece_ty, target->ptr_bytes) / 8u);
+                        for (uint32_t p = 0u; p < rsp->count; ++p) {
+                            PirValueId lp = emit_padd(mod, fn, b, &new_insts, pir_op_val(al.results[0], tptr), (uint64_t)p * pb, idx_ty, ln, lc);
+                            PirInst ld = pir_make_inst(PIR_OP_LOAD, rsp->piece_ty, ln, lc);
+                            ld.align = pb; ld.operand_count = 1u; ld.operands = pir_alloc_ops(mod, 1u);
+                            ld.operands[0] = pir_op_val(lp, tptr);
+                            ld.results[0]  = rsp->ids[p];
+                            pir_fn_append_inst(fn, &new_insts, ld);
+                        }
+                    } else {
+                        PirInst ld = pir_make_inst(PIR_OP_LOAD, copy.ty, ln, lc);
+                        ld.align = total_bytes; ld.operand_count = 1u; ld.operands = pir_alloc_ops(mod, 1u);
+                        ld.operands[0] = pir_op_val(al.results[0], tptr);
+                        ld.results[0]  = r0;
+                        pir_fn_append_inst(fn, &new_insts, ld);
+                    }
+                }
+            } else if (copy.op == PIR_OP_SELECT) {
+                const VecSplit *csp = &splits[copy.operands[0].u.val];
+                const VecSplit *tsp = &splits[copy.operands[1].u.val];
+                const VecSplit *fsp = &splits[copy.operands[2].u.val];
+                for (uint32_t p = 0u; p < rsp->count; ++p) {
+                    PirOperand cond_p = pir_op_val(csp->ids[p], csp->piece_ty);
+                    if (max_bits == 0u) {
+                        /* Convert -1/0 integer mask lane to i8 1/0 for scalar select. */
+                        PirInst ne = pir_make_inst(PIR_OP_CMP_NE, csp->piece_ty, ln, lc);
+                        ne.operand_count = 2u; ne.operands = pir_alloc_ops(mod, 2u);
+                        ne.operands[0] = cond_p;
+                        ne.operands[1] = pir_op_imm_i(0u, false, csp->piece_ty);
+                        ne.results[0]  = pir_fn_new_val(mod, fn, "sb", t8, b, PIR_INVALID_ID, 0u);
+                        pir_fn_append_inst(fn, &new_insts, ne);
+                        cond_p = pir_op_val(ne.results[0], t8);
+                    }
+                    PirInst sel = pir_make_inst(PIR_OP_SELECT, rsp->piece_ty, ln, lc);
+                    sel.operand_count = 3u; sel.operands = pir_alloc_ops(mod, 3u);
+                    sel.operands[0] = cond_p;
+                    sel.operands[1] = pir_op_val(tsp->ids[p], rsp->piece_ty);
+                    sel.operands[2] = pir_op_val(fsp->ids[p], rsp->piece_ty);
+                    sel.results[0]  = rsp->ids[p];
+                    pir_fn_append_inst(fn, &new_insts, sel);
+                }
+            } else if (is_cmp_op(copy.op)) {
+                const VecSplit *asp = &splits[copy.operands[0].u.val];
+                const VecSplit *bsp = &splits[copy.operands[1].u.val];
+                for (uint32_t p = 0u; p < rsp->count; ++p) {
+                    if (max_bits == 0u) {
+                        /* Scalar cmp returns i8 (0/1); widen to -1/0 mask lane. */
+                        PirInst c = pir_make_inst(copy.op, asp->piece_ty, ln, lc);
+                        c.operand_count = 2u; c.operands = pir_alloc_ops(mod, 2u);
+                        c.operands[0] = pir_op_val(asp->ids[p], asp->piece_ty);
+                        c.operands[1] = pir_op_val(bsp->ids[p], bsp->piece_ty);
+                        c.results[0]  = pir_fn_new_val(mod, fn, "vc", t8, b, PIR_INVALID_ID, 0u);
+                        pir_fn_append_inst(fn, &new_insts, c);
+
+                        PirInst m = pir_make_inst(PIR_OP_SELECT, rsp->piece_ty, ln, lc);
+                        m.operand_count = 3u; m.operands = pir_alloc_ops(mod, 3u);
+                        m.operands[0] = pir_op_val(c.results[0], t8);
+                        m.operands[1] = pir_op_imm_i(1u, true, rsp->piece_ty);
+                        m.operands[2] = pir_op_imm_i(0u, false, rsp->piece_ty);
+                        m.results[0]  = rsp->ids[p];
+                        pir_fn_append_inst(fn, &new_insts, m);
+                    } else {
+                        PirInst c = pir_make_inst(copy.op, asp->piece_ty, ln, lc);
+                        c.operand_count = 2u; c.operands = pir_alloc_ops(mod, 2u);
+                        c.operands[0] = pir_op_val(asp->ids[p], asp->piece_ty);
+                        c.operands[1] = pir_op_val(bsp->ids[p], bsp->piece_ty);
+                        c.results[0]  = rsp->ids[p];
+                        pir_fn_append_inst(fn, &new_insts, c);
+                    }
+                }
+            } else {
+                /* Generic lane-wise unary or binary op (arith, bitwise, shift, float, casts). */
+                for (uint32_t p = 0u; p < rsp->count; ++p) {
+                    PirInst ni = pir_make_inst(copy.op, rsp->piece_ty, ln, lc);
+                    ni.flags         = copy.flags;
+                    ni.operand_count = copy.operand_count;
+                    ni.operands      = pir_alloc_ops(mod, copy.operand_count);
+                    for (uint32_t k = 0u; k < copy.operand_count; ++k) {
+                        const VecSplit *osp = &splits[copy.operands[k].u.val];
+                        ni.operands[k] = pir_op_val(osp->ids[p], osp->piece_ty);
+                    }
+                    ni.results[0] = rsp->ids[p];
+                    pir_fn_append_inst(fn, &new_insts, ni);
+                }
+            }
+        }
+        PIR_VEC_FREE(&fn->blocks.data[b].insts);
+        fn->blocks.data[b].insts = new_insts;
+    }
+
+    for (uint32_t i = 0u; i < aliases.len; ++i) {
+        PirValueId root = aliases.data[i].to;
+        for (bool progress = true; progress; ) {
+            progress = false;
+            for (uint32_t k = 0u; k < aliases.len; ++k) {
+                if (aliases.data[k].from == root) {
+                    root = aliases.data[k].to;
+                    progress = true;
+                    break;
+                }
+            }
+        }
+        pir_fn_replace_val_uses(fn, aliases.data[i].from, root);
+    }
+    PIR_VEC_FREE(&aliases);
+    free(splits);
+}
+
+bool pir_legalize_simd(PirModule *mod, const PirTargetSpec *target, PirDiag *diag) {
+    (void)diag;
+    if (target->caps.max_simd_bits >= 256u) {
+        return true;
+    }
+    for (uint32_t fi = 0u; fi < mod->funcs.len; ++fi) {
+        legalize_simd_func(mod, target, fi);
+    }
+    return true;
+}

@@ -1,0 +1,1207 @@
+#ifndef SLIMCC_H
+#define SLIMCC_H
+
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE 1
+#endif
+#define _XOPEN_SOURCE 700
+#include <assert.h>
+#include <errno.h>
+#include <glob.h>
+#include <inttypes.h>
+#include <libgen.h>
+#include <limits.h>
+#include <signal.h>
+#include <spawn.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#if defined(__has_builtin)
+# define SLIMCC_HAS_BUILTIN(x) __has_builtin(x)
+#else
+# define SLIMCC_HAS_BUILTIN(x) 0
+#endif
+
+#if defined(__has_attribute)
+# define SLIMCC_HAS_ATTR(x) __has_attribute(x)
+#else
+# define SLIMCC_HAS_ATTR(x) 0
+#endif
+
+#if defined(__has_c_attribute)
+# define SLIMCC_HAS_C_ATTR(x) __has_c_attribute(x)
+#else
+# define SLIMCC_HAS_C_ATTR(x) 0
+#endif
+
+#if defined(__has_feature)
+# define SLIMCC_HAS_FEAT(x) __has_feature(x)
+#else
+# define SLIMCC_HAS_FEAT(x) 0
+#endif
+
+#if SLIMCC_HAS_FEAT(address_sanitizer) || defined(__SANITIZE_ADDRESS__)
+# define USE_ASAN
+# include <sanitizer/asan_interface.h>
+#endif
+
+#if SLIMCC_HAS_FEAT(undefined_behavior_sanitizer) || defined(__SANITIZE_UNDEFINED__)
+# define USE_UBSAN
+#endif
+
+#if SLIMCC_HAS_FEAT(type_sanitizer) || defined(__SANITIZE_TYPE__)
+# define USE_TYSAN
+#endif
+
+#if defined(USE_ASAN) || defined(__FILC__)
+# define EAGER_FREE 1
+#else
+# define EAGER_FREE 0
+#endif
+
+#if (defined(__GNUC__) && __GNUC__ >= 3) || SLIMCC_HAS_ATTR(format)
+# define FMTCHK(x, y) __attribute__((format(printf, (x), (y))))
+#else
+# define FMTCHK(x, y)
+#endif
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+# define NORETURN _Noreturn
+#elif __GNUC__ >= 3 || SLIMCC_HAS_ATTR(noreturn)
+# define NORETURN __attribute__((noreturn))
+#elif SLIMCC_HAS_C_ATTR(noreturn)
+# define NORETURN [[noreturn]]
+#else
+# define NORETURN
+#endif
+
+#if defined(__SIZEOF_LONG_LONG__) && __SIZEOF_LONG_LONG__ == 8
+# if SLIMCC_HAS_BUILTIN(__builtin_popcountll)
+#  define Pop64(x) __builtin_popcountll((uint64_t)(x))
+# endif
+# if SLIMCC_HAS_BUILTIN(__builtin_ctzll)
+#  define Ctz64(x) __builtin_ctzll((uint64_t)(x))
+# endif
+# if SLIMCC_HAS_BUILTIN(__builtin_clzll)
+#  define Clz64(x) __builtin_clzll((uint64_t)(x))
+# endif
+#endif
+
+#if defined(__has_include)
+# if __has_include(<stdbit.h>)
+#  include <stdbit.h>
+#  ifndef Pop64
+#   define Pop64(x) (int)stdc_count_ones((uint64_t)(x))
+#  endif
+#  ifndef Ctz64
+#   define Ctz64(x) (int)stdc_trailing_zeros((uint64_t)(x))
+#  endif
+#  ifndef Clz64
+#   define Clz64(x) (int)stdc_leading_zeros((uint64_t)(x))
+#  endif
+# endif
+#endif
+
+#ifndef Pop64
+# define Pop64(x) _pop64_impl(x)
+static inline int _pop64_impl(uint64_t v) {
+  int cnt = 0;
+  for (; v; cnt++)
+    v &= v - 1;
+  return cnt;
+}
+#endif
+
+#ifndef Ctz64
+# define Ctz64(x) _ctz64_impl(x)
+static inline int _ctz64_impl(uint64_t v) {
+  return Pop64((v & -v) - 1);
+}
+#endif
+
+#ifdef __clang__
+# pragma clang diagnostic ignored "-Wswitch"
+#endif
+
+#if defined(__GNUC__)
+# define BUFF_CAST(_t, _ptr)  \
+   __extension__({            \
+    union U {                 \
+      char _m1;               \
+      _t _m2;                 \
+    };                        \
+    ((union U *)(_ptr))->_m2; \
+   })
+#else
+# define BUFF_CAST(_t, _ptr) (*((_t *)(_ptr)))
+#endif
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+# define S_ASSERT(x) static_assert((x), "");
+#else
+# define S_ASSERT(x)
+#endif
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+# define ANON_UNION_START union {
+# define ANON_UNION_END \
+   }                    \
+   ;
+#else
+# define ANON_UNION_START
+# define ANON_UNION_END
+#endif
+
+#define MAX(x, y) ((x) < (y) ? (y) : (x))
+#define MIN(x, y) ((x) < (y) ? (x) : (y))
+
+#define Ucast(c) (unsigned int)(unsigned char)(c)
+#define Inrange(c, x, y) ((Ucast(c) - Ucast(x)) <= (Ucast(y) - Ucast(x)))
+#define Isdigit(c) Inrange((c), '0', '9')
+#define Isalpha(c) Inrange((c) | 0x20, 'a', 'z')
+#define Isalnum(c) (Isalpha(c) || Isdigit(c))
+#define Isxdigit(c) (Isdigit(c) || Inrange((c) | 0x20, 'a', 'f'))
+#define Casecmp(c, a) (((c) | 0x20) == a)
+
+#ifdef BOOTSTRAP_NO_LDOUBLE
+typedef double long_double_t;
+#else
+typedef long double long_double_t;
+#endif
+
+typedef struct Type Type;
+typedef struct Node Node;
+typedef struct Member Member;
+typedef struct Relocation Relocation;
+typedef struct LocalLabel LocalLabel;
+typedef struct EnumVal EnumVal;
+typedef union FPVal FPVal;
+typedef struct AsmContext AsmContext;
+typedef struct FuncObj FuncObj;
+typedef struct SlashDelta SlashDelta;
+
+//
+// alloc.c
+//
+
+typedef struct Pool Pool;
+typedef struct {
+  Pool *cur;
+  Pool *head;
+  int used;
+} Arena;
+
+char *arena_format(Arena *arena, const char *fmt, ...);
+char *arena_strdup(Arena *arena, const char *str);
+char *arena_copy_string(Arena *arena, const char *src, size_t len);
+void arena_on(Arena *arena);
+void arena_off(Arena *arena);
+void *arena_calloc(Arena *a, size_t sz);
+void *arena_malloc(Arena *a, size_t sz);
+
+bool check_mem_usage(void);
+
+extern Arena ast_arena;
+extern Arena cc1_arena;
+extern Arena pp_arena;
+extern bool free_alloc;
+
+//
+// hashmap.c
+//
+
+typedef struct {
+  const char *key;
+  int keylen;
+  void *val;
+} HashEntry;
+
+typedef struct {
+  HashEntry *buckets;
+  int32_t capacity;
+  int32_t used;
+} HashMap;
+
+HashEntry *hashmap_get_or_insert(HashMap *map, const char *key, int keylen);
+void *hashmap_get(HashMap *map, const char *key);
+void *hashmap_get2(HashMap *map, const char *key, int keylen);
+void hashmap_put(HashMap *map, const char *key, void *val);
+void hashmap_put2(HashMap *map, const char *key, int keylen, void *val);
+void hashmap_delete(HashMap *map, const char *key);
+void hashmap_delete2(HashMap *map, const char *key, int keylen);
+void hashmap_test(void);
+
+// Represents a deleted hash entry
+#define TOMBSTONE ((void *)-1)
+#define TOMBSTONE_CASE ((uintptr_t)-1)
+
+//
+// strings.c
+//
+
+#define GrowArr(_data, _cap)                         \
+  do {                                               \
+    _data = grow_array(_data, sizeof(*_data), _cap); \
+  } while (0)
+
+typedef struct {
+  const char **data;
+  int32_t capacity;
+  int32_t len;
+} StringArray;
+
+void *grow_array(void *data, size_t sz, int32_t *cap);
+void strarray_push(StringArray *arr, const char *s);
+char *format(const char *fmt, ...) FMTCHK(1, 2);
+
+//
+// tokenize.c
+//
+
+typedef enum {
+  TK_IDENT,   // Identifiers
+  TK_KEYWORD, // Keywords
+  TK_STR,     // String literals
+  TK_ASM_STR,
+  TK_CHAR_LIT, // Character literals
+  TK_CHAR_LIT_PPEV = TK_CHAR_LIT + 1,
+  TK_PP_NUM, // Preprocessing numbers
+  TK_PP_NUM_PPEV = TK_PP_NUM + 1,
+  TK_INTMAX_NUM,
+  TK_FMARK,  // Filemarkers for -E
+  TK_PMARK,  // Placermarkers
+  TK_ATTR,   // GNU attribute
+  TK_BATTR,  // C23 attribute
+  TK_PRAGMA, // #pragma's
+  TK_EOF,    // End-of-file markers
+  TK_INVALID,
+
+  // Punctuators
+  TK_PUNCT,
+  TK_LPAREN,
+  TK_RPAREN,
+  TK_COMMA,
+  TK_SEMI,
+  TK_QMARK,
+  TK_LBRACK,
+  TK_RBRACK,
+  TK_LCURLY,
+  TK_RCURLY,
+  TK_BITNOT,
+  TK_LANGLE,
+  TK_LANGLE_EQ,
+  TK_LANGLE2,
+  TK_RANGLE,
+  TK_RANGLE_EQ,
+  TK_RANGLE2,
+  TK_NOT,
+  TK_NOT_EQ,
+  TK_REM,
+  TK_MUL,
+  TK_DIV,
+  TK_XOR,
+  TK_EQ2,
+  TK_HASH,
+  TK_HASH2,
+  TK_DOT,
+  TK_DOT3,
+  TK_COLON,
+  TK_COLON2,
+  TK_AND,
+  TK_AND2,
+  TK_ADD,
+  TK_ADD2,
+  TK_SUB,
+  TK_SUB2,
+  TK_OR,
+  TK_OR2,
+  TK_ARROW,
+
+  TK_EQ,
+  TK_ADD_EQ,
+  TK_SUB_EQ,
+  TK_MUL_EQ,
+  TK_DIV_EQ,
+  TK_REM_EQ,
+  TK_AND_EQ,
+  TK_OR_EQ,
+  TK_XOR_EQ,
+  TK_LANGLE2_EQ,
+  TK_RANGLE2_EQ,
+
+  TK_PUNCT_END,
+
+  TK_return,
+  TK_if,
+  TK_else,
+  TK_for,
+  TK_while,
+  TK_do,
+  TK_goto,
+  TK_break,
+  TK_continue,
+  TK_switch,
+  TK_case,
+  TK_default,
+  TK_sizeof,
+  TK_Generic,
+  TK_Countof,
+  TK_alignof,
+  TK_asm,
+  TK_static_assert,
+  TK_true,
+  TK_false,
+  TK_nullptr,
+  TK_defer,
+  TK_FUNCTION,
+  TK_GNU_label,
+
+  TK_TYPEKW,
+  TK_void,
+  TK_char,
+  TK_short,
+  TK_int,
+  TK_long,
+  TK_float,
+  TK_double,
+  TK_unsigned,
+  TK_struct,
+  TK_union,
+  TK_enum,
+  TK_typedef,
+  TK_static,
+  TK_extern,
+  TK_auto,
+  TK_register,
+  TK_Atomic,
+  TK_Noreturn,
+  TK_BitInt,
+  TK_auto_type,
+  TK_alignas,
+  TK_bool,
+  TK_const,
+  TK_constexpr,
+  TK_inline,
+  TK_restrict,
+  TK_signed,
+  TK_typeof,
+  TK_typeof_unqual,
+  TK_thread_local,
+  TK_volatile,
+  TK_TYPEKW_END,
+} TokenKind;
+
+typedef enum {
+  INCL_ABS = -2,
+  INCL_REL = -1,
+} InclIdx;
+
+typedef struct File File;
+struct File {
+  const char *name;
+  const char *contents;
+  int file_no;
+
+  int display_file_no;
+  int line_delta;
+  InclIdx incl_idx;
+  bool is_syshdr;
+  bool is_placeholder;
+};
+
+typedef struct Token Token;
+struct Token {
+  Token *next;
+  TokenKind kind : 16;
+  bool at_bol : 1;      // True if this token is at beginning of line
+  bool has_space : 1;   // True if this token follows a space character
+  bool dont_expand : 1; // True if a macro name is encountered during its expansion
+  bool is_incl_guard : 1;
+  bool is_root : 1;
+  bool is_live : 1;
+  bool has_ucn : 1;
+  int len;         // Token length
+  const char *loc; // Token location
+  File *file;
+  Token *origin; // If this is expanded from a macro, the original token
+  int line_no;   // Line number
+  int display_line_no;
+  int display_file_no;
+  Type *ty; // Used if TK_INT_NUM or TK_STR
+  ANON_UNION_START
+  Token *attr_next;
+  Token *alloc_next;
+  ANON_UNION_END
+  ANON_UNION_START
+  int64_t ival; // If kind is TK_INT_NUM, its value
+  char *str;    // String literal contents including terminating '\0'
+  Token *label_next;
+  ANON_UNION_END
+};
+
+NORETURN void error_ice(const char *file, int32_t line);
+NORETURN void error(const char *fmt, ...) FMTCHK(1, 2);
+NORETURN void error_at(const char *loc, const char *fmt, ...) FMTCHK(2, 3);
+NORETURN void error_tok(Token *tok, const char *fmt, ...) FMTCHK(2, 3);
+void warn_tok(Token *tok, const char *fmt, ...) FMTCHK(2, 3);
+void notice_tok(Token *tok, const char *fmt, ...) FMTCHK(2, 3);
+void verror_at_tok(Token *tok, const char *fmt, va_list ap);
+bool equal(Token *tok, const char *op);
+bool equal_ext(Token *tok, const char *op);
+Token *skip_tk(Token *tok, TokenKind);
+bool consume(Token **rest, Token *tok, const char *str);
+bool consume_tk(Token **rest, Token *tok, TokenKind kind);
+Token *tokenize_file(const char *path, Token *tok, Token **end);
+File *new_file(const char *name, const char *contents);
+int add_display_file(const char *path);
+void tokenize_string_literal(Token *tok, Type *basety);
+Token *tokenize(File *file, SlashDelta *delta, Token **end);
+void convert_pp_number(Token *tok, Node *node);
+bool is_pp_token_int(Token *tok);
+TokenKind ident_keyword(Token *tok);
+void convert_ucn_ident(Token *tok);
+
+#define internal_error() error_ice(__FILE__, __LINE__)
+
+//
+// preprocess.c
+//
+
+void init_macros(void);
+void define_macro(const char *name, const char *buf);
+void define_macro_cli(const char *str);
+void undef_macro(const char *name);
+void dump_defines(FILE *out);
+Token *preprocess(const char *file, StringArray *incls, StringArray *macros);
+Token *prepare_parse(Token *tok);
+extern Token *last_alloc_tok;
+extern Token *tok_freelist;
+
+//
+// parse.c
+//
+
+typedef enum {
+  OBJ_GLOBAL = 0,
+  OBJ_TLS,
+  OBJ_LOCAL,
+  OBJ_INDIR,
+} ObjKind;
+
+typedef struct Obj Obj;
+struct Obj {
+  Obj *next;
+  char *name;
+  Type *ty;
+  ObjKind kind;
+  bool is_live;
+  bool is_used;
+  bool is_compound_lit;
+  bool is_string_lit;
+  int alt_align;
+
+  // Local variable
+  int ofs;
+  const char *ptr;
+  Obj *param_next;
+  bool pass_by_stack;
+  bool is_zero_sized_arg;
+  int stack_offset;
+  Node *arg_expr;
+  Obj *vptr;
+
+  // Global variable or function
+  bool is_definition;
+  bool is_static;
+  bool is_weak;
+  bool is_static_lvar;
+  Obj *static_lvars;
+  char *alias_name;
+  char *visibility;
+  char *asm_name;
+
+  // Global variable
+  bool is_common;
+  bool is_nocommon;
+  char *section_name;
+  char *init_data;
+  Relocation *rel;
+
+  // constexpr variable
+  char *constexpr_data;
+
+  // Function
+  bool export_fn;
+  bool is_gnu_inline;
+  bool is_always_inline;
+  bool is_naked;
+  bool is_noreturn;
+  bool returns_twice;
+  bool dont_reuse_stk;
+  bool dealloc_vla;
+  bool is_ctor;
+  bool is_dtor;
+  uint16_t ctor_prior;
+  uint16_t dtor_prior;
+  Node *body;
+  FuncObj *output; // backend defined output object
+};
+
+struct Relocation {
+  Relocation *next;
+  int offset;
+  Node *label;
+  Obj *var;
+  int64_t addend;
+};
+
+typedef enum {
+  DF_VLA_DEALLOC,
+  DF_CLEANUP_FN,
+  DF_DEFER_STMT,
+} DeferKind;
+
+typedef struct DeferStmt DeferStmt;
+struct DeferStmt {
+  DeferKind kind;
+  DeferStmt *next;
+  Obj *vla;
+  Node *cleanup_fn;
+  Node *stmt;
+};
+
+typedef enum {
+  ASMOP_NULL = 0,
+  ASMOP_NUM,
+  ASMOP_SYMBOLIC,
+  ASMOP_MEM,
+  ASMOP_REG,
+  ASMOP_FLAG,
+} AsmOpKind;
+
+typedef struct AsmParam AsmParam;
+struct AsmParam {
+  AsmParam *next;
+  AsmOpKind kind;
+  Token *name;
+  Token *constraint;
+  char *flag;
+  AsmParam *match;
+  Node *arg;
+  Obj *ptr;
+  Obj *var;
+  int64_t val;
+  uint64_t reg_constraint;
+  int label_id;
+  int reg;
+  int var_asm_reg;
+  bool is_mem_inreg;
+  bool is_early_clobber;
+  bool is_clobbered_x87;
+};
+
+// AST node
+typedef enum {
+  ND_NULL_STMT,
+  ND_NULL_EXPR, // Do nothing
+  ND_ADD,       // +
+  ND_SUB,       // -
+  ND_MUL,       // *
+  ND_DIV,       // /
+  ND_POS,       // unary +
+  ND_NEG,       // unary -
+  ND_REM,       // %
+  ND_BITAND,    // &
+  ND_BITOR,     // |
+  ND_BITXOR,    // ^
+  ND_SHL,       // <<
+  ND_SHR,       // >>
+  ND_SAR,       // arithmetic >>
+  ND_EQ,        // ==
+  ND_NE,        // !=
+  ND_LT,        // <
+  ND_LE,        // <=
+  ND_GT,        // >
+  ND_GE,        // >=
+  ND_ASSIGN,    // =
+  ND_COND,      // ?:
+  ND_COMMA,     // ,
+  ND_MEMBER,    // . (struct member access)
+  ND_ADDR,      // unary &
+  ND_DEREF,     // unary *
+  ND_NOT,       // !
+  ND_BITNOT,    // ~
+  ND_LOGAND,    // &&
+  ND_LOGOR,     // ||
+  ND_RETURN,    // "return"
+  ND_IF,        // "if"
+  ND_FOR,       // "for" or "while"
+  ND_DO,        // "do"
+  ND_SWITCH,    // "switch"
+  ND_CASE,      // switch cases
+  ND_DEFAULT,   // switch default case
+  ND_BLOCK,     // { ... }
+  ND_BREAK,
+  ND_CONT,
+  ND_GOTO,      // "goto"
+  ND_GOTO_EXPR, // "goto" labels-as-values
+  ND_ASM_GOTO,
+  ND_LABEL,     // Labeled statement
+  ND_LABEL_VAL, // [GNU] Labels-as-values
+  ND_FUNCALL,   // Function call
+  ND_EXPR_STMT, // Expression statement
+  ND_STMT_EXPR, // Statement expression
+  ND_VAR,       // Variable
+  ND_NUM,       // Integer
+  ND_CAST,      // Type cast
+  ND_INIT_SEQ,
+  ND_ASM,      // "asm"
+  ND_CAS,      // Atomic compare-and-swap
+  ND_EXCH,     // Atomic exchange
+  ND_VA_START, // "va_start"
+  ND_VA_COPY,  // "va_copy"
+  ND_VA_ARG,   // "va_arg"
+  ND_CHAIN,
+  ND_ALLOCA,
+  ND_ALLOCA_ZINIT,
+  ND_ARITH_ASSIGN,
+  ND_POST_INCDEC,
+  ND_CKD_ARITH,
+  ND_FRAME_ADDR,
+  ND_RTN_ADDR,
+  ND_THREAD_FENCE,
+  ND_UNREACHABLE,
+  ND_UNKNOWN,
+} NodeKind;
+
+typedef struct CaseRange CaseRange;
+struct CaseRange {
+  CaseRange *next;
+  Node *label;
+  int64_t lo;
+  int64_t hi;
+};
+
+typedef union {
+  uint64_t as64;
+  uint32_t as32;
+  uint8_t as8;
+} BitBuf;
+
+// AST node type
+struct Node {
+  Node *next;
+  NodeKind kind;
+  NodeKind arith_kind : 30; // Arithmetic Assignment
+  bool no_label : 1;
+  bool is_nonlval : 1;
+  Type *ty;
+  Token *tok; // Representative token
+
+  DeferStmt *dfr_from;
+  DeferStmt *dfr_dest;
+
+  ANON_UNION_START
+  // Misc
+  struct {
+    Node *lhs;
+    Node *rhs;
+    Node *target;
+    Obj *var;
+    Member *member;
+  } m;
+
+  // Numeric literal
+  struct {
+    int64_t val;
+    BitBuf *bitint_data;
+    long_double_t fval;
+    enum {
+      MATH_CONSTANT_NOT = 0,
+      MATH_CONSTANT_NANF,
+      MATH_CONSTANT_INFF,
+      MATH_CONSTANT_NANSF,
+      MATH_CONSTANT_NANS,
+      MATH_CONSTANT_NANSL,
+    } constant;
+  } num;
+
+  // Block or statement expression
+  struct {
+    Node *body;
+    Node *local_labels;
+    Node *result;
+  } blk;
+
+  // if, ?:, for, do, while, switch
+  struct {
+    Node *cond;
+    Node *then;
+    ANON_UNION_START
+    Node *els;
+    Node *for_init;
+    Node *sw_default;
+    ANON_UNION_END
+    ANON_UNION_START
+    Node *for_inc;
+    CaseRange *sw_cases;
+    ANON_UNION_END
+    int64_t id;
+  } ctrl;
+
+  // labels
+  struct {
+    Node *next;
+    int64_t id;
+  } lbl;
+
+  // case
+  struct {
+    Node *parent_sw;
+    int64_t id;
+  } cases;
+
+  // break, continue, goto
+  struct {
+    Node *parent_loop;
+    Node *target;
+  } jmp;
+
+  // Function call
+  struct {
+    Node *expr;
+    Obj *rtn_buf;
+    Obj *args;
+    Obj *alloca_args;
+  } call;
+
+  // Atomic compare-and-swap
+  struct {
+    Node *addr;
+    Node *old_val;
+    Node *new_val;
+  } cas;
+
+  // GNU inline assembly
+  struct {
+    Token *str_tok;
+    AsmParam *outputs;
+    AsmParam *inputs;
+    Token *clobbers;
+    AsmParam *labels;
+    AsmContext *ctx; // backend defined
+  } gasm;
+  ANON_UNION_END
+};
+
+// Represents a block scope.
+typedef struct Scope Scope;
+struct Scope {
+  Scope *parent;
+  Scope *children;
+  Scope *sibling_next;
+
+  Obj *locals;
+  LocalLabel *labels;
+  Node *gotos;
+  bool is_temporary;
+  bool is_stmt;
+  bool is_fn_base;
+  bool has_label;
+  bool has_alloca;
+
+  HashMap vars;
+  HashMap tags;
+};
+
+Node *new_cast(Node *expr, Type *ty);
+int64_t const_expr(Token **rest, Token *tok);
+int64_t eval_sign_extend(Type *ty, int64_t val);
+void eval_fp(Node *node, FPVal *fval);
+Obj *parse(Token *tok);
+Token *skip_paren(Token *tok);
+Node *new_node(NodeKind kind, Token *tok);
+Node *new_var_node(Obj *obj, Token *tok);
+Obj *new_lvar(Type *ty);
+bool is_const_var(Obj *var);
+bool is_const_expr(Node *node, int64_t *val);
+bool is_const_expr_strict(Node *node, int64_t *val);
+bool is_const_fp(Node *node, FPVal *fval);
+bool is_const_zero_bitint(Node *node);
+Obj *eval_var_opt(Node *node, int *ofs, bool let_array, bool let_atomic);
+bool equal_tok(Token *a, Token *b);
+Obj *get_symbol_var(const char *);
+Type *vla_cond_result_len(Type *ty1, Type *ty2, Type *base, Node **cond, Obj **cond_var);
+
+//
+// bitint.c
+//
+
+int32_t eval_bitint_first_set(int32_t bits, BitBuf *op);
+bool eval_bitint_to_bool(int32_t bits, BitBuf *op);
+void eval_bitint_sign_ext(int32_t bits, BitBuf *op, int32_t bits2, bool is_unsigned);
+void eval_bitint_neg(int32_t bits, BitBuf *op);
+void eval_bitint_bitnot(int32_t bits, BitBuf *op);
+void eval_bitint_bitand(int32_t bits, BitBuf *lh, BitBuf *rh);
+void eval_bitint_bitor(int32_t bits, BitBuf *lh, BitBuf *rh);
+void eval_bitint_bitxor(int32_t bits, BitBuf *lh, BitBuf *rh);
+void eval_bitint_shl(int32_t bits, BitBuf *src, BitBuf *dst, int32_t amount);
+void eval_bitint_shr(int32_t bits, BitBuf *src, BitBuf *dst, int32_t amount,
+                     bool is_unsigned);
+void *eval_bitint_bitfield_load(int32_t bits, BitBuf *src, BitBuf *dst, int32_t width,
+                                int32_t ofs, bool is_unsigned);
+void eval_bitint_bitfield_save(int32_t bits, BitBuf *src, BitBuf *dst, int32_t width,
+                               int32_t ofs);
+void eval_bitint_add(int32_t bits, BitBuf *lh, BitBuf *rh);
+void eval_bitint_sub(int32_t bits, BitBuf *lh, BitBuf *rh);
+void eval_bitint_mul(int32_t bits, BitBuf *lh, BitBuf *rh);
+void eval_bitint_div(int32_t bits, BitBuf *lh, BitBuf *rh, bool is_unsigned, bool is_div);
+int eval_bitint_cmp(int32_t bits, BitBuf *lh, BitBuf *rh, bool is_unsigned);
+
+//
+// type.c
+//
+
+typedef enum {
+  ETY_I8 = 0,
+  ETY_U8,
+  ETY_I16,
+  ETY_U16,
+  ETY_I32,
+  ETY_U32,
+  ETY_I64,
+  ETY_U64,
+} EnumType;
+
+struct EnumVal {
+  EnumVal *next;
+  Token *name;
+  int64_t val;
+  Type *ty;
+};
+
+union FPVal {
+  uint64_t chunk[2];
+  uint32_t chunk32[4];
+  long_double_t ld;
+  double d;
+  float f;
+};
+
+typedef enum {
+  TY_VOID,
+  TY_BOOL,
+  TY_PCHAR,
+  TY_CHAR,
+  TY_SHORT,
+  TY_INT,
+  TY_LONG,
+  TY_LONGLONG,
+  TY_FLOAT,
+  TY_DOUBLE,
+  TY_LDOUBLE,
+  TY_ENUM_INCMP,
+  TY_PTR,
+  TY_NULLPTR,
+  TY_FUNC,
+  TY_FUNC_INCMP,
+  TY_ARRAY,
+  TY_ARRAY_INCMP,
+  TY_VLA, // variable-length array
+  TY_STRUCT,
+  TY_UNION,
+  TY_BITINT,
+  TY_AUTO,
+  TY_ASM,
+} TypeKind;
+
+typedef enum {
+  Q_NONE = 0,
+  Q_CONST = 1,
+  Q_VOLATILE = 1 << 1,
+  Q_ATOMIC = 1 << 2,
+  Q_RESTRICT = 1 << 3,
+} QualMask;
+
+struct Type {
+  TypeKind kind;
+  int64_t size;
+  int32_t align;
+  bool is_unsigned;
+  bool is_enum;
+  bool is_int_enum;
+  bool is_fixed_enum;
+  QualMask qual;
+  Type *origin;
+  Type *decl_next; // forward declarations
+  Token *tag;
+  EnumVal *enums;
+
+  // Pointer-to or array-of type.
+  Type *base;
+
+  // _BitInt
+  int64_t bit_cnt;
+
+  // Array
+  int64_t array_len;
+
+  // Variable-length array
+  Node *vla_len_expr;
+  Obj *vla_len_val;
+
+  // Struct
+  Member *members;
+  bool is_flexible;
+  bool is_constructing;
+  bool has_const_member;
+
+  // Function type
+  Scope *scopes;
+  Type *return_ty;
+  Obj *param_list;
+  Node *pre_calc;
+  bool is_variadic;
+  bool is_oldstyle;
+};
+
+// Struct member
+struct Member {
+  Member *next;
+  Type *ty;
+  Token *name;
+  int64_t offset;
+  int idx;
+  int alt_align;
+  bool is_packed;
+
+  bool is_bitfield;
+  bool is_aligned_bitfield;
+  int bit_offset;
+  int bit_width;
+};
+
+extern Type *ty_void;
+extern Type *ty_bool;
+extern Type *ty_nullptr;
+
+extern Type *ty_pchar;
+
+extern Type *ty_char;
+extern Type *ty_short;
+extern Type *ty_int;
+extern Type *ty_long;
+extern Type *ty_llong;
+
+extern Type *ty_uchar;
+extern Type *ty_ushort;
+extern Type *ty_uint;
+extern Type *ty_ulong;
+extern Type *ty_ullong;
+
+extern Type *ty_float;
+extern Type *ty_double;
+extern Type *ty_ldouble;
+
+extern Type *ty_size_t;
+extern Type *ty_ptrdiff_t;
+
+extern Type *ty_intmax_t;
+extern Type *ty_uintmax_t;
+extern Type *ty_eval_int;
+
+extern Type *ty_char16_t;
+extern Type *ty_char32_t;
+extern Type *ty_wchar_t;
+
+extern Type *enum_ty[8];
+extern EnumType ety_of_int;
+
+bool is_pow_of_two(uint64_t val);
+bool is_integer(Type *ty);
+bool is_int_class(Type *ty);
+bool is_flonum(Type *ty);
+bool is_numeric(Type *ty);
+bool is_array(Type *ty);
+bool is_decay_ty(Type *ty);
+bool is_bitfield(Node *node);
+bool is_redundant_cast(Node *expr, Type *ty);
+bool is_compatible(Type *t1, Type *t2);
+bool is_compatible2(Type *t1, Type *t2);
+bool is_record_compat(Type *t1, Type *t2, bool is_redecl);
+bool is_null_ptr_constant(Node *node);
+bool is_ptr(Type *ty);
+int next_pow_of_two(int val);
+int64_t bit_size(Type *ty);
+int64_t bitint_buffer_size(Type *ty);
+int32_t bitfield_footprint(Member *mem);
+void init_ty_lp64(void);
+Type *copy_type(Type *ty);
+Type *pointer_to(Type *base);
+Type *ptr_decay(Type *ty);
+void ptr_convert(Node **node);
+void unqual_rtn_ty(Type *ty, Token *tok);
+Type *func_type(TypeKind kind, Type *return_ty);
+Type *get_func_ty(Node *node);
+Type *array_type(Type *base);
+Type *array_of(Type *base, int64_t size);
+Type *vla_of(Type *base, Node *expr, int64_t arr_len);
+void array_setty(Type *ty, Type *base, int64_t size);
+void vla_setty(Type *ty, Node *size, int64_t arr_len);
+Type *new_type(TypeKind kind, int64_t size, int align);
+Type *new_bitint(int64_t width, Token *tok);
+Type *get_elem(Type *ty);
+Type *unqual(Type *ty);
+Type *tyof_unqual(Type *ty);
+Type *new_derived_type(Type *newty, QualMask qual, Type *ty);
+bool chk_qual_type(QualMask qual, Type *ty);
+Type *aligned_type(int align, Type *ty);
+Type *add_qual(QualMask msk, Type *ty, Token *tok);
+bool mem_iter(Member **mem);
+bool vmty_iter(Type **ty);
+Node *assign_cast(Type *to, Node *expr);
+
+void _add_type(Node *node);
+#define add_type(_n) \
+  do {               \
+    if (!(_n)->ty)   \
+      _add_type(_n); \
+  } while (0)
+
+//
+// codegen.c
+//
+
+int codegen(Obj *prog, FILE *out);
+void prepare_funcall(Node *node, Scope *scope);
+void prepare_inline_asm(Node *node);
+int64_t align_to(int64_t n, int64_t align);
+bool va_arg_need_copy(Type *ty);
+bool bitint_rtn_need_copy(size_t width);
+void emit_text(Obj *fn);
+
+//
+// unicode.c
+//
+
+int encode_utf8(char *buf, uint32_t c);
+uint32_t decode_utf8(const char **new_pos, const char *p);
+bool is_ident1(uint32_t c);
+bool is_ident2(uint32_t c);
+int display_width(const char *p, int len);
+
+//
+// platform.c
+//
+
+void platform_init_driver(void);
+void platform_init_cc1(void);
+void platform_stdinc_paths(StringArray *paths);
+void platform_search_dirs(StringArray *paths);
+void run_assembler(StringArray *as_args, const char *input, const char *output);
+void run_linker(StringArray *paths, StringArray *args, const char *output);
+
+//
+// main.c
+//
+
+typedef enum { STD_C89, STD_C94, STD_C99, STD_C11, STD_C17, STD_C23, STD_C2Y } StdVer;
+
+typedef enum {
+  LT_RELO,
+  LT_SHARED,
+  LT_DYNAMIC,
+  LT_STATIC_PIE,
+  LT_STATIC,
+  LT_PIE,
+} LinkType;
+
+NORETURN void cleanup_exit(int status);
+bool file_exists(const char *path);
+bool in_sysincl_path(int idx);
+bool ignore_missing_dep(const char *path, const char *filename, Token *tok);
+void add_dep_file(const char *path, bool is_sys);
+char *find_dir_w_file(const char *pattern);
+void run_subprocess(const char **argv);
+void add_include_path(StringArray *arr, const char *s);
+
+LinkType link_type_gnustyle(void);
+void ldarg_gnu_base(StringArray *arr, const char *output);
+void ldarg_gnu_linktype(StringArray *arr, LinkType lt, const char *ldso_path);
+void ldarg_gnu_crtbegin(StringArray *arr, LinkType lt, const char *gcc_libpath);
+void ldarg_gnu_inputs(StringArray *arr, StringArray *paths, StringArray *args);
+void ldarg_gnu_lc_lgcc(StringArray *arr, LinkType lt, bool has_libgcc);
+void ldarg_gnu_crtend(StringArray *arr, LinkType lt, const char *gcc_libpath);
+void run_assembler_gnustyle(StringArray *as_args, const char *input, const char *output);
+void run_linker_gnustyle(StringArray *paths, StringArray *inputs, const char *output,
+                         const char *ldso_path, const char *libpath,
+                         const char *gcclibpath);
+
+extern char *argv0;
+extern StringArray include_paths;
+extern StringArray iquote_paths;
+extern StringArray display_files;
+extern bool opt_E;
+extern bool opt_dM;
+extern bool opt_P;
+extern int opt_fpic;
+extern int opt_fpie;
+extern bool opt_femulated_tls;
+extern int opt_fn_align;
+extern bool opt_use_plt;
+extern bool opt_fcommon;
+extern bool opt_optimize;
+extern bool opt_reuse_stack;
+extern bool opt_g;
+extern bool opt_func_sections;
+extern bool opt_data_sections;
+extern bool opt_werror;
+extern const char *opt_visibility;
+extern bool opt_cc1_asm_pp;
+extern StdVer opt_std;
+extern bool is_iso_std;
+extern bool opt_fdefer_ts;
+extern bool opt_short_enums;
+extern bool opt_gnu_keywords;
+extern bool opt_gnu89_inline;
+extern bool opt_ms_anon_struct;
+extern bool opt_disable_visibility;
+extern bool opt_fake_always_inline;
+
+extern bool opt_pie;
+extern bool opt_nopie;
+extern bool opt_pthread;
+extern bool opt_r;
+extern bool opt_rdynamic;
+extern bool opt_static;
+extern bool opt_static_pie;
+extern bool opt_static_libgcc;
+extern bool opt_shared;
+extern bool opt_s;
+extern bool opt_nostartfiles;
+extern bool opt_nodefaultlibs;
+extern bool opt_nolibc;
+extern const char *default_ld;
+extern const char *default_as;
+extern const char *dumpmachine_str;
+
+#ifdef SLIMCC_PIR
+extern const char *opt_isysroot;
+extern const char *opt_pirc;
+extern const char *opt_pir_target;
+extern int opt_pir_opt_level;
+extern bool opt_emit_pir;
+extern bool opt_fwrapv;
+#endif
+
+#endif

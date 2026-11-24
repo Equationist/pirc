@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 Ummon Karpe
+# SPDX-License-Identifier: BSD-3-Clause
+
+# ada83-pir — Ada 83 -> DIANA -> PIR -> pirc compiler driver
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+DIANA_BIN="$ROOT/frontends/diana/bin"
+DIANA2PIR="$SCRIPT_DIR/bin/diana2pir"
+RTL_IMG="$SCRIPT_DIR/build/rtl_lib"
+PIRC="${PIRC:-$ROOT/build/pirc}"
+
+TARGET="aarch64-apple-darwin"
+OPT="-O2"
+CHECKS_FLAG="--checks"
+EMIT_PIR=0
+EMIT_ASM=0
+DO_INTERP=0
+OUTPUT=""
+SRCS=()
+
+usage() {
+    cat >&2 <<EOF
+Usage: ada83-pir [options] <file1.ada> [file2.ada ...]
+Options:
+  -o <file>           Output executable (or .pir/.s with --emit-pir/-S)
+  -O0 | -O1 | -O2     Optimization level passed to pirc (default: -O2)
+  --target=<triple>   Target triple (aarch64-apple-darwin | x86_64-apple-darwin)
+  --no-checks         Suppress Ada runtime range/index/overflow checks
+  --checks            Enable Ada runtime checks (default)
+  --emit-pir          Emit PIR HIR only (single input file)
+  -S                  Emit assembly only (single input file)
+  --interp            Run via pirc --interp (single input file, no C runtime I/O)
+  --pirc=<path>       Override pirc binary path
+EOF
+    exit 1
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) shift; OUTPUT="$1" ;;
+        -O0|-O1|-O2) OPT="$1" ;;
+        --target=*) TARGET="${1#--target=}" ;;
+        --target) shift; TARGET="$1" ;;
+        --no-checks) CHECKS_FLAG="--no-checks" ;;
+        --checks) CHECKS_FLAG="--checks" ;;
+        --emit-pir) EMIT_PIR=1 ;;
+        -S) EMIT_ASM=1 ;;
+        --interp) DO_INTERP=1 ;;
+        --pirc=*) PIRC="${1#--pirc=}" ;;
+        -h|--help) usage ;;
+        -*) echo "ada83-pir: unknown option '$1'" >&2; usage ;;
+        *) SRCS+=("$1") ;;
+    esac
+    shift
+done
+
+if [ ${#SRCS[@]} -eq 0 ]; then
+    usage
+fi
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/ada83_pir.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+
+# Copy pre-built 64-bit Ada 83 RTL library image into isolated working dir
+cp "$RTL_IMG/PARSE.VM" "$WORK/PARSE.VM"
+cp "$RTL_IMG/PARSE.BIN" "$WORK/PARSE.BIN"
+cp "$RTL_IMG/DIANA.BIN" "$WORK/DIANA.BIN"
+cp "$RTL_IMG/ADA__LIB.CTL" "$WORK/ADA__LIB.CTL"
+cp -R "$RTL_IMG/ADA__LIB" "$WORK/ADA__LIB"
+
+OBJS=()
+LAST_IDX=$((${#SRCS[@]} - 1))
+
+for idx in "${!SRCS[@]}"; do
+    src_abs="$(cd "$(dirname "${SRCS[$idx]}")" && pwd)/$(basename "${SRCS[$idx]}")"
+    base="$(basename "$src_abs")"
+    pir_out="$WORK/unit_${idx}.pir"
+    obj_out="$WORK/unit_${idx}.o"
+
+    (
+        cd "$WORK"
+        rm -f '$$$.TMP' '$$$PGM.TMP' SEMPHASE.TMP WRITELIB.TMP ADA__LIB.TMP
+        cp "$src_abs" '$$$PGM.TMP'
+        cp PARSE.VM '$$$.TMP'
+        chmod 644 '$$$.TMP'
+
+        if ! "$DIANA_BIN/parphase" >"$WORK/par.log" 2>&1; then
+            cat "$WORK/par.log" >&2
+            exit 1
+        fi
+        if grep -q "Syntax error" "$WORK/par.log"; then
+            "$DIANA_BIN/errphase" >&2 || cat "$WORK/par.log" >&2
+            exit 1
+        fi
+        if ! "$DIANA_BIN/libphase" >"$WORK/lib.log" 2>&1; then
+            cat "$WORK/lib.log" >&2
+            exit 1
+        fi
+        cp '$$$.TMP' SEMPHASE.TMP
+        if ! "$DIANA_BIN/semphase" >"$WORK/sem.log" 2>&1; then
+            "$DIANA_BIN/errphase" >&2 || cat "$WORK/sem.log" >&2
+            exit 1
+        fi
+        # Check for semantic errors
+        "$DIANA_BIN/errphase" >"$WORK/err.log" 2>&1 || true
+        if grep -q '==>' "$WORK/err.log"; then
+            cat "$WORK/err.log" >&2
+            exit 1
+        fi
+
+        # Emit PIR from the attributed DIANA VM before writelib compacts it
+        main_flag="--no-main"
+        if [ "$idx" -eq "$LAST_IDX" ]; then
+            main_flag="--main"
+        fi
+        "$DIANA2PIR" --target="$TARGET" "$CHECKS_FLAG" "$main_flag" -o "$pir_out"
+
+        # Save compiled unit to ADA__LIB for subsequent units (with clauses)
+        if [ -f ADA__LIB.TMP ]; then
+            mv ADA__LIB.TMP ADA__LIB.CTL
+        fi
+        cp '$$$.TMP' WRITELIB.TMP
+        "$DIANA_BIN/writelib" >"$WORK/wlib.log" 2>&1 || true
+    )
+
+    if [ "$EMIT_PIR" -eq 1 ]; then
+        if [ -n "$OUTPUT" ]; then
+            cp "$pir_out" "$OUTPUT"
+        else
+            cat "$pir_out"
+        fi
+        exit 0
+    fi
+
+    if [ "$DO_INTERP" -eq 1 ]; then
+        exec "$PIRC" --interp --target="$TARGET" "$OPT" "$pir_out"
+    fi
+
+    if [ "$EMIT_ASM" -eq 1 ]; then
+        if [ -n "$OUTPUT" ]; then
+            "$PIRC" --target="$TARGET" "$OPT" -S "$pir_out" -o "$OUTPUT"
+        else
+            "$PIRC" --target="$TARGET" "$OPT" -S "$pir_out"
+        fi
+        exit 0
+    fi
+
+    "$PIRC" --target="$TARGET" "$OPT" -c "$pir_out" -o "$obj_out"
+    OBJS+=("$obj_out")
+done
+
+if [ -z "$OUTPUT" ]; then
+    OUTPUT="a.out"
+fi
+
+case "$TARGET" in
+    aarch64-apple-darwin*)
+        cc -arch arm64 "${OBJS[@]}" "$SCRIPT_DIR/build/ada_rt_arm64.o" "$SCRIPT_DIR/build/pir_rt_arm64.o" -lm -o "$OUTPUT"
+        ;;
+    x86_64-apple-darwin*)
+        cc -arch x86_64 "${OBJS[@]}" "$SCRIPT_DIR/build/ada_rt_x64.o" "$SCRIPT_DIR/build/pir_rt_x64.o" -lm -o "$OUTPUT"
+        ;;
+    *)
+        echo "ada83-pir: unsupported link target '$TARGET'" >&2
+        exit 1
+        ;;
+esac

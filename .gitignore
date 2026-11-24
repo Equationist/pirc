@@ -1,0 +1,32 @@
+# Build outputs
+/build/
+*.o
+*.a
+*.dSYM/
+*.out
+a.out
+
+# macOS metadata
+.DS_Store
+
+# Editor / IDE
+.vscode/
+*.swp
+*~
+
+# Frontends: slimcc-pir build outputs
+/frontends/slimcc-pir/slimcc-pir
+/frontends/slimcc-pir/*.pir.o
+/frontends/slimcc-pir/platform/*.pir.o
+
+# Frontends: ada83-pir build outputs
+/frontends/ada83-pir/bin/
+/frontends/ada83-pir/obj/
+/frontends/ada83-pir/build/
+
+# Frontends: diana (vendored) build outputs
+/frontends/diana/bin/
+/frontends/diana/obj/
+/frontends/diana/lib/
+/frontends/diana/alire/
+/frontends/diana/config/
