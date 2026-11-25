@@ -1,0 +1,16 @@
+with USERPK; use USERPK;
+with semglob; use semglob;
+
+package INSTANT is
+
+    procedure WALK_INSTANTIATION
+	    ( UNIT_ID: TREE
+	    ; INSTANTIATION: TREE
+	    ; H: H_TYPE );
+
+    procedure CHECK_GEN_BODY_UNCON
+	    ( GEN_ID: TREE
+	    ; FORMAL_ID: TREE
+	    ; BODY_NODE: TREE
+	    ; SRC_POS: TREE );
+end INSTANT;

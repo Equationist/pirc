@@ -11,23 +11,28 @@ CFLAGS    ?= -std=c99 -O2 -Wall -Wextra -Werror
 
 RTL_IMG   := build/rtl_lib
 BIN       := bin/diana2pir
+BIND_BIN  := bin/ada83_bind
 RT_ARM64  := build/ada_rt_arm64.o
 RT_X64    := build/ada_rt_x64.o
+IO_ARM64  := build/ada_io_arm64.o
+IO_X64    := build/ada_io_x64.o
+TK_ARM64  := build/ada_task_arm64.o
+TK_X64    := build/ada_task_x64.o
 PIR_ARM64 := build/pir_rt_arm64.o
 PIR_X64   := build/pir_rt_x64.o
 
 .PHONY: all clean diana2pir rtl runtime
 
-all: $(BIN) $(RTL_IMG)/PARSE.VM $(RT_ARM64) $(PIR_ARM64) $(RT_X64) $(PIR_X64)
+all: $(BIN) $(BIND_BIN) $(RTL_IMG)/PARSE.VM $(RT_ARM64) $(IO_ARM64) $(TK_ARM64) $(PIR_ARM64) $(RT_X64) $(IO_X64) $(TK_X64) $(PIR_X64)
 
-diana2pir: $(BIN)
+diana2pir: $(BIN) $(BIND_BIN)
 
-$(BIN): ada83_pir.gpr src/*.ads src/*.adb $(DIANA_DIR)/lib/libdiana.a
+$(BIN) $(BIND_BIN): ada83_pir.gpr src/*.ads src/*.adb $(DIANA_DIR)/lib/libdiana.a
 	gprbuild -p -P ada83_pir.gpr -largs $(LINKER_FL)
 
 rtl: $(RTL_IMG)/PARSE.VM
 
-$(RTL_IMG)/PARSE.VM: rtl/_standrd.aa rtl/system.aa rtl/calendar.aa $(DIANA_DIR)/bin/loadgrmr $(DIANA_DIR)/bin/fixpre
+$(RTL_IMG)/PARSE.VM: rtl/_standrd.aa rtl/system.aa rtl/calendar.aa rtl/text_io.aa rtl/seq__io.aa rtl/dir__io.aa rtl/low__io.aa $(DIANA_DIR)/bin/loadgrmr $(DIANA_DIR)/bin/fixpre
 	@rm -rf $(RTL_IMG)
 	@mkdir -p $(RTL_IMG)/ADA__LIB
 	@cd $(RTL_IMG) && \
@@ -42,7 +47,10 @@ $(RTL_IMG)/PARSE.VM: rtl/_standrd.aa rtl/system.aa rtl/calendar.aa $(DIANA_DIR)/
 		sh $(DIANA_DIR)/share/diana/scripts/makepre >/dev/null && \
 		for f in $(abspath rtl/system.aa) \
 		         $(DIANA_DIR)/share/diana/rtl/io__exc.aa \
-		         $(DIANA_DIR)/share/diana/rtl/text_io.aa \
+		         $(abspath rtl/text_io.aa) \
+		         $(abspath rtl/seq__io.aa) \
+		         $(abspath rtl/dir__io.aa) \
+		         $(abspath rtl/low__io.aa) \
 		         $(abspath rtl/calendar.aa) \
 		         $(DIANA_DIR)/share/diana/rtl/unc__dea.aa \
 		         $(DIANA_DIR)/share/diana/rtl/unc__con.aa; do \
@@ -51,7 +59,7 @@ $(RTL_IMG)/PARSE.VM: rtl/_standrd.aa rtl/system.aa rtl/calendar.aa $(DIANA_DIR)/
 		rm -f *.TMP _standrd.aa
 	@echo "[ada83-pir] Built 64-bit Ada 83 RTL library image in $(RTL_IMG)"
 
-runtime: $(RT_ARM64) $(PIR_ARM64) $(RT_X64) $(PIR_X64)
+runtime: $(RT_ARM64) $(IO_ARM64) $(TK_ARM64) $(PIR_ARM64) $(RT_X64) $(IO_X64) $(TK_X64) $(PIR_X64)
 
 build:
 	@mkdir -p build
@@ -59,11 +67,23 @@ build:
 $(RT_ARM64): runtime/ada_rt.c | build
 	$(CC) $(CFLAGS) -arch arm64 -c runtime/ada_rt.c -o $@
 
+$(IO_ARM64): runtime/ada_io.c | build
+	$(CC) $(CFLAGS) -arch arm64 -c runtime/ada_io.c -o $@
+
+$(TK_ARM64): runtime/ada_task.c | build
+	$(CC) $(CFLAGS) -arch arm64 -c runtime/ada_task.c -o $@
+
 $(PIR_ARM64): $(ROOT)/runtime/pir_rt.c | build
 	$(CC) -O2 -arch arm64 -c $(ROOT)/runtime/pir_rt.c -o $@
 
 $(RT_X64): runtime/ada_rt.c | build
 	$(CC) $(CFLAGS) -arch x86_64 -c runtime/ada_rt.c -o $@
+
+$(IO_X64): runtime/ada_io.c | build
+	$(CC) $(CFLAGS) -arch x86_64 -c runtime/ada_io.c -o $@
+
+$(TK_X64): runtime/ada_task.c | build
+	$(CC) $(CFLAGS) -arch x86_64 -c runtime/ada_task.c -o $@
 
 $(PIR_X64): $(ROOT)/runtime/pir_rt.c | build
 	$(CC) -O2 -arch x86_64 -c $(ROOT)/runtime/pir_rt.c -o $@

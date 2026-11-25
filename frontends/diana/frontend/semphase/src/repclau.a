@@ -1,0 +1,1144 @@
+with TEXT2_IO; use TEXT2_IO;
+with DIANA, DIANAMAN, DIANATTR; use DIANA, DIANAMAN, DIANATTR;
+with DEFUTIL; use DEFUTIL;
+with VISUTIL; use VISUTIL;
+with MAKENOD; use MAKENOD;
+with UARITH;
+with SEMGLOB; use SEMGLOB;
+with EXPTYPE, EXPRESO; use EXPTYPE, EXPRESO;
+with REQUTIL; use REQUTIL;
+with SETUTIL; use SETUTIL;
+with ATTWALK; use ATTWALK;
+with NODWALK; use NODWALK;
+with PRENAME;
+
+package body REPCLAU is
+
+    MAX_SEEN_REP: constant NATURAL := 256;
+    SEEN_SMALL: array (1 .. MAX_SEEN_REP) of TREE;
+    SEEN_SMALL_CNT: NATURAL := 0;
+    SEEN_ENUM_REP: array (1 .. MAX_SEEN_REP) of TREE;
+    SEEN_ENUM_CNT: NATURAL := 0;
+    SEEN_REC_REP: array (1 .. MAX_SEEN_REP) of TREE;
+    SEEN_REC_CNT: NATURAL := 0;
+    SEEN_SS: array (1 .. MAX_SEEN_REP) of TREE;
+    SEEN_SS_CNT: NATURAL := 0;
+
+    procedure CHECK_TYPE_IN_CURRENT_REGION(ID: TREE; SRCPOS: TREE; H: H_TYPE) is
+	DEF: TREE;
+    begin
+	if ID = CONST_VOID or else KIND(ID) not in CLASS_TYPE_NAME then
+	    return;
+	end if;
+	DEF := GET_DEF_FOR_ID(ID);
+	if D(XD_REGION_DEF, DEF) /= H.REGION_DEF
+	or else (H.IS_IN_BODY and then DB(XD_IS_IN_SPEC, DEF)) then
+	    ERROR(SRCPOS, "Representation clause must be in same declarative part");
+	end if;
+	if IS_FROZEN(D(SM_TYPE_SPEC, ID)) then
+	    ERROR(SRCPOS, "Representation clause cannot follow a forcing occurrence");
+	end if;
+    end CHECK_TYPE_IN_CURRENT_REGION;
+
+    function HAS_NONSTATIC_CONSTRAINT(TS: TREE; DEPTH: NATURAL := 0) return BOOLEAN is
+	BS: constant TREE := GET_BASE_STRUCT(TS);
+    begin
+	if TS = CONST_VOID or else DEPTH > 6 then return FALSE; end if;
+	if KIND(TS) in DN_ENUMERATION .. DN_FIXED then
+	    if D(SM_RANGE, TS) /= CONST_VOID then
+		if KIND(D(SM_RANGE, TS)) = DN_RANGE_ATTRIBUTE then
+		    return TRUE;
+		elsif KIND(D(SM_RANGE, TS)) = DN_RANGE then
+		    if not DB(SM_IS_ANONYMOUS, TS) then
+			if GET_STATIC_VALUE(D(AS_EXP1, D(SM_RANGE, TS))) = CONST_VOID
+			or else GET_STATIC_VALUE(D(AS_EXP2, D(SM_RANGE, TS))) = CONST_VOID then
+			    return TRUE;
+			end if;
+		    end if;
+		end if;
+	    end if;
+	    return FALSE;
+	elsif KIND(TS) = DN_CONSTRAINED_ARRAY then
+	    declare
+		IL: SEQ_TYPE := MAKE;
+		IT: TREE;
+	    begin
+		if D(SM_INDEX_SUBTYPE_S, TS) /= CONST_VOID then
+		    IL := LIST(D(SM_INDEX_SUBTYPE_S, TS));
+		end if;
+		while not IS_EMPTY(IL) loop
+		    POP(IL, IT);
+		    if HAS_NONSTATIC_CONSTRAINT(IT, DEPTH + 1) then return TRUE; end if;
+		end loop;
+	    end;
+	    if BS /= CONST_VOID and then KIND(BS) = DN_ARRAY then
+		return HAS_NONSTATIC_CONSTRAINT(D(SM_COMP_TYPE, BS), DEPTH + 1);
+	    end if;
+	    return FALSE;
+	elsif KIND(TS) = DN_ARRAY then
+	    return TRUE;
+	elsif KIND(TS) = DN_CONSTRAINED_RECORD then
+	    if D(SM_NORMALIZED_DSCRMT_S, TS) /= CONST_VOID then
+		declare
+		    EL: SEQ_TYPE := LIST(D(SM_NORMALIZED_DSCRMT_S, TS));
+		    E: TREE;
+		begin
+		    while not IS_EMPTY(EL) loop
+			POP(EL, E);
+			if GET_STATIC_VALUE(E) = CONST_VOID then return TRUE; end if;
+		    end loop;
+		end;
+	    end if;
+	    if BS /= CONST_VOID and then KIND(BS) = DN_RECORD then
+		return HAS_NONSTATIC_CONSTRAINT(BS, DEPTH + 1);
+	    end if;
+	    return FALSE;
+	elsif KIND(TS) = DN_RECORD then
+	    if D(SM_DISCRIMINANT_S, TS) /= CONST_VOID then
+		declare
+		    DL: SEQ_TYPE := LIST(D(SM_DISCRIMINANT_S, TS));
+		    DD: TREE;
+		begin
+		    while not IS_EMPTY(DL) loop
+			POP(DL, DD);
+			if KIND(DD) = DN_DSCRMT_DECL then
+			    declare
+				NS: constant SEQ_TYPE := LIST(D(AS_SOURCE_NAME_S, DD));
+			    begin
+				if not IS_EMPTY(NS) and then HAS_NONSTATIC_CONSTRAINT(D(SM_OBJ_TYPE, HEAD(NS)), DEPTH + 1) then
+				    return TRUE;
+				end if;
+			    end;
+			end if;
+		    end loop;
+		end;
+	    end if;
+	    declare
+		function CL_NONSTAT(CL: TREE) return BOOLEAN is
+		    DL: SEQ_TYPE;
+		    IT: TREE;
+		    VP: TREE;
+		    VL: SEQ_TYPE;
+		    VN: TREE;
+		begin
+		    if CL = CONST_VOID or else KIND(CL) /= DN_COMP_LIST then return FALSE; end if;
+		    if D(AS_DECL_S, CL) /= CONST_VOID then
+			DL := LIST(D(AS_DECL_S, CL));
+			while not IS_EMPTY(DL) loop
+			    POP(DL, IT);
+			    if KIND(IT) = DN_VARIABLE_DECL then
+				declare
+				    NS: constant SEQ_TYPE := LIST(D(AS_SOURCE_NAME_S, IT));
+				begin
+				    if not IS_EMPTY(NS) and then HAS_NONSTATIC_CONSTRAINT(D(SM_OBJ_TYPE, HEAD(NS)), DEPTH + 1) then
+					return TRUE;
+				    end if;
+				end;
+			    end if;
+			end loop;
+		    end if;
+		    VP := D(AS_VARIANT_PART, CL);
+		    if VP /= CONST_VOID and then KIND(VP) = DN_VARIANT_PART and then D(AS_VARIANT_S, VP) /= CONST_VOID then
+			VL := LIST(D(AS_VARIANT_S, VP));
+			while not IS_EMPTY(VL) loop
+			    POP(VL, VN);
+			    if KIND(VN) = DN_VARIANT and then CL_NONSTAT(D(AS_COMP_LIST, VN)) then
+				return TRUE;
+			    end if;
+			end loop;
+		    end if;
+		    return FALSE;
+		end CL_NONSTAT;
+	    begin
+		return CL_NONSTAT(D(SM_COMP_LIST, TS));
+	    end;
+	elsif KIND(TS) in CLASS_PRIVATE_SPEC and then D(SM_TYPE_SPEC, TS) /= CONST_VOID then
+	    return HAS_NONSTATIC_CONSTRAINT(D(SM_TYPE_SPEC, TS), DEPTH + 1);
+	end if;
+	return FALSE;
+    end HAS_NONSTATIC_CONSTRAINT;
+
+    -- $$$$ should not be here
+    procedure REQUIRE_CURRENT_REGION
+		( NAME: TREE
+		; DEFSET: in out DEFSET_TYPE
+		; H: H_TYPE )
+    is
+	TEMP_DEFSET: DEFSET_TYPE := DEFSET;
+	TEMP_DEFINTERP: DEFINTERP_TYPE;
+	TEMP_DEF: TREE;
+	SOURCE_NAME: TREE;
+	UNIT_DESC: TREE;
+    begin
+	if IS_EMPTY(TEMP_DEFSET) then
+	    return;
+	end if;
+
+	DEFSET := EMPTY_DEFSET;
+	while not IS_EMPTY(TEMP_DEFSET) loop
+	    POP(TEMP_DEFSET, TEMP_DEFINTERP);
+	    TEMP_DEF := GET_DEF(TEMP_DEFINTERP);
+
+	    if D(XD_REGION_DEF, TEMP_DEF) = H.REGION_DEF
+	    and then not (H.IS_IN_BODY and DB(XD_IS_IN_SPEC, TEMP_DEF)) then
+		-- $$$$ don't know if derived is legal $$$$ assume not
+		SOURCE_NAME := D(XD_SOURCE_NAME,TEMP_DEF);
+		if KIND(SOURCE_NAME) = DN_BLTN_OPERATOR_ID then
+		    null;
+		elsif KIND(SOURCE_NAME) in CLASS_SUBPROG_NAME then
+		    UNIT_DESC := D(SM_UNIT_DESC, SOURCE_NAME);
+		    if KIND(UNIT_DESC) /= DN_RENAMES_UNIT
+		    and then KIND(UNIT_DESC)
+				not in DN_IMPLICIT_NOT_EQ
+				    .. DN_DERIVED_SUBPROG
+		    then
+		        ADD_TO_DEFSET(DEFSET, TEMP_DEFINTERP);
+		    end if;
+		else
+		    ADD_TO_DEFSET(DEFSET, TEMP_DEFINTERP);
+		end if;
+	    end if;
+	end loop;
+
+	if IS_EMPTY(DEFSET) then
+	    ERROR(D(LX_SRCPOS,NAME), "Must be in current region");
+	end if;
+    end;
+
+
+    procedure RESOLVE_LENGTH_REP(ATTRIBUTE: TREE; EXP: in out TREE; H: H_TYPE)
+    is
+	use PRENAME;
+	ATTRIBUTE_ID: TREE;
+	PREFIX: TREE := D(AS_NAME, ATTRIBUTE);
+	PREFIX_TYPE: TREE := EVAL_TYPE_MARK(PREFIX);
+	TYPESET: TYPESET_TYPE;
+	STATIC_VALUE: TREE := CONST_VOID;
+    begin
+	ATTRIBUTE_ID := EVAL_ATTRIBUTE_IDENTIFIER(ATTRIBUTE);
+	PREFIX := RESOLVE_TYPE_MARK(PREFIX);
+	D(AS_NAME, ATTRIBUTE, PREFIX);
+	D(SM_EXP_TYPE, ATTRIBUTE, CONST_VOID);
+	-- LRM 13.1(3): representation clause must be in same declarative part as entity
+	declare
+	    PFX_CHK: TREE := PREFIX;
+	begin
+	    if PFX_CHK /= CONST_VOID and then KIND(PFX_CHK) = DN_SELECTED then
+		PFX_CHK := D(AS_DESIGNATOR, PFX_CHK);
+	    end if;
+	    if PFX_CHK /= CONST_VOID and then KIND(PFX_CHK) = DN_USED_NAME_ID then
+		CHECK_TYPE_IN_CURRENT_REGION(D(SM_DEFN, PFX_CHK), D(LX_SRCPOS, PREFIX), H);
+	    end if;
+	end;
+	EVAL_EXP_TYPES(EXP, TYPESET);
+	if ATTRIBUTE_ID /= CONST_VOID then
+            case DEFINED_ATTRIBUTES'VAL(DI(XD_POS,ATTRIBUTE_ID)) is
+	    when SIZE =>
+		REQUIRE_INTEGER_TYPE(EXP, TYPESET);
+		REQUIRE_UNIQUE_TYPE(EXP, TYPESET);
+		EXP := RESOLVE_EXP(EXP, TYPESET);
+		if not IS_EMPTY(TYPESET) then
+		    STATIC_VALUE := GET_STATIC_VALUE(EXP);
+		    if STATIC_VALUE = CONST_VOID then
+                        ERROR(D(LX_SRCPOS,EXP), "Static expression required");
+		    elsif UARITH.U_POS(UARITH."<"(STATIC_VALUE, UARITH.U_VAL(0))) /= 0 then
+			ERROR(D(LX_SRCPOS,EXP), "Size must be non-negative");
+		    end if;
+		end if;
+		-- LRM 13.1(4): length clause cannot be given for a subtype declared by a subtype_declaration
+		declare
+		    PFX_N: TREE := PREFIX;
+		    PFX_D: TREE := CONST_VOID;
+		begin
+		    if PFX_N /= CONST_VOID and then KIND(PFX_N) = DN_SELECTED then
+			PFX_N := D(AS_DESIGNATOR, PFX_N);
+		    end if;
+		    if PFX_N /= CONST_VOID and then KIND(PFX_N) = DN_USED_NAME_ID then
+			PFX_D := D(SM_DEFN, PFX_N);
+		    end if;
+		    if PFX_D /= CONST_VOID and then KIND(PFX_D) = DN_SUBTYPE_ID then
+			ERROR(D(LX_SRCPOS, PREFIX), "Size clause not allowed for subtype");
+		    elsif PFX_D /= CONST_VOID and then KIND(PFX_D) in CLASS_TYPE_NAME
+		    and then D(SM_TYPE_SPEC, PFX_D) /= CONST_VOID
+		    and then KIND(D(SM_TYPE_SPEC, PFX_D)) = DN_INCOMPLETE
+		    and then D(XD_FULL_TYPE_SPEC, D(SM_TYPE_SPEC, PFX_D)) = CONST_VOID then
+			ERROR(D(LX_SRCPOS, PREFIX), "Size clause not allowed for incomplete type");
+		    end if;
+		end;
+		declare
+		    UNDER_T: TREE := PREFIX_TYPE;
+		begin
+		    while UNDER_T /= CONST_VOID and then KIND(UNDER_T) in DN_PRIVATE .. DN_L_PRIVATE loop
+			if D(SM_TYPE_SPEC, UNDER_T) /= CONST_VOID then
+			    UNDER_T := D(SM_TYPE_SPEC, UNDER_T);
+			elsif D(SM_DERIVED, UNDER_T) /= CONST_VOID then
+			    UNDER_T := D(SM_DERIVED, UNDER_T);
+			else
+			    exit;
+			end if;
+		    end loop;
+		    if KIND(UNDER_T) in CLASS_SCALAR then
+		        -- LRM 13.2(6): reject 'SIZE smaller than minimum bits required for scalar subtype
+		        if STATIC_VALUE /= CONST_VOID and then UARITH.U_POS(UARITH."<"(STATIC_VALUE, UARITH.U_VAL(0))) = 0 then
+			    declare
+			        use UARITH;
+			        PFX_SUB: TREE := D(SM_TYPE_SPEC, D(SM_DEFN, PREFIX));
+			        RNG: TREE;
+			        V1, V2: TREE;
+			        REQ_BITS: INTEGER := 0;
+			    begin
+			        if PFX_SUB /= CONST_VOID and then KIND(PFX_SUB) in DN_PRIVATE .. DN_L_PRIVATE then
+				    if D(SM_TYPE_SPEC, PFX_SUB) /= CONST_VOID then
+					PFX_SUB := D(SM_TYPE_SPEC, PFX_SUB);
+				    else
+					PFX_SUB := UNDER_T;
+				    end if;
+			        elsif PFX_SUB /= CONST_VOID and then KIND(PFX_SUB) = DN_INCOMPLETE then
+				    PFX_SUB := D(XD_FULL_TYPE_SPEC, PFX_SUB);
+			        end if;
+			        if PFX_SUB /= CONST_VOID and then KIND(PFX_SUB) in DN_ENUMERATION .. DN_INTEGER then
+				    RNG := D(SM_RANGE, PFX_SUB);
+				    if RNG /= CONST_VOID and then KIND(RNG) = DN_RANGE then
+				        V1 := GET_STATIC_VALUE(D(AS_EXP1, RNG));
+				        V2 := GET_STATIC_VALUE(D(AS_EXP2, RNG));
+				        if V1 = CONST_VOID or else V2 = CONST_VOID then
+					    ERROR(D(LX_SRCPOS, PREFIX), "Size clause not allowed for non-static range");
+				        elsif V1 <= V2 then
+					    if KIND(PFX_SUB) = DN_ENUMERATION then
+						declare
+						    BT_EN: constant TREE := GET_BASE_STRUCT(PFX_SUB);
+						    EL: SEQ_TYPE;
+						    LIT: TREE;
+						    REP_V1: TREE := CONST_VOID;
+						    REP_V2: TREE := CONST_VOID;
+						    HAS_EREP: BOOLEAN := FALSE;
+						begin
+						    if BT_EN /= CONST_VOID and then KIND(BT_EN) = DN_ENUMERATION then
+							for K in 1 .. SEEN_ENUM_CNT loop
+							    if SEEN_ENUM_REP(K) = BT_EN then
+								HAS_EREP := TRUE;
+								exit;
+							    end if;
+							end loop;
+							if HAS_EREP then
+							    EL := LIST(D(SM_LITERAL_S, BT_EN));
+							    while not IS_EMPTY(EL) loop
+								POP(EL, LIT);
+								if D(SM_REP, LIT) /= CONST_VOID then
+								    if U_EQUAL(U_VAL(DI(SM_POS, LIT)), V1) then
+									REP_V1 := D(SM_REP, LIT);
+								    end if;
+								    if U_EQUAL(U_VAL(DI(SM_POS, LIT)), V2) then
+									REP_V2 := D(SM_REP, LIT);
+								    end if;
+								end if;
+							    end loop;
+							end if;
+						    end if;
+						    if REP_V1 /= CONST_VOID and then REP_V2 /= CONST_VOID then
+							V1 := REP_V1;
+							V2 := REP_V2;
+						    end if;
+						end;
+					    end if;
+					    if U_POS(V1 < U_VAL(0)) /= 0 then
+					        -- Signed 2's complement: need 2**(B-1) > V2 and -2**(B-1) <= V1
+					        REQ_BITS := 1;
+					        while REQ_BITS < 64
+					        and then (not (V2 <= U_VAL(2) ** U_VAL(REQ_BITS - 1) - U_VAL(1))
+						          or else U_POS(V1 < -(U_VAL(2) ** U_VAL(REQ_BITS - 1))) /= 0)
+					        loop
+						    REQ_BITS := REQ_BITS + 1;
+					        end loop;
+					    else
+					        -- Non-negative: need 2**B - 1 >= V2
+					        REQ_BITS := 1;
+					        while REQ_BITS < 64
+					        and then not (V2 <= U_VAL(2) ** U_VAL(REQ_BITS) - U_VAL(1))
+					        loop
+						    REQ_BITS := REQ_BITS + 1;
+					        end loop;
+					    end if;
+					    if U_POS(STATIC_VALUE < U_VAL(REQ_BITS)) /= 0 then
+					        ERROR(D(LX_SRCPOS, EXP), "Size too small for type");
+					    end if;
+				        end if;
+				    end if;
+			        elsif PFX_SUB /= CONST_VOID and then KIND(PFX_SUB) = DN_FLOAT then
+				    if DI(CD_IMPL_SIZE, UNDER_T) > 0
+				    and then U_POS(STATIC_VALUE < U_VAL(DI(CD_IMPL_SIZE, UNDER_T))) /= 0 then
+					ERROR(D(LX_SRCPOS, EXP), "Size too small for floating point type");
+				    end if;
+			        elsif PFX_SUB /= CONST_VOID and then KIND(PFX_SUB) = DN_FIXED then
+				    declare
+					SM: constant TREE := D(CD_IMPL_SMALL, UNDER_T);
+				    begin
+					RNG := D(SM_RANGE, PFX_SUB);
+					if SM /= CONST_VOID and then RNG /= CONST_VOID and then KIND(RNG) = DN_RANGE then
+					    V1 := GET_STATIC_VALUE(D(AS_EXP1, RNG));
+					    V2 := GET_STATIC_VALUE(D(AS_EXP2, RNG));
+					    if V1 /= CONST_VOID and then V2 /= CONST_VOID and then V1 <= V2 then
+						declare
+						    ZERO_R: constant TREE := SM * U_VAL(0);
+						    IS_NEG: constant BOOLEAN := (U_POS(V1 < ZERO_R) /= 0);
+						begin
+						    REQ_BITS := 1;
+						    if IS_NEG then
+							while REQ_BITS < 64
+							and then (not (V2 <= SM * (U_VAL(2) ** U_VAL(REQ_BITS - 1)))
+								  or else not (-(SM * (U_VAL(2) ** U_VAL(REQ_BITS - 1))) <= V1))
+							loop
+							    REQ_BITS := REQ_BITS + 1;
+							end loop;
+						    else
+							while REQ_BITS < 64
+							and then not (V2 <= SM * (U_VAL(2) ** U_VAL(REQ_BITS)))
+							loop
+							    REQ_BITS := REQ_BITS + 1;
+							end loop;
+						    end if;
+						    if U_POS(STATIC_VALUE < U_VAL(REQ_BITS)) /= 0 then
+							ERROR(D(LX_SRCPOS, EXP), "Size too small for fixed point type");
+						    end if;
+						end;
+					    end if;
+					end if;
+				    end;
+			        end if;
+			        -- Also propagate CD_IMPL_SIZE to the first-named subtype (PREFIX_SUBTYPE)!
+			        -- Skip for private types because lines below clone UNDER_T to avoid clobbering parent's 'SIZE.
+			        if not (KIND(PREFIX_TYPE) in DN_PRIVATE .. DN_L_PRIVATE)
+			        and then PFX_SUB /= CONST_VOID and then KIND(PFX_SUB) in CLASS_SCALAR then
+				    D(CD_IMPL_SIZE, PFX_SUB, STATIC_VALUE);
+			        end if;
+			    end;
+		        end if;
+		        if KIND(PREFIX_TYPE) in DN_PRIVATE .. DN_L_PRIVATE
+		        and then UNDER_T /= CONST_VOID
+		        and then KIND(UNDER_T) in CLASS_SCALAR then
+			    -- LRM 13.2 (cd1c04a, cd2a32c/g): clone underlying scalar spec so parent's 'SIZE is not clobbered
+			    declare
+				COPY_T: constant TREE := COPY_NODE(UNDER_T);
+			    begin
+				D(CD_IMPL_SIZE, COPY_T, STATIC_VALUE);
+				D(SM_TYPE_SPEC, PREFIX_TYPE, COPY_T);
+			    end;
+		        else
+			    D(CD_IMPL_SIZE, UNDER_T, STATIC_VALUE);
+			    if KIND(PREFIX_TYPE) in CLASS_SCALAR then
+				D(CD_IMPL_SIZE, PREFIX_TYPE, STATIC_VALUE);
+			    end if;
+		        end if;
+		    elsif KIND(PREFIX_TYPE) = DN_ACCESS then
+		        if STATIC_VALUE /= CONST_VOID and then UARITH.U_POS(UARITH."<"(STATIC_VALUE, UARITH.U_VAL(64))) /= 0 then
+			    ERROR(D(LX_SRCPOS, EXP), "Size too small for access type");
+		        else
+			    D(SM_SIZE, PREFIX_TYPE, STATIC_VALUE);
+		        end if;
+		    elsif KIND(PREFIX_TYPE) = DN_ARRAY then
+			-- Check constrained array minimum size & static bounds (bd2a12a, bd2a67a)
+			declare
+			    use UARITH;
+			    PFX_SUB: constant TREE := D(SM_TYPE_SPEC, D(SM_DEFN, PREFIX));
+			begin
+			    if PFX_SUB /= CONST_VOID and then KIND(PFX_SUB) = DN_CONSTRAINED_ARRAY then
+				declare
+				    IS_N: constant TREE := D(SM_INDEX_SUBTYPE_S, PFX_SUB);
+				    IL: SEQ_TYPE := LIST(IS_N);
+				    IT: TREE;
+				    RNG: TREE;
+				    V1, V2: TREE;
+				    TOT_EL: TREE := U_VAL(1);
+				    HAS_NONSTAT: BOOLEAN := FALSE;
+				    COMP_T: constant TREE := D(SM_COMP_TYPE, PREFIX_TYPE);
+				    COMP_BITS: INTEGER := 8;
+				begin
+				    while not IS_EMPTY(IL) loop
+					POP(IL, IT);
+					RNG := D(SM_RANGE, IT);
+					if RNG /= CONST_VOID and then KIND(RNG) = DN_RANGE then
+					    V1 := GET_STATIC_VALUE(D(AS_EXP1, RNG));
+					    V2 := GET_STATIC_VALUE(D(AS_EXP2, RNG));
+					    if V1 = CONST_VOID or else V2 = CONST_VOID then
+						HAS_NONSTAT := TRUE;
+					    elsif V1 <= V2 then
+						TOT_EL := TOT_EL * (V2 - V1 + U_VAL(1));
+					    else
+						TOT_EL := U_VAL(0);
+					    end if;
+					else
+					    HAS_NONSTAT := TRUE;
+					end if;
+				    end loop;
+				    if HAS_NONSTAT or else HAS_NONSTATIC_CONSTRAINT(COMP_T) then
+					ERROR(D(LX_SRCPOS, PREFIX), "Size clause not allowed for array with non-static bounds");
+				    elsif STATIC_VALUE /= CONST_VOID and then COMP_T /= CONST_VOID then
+					if KIND(COMP_T) in CLASS_SCALAR and then DI(CD_IMPL_SIZE, COMP_T) > 0 then
+					    COMP_BITS := DI(CD_IMPL_SIZE, COMP_T);
+					elsif KIND(COMP_T) = DN_ENUMERATION then
+					    COMP_BITS := 1;
+					end if;
+					if U_POS(STATIC_VALUE < TOT_EL * U_VAL(COMP_BITS)) /= 0 then
+					    ERROR(D(LX_SRCPOS, EXP), "Size too small for array type");
+					end if;
+				    end if;
+				end;
+			    elsif PFX_SUB /= CONST_VOID and then KIND(PFX_SUB) = DN_ARRAY then
+				ERROR(D(LX_SRCPOS, PREFIX), "Size clause not allowed for unconstrained array type");
+			    end if;
+			    D(SM_SIZE, PREFIX_TYPE, STATIC_VALUE);
+			end;
+		    elsif KIND(PREFIX_TYPE) = DN_RECORD then
+			-- Check record non-static constraint (bd2a13b) and minimum size (bd2a77a)
+			if HAS_NONSTATIC_CONSTRAINT(PREFIX_TYPE) then
+			    ERROR(D(LX_SRCPOS, PREFIX), "Size clause not allowed for record with non-static constraints");
+			end if;
+			declare
+			    use UARITH;
+			    CL: constant TREE := D(SM_COMP_LIST, PREFIX_TYPE);
+			    MIN_BITS: INTEGER := 0;
+			begin
+			    if CL /= CONST_VOID and then D(AS_DECL_S, CL) /= CONST_VOID then
+				declare
+				    DL: SEQ_TYPE := LIST(D(AS_DECL_S, CL));
+				    IT: TREE;
+				    NS: SEQ_TYPE;
+				    SN: TREE;
+				    CT: TREE;
+				begin
+				    while not IS_EMPTY(DL) loop
+					POP(DL, IT);
+					if KIND(IT) = DN_VARIABLE_DECL then
+					    NS := LIST(D(AS_SOURCE_NAME_S, IT));
+					    while not IS_EMPTY(NS) loop
+						POP(NS, SN);
+						CT := D(SM_OBJ_TYPE, SN);
+						if CT /= CONST_VOID and then KIND(CT) in DN_ENUMERATION .. DN_INTEGER then
+						    declare
+							CBT: constant TREE := D(SM_BASE_TYPE, CT);
+							CRNG: constant TREE := D(SM_RANGE, CT);
+							CBITS: INTEGER := 1;
+							V1, V2, DIFF, POW2: TREE;
+						    begin
+							if CBT = CT and then DI(CD_IMPL_SIZE, CT) > 0 then
+							    CBITS := DI(CD_IMPL_SIZE, CT);
+							elsif CRNG /= CONST_VOID and then KIND(CRNG) = DN_RANGE then
+							    V1 := GET_STATIC_VALUE(D(AS_EXP1, CRNG));
+							    V2 := GET_STATIC_VALUE(D(AS_EXP2, CRNG));
+							    if V1 /= CONST_VOID and then V2 /= CONST_VOID
+							    and then U_POS(V1 <= V2) /= 0 then
+								if U_POS(V1 < U_VAL(0)) /= 0 then
+								    -- signed: need sign bit + magnitude bits
+								    DIFF := U_VAL(0) - V1;
+								    if U_POS(V2 >= DIFF) /= 0 then
+									DIFF := V2 + U_VAL(1);
+								    end if;
+								    POW2 := U_VAL(1);
+								    CBITS := 1;
+								    while U_POS(POW2 < DIFF) /= 0 and then CBITS < 64 loop
+									POW2 := POW2 + POW2;
+									CBITS := CBITS + 1;
+								    end loop;
+								else
+								    -- non-negative: fit 0..V2
+								    POW2 := U_VAL(2);
+								    CBITS := 1;
+								    while U_POS(POW2 <= V2) /= 0 and then CBITS < 64 loop
+									POW2 := POW2 + POW2;
+									CBITS := CBITS + 1;
+								    end loop;
+								end if;
+							    end if;
+							end if;
+							MIN_BITS := MIN_BITS + CBITS;
+						    end;
+						elsif CT /= CONST_VOID and then KIND(CT) = DN_FLOAT then
+						    MIN_BITS := MIN_BITS + 32;
+						else
+						    MIN_BITS := MIN_BITS + 1;
+						end if;
+					    end loop;
+					end if;
+				    end loop;
+				end;
+			    end if;
+			    if STATIC_VALUE /= CONST_VOID and then MIN_BITS > 0
+			    and then U_POS(STATIC_VALUE < U_VAL(MIN_BITS)) /= 0 then
+				ERROR(D(LX_SRCPOS, EXP), "Size too small for record type");
+			    end if;
+			    D(SM_SIZE, PREFIX_TYPE, STATIC_VALUE);
+			end;
+		    elsif KIND(PREFIX_TYPE) = DN_TASK_SPEC
+		    or KIND(PREFIX_TYPE) in CLASS_UNCONSTRAINED then
+		        D(SM_SIZE, PREFIX_TYPE, STATIC_VALUE);
+		    end if;
+		end;
+	    when STORAGE_SIZE =>
+		REQUIRE_INTEGER_TYPE(EXP, TYPESET);
+		REQUIRE_UNIQUE_TYPE(EXP, TYPESET);
+		EXP := RESOLVE_EXP(EXP, TYPESET);
+		if KIND(PREFIX_TYPE) /= DN_TASK_SPEC
+		and KIND(PREFIX_TYPE) /= DN_ACCESS then
+		    ERROR(D(LX_SRCPOS,ATTRIBUTE)
+                            , "Must be access or task type");
+		elsif KIND(PREFIX_TYPE) = DN_ACCESS
+		and then D(SM_DERIVED, PREFIX_TYPE) /= CONST_VOID then
+		    ERROR(D(LX_SRCPOS, ATTRIBUTE), "Storage_Size not allowed for derived access type");
+		else
+		    declare
+			DUP_SS: BOOLEAN := FALSE;
+		    begin
+			for K in 1 .. SEEN_SS_CNT loop
+			    if SEEN_SS(K) = PREFIX_TYPE then
+				DUP_SS := TRUE;
+				exit;
+			    end if;
+			end loop;
+			if DUP_SS then
+			    ERROR(D(LX_SRCPOS, ATTRIBUTE), "Duplicate Storage_Size clause");
+			else
+			    if SEEN_SS_CNT < MAX_SEEN_REP then
+				SEEN_SS_CNT := SEEN_SS_CNT + 1;
+				SEEN_SS(SEEN_SS_CNT) := PREFIX_TYPE;
+			    end if;
+			    D(SM_STORAGE_SIZE, PREFIX_TYPE, EXP);
+			end if;
+		    end;
+		end if;
+	    when SMALL =>
+		REQUIRE_REAL_TYPE(EXP, TYPESET);
+		REQUIRE_UNIQUE_TYPE(EXP, TYPESET);
+		EXP := RESOLVE_EXP(EXP, TYPESET);
+		if not IS_EMPTY(TYPESET) then
+		    STATIC_VALUE := GET_STATIC_VALUE(EXP);
+		    if STATIC_VALUE = CONST_VOID then
+                        ERROR(D(LX_SRCPOS,EXP), "Static expression required");
+		    end if;
+		end if;
+		if KIND(PREFIX_TYPE) /= DN_FIXED then
+		    ERROR(D(LX_SRCPOS,ATTRIBUTE)
+                            , "Must be fixed point type");
+		else
+		    declare
+			DUP_SM: BOOLEAN := FALSE;
+		    begin
+			for K in 1 .. SEEN_SMALL_CNT loop
+			    if SEEN_SMALL(K) = PREFIX_TYPE then
+				DUP_SM := TRUE;
+				exit;
+			    end if;
+			end loop;
+			if DUP_SM then
+			    ERROR(D(LX_SRCPOS, ATTRIBUTE), "Duplicate Small clause");
+			elsif SEEN_SMALL_CNT < MAX_SEEN_REP then
+			    SEEN_SMALL_CNT := SEEN_SMALL_CNT + 1;
+			    SEEN_SMALL(SEEN_SMALL_CNT) := PREFIX_TYPE;
+			end if;
+		    end;
+		    if STATIC_VALUE /= CONST_VOID then
+			if UARITH."<="(D(XD_NUMER, STATIC_VALUE), UARITH.U_VAL(0)) then
+			    ERROR(D(LX_SRCPOS, EXP), "Small must be positive");
+			elsif D(SM_ACCURACY, PREFIX_TYPE) /= CONST_VOID
+			and then not UARITH."<="(STATIC_VALUE, D(SM_ACCURACY, PREFIX_TYPE)) then
+			    ERROR(D(LX_SRCPOS, EXP), "Small must not exceed delta");
+			end if;
+		    end if;
+		    D(CD_IMPL_SMALL, PREFIX_TYPE, STATIC_VALUE);
+		    declare
+			use UARITH;
+			PREFIX_SUBTYPE: TREE
+				 := D(SM_TYPE_SPEC, D(SM_DEFN,PREFIX));
+			POW_32: TREE := U_VALUE("16#100000000#");
+		    begin
+			if KIND(PREFIX_SUBTYPE) in DN_PRIVATE .. DN_L_PRIVATE
+			then
+			    PREFIX_SUBTYPE := D(SM_TYPE_SPEC, PREFIX_SUBTYPE);
+			elsif KIND(PREFIX_SUBTYPE) = DN_INCOMPLETE then
+			    PREFIX_SUBTYPE
+				    := D(XD_FULL_TYPE_SPEC,PREFIX_SUBTYPE);
+			end if;
+			if KIND(PREFIX_SUBTYPE) = DN_FIXED then
+			    D(CD_IMPL_SMALL, PREFIX_SUBTYPE, STATIC_VALUE);
+			end if;
+			D(SM_VALUE, D(AS_EXP1, D(SM_RANGE,PREFIX_TYPE))
+				, (- POW_32) * STATIC_VALUE );
+			D(SM_VALUE, D(AS_EXP2, D(SM_RANGE,PREFIX_TYPE))
+				, (POW_32 - U_VAL(1)) * STATIC_VALUE );
+		    end;
+		end if;
+	    when others =>
+		ERROR(D(LX_SRCPOS,D(AS_USED_NAME_ID,ATTRIBUTE))
+                        , "This attribute not allowed in length clause");
+		EXP := RESOLVE_EXP(EXP, CONST_VOID);
+	    end case;
+	end if;
+    end RESOLVE_LENGTH_REP;
+
+    procedure RESOLVE_ENUM_REP(SIMPLE_NAME: in out TREE; EXP: TREE; H: H_TYPE)
+    is
+	ENUM_TYPE: TREE := EVAL_TYPE_MARK(SIMPLE_NAME);
+	DUMMY: TREE;
+	ENUM_LIST: SEQ_TYPE;
+	ENUM: TREE;
+	ITEM_LIST: SEQ_TYPE;
+	ITEM: TREE;
+	CHOICE: TREE;
+	CHOICE_VALUE: TREE;
+	CURRENT_VALUE: TREE;
+	PRIOR_VALUE: TREE;
+	DUMMY_ARRAY_TYPE: TREE;
+    begin
+	SIMPLE_NAME := RESOLVE_TYPE_MARK(SIMPLE_NAME);
+	if KIND(ENUM_TYPE) /= DN_ENUMERATION then
+	    DUMMY := RESOLVE_EXP(EXP, CONST_VOID);
+	    return;
+	end if;
+	declare
+	    SN_CHK: TREE := SIMPLE_NAME;
+	    DUP_EN: BOOLEAN := FALSE;
+	begin
+	    if SN_CHK /= CONST_VOID and then KIND(SN_CHK) = DN_SELECTED then
+		SN_CHK := D(AS_DESIGNATOR, SN_CHK);
+	    end if;
+	    if SN_CHK /= CONST_VOID and then KIND(SN_CHK) = DN_USED_NAME_ID then
+		CHECK_TYPE_IN_CURRENT_REGION(D(SM_DEFN, SN_CHK), D(LX_SRCPOS, SIMPLE_NAME), H);
+	    end if;
+	    for K in 1 .. SEEN_ENUM_CNT loop
+		if SEEN_ENUM_REP(K) = ENUM_TYPE then
+		    DUP_EN := TRUE;
+		    exit;
+		end if;
+	    end loop;
+	    if DUP_EN then
+		ERROR(D(LX_SRCPOS, SIMPLE_NAME), "Duplicate enumeration representation clause");
+	    elsif SEEN_ENUM_CNT < MAX_SEEN_REP then
+		SEEN_ENUM_CNT := SEEN_ENUM_CNT + 1;
+		SEEN_ENUM_REP(SEEN_ENUM_CNT) := ENUM_TYPE;
+	    end if;
+	end;
+
+	-- (just in case it doesn't resolve)
+	D(SM_NORMALIZED_COMP_S
+		, EXP
+		, MAKE_GENERAL_ASSOC_S(MAKE) );
+
+	DUMMY_ARRAY_TYPE := MAKE_ARRAY
+			( SM_COMP_TYPE => MAKE(DN_UNIVERSAL_INTEGER)
+			, SM_INDEX_S => MAKE_INDEX_S
+				( SINGLETON(ENUM_TYPE) ));
+	D(SM_BASE_TYPE, DUMMY_ARRAY_TYPE, DUMMY_ARRAY_TYPE);
+	DUMMY := RESOLVE_EXP(EXP, DUMMY_ARRAY_TYPE);
+	D(SM_EXP_TYPE, EXP, CONST_VOID);
+
+	-- check and insert values
+	ENUM_LIST := LIST(D(SM_LITERAL_S, ENUM_TYPE));
+	ITEM_LIST := LIST(D(SM_NORMALIZED_COMP_S, EXP));
+	if IS_EMPTY(ITEM_LIST) then
+	    return;
+	end if;
+
+	while not IS_EMPTY(ENUM_LIST) loop
+	    POP(ENUM_LIST, ENUM);
+	    if IS_EMPTY(ITEM_LIST) then
+                ERROR(D(LX_SRCPOS,EXP), "Too few values");
+		return;
+	    end if;
+	    POP(ITEM_LIST, ITEM);
+	    if KIND(ITEM) = DN_NAMED then
+		CHOICE := HEAD(LIST(D(AS_CHOICE_S, ITEM)));
+		ITEM := D(AS_EXP, ITEM);
+		if KIND(CHOICE) = DN_CHOICE_EXP then
+		    CHOICE_VALUE := GET_STATIC_VALUE(D(AS_EXP,CHOICE));
+		elsif KIND(CHOICE) = DN_CHOICE_RANGE
+		and then KIND(D(AS_DISCRETE_RANGE,CHOICE)) = DN_RANGE then
+		    CHOICE_VALUE := GET_STATIC_VALUE
+			    ( D(AS_EXP1, D(AS_DISCRETE_RANGE,CHOICE)) );
+		    if CHOICE_VALUE /= CONST_VOID
+		    and then not UARITH.U_EQUAL
+			    ( CHOICE_VALUE
+			    , D(AS_EXP2, D(AS_DISCRETE_RANGE,CHOICE)) )
+		    then
+                        ERROR(D(LX_SRCPOS,CHOICE), "Duplicates not allowed");
+			return;
+		    end if;
+		else
+		    CHOICE_VALUE := CONST_VOID;
+		end if;
+		if CHOICE_VALUE = CONST_VOID then
+                    ERROR(D(LX_SRCPOS,CHOICE), "Must be static, not others");
+		    return;
+		elsif not UARITH.U_EQUAL
+			( CHOICE_VALUE
+			, D(SM_POS, ENUM) )
+		then
+                    ERROR(D(LX_SRCPOS,CHOICE), "Must exactly match enum lits");
+		    return;
+		end if;
+	    end if;
+	    CURRENT_VALUE := GET_STATIC_VALUE(ITEM);
+	    if CURRENT_VALUE = CONST_VOID then
+                ERROR(D(LX_SRCPOS,EXP), "Static value required");
+	        return;
+	    end if;
+	    if DI(SM_POS, ENUM) /= 0
+            and then UARITH."<="(CURRENT_VALUE, PRIOR_VALUE) then
+                ERROR(D(LX_SRCPOS,EXP), "Values must be in order");
+	    end if;
+	    PRIOR_VALUE := CURRENT_VALUE;
+	    D(SM_REP, ENUM, CURRENT_VALUE);
+	end loop;
+
+	if not IS_EMPTY(ITEM_LIST) then
+            ERROR(D(LX_SRCPOS,HEAD(ITEM_LIST)), "Too many values");
+	end if;
+    end;
+
+    procedure RESOLVE_ADDRESS_REP
+		( SIMPLE_NAME: in out TREE
+		; EXP: in out TREE
+		; H: H_TYPE)
+    is
+	NAME_DEFSET: DEFSET_TYPE;
+	NAME_ID: TREE := CONST_VOID;
+	TYPESET: TYPESET_TYPE;
+    begin
+	FIND_DIRECT_VISIBILITY(SIMPLE_NAME, NAME_DEFSET);
+	REQUIRE_CURRENT_REGION(SIMPLE_NAME, NAME_DEFSET, H);
+	REQUIRE_UNIQUE_DEF(SIMPLE_NAME, NAME_DEFSET);
+	NAME_ID := GET_THE_ID(NAME_DEFSET);
+	case KIND(NAME_ID) is
+	when CLASS_OBJECT_NAME =>
+	    STASH_DEFSET(SIMPLE_NAME, NAME_DEFSET);
+	    SIMPLE_NAME := RESOLVE_EXP(SIMPLE_NAME, GET_BASE_TYPE(NAME_ID));
+	when CLASS_SUBPROG_NAME =>
+	    SIMPLE_NAME := RESOLVE_NAME(SIMPLE_NAME, NAME_ID);
+	when DN_TYPE_ID =>
+	    if KIND(D(SM_TYPE_SPEC, NAME_ID)) /= DN_TASK_SPEC then
+                ERROR(D(LX_SRCPOS,SIMPLE_NAME), "Address clause not allowed");
+		NAME_ID := CONST_VOID;
+	    end if;
+	when DN_ENTRY_ID =>
+	    SIMPLE_NAME := RESOLVE_NAME(SIMPLE_NAME, NAME_ID);
+	    if KIND(D(SM_SPEC, NAME_ID)) = DN_ENTRY then
+		if D(AS_DISCRETE_RANGE, D(SM_SPEC,NAME_ID)) /= CONST_VOID then
+		    ERROR(D(LX_SRCPOS,SIMPLE_NAME), "Address for entry family");
+		    NAME_ID := CONST_VOID;
+		else
+		    declare
+			PL: SEQ_TYPE := LIST(D(AS_PARAM_S, D(SM_SPEC, NAME_ID)));
+			PI: TREE;
+		    begin
+			while not IS_EMPTY(PL) loop
+			    POP(PL, PI);
+			    if KIND(PI) = DN_OUT or else KIND(PI) = DN_IN_OUT then
+				ERROR(D(LX_SRCPOS, SIMPLE_NAME),
+				      "Interrupt entry cannot have OUT or IN OUT parameters");
+				exit;
+			    end if;
+			end loop;
+		    end;
+		end if;
+	    end if;
+	when DN_VOID =>
+	    null;
+	when others =>
+            ERROR(D(LX_SRCPOS,SIMPLE_NAME), "Address clause not allowed");
+	    NAME_ID := CONST_VOID;
+	end case;
+
+	if PREDEFINED_ADDRESS = CONST_VOID or else not SYSTEM_IS_WITHED then
+            ERROR(D(LX_SRCPOS,EXP), "Predefined SYSTEM not withed");
+	end if;
+	EVAL_EXP_TYPES(EXP, TYPESET);
+	REQUIRE_TYPE(GET_BASE_TYPE(PREDEFINED_ADDRESS), EXP, TYPESET);
+	EXP := RESOLVE_EXP(EXP, TYPESET);
+
+	case KIND(NAME_ID) is
+	when CLASS_OBJECT_NAME =>
+	    D(SM_ADDRESS, NAME_ID, EXP);
+	    if KIND(D(SM_OBJ_TYPE,NAME_ID)) = DN_TASK_SPEC then
+		D(SM_ADDRESS, D(SM_OBJ_TYPE,NAME_ID), EXP);
+	    end if;
+	when CLASS_SUBPROG_NAME | DN_ENTRY_ID =>
+	    D(SM_ADDRESS, NAME_ID, EXP);
+	when CLASS_TYPE_NAME =>
+	    D(SM_ADDRESS, D(SM_TYPE_SPEC,NAME_ID), EXP);
+	when others =>
+	    null;
+	end case;
+    end;
+
+    procedure RESOLVE_RECORD_REP
+		( SIMPLE_NAME:	in out TREE
+		; ALIGNMENT:	TREE
+		; COMP_REP_S:	TREE
+		; H:		H_TYPE )
+    is
+	DEFSET: DEFSET_TYPE;
+	NAME_ID: TREE;
+	NAME_TYPE: TREE;
+	RECORD_DEF: TREE;
+	TYPESET: TYPESET_TYPE;
+	REP_LIST: SEQ_TYPE := LIST(COMP_REP_S);
+	COMP_REP: TREE;
+	REP_NAME: TREE;
+	REP_EXP: TREE;
+	REP_RANGE: TREE;
+	IS_SUBTYPE: BOOLEAN;
+	DEFLIST: SEQ_TYPE;
+	DEF: TREE;
+    begin
+	FIND_DIRECT_VISIBILITY(SIMPLE_NAME, DEFSET);
+	REQUIRE_UNIQUE_DEF(SIMPLE_NAME, DEFSET);
+	NAME_ID := GET_THE_ID(DEFSET);
+	if KIND(NAME_ID) not in CLASS_TYPE_NAME
+	or else KIND(GET_BASE_TYPE(NAME_ID)) /= DN_RECORD then
+	    NAME_ID := CONST_VOID;
+            ERROR(D(LX_SRCPOS,SIMPLE_NAME), "Must be record type");
+	    RECORD_DEF := CONST_VOID;
+	else
+	    NAME_TYPE := GET_BASE_TYPE(NAME_ID);
+	    RECORD_DEF := GET_DEF(HEAD(DEFSET));
+	    CHECK_TYPE_IN_CURRENT_REGION(NAME_ID, D(LX_SRCPOS, SIMPLE_NAME), H);
+	    declare
+		DUP_REC: BOOLEAN := FALSE;
+	    begin
+		for K in 1 .. SEEN_REC_CNT loop
+		    if SEEN_REC_REP(K) = NAME_TYPE then
+			DUP_REC := TRUE;
+			exit;
+		    end if;
+		end loop;
+		if DUP_REC then
+		    ERROR(D(LX_SRCPOS, SIMPLE_NAME), "Duplicate record representation clause");
+		elsif SEEN_REC_CNT < MAX_SEEN_REP then
+		    SEEN_REC_CNT := SEEN_REC_CNT + 1;
+		    SEEN_REC_REP(SEEN_REC_CNT) := NAME_TYPE;
+		end if;
+	    end;
+	end if;
+	SIMPLE_NAME := MAKE_USED_NAME_ID_FROM_OBJECT (SIMPLE_NAME);
+	D(SM_DEFN, SIMPLE_NAME, NAME_ID);
+
+	WALK_ITEM_S(D(AS_PRAGMA_S,ALIGNMENT), H);
+	if D(AS_EXP,ALIGNMENT) /= CONST_VOID then
+	    EVAL_EXP_TYPES(D(AS_EXP,ALIGNMENT), TYPESET);
+	    REQUIRE_INTEGER_TYPE(D(AS_EXP,ALIGNMENT),TYPESET);
+	    REQUIRE_UNIQUE_TYPE(D(AS_EXP,ALIGNMENT),TYPESET);
+	    D(AS_EXP, ALIGNMENT, RESOLVE_EXP(D(AS_EXP,ALIGNMENT),TYPESET));
+	    if not IS_EMPTY(TYPESET)
+	    and then GET_STATIC_VALUE(D(AS_EXP,ALIGNMENT)) = CONST_VOID then
+                ERROR(D(LX_SRCPOS,ALIGNMENT), "Alignment not static");
+	    end if;
+	end if;
+
+	declare
+	    type BIT_REC is record
+		COMP_ID: TREE;
+		LO_BIT: TREE;
+		HI_BIT: TREE;
+		IS_VAR: BOOLEAN;
+	    end record;
+	    PLACED: array (1 .. 128) of BIT_REC;
+	    PLACED_CNT: NATURAL := 0;
+
+	    function IS_IN_FIXED_PART(CID: TREE) return BOOLEAN is
+		CL: TREE;
+		DL: SEQ_TYPE;
+		IT: TREE;
+		NS: SEQ_TYPE;
+		SN: TREE;
+	    begin
+		if NAME_TYPE = CONST_VOID or else KIND(NAME_TYPE) /= DN_RECORD then
+		    return TRUE;
+		end if;
+		if D(SM_DISCRIMINANT_S, NAME_TYPE) /= CONST_VOID then
+		    DL := LIST(D(SM_DISCRIMINANT_S, NAME_TYPE));
+		    while not IS_EMPTY(DL) loop
+			POP(DL, IT);
+			if KIND(IT) = DN_DSCRMT_DECL then
+			    NS := LIST(D(AS_SOURCE_NAME_S, IT));
+			    while not IS_EMPTY(NS) loop
+				POP(NS, SN);
+				if SN = CID then return TRUE; end if;
+			    end loop;
+			end if;
+		    end loop;
+		end if;
+		CL := D(SM_COMP_LIST, NAME_TYPE);
+		if CL /= CONST_VOID and then D(AS_DECL_S, CL) /= CONST_VOID then
+		    DL := LIST(D(AS_DECL_S, CL));
+		    while not IS_EMPTY(DL) loop
+			POP(DL, IT);
+			if KIND(IT) = DN_VARIABLE_DECL then
+			    NS := LIST(D(AS_SOURCE_NAME_S, IT));
+			    while not IS_EMPTY(NS) loop
+				POP(NS, SN);
+				if SN = CID then return TRUE; end if;
+			    end loop;
+			end if;
+		    end loop;
+		end if;
+		return FALSE;
+	    end IS_IN_FIXED_PART;
+
+	    function COMP_IN_COMP_LIST(CID, CL: TREE) return BOOLEAN is
+		DL: SEQ_TYPE;
+		IT: TREE;
+		NS: SEQ_TYPE;
+		SN: TREE;
+		VP: TREE;
+		VL: SEQ_TYPE;
+		VN: TREE;
+	    begin
+		if CL = CONST_VOID then return FALSE; end if;
+		if D(AS_DECL_S, CL) /= CONST_VOID then
+		    DL := LIST(D(AS_DECL_S, CL));
+		    while not IS_EMPTY(DL) loop
+			POP(DL, IT);
+			if KIND(IT) = DN_VARIABLE_DECL then
+			    NS := LIST(D(AS_SOURCE_NAME_S, IT));
+			    while not IS_EMPTY(NS) loop
+				POP(NS, SN);
+				if SN = CID then return TRUE; end if;
+			    end loop;
+			end if;
+		    end loop;
+		end if;
+		VP := D(AS_VARIANT_PART, CL);
+		if VP /= CONST_VOID and then D(AS_VARIANT_S, VP) /= CONST_VOID then
+		    VL := LIST(D(AS_VARIANT_S, VP));
+		    while not IS_EMPTY(VL) loop
+			POP(VL, VN);
+			if KIND(VN) = DN_VARIANT and then COMP_IN_COMP_LIST(CID, D(AS_COMP_LIST, VN)) then
+			    return TRUE;
+			end if;
+		    end loop;
+		end if;
+		return FALSE;
+	    end COMP_IN_COMP_LIST;
+
+	    function IN_DIFF_VARIANTS(C1, C2, CL: TREE) return BOOLEAN is
+		VP: TREE;
+		VL: SEQ_TYPE;
+		VN: TREE;
+		V1, V2: TREE := CONST_VOID;
+	    begin
+		if CL = CONST_VOID then return FALSE; end if;
+		VP := D(AS_VARIANT_PART, CL);
+		if VP = CONST_VOID or else D(AS_VARIANT_S, VP) = CONST_VOID then
+		    return FALSE;
+		end if;
+		VL := LIST(D(AS_VARIANT_S, VP));
+		while not IS_EMPTY(VL) loop
+		    POP(VL, VN);
+		    if KIND(VN) = DN_VARIANT then
+			if COMP_IN_COMP_LIST(C1, D(AS_COMP_LIST, VN)) then V1 := VN; end if;
+			if COMP_IN_COMP_LIST(C2, D(AS_COMP_LIST, VN)) then V2 := VN; end if;
+		    end if;
+		end loop;
+		if V1 /= CONST_VOID and then V2 /= CONST_VOID then
+		    if V1 /= V2 then return TRUE; end if;
+		    return IN_DIFF_VARIANTS(C1, C2, D(AS_COMP_LIST, V1));
+		end if;
+		return FALSE;
+	    end IN_DIFF_VARIANTS;
+	begin
+	while not IS_EMPTY(REP_LIST) loop
+	    POP(REP_LIST, COMP_REP);
+	    if KIND(COMP_REP) = DN_COMP_REP then
+	        REP_NAME := D(AS_NAME, COMP_REP);
+	    	REP_EXP := D(AS_EXP, COMP_REP);
+	    	REP_RANGE := D(AS_RANGE, COMP_REP);
+
+	    	REP_NAME := MAKE_USED_NAME_ID_FROM_OBJECT(REP_NAME);
+	    	D(SM_DEFN, REP_NAME, CONST_VOID);
+	    	if RECORD_DEF /= CONST_VOID then
+		    DEFLIST := LIST(D(LX_SYMREP,REP_NAME));
+		    while not IS_EMPTY(DEFLIST) loop
+		    	POP(DEFLIST,DEF);
+		        if D(XD_REGION_DEF,DEF) = RECORD_DEF then
+			    D(SM_DEFN, REP_NAME, D(XD_SOURCE_NAME, DEF));
+			    exit;
+		    	end if;
+		    end loop;
+		    if D(SM_DEFN, REP_NAME) = CONST_VOID then
+                        ERROR(D(LX_SRCPOS,REP_NAME)
+				, "Not a component of record");
+		    end if;
+	        end if;
+
+	        EVAL_EXP_TYPES(REP_EXP, TYPESET);
+	        REQUIRE_INTEGER_TYPE(REP_EXP, TYPESET);
+	        REQUIRE_UNIQUE_TYPE(REP_EXP, TYPESET);
+	        REP_EXP := RESOLVE_EXP(REP_EXP, TYPESET);
+
+	        EVAL_EXP_SUBTYPE_TYPES(REP_RANGE, TYPESET, IS_SUBTYPE);
+	        REQUIRE_INTEGER_TYPE(REP_RANGE, TYPESET);
+	        REQUIRE_UNIQUE_TYPE(REP_RANGE, TYPESET);
+	        REP_RANGE := RESOLVE_DISCRETE_RANGE
+			    (REP_RANGE, GET_THE_TYPE(TYPESET));
+	        if KIND(REP_RANGE) = DN_RANGE
+	        and then GET_STATIC_VALUE(D(AS_EXP1,REP_RANGE)) /= CONST_VOID
+	        and then GET_STATIC_VALUE(D(AS_EXP2,REP_RANGE)) /= CONST_VOID
+	        then
+		    declare
+			use UARITH;
+			POS_V: constant TREE := GET_STATIC_VALUE(REP_EXP);
+			FB_V: constant TREE := GET_STATIC_VALUE(D(AS_EXP1, REP_RANGE));
+			LB_V: constant TREE := GET_STATIC_VALUE(D(AS_EXP2, REP_RANGE));
+			CID: constant TREE := D(SM_DEFN, REP_NAME);
+		    begin
+			if POS_V /= CONST_VOID and then CID /= CONST_VOID then
+			    declare
+				CT_C: constant TREE := D(SM_OBJ_TYPE, CID);
+				CB_C: constant TREE := GET_BASE_STRUCT(CT_C);
+			    begin
+				if CB_C /= CONST_VOID
+				and then (KIND(CB_C) = DN_RECORD or else KIND(CB_C) in CLASS_PRIVATE_SPEC)
+				and then D(SM_DISCRIMINANT_S, CB_C) /= CONST_VOID
+				and then not IS_EMPTY(LIST(D(SM_DISCRIMINANT_S, CB_C)))
+				and then HAS_NONSTATIC_CONSTRAINT(CT_C) then
+				    ERROR(D(LX_SRCPOS, COMP_REP), "Component clause not allowed for non-statically constrained discriminated component");
+				end if;
+			    end;
+			    declare
+				LO_B: constant TREE := POS_V * U_VAL(8) + FB_V;
+				HI_B: constant TREE := POS_V * U_VAL(8) + LB_V;
+				IS_V: constant BOOLEAN := not IS_IN_FIXED_PART(CID);
+			    begin
+				if U_POS(POS_V < U_VAL(0)) /= 0 or else U_POS(FB_V < U_VAL(0)) /= 0 then
+				    ERROR(D(LX_SRCPOS, COMP_REP), "Negative position or bit in component clause");
+				end if;
+				for K in 1 .. PLACED_CNT loop
+				    if PLACED(K).COMP_ID = CID then
+					ERROR(D(LX_SRCPOS, COMP_REP), "Duplicate component clause");
+				    elsif not (NAME_TYPE /= CONST_VOID and then KIND(NAME_TYPE) = DN_RECORD
+					       and then IN_DIFF_VARIANTS(CID, PLACED(K).COMP_ID, D(SM_COMP_LIST, NAME_TYPE)))
+				    and then U_POS(HI_B < PLACED(K).LO_BIT) = 0
+				    and then U_POS(PLACED(K).HI_BIT < LO_B) = 0 then
+					ERROR(D(LX_SRCPOS, COMP_REP), "Overlapping component clauses");
+				    end if;
+				end loop;
+				if PLACED_CNT < 128 then
+				    PLACED_CNT := PLACED_CNT + 1;
+				    PLACED(PLACED_CNT) := (CID, LO_B, HI_B, IS_V);
+				end if;
+			    end;
+			end if;
+		    end;
+	        else
+                    ERROR(D(LX_SRCPOS, REP_RANGE), "Static range required");
+	        end if;
+
+	        D(AS_NAME, COMP_REP, REP_NAME);
+	        D(AS_EXP, COMP_REP, REP_EXP);
+	        D(AS_RANGE, COMP_REP, REP_RANGE);
+	    else -- must be pragma
+		walk(d(as_pragma,COMP_REP), h);
+	    end if;
+	end loop;
+	end;
+    end RESOLVE_RECORD_REP;
+
+end REPCLAU;

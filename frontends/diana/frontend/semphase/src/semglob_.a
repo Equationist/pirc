@@ -1,0 +1,116 @@
+with USERPK; use USERPK;
+with DIANAMAN; use DIANAMAN;
+
+package SEMGLOB is
+    -- global types and data for semantic phase
+
+    -- saved and restored around bodies
+    type SB_TYPE is
+	record
+	    null;
+	end record;
+
+    -- saved and restored around regions
+    type SU_TYPE is
+	record
+	    USED_PACKAGE_LIST:		SEQ_TYPE;
+	    INCOMPLETE_TYPE_LIST:	SEQ_TYPE;
+	    PRIVATE_TYPE_LIST:		SEQ_TYPE;
+	end record;
+
+    -- hereditary information
+    type H_TYPE is
+	record
+	    REGION_DEF: 	TREE;
+	    LEX_LEVEL:		NATURAL;
+	    IS_IN_SPEC: 	BOOLEAN;
+	    IS_IN_BODY: 	BOOLEAN;
+	    SUBP_SYMREP:	TREE;
+	    RETURN_TYPE:	TREE;
+	    ENCLOSING_LOOP_ID:	TREE;
+	end record;
+
+    -- global data
+    SB: 	SB_TYPE;
+    SU: 	SU_TYPE;
+    INITIAL_H:	H_TYPE;
+
+    PREDEFINED_BOOLEAN: 	TREE;
+    PREDEFINED_SHORT_INTEGER:	TREE;
+    PREDEFINED_INTEGER: 	TREE;
+    PREDEFINED_LONG_INTEGER:	TREE;
+    PREDEFINED_LARGEST_INTEGER: TREE;
+    PREDEFINED_FLOAT:		TREE;
+    PREDEFINED_LONG_FLOAT:	TREE;
+    PREDEFINED_LARGEST_FLOAT:	TREE;
+    PREDEFINED_STRING:		TREE;
+    PREDEFINED_DURATION:	TREE;
+    PREDEFINED_ADDRESS: 	TREE;
+
+    PREDEFINED_STANDARD_DEF:	TREE;
+    PREDEFINED_STANDARD_ID:	TREE;
+
+    PREDEFINED_SHORT_INTEGER_FIRST:	TREE;
+    PREDEFINED_SHORT_INTEGER_LAST:	TREE;
+    PREDEFINED_INTEGER_FIRST:		TREE;
+    PREDEFINED_INTEGER_LAST:		TREE;
+    PREDEFINED_LONG_INTEGER_FIRST:	TREE;
+    PREDEFINED_LONG_INTEGER_LAST:	TREE;
+    PREDEFINED_FLOAT_FIRST:		TREE;
+    PREDEFINED_FLOAT_LAST:		TREE;
+    PREDEFINED_FLOAT_ACCURACY:		TREE;
+    PREDEFINED_LONG_FLOAT_FIRST:	TREE;
+    PREDEFINED_LONG_FLOAT_LAST: 	TREE;
+    PREDEFINED_LONG_FLOAT_ACCURACY:	TREE;
+
+    -- Active region stack & transient legality state
+    REGION_STACK: array (1 .. 128) of TREE;
+    REGION_SP: NATURAL := 0;
+    CURRENT_REGION_DEF: TREE;
+    FORBIDDEN_SELECTOR_SYMREP: TREE;
+    FUNC_HAS_RETURN: BOOLEAN := FALSE;
+    COMPILATION_UNIT_LEX_LEVEL: NATURAL := 2;
+    SYSTEM_IS_WITHED: BOOLEAN := FALSE;
+    CAN_RETURN: BOOLEAN := FALSE;
+    IN_HANDLER: BOOLEAN := FALSE;
+    STM_BARRIER: NATURAL := 0;
+    STM_SP: NATURAL := 0;
+    LOOP_BARRIER: NATURAL := 0;
+    LOOP_SP: NATURAL := 0;
+    IN_GENERIC_FORMALS: BOOLEAN := FALSE;
+    IN_DEFAULT_EXP: BOOLEAN := FALSE;
+    ALLOW_DEFERRED_CONST: BOOLEAN := FALSE;
+
+    -- B9: constrained incomplete types (b37212a/b)
+    CONSTR_INC_CNT: NATURAL := 0;
+    CONSTR_INC_TS: array (1 .. 128) of TREE;
+    CONSTR_INC_POS: array (1 .. 128) of TREE;
+
+    -- B6: type freezing / forcing occurrences (bd1b01a/3c/4d/5e)
+    FROZEN_CNT: NATURAL := 0;
+    FROZEN_ARR: array (1 .. 1024) of TREE;
+    procedure FREEZE_TYPE(TS: TREE);
+    function IS_FROZEN(TS: TREE) return BOOLEAN;
+
+    -- B1: generic body map & pending unconstrained formal checks (bc3204*/bc3205*)
+    GEN_BODY_CNT: NATURAL := 0;
+    GEN_BODY_ID: array (1 .. 256) of TREE;
+    GEN_BODY_NODE: array (1 .. 256) of TREE;
+    PEND_UNCON_CNT: NATURAL := 0;
+    PEND_UNCON_GEN: array (1 .. 256) of TREE;
+    PEND_UNCON_FRM: array (1 .. 256) of TREE;
+    PEND_UNCON_POS: array (1 .. 256) of TREE;
+
+    -- B8: deferred implicit access deref operations (b38106a/b, b74205b)
+    DEF_ACC_CNT: NATURAL := 0;
+    DEF_ACC_TS: array (1 .. 128) of TREE;
+    DEF_ACC_REG: array (1 .. 128) of TREE;
+    DEF_ACC_ACT: array (1 .. 128) of BOOLEAN;
+    function IS_ACC_DEREF_BLOCKED(TS: TREE) return BOOLEAN;
+
+    -- initialization procedure
+    procedure INITIALIZE_GLOBAL_DATA;
+
+    -- initialize types
+    procedure INITIALIZE_PREDEFINED_TYPES;
+end SEMGLOB;

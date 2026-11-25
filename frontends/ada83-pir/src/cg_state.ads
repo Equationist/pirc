@@ -6,6 +6,7 @@ with Ada.Containers.Vectors;
 with Ada.Strings.Unbounded; use Ada.Strings.Unbounded;
 with Interfaces; use Interfaces;
 with USERPK; use USERPK;
+with DIANA; use DIANA;
 with Pir_Emit;
 
 package Cg_State is
@@ -48,12 +49,17 @@ package Cg_State is
 
    -- Field index map: (Record_Type_Key, Comp_Id_Key) -> Field_Index (0-based)
    type Field_Entry is record
-      Field_Idx : Natural := 0;
-      In_Union  : Boolean := False;
-      Union_Idx : Natural := 0;
-      Var_Idx   : Natural := 0;
-      Var_Type  : Unbounded_String;
-      Var_Field : Natural := 0;
+      Field_Idx           : Natural := 0;
+      In_Union            : Boolean := False;
+      Union_Idx           : Natural := 0;
+      Var_Idx             : Natural := 0;
+      Var_Type            : Unbounded_String;
+      Var_Field           : Natural := 0;
+      Byte_Offset         : Natural := 0;
+      Field_Size          : Natural := 0;
+      Has_Explicit_Offset : Boolean := False;
+      Bit_Offset          : Natural := 0;
+      Bit_Size            : Natural := 0;
    end record;
 
    package Field_Maps is new Ada.Containers.Hashed_Maps
@@ -65,7 +71,9 @@ package Cg_State is
    -- Variable / object binding
    type Var_Kind is
      (VK_Global,
+      VK_Global_Ptr,
       VK_Local_Alloca,
+      VK_Local_Ptr,
       VK_Param_Val,
       VK_Param_Ptr,
       VK_Uncon_Array_Param,
@@ -87,13 +95,17 @@ package Cg_State is
       NDims          : Natural := 0;
       First_Regs     : Str_Array_4;
       Last_Regs      : Str_Array_4;
+      Has_Desc       : Boolean := False;
+      Desc_Global    : Unbounded_String;
       -- For compile-time scalar constants:
       Const_I64      : Integer_64 := 0;
       Const_F64      : IEEE_Float_64 := 0.0;
       -- For read-only loop parameters with statically known bounds:
-      Has_Static_Rng : Boolean := False;
-      Rng_Lo         : Integer_64 := 0;
-      Rng_Hi         : Integer_64 := 0;
+      Has_Static_Rng  : Boolean := False;
+      Rng_Lo          : Integer_64 := 0;
+      Rng_Hi          : Integer_64 := 0;
+      -- For OUT / IN OUT unconstrained record parameters with default discriminants (LRM 3.7.2/3.7.4):
+      Constrained_Reg : Unbounded_String;
    end record;
 
    package Var_Maps is new Ada.Containers.Hashed_Maps
@@ -114,8 +126,10 @@ package Cg_State is
       Ret_Composite : Boolean := False;
       Ret_Uncon_Arr : Boolean := False;
       Ret_Type      : TREE := (0, 0, 0);
-      Is_External   : Boolean := False;
-      Is_Emitted    : Boolean := False;
+      Is_External    : Boolean := False;
+      Is_Emitted     : Boolean := False;
+      Is_C_Interface : Boolean := False;
+      Elab_Flag      : Unbounded_String;
    end record;
 
    package Subp_Maps is new Ada.Containers.Hashed_Maps
@@ -133,9 +147,10 @@ package Cg_State is
 
    -- Loop exit label stack
    type Loop_Entry is record
-      Label_Key  : Unsigned_32 := 0; -- 0 if unnamed
-      Exit_Label : Unbounded_String;
-      SS_Depth   : Natural := 0;
+      Label_Key    : Unsigned_32 := 0; -- 0 if unnamed
+      Exit_Label   : Unbounded_String;
+      SS_Depth     : Natural := 0;
+      Master_Depth : Natural := 0;
    end record;
 
    package Loop_Vecs is new Ada.Containers.Vectors (Natural, Loop_Entry);
@@ -175,6 +190,121 @@ package Cg_State is
 
    package Copy_Out_Vecs is new Ada.Containers.Vectors (Natural, Copy_Out_Entry);
 
+   -- Task type & entry descriptors (Ada 83 Chapter 9)
+   type Entry_Info is record
+      Task_Key      : Unsigned_32 := 0;
+      Base_Idx      : Natural := 0;
+      Is_Family     : Boolean := False;
+      Fam_Is_Static : Boolean := True;
+      Fam_Lo        : Integer_64 := 0;
+      Fam_Hi        : Integer_64 := 0;
+      Fam_DR        : TREE := (0, 0, 0);
+      Entry_Header  : TREE := (0, 0, 0);
+      Pkt_Type      : Unbounded_String;
+      Has_Params    : Boolean := False;
+   end record;
+
+   type Renamed_Entry_Info is record
+      Task_Sym : Unbounded_String;
+      Idx_Sym  : Unbounded_String;
+      Entry_Id : TREE := (0, 0, 0);
+   end record;
+
+   package Renamed_Entry_Maps is new Ada.Containers.Hashed_Maps
+     (Key_Type        => Unsigned_32,
+      Element_Type    => Renamed_Entry_Info,
+      Hash            => Hash_U32,
+      Equivalent_Keys => "=");
+
+   package I64_Maps is new Ada.Containers.Hashed_Maps
+     (Key_Type        => Unsigned_32,
+      Element_Type    => Integer_64,
+      Hash            => Hash_U32,
+      Equivalent_Keys => "=");
+
+   package Entry_Maps is new Ada.Containers.Hashed_Maps
+     (Key_Type        => Unsigned_32,
+      Element_Type    => Entry_Info,
+      Hash            => Hash_U32,
+      Equivalent_Keys => "=");
+
+   type Task_Info is record
+      Body_Fn      : Unbounded_String;
+      Num_Entries  : Natural := 1;
+      Parent_Subp  : Unsigned_32 := 0;
+      Needs_SL     : Boolean := False;
+      Is_Emitted   : Boolean := False;
+      Elab_Flag    : Unbounded_String;
+      Inst_Tag     : Unbounded_String;
+      Has_Priority     : Boolean := False;
+      Priority         : Integer := 0;
+      Storage_Size     : Integer_64 := 0;
+      Storage_Size_Exp : TREE := (0, 0, 0);
+   end record;
+
+   package Task_Maps is new Ada.Containers.Hashed_Maps
+     (Key_Type        => Unsigned_32,
+      Element_Type    => Task_Info,
+      Hash            => Hash_U32,
+      Equivalent_Keys => "=");
+
+   package Tree_Map_Maps is new Ada.Containers.Hashed_Maps
+     (Key_Type        => Unsigned_32,
+      Element_Type    => Tree_Maps.Map,
+      Hash            => Hash_U32,
+      Equivalent_Keys => "=",
+      "="             => Tree_Maps."=");
+
+   -- Pre-evaluated subtype bounds / discriminants / component constraint expressions (LRM 3.2.1, 3.7.2)
+   type Saved_Range_Info is record
+      Lo_Ptr     : Unbounded_String;
+      Hi_Ptr     : Unbounded_String;
+      Pir_Type   : Unbounded_String;
+      Align      : Natural := 4;
+      Is_Global  : Boolean := False;
+      Owner_Subp : Unsigned_32 := 0;
+   end record;
+
+   package Saved_Range_Maps is new Ada.Containers.Hashed_Maps
+     (Key_Type        => Unsigned_32,
+      Element_Type    => Saved_Range_Info,
+      Hash            => Hash_U32,
+      Equivalent_Keys => "=");
+
+   type Saved_Disc_Ptrs  is array (1 .. 8) of Unbounded_String;
+   type Saved_Disc_Types is array (1 .. 8) of Unbounded_String;
+   type Saved_Disc_Aligns is array (1 .. 8) of Natural;
+
+   type Saved_Disc_Info is record
+      Count      : Natural := 0;
+      Ptrs       : Saved_Disc_Ptrs;
+      Pir_Types  : Saved_Disc_Types;
+      Aligns     : Saved_Disc_Aligns := (others => 4);
+      Is_Global  : Boolean := False;
+      Owner_Subp : Unsigned_32 := 0;
+   end record;
+
+   package Saved_Disc_Maps is new Ada.Containers.Hashed_Maps
+     (Key_Type        => Unsigned_32,
+      Element_Type    => Saved_Disc_Info,
+      Hash            => Hash_U32,
+      Equivalent_Keys => "=");
+
+   type Saved_Expr_Info is record
+      Ptr_Reg    : Unbounded_String;
+      Pir_Type   : Unbounded_String;
+      Ada_Type   : TREE := (0, 0, 0);
+      Align      : Natural := 4;
+      Is_Global  : Boolean := False;
+      Owner_Subp : Unsigned_32 := 0;
+   end record;
+
+   package Saved_Expr_Maps is new Ada.Containers.Hashed_Maps
+     (Key_Type        => Unsigned_32,
+      Element_Type    => Saved_Expr_Info,
+      Hash            => Hash_U32,
+      Equivalent_Keys => "=");
+
    type Context is limited record
       E             : Pir_Emit.Emitter;
       Enable_Checks : Boolean := True;
@@ -185,28 +315,55 @@ package Cg_State is
       Fields        : Field_Maps.Map;
       Vars          : Var_Maps.Map;
       Subps         : Subp_Maps.Map;
+      Tasks         : Task_Maps.Map;
+      Entries       : Entry_Maps.Map;
       Generic_Decls : Tree_Maps.Map;
-      Generic_Body  : Tree_Maps.Map;
-      Generic_Subst : Tree_Maps.Map; -- active formal -> actual during generic emission
+      Generic_Body   : Tree_Maps.Map;
+      Gen_Subunits   : Tree_Maps.Map; -- separate subunit bodies belonging to generic templates (c94008d, ca3011a)
+      Generic_Env    : Tree_Map_Maps.Map; -- captured outer Generic_Subst for nested generics
+      Gen_Elab_Flags : Type_Maps.Map; -- generic key -> Pir_Type holds @ada_gelab_... global
+      Generic_Subst  : Tree_Maps.Map; -- active formal -> actual during generic emission
+      Subp_Renames  : Tree_Maps.Map; -- SID -> DN_RENAMES_UNIT (when instant.a leaves SM_UNIT_DESC void)
+      Gen_Inst_Tag  : Unbounded_String; -- per-instantiation disambiguator for local subps
+      In_Subunit      : Boolean := False; -- True when emitting a DN_SUBUNIT compilation unit
+      In_Lib_Pkg_Body : Boolean := False; -- True when emitting a non-support library package body
+      Has_Stubs       : Boolean := False; -- True when emitting a unit that contains DN_STUB declarations
       Exc_Tags      : Type_Maps.Map; -- reuse U32 -> Pir_Type holds tag symbol name
 
-      -- Current subprogram state
-      Cur_Subp_Key  : Unsigned_32 := 0;
-      Cur_Subp_Node : TREE := (0, 0, 0);
-      Cur_Ret_Type  : TREE := (0, 0, 0);
-      Cur_Ret_Comp  : Boolean := False;
-      Cur_Ret_Uncon : Boolean := False;
-      Cur_Ret_Ptr   : Unbounded_String;
-      Cur_Frame_Reg : Unbounded_String;
-      Cur_SL_Reg    : Unbounded_String;
-      Cur_Is_Func   : Boolean := False;
-      Uplevel_Cache : Type_Maps.Map; -- cached entry-block uplevel var address regs per subprogram
+      -- Current subprogram / task state
+      Cur_Subp_Key      : Unsigned_32 := 0;
+      Cur_Subp_Node     : TREE := (0, 0, 0);
+      Cur_Ret_Type      : TREE := (0, 0, 0);
+      Cur_Ret_Comp      : Boolean := False;
+      Cur_Ret_Uncon     : Boolean := False;
+      Cur_Ret_Ptr       : Unbounded_String;
+      Cur_Frame_Reg     : Unbounded_String;
+      Cur_SL_Reg        : Unbounded_String;
+      Cur_Master_Reg    : Unbounded_String;
+      Cur_Task_Reg      : Unbounded_String;
+      Cur_Task_Exit_Lbl : Unbounded_String;
+      Cur_Is_Func       : Boolean := False;
+      Uplevel_Cache     : Type_Maps.Map; -- cached entry-block uplevel var address regs per subprogram
+      Pkg_Task_Marks    : Type_Maps.Map; -- local package task marks (PID key -> mark reg in Pir_Type)
+      Pkg_Task_Groups   : I64_Maps.Map;  -- local package task group IDs (PID key -> group_id)
+      Cur_Task_Group_Id : Integer_64 := 0;
+      Next_Task_Group_Id : Integer_64 := 1;
+      Renamed_Entries   : Renamed_Entry_Maps.Map; -- SID key -> pre-evaluated task/idx globals
+      Access_Masters    : Type_Maps.Map; -- access base type key -> @ada_accmst_... global sym in Pir_Type
+      Saved_Type_Ranges : Saved_Range_Maps.Map; -- scalar subtype key -> pre-evaluated Lo/Hi allocas/globals
+      Saved_Type_Discs  : Saved_Disc_Maps.Map;  -- constrained record key -> pre-evaluated disc allocas/globals
+      Saved_Expr_Vals   : Saved_Expr_Maps.Map;  -- record comp constraint expr key -> pre-evaluated alloca/global
+      Gen_Local_Exc_Tags : Type_Maps.Map;       -- generic-local exception key -> tagged @__ada_exc_... sym
 
-      Loops         : Loop_Vecs.Vector;
-      Handlers      : Handler_Vecs.Vector;
-      Copy_Outs     : Copy_Out_Vecs.Vector;
-      SS_Marks      : Str_Vecs.Vector;
-      Pending_Insts : Pending_Inst_Vecs.Vector;
+      Loops             : Loop_Vecs.Vector;
+      Handlers          : Handler_Vecs.Vector;
+      Copy_Outs         : Copy_Out_Vecs.Vector;
+      SS_Marks          : Str_Vecs.Vector;
+      Master_Stack      : Str_Vecs.Vector;
+      Accept_End_Lbls   : Str_Vecs.Vector;
+      Accept_Mst_Depths : U32_Vecs.Vector;
+      Label_Mst_Depths  : I64_Maps.Map;
+      Pending_Insts     : Pending_Inst_Vecs.Vector;
 
       -- Withed user packages to elaborate in main
       Elab_Funcs    : U32_Vecs.Vector;
@@ -221,9 +378,22 @@ package Cg_State is
 
    -- Apply active generic substitution (if any) to a DIANA type or definition node
    function Subst_Tree (Ctx : Context; T : TREE) return TREE;
+   function Subst_Resolve_Type (Ctx : Context; T : TREE) return TREE;
+   function Subst_Base_Type (Ctx : Context; T : TREE) return TREE;
+
+   -- Emit element pointer for array of ETI (handles array-of-arrays via ptr_add byte stride!)
+   function Emit_Elem_Ptr
+     (Ctx      : in out Context;
+      ETI      : Type_Info;
+      Base_Ptr : String;
+      Idx_64   : String) return String;
 
    -- Resolve and materialize PIR type info for any DIANA type spec
    function Get_Type_Info (Ctx : in out Context; Raw_Type : TREE) return Type_Info;
+
+   -- Check whether a record/private type has discriminants with defaults, or whether a param needs a hidden 'CONSTRAINED i8 arg
+   function Record_Has_Default_Discs (Ctx : Context; Raw_T : TREE) return Boolean;
+   function Needs_Constrained_Param (Ctx : Context; Raw_T : TREE; Mode : NODE_NAME) return Boolean;
 
    -- Get exception global tag symbol name (e.g. "@__ada_exc_constraint_error")
    function Get_Exc_Tag (Ctx : in out Context; Exc_Id : TREE) return String;
@@ -231,11 +401,29 @@ package Cg_State is
    function Program_Error_Tag (Ctx : in out Context) return String;
    function Storage_Error_Tag (Ctx : in out Context) return String;
 
-   -- Ensure runtime externs are declared
+   -- Register a task specification and its entries / entry param packet types
+   procedure Register_Task_Spec
+     (Ctx         : in out Context;
+      Task_Spec   : TREE;
+      Parent_Subp : Unsigned_32);
+
+   -- Load enclosing task's %__self via static-link chain (for nested subprograms/tasks)
+   function Emit_Enclosing_Task_Self_By_Key
+     (Ctx       : in out Context;
+      Target_TK : Unsigned_32) return String;
+
+   -- Emit runtime externs are declared
    procedure Ensure_Runtime_Externs (Ctx : in out Context);
 
+   -- Check whether a subprogram has `pragma INTERFACE (C, ...)`
+   function Is_C_Interfaced (Subp_Id : TREE) return Boolean;
+
    -- Compute deterministic mangled PIR symbol name for a subprogram
-   function Mangle_Subp_Name (Ctx : in out Context; Subp_Id : TREE; Spec_Node : TREE) return String;
+   function Mangle_Subp_Name
+     (Ctx        : in out Context;
+      Subp_Id    : TREE;
+      Spec_Node  : TREE;
+      Is_Subunit : Boolean := False) return String;
 
    -- Emit a raise of an exception tag (jumps to local handler if inside one, else resume)
    procedure Emit_Raise_Tag (Ctx : in out Context; Tag_Sym : String);

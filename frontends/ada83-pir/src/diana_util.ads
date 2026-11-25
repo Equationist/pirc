@@ -26,8 +26,13 @@ package Diana_Util is
    function Base_Type_Spec (T : TREE) return TREE;
 
    -- Universal integer and real decoding from DIANA SM_VALUE nodes
+   function Safe_SM_Value (Node : TREE) return TREE;
    function Has_Static_Val (T : TREE) return Boolean;
    function Eval_Int64 (Val_Node : TREE) return Integer_64;
+   procedure Eval_Int64_Checked
+     (Val_Node   : TREE;
+      Val        : out Integer_64;
+      Overflowed : out Boolean);
    function Eval_Float64 (Val_Node : TREE) return IEEE_Float_64;
    function Format_Float64 (V : IEEE_Float_64) return String;
 
@@ -42,6 +47,7 @@ package Diana_Util is
    function Is_Access_Type (T : TREE) return Boolean;
    function Is_Scalar_Type (T : TREE) return Boolean;
    function Is_Record_Type (T : TREE) return Boolean;
+   function Is_Task_Type (T : TREE) return Boolean;
    function Is_Constrained_Array (T : TREE) return Boolean;
    function Is_Unconstrained_Array (T : TREE) return Boolean;
    function Is_Array_Type (T : TREE) return Boolean;
@@ -51,6 +57,8 @@ package Diana_Util is
    function Scalar_Bits (T : TREE) return Natural;
    function Pir_Scalar_Type (T : TREE) return String;
    function Fixed_Small (T : TREE) return IEEE_Float_64;
+   function Fixed_Attr_Small (T : TREE) return IEEE_Float_64;
+   function Fixed_Delta (T : TREE) return IEEE_Float_64;
 
    -- Static range extraction for discrete subtypes (returns False if dynamic)
    procedure Get_Discrete_Bounds
@@ -62,6 +70,8 @@ package Diana_Util is
    -- Check if a symbol belongs to a predefined RTL package (STANDARD, TEXT_IO, CALENDAR, etc.)
    function Enclosing_Package_Name (Id : TREE) return String;
    function Qualified_Ada_Name (Id : TREE) return String;
+   function Is_Library_Level (Id : TREE) return Boolean;
+   function Is_Predefined_Standard_Pkg (Pkg_Id : TREE) return Boolean;
 
    -- Convert a DIANA string literal node's symbol text into raw characters (unquoting "")
    function Decode_Ada_String_Lit (Raw : String) return String;

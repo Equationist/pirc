@@ -9,7 +9,7 @@ package SYSTEM is
     MIN_INT	  : constant := -(2**63);
     MAX_DIGITS	  : constant := 15;
     MAX_MANTISSA  : constant := 63;
-    FINE_DELTA	  : constant := 1.0E-9;
+    FINE_DELTA	  : constant := 2.0**(-63);
     TICK	  : constant := 1.0E-9;
 
     subtype PRIORITY is INTEGER range 0 .. 10;

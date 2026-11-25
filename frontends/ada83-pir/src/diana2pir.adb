@@ -11,10 +11,13 @@ with DIANATTR; use DIANATTR;
 with Pir_Emit;
 with Cg_State;
 with Cg_Stmt;
+with Lib_Binder;
 
 procedure Diana2Pir is
    Target_Triple : Unbounded_String := To_Unbounded_String ("aarch64-apple-darwin");
    Output_Path   : Unbounded_String := Null_Unbounded_String;
+   Record_Obj    : Unbounded_String := Null_Unbounded_String;
+   Lib_Dir       : Unbounded_String := To_Unbounded_String ("ADA__LIB");
    Enable_Checks : Boolean := True;
    Emit_Main     : Boolean := True;
 
@@ -37,6 +40,16 @@ begin
             Target_Triple := To_Unbounded_String (Ada.Command_Line.Argument (I));
          elsif Arg'Length > 9 and then Arg (Arg'First .. Arg'First + 8) = "--target=" then
             Target_Triple := To_Unbounded_String (Arg (Arg'First + 9 .. Arg'Last));
+         elsif Arg = "--record-obj" and then I + 1 <= Ada.Command_Line.Argument_Count then
+            I := I + 1;
+            Record_Obj := To_Unbounded_String (Ada.Command_Line.Argument (I));
+         elsif Arg'Length > 13 and then Arg (Arg'First .. Arg'First + 12) = "--record-obj=" then
+            Record_Obj := To_Unbounded_String (Arg (Arg'First + 13 .. Arg'Last));
+         elsif Arg = "--lib" and then I + 1 <= Ada.Command_Line.Argument_Count then
+            I := I + 1;
+            Lib_Dir := To_Unbounded_String (Ada.Command_Line.Argument (I));
+         elsif Arg'Length > 6 and then Arg (Arg'First .. Arg'First + 5) = "--lib=" then
+            Lib_Dir := To_Unbounded_String (Arg (Arg'First + 6 .. Arg'Last));
          elsif Arg = "-o" and then I + 1 <= Ada.Command_Line.Argument_Count then
             I := I + 1;
             Output_Path := To_Unbounded_String (Ada.Command_Line.Argument (I));
@@ -72,6 +85,9 @@ begin
 
       Cg_Stmt.Emit_Compilation (Ctx, Structure);
       Pir_Emit.Write_Module (Ctx.E, To_String (Output_Path));
+      if Length (Record_Obj) > 0 then
+         Lib_Binder.Record_Compilation_Units (Structure, To_String (Record_Obj), To_String (Lib_Dir));
+      end if;
    end;
    CLOSE_DIANA;
 end Diana2Pir;

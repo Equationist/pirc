@@ -18,6 +18,7 @@ package body Pir_Emit is
       E.Externs_Buf := Null_Unbounded_String;
       E.Funcs_Buf   := Null_Unbounded_String;
       E.Sym_Set     := To_Unbounded_String ("|");
+      E.Def_Funcs   := To_Unbounded_String ("|");
       E.Type_Set    := To_Unbounded_String ("|");
       E.Sym_Counter := 0;
    end Init;
@@ -111,13 +112,23 @@ package body Pir_Emit is
      (E     : in out Emitter;
       Saved : in out Func_Buffer)
    is
+      Hdr    : constant String := To_String (E.Cur.Header);
+      At_Pos : constant Natural := Ada.Strings.Fixed.Index (Hdr, "@");
+      LP_Pos : constant Natural := (if At_Pos > 0 then Ada.Strings.Fixed.Index (Hdr, "(", From => At_Pos) else 0);
+      FName  : constant String :=
+        (if At_Pos > 0 and then LP_Pos > At_Pos then Hdr (At_Pos .. LP_Pos - 1) else "");
    begin
-      Append (E.Funcs_Buf, E.Cur.Header & " {" & NL);
-      Append (E.Funcs_Buf, ".entry:" & NL);
-      Append (E.Funcs_Buf, E.Cur.Entry_Alloc);
-      Append (E.Funcs_Buf, E.Cur.Entry_Body);
-      Append (E.Funcs_Buf, E.Cur.Rest_Body);
-      Append (E.Funcs_Buf, "}" & NL & NL);
+      if FName'Length = 0 or else Index (E.Def_Funcs, "|" & FName & "|") = 0 then
+         if FName'Length > 0 then
+            Append (E.Def_Funcs, FName & "|");
+         end if;
+         Append (E.Funcs_Buf, E.Cur.Header & " {" & NL);
+         Append (E.Funcs_Buf, ".entry:" & NL);
+         Append (E.Funcs_Buf, E.Cur.Entry_Alloc);
+         Append (E.Funcs_Buf, E.Cur.Entry_Body);
+         Append (E.Funcs_Buf, E.Cur.Rest_Body);
+         Append (E.Funcs_Buf, "}" & NL & NL);
+      end if;
       E.Cur := Saved;
    end End_Func;
 
@@ -145,7 +156,7 @@ package body Pir_Emit is
       N : constant Natural := E.Cur.Reg_Counter;
    begin
       E.Cur.Reg_Counter := N + 1;
-      return "%" & Prefix & Img (N);
+      return "%" & Prefix & "_" & Img (N);
    end Next_Reg;
 
    function Next_Label (E : in out Emitter; Prefix : String := "L") return String is
@@ -268,7 +279,40 @@ package body Pir_Emit is
             Ada.Text_IO.Put_Line (F, To_String (E.Globals_Buf));
          end if;
          if Length (E.Externs_Buf) > 0 then
-            Ada.Text_IO.Put_Line (F, To_String (E.Externs_Buf));
+            -- Filter out extern func declarations that were subsequently defined in this module
+            declare
+               Ext_S : constant String := To_String (E.Externs_Buf);
+               Pos   : Positive := Ext_S'First;
+            begin
+               while Pos <= Ext_S'Last loop
+                  declare
+                     LF_Pos : constant Natural := Ada.Strings.Fixed.Index (Ext_S, (1 => NL), From => Pos);
+                     End_P  : constant Natural := (if LF_Pos > 0 then LF_Pos - 1 else Ext_S'Last);
+                     Line   : constant String := Ext_S (Pos .. End_P);
+                     At_Pos : constant Natural := Ada.Strings.Fixed.Index (Line, "@");
+                     LP_Pos : constant Natural := (if At_Pos > 0 then Ada.Strings.Fixed.Index (Line, "(", From => At_Pos) else 0);
+                     Skip   : Boolean := False;
+                  begin
+                     if At_Pos > 0 and then LP_Pos > At_Pos then
+                        declare
+                           EName : constant String := Line (At_Pos .. LP_Pos - 1);
+                        begin
+                           if Index (E.Def_Funcs, "|" & EName & "|") > 0 then
+                              Skip := True;
+                           end if;
+                        end;
+                     end if;
+                     if not Skip and then Line'Length > 0 then
+                        Ada.Text_IO.Put_Line (F, Line);
+                     end if;
+                     if LF_Pos = 0 then
+                        exit;
+                     end if;
+                     Pos := LF_Pos + 1;
+                  end;
+               end loop;
+               Ada.Text_IO.New_Line (F);
+            end;
          end if;
          Ada.Text_IO.Put (F, To_String (E.Funcs_Buf));
       end Dump;

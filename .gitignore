@@ -30,3 +30,11 @@ a.out
 /frontends/diana/lib/
 /frontends/diana/alire/
 /frontends/diana/config/
+/frontends/diana/frontend/alire/
+/frontends/diana/frontend/config/
+/frontends/diana/frontend/*/alire/
+/frontends/diana/frontend/*/config/
+# Diana Ada 83 sources use .a extension (do not ignore as C static archives)
+!frontends/diana/frontend/*/src/*.a
+!frontends/diana/misc/*.a
+!frontends/diana/source/*.a

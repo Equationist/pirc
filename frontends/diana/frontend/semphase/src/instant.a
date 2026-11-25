@@ -1,0 +1,1781 @@
+with TEXT2_IO; use TEXT2_IO; -- for debug
+with TEXT_IO;
+with DIANA, DIANATTR, DIANAMAN; use DIANA, DIANATTR, DIANAMAN;
+with DEFUTIL; use DEFUTIL;
+with VISUTIL; use VISUTIL;
+with MAKENOD; use MAKENOD;
+with GENSUBS; use GENSUBS;
+with HOMUNIT; use HOMUNIT;
+with EXPTYPE, EXPRESO; use EXPTYPE, EXPRESO;
+with REQUTIL; use REQUTIL;
+with SETUTIL; use SETUTIL;
+with NODWALK; use NODWALK;
+with NEWSNAM;
+
+package body INSTANT is
+
+    type FORMAL_ARRAY_DATA is
+	record
+	    ID:	  	TREE;
+	    SYM:	TREE;
+	    ACTUAL:     TREE;
+	end record;
+
+    type FORMAL_ARRAY_TYPE
+		is array (POSITIVE range <>) of FORMAL_ARRAY_DATA;
+
+
+    procedure RESOLVE_GENERIC_FORMALS
+		( NODE_HASH: in out NODE_HASH_TYPE
+		; GENERIC_PARAM_S: TREE
+		; GENERAL_ASSOC_S: TREE
+		; NEW_DECL_S: out TREE
+		; H: H_TYPE );
+
+    function COUNT_GENERIC_FORMALS (ITEM_S: TREE) return NATURAL;
+
+    procedure SPREAD_GENERIC_FORMALS
+		( ITEM_S:	TREE
+		; FORMAL:	out FORMAL_ARRAY_TYPE );
+
+    procedure WALK_GENERIC_ACTUAL
+		( NODE_HASH:	in out NODE_HASH_TYPE
+		; FORMAL_ID:	TREE
+		; ACTUAL_EXP:	in out TREE
+		; H: H_TYPE );
+
+    procedure CONSTRUCT_INSTANCE_DECL
+		( NODE_HASH:	in out NODE_HASH_TYPE
+		; FORMAL_ID:	TREE
+		; ACTUAL_EXP:	TREE
+		; NEW_DECL_LIST:in out SEQ_TYPE
+		; H: H_TYPE );
+
+    procedure FIX_DECLS_AND_SUBSTITUTE
+                (DECL_S: TREE; NODE_HASH: in out NODE_HASH_TYPE; H: H_TYPE);
+
+    -- $$$$ shouldn't be here
+    function LENGTH(L: SEQ_TYPE) return NATURAL is
+	TEMP: SEQ_TYPE := L;
+        COUNT: NATURAL := 0;
+    begin
+        while not IS_EMPTY(TEMP) loop
+	    COUNT := COUNT + 1;
+	    TEMP := TAIL(TEMP);
+	end loop;
+	return COUNT;
+    end LENGTH;
+
+
+    procedure WALK_INSTANTIATION
+	    ( UNIT_ID: TREE
+	    ; INSTANTIATION: TREE
+	    ; H: H_TYPE )
+    is
+	GEN_ASSOC_S:	constant TREE := D(AS_GENERAL_ASSOC_S, INSTANTIATION);
+	NAME:		TREE := D(AS_NAME, INSTANTIATION);
+
+	UNIT_DEF:	constant TREE := GET_DEF_FOR_ID(UNIT_ID);
+	GENERIC_ID:	TREE;
+	NODE_HASH:	NODE_HASH_TYPE;
+	NEW_DECL_S:	TREE;
+	UNIT_SPEC:	TREE;
+    begin
+	PUT("Instantiation ");PUT(NODE_REP(UNIT_ID));PUT(' ');
+	PUT_LINE(PRINTNAME(D(LX_SYMREP,UNIT_ID)));
+
+	-- resolve the generic unit name
+	NAME := WALK_NAME(DN_GENERIC_ID, NAME);
+	D(AS_NAME, INSTANTIATION, NAME);
+	GENERIC_ID := GET_NAME_DEFN(NAME);
+
+	-- quit if no generic unit was found
+	if GENERIC_ID = CONST_VOID then
+	    return;
+	end if;
+
+	-- LRM 12.3(3): instantiation kind must match generic unit kind
+	declare
+	    G_SPEC: constant TREE := D(SM_SPEC, GENERIC_ID);
+	begin
+	    if G_SPEC /= CONST_VOID then
+		if (KIND(UNIT_ID) = DN_PACKAGE_ID and then KIND(G_SPEC) /= DN_PACKAGE_SPEC)
+		or else (KIND(UNIT_ID) = DN_PROCEDURE_ID and then KIND(G_SPEC) /= DN_PROCEDURE_SPEC)
+		or else ((KIND(UNIT_ID) = DN_FUNCTION_ID or else KIND(UNIT_ID) = DN_OPERATOR_ID)
+			 and then KIND(G_SPEC) /= DN_FUNCTION_SPEC)
+		then
+		    ERROR(D(LX_SRCPOS, INSTANTIATION), "Generic unit kind mismatch");
+		    return;
+		end if;
+	    end if;
+	    -- LRM 12.3(17): generic unit cannot instantiate itself directly or indirectly (bc3009a/c)
+	    if DI(XD_LEX_LEVEL, GET_DEF_FOR_ID(GENERIC_ID)) > 0 then
+		ERROR(D(LX_SRCPOS, INSTANTIATION), "Recursive generic instantiation not allowed");
+		return;
+	    end if;
+	    declare
+		-- Walk up enclosing regions to find enclosing generic unit (if any)
+		RDEF: TREE := H.REGION_DEF;
+		ENC_GEN: TREE := CONST_VOID;
+		function GEN_REACHES(SRC, TGT: TREE; DEPTH: NATURAL) return BOOLEAN is
+		    GS: TREE;
+		    function SCAN_DS(DS: TREE) return BOOLEAN is
+			DL: SEQ_TYPE;
+			IT: TREE;
+		    begin
+			if DS = CONST_VOID then return FALSE; end if;
+			DL := LIST(DS);
+			while not IS_EMPTY(DL) loop
+			    POP(DL, IT);
+			    if (KIND(IT) = DN_PACKAGE_DECL or else KIND(IT) = DN_SUBPROG_ENTRY_DECL)
+			    and then D(AS_UNIT_KIND, IT) /= CONST_VOID
+			    and then KIND(D(AS_UNIT_KIND, IT)) = DN_INSTANTIATION then
+				declare
+				    CALLEE: constant TREE := GET_NAME_DEFN(D(AS_NAME, D(AS_UNIT_KIND, IT)));
+				begin
+				    if CALLEE = TGT then return TRUE; end if;
+				    if CALLEE /= CONST_VOID and then KIND(CALLEE) = DN_GENERIC_ID
+				    and then GEN_REACHES(CALLEE, TGT, DEPTH + 1) then
+					return TRUE;
+				    end if;
+				end;
+			    end if;
+			end loop;
+			return FALSE;
+		    end SCAN_DS;
+		begin
+		    if SRC = CONST_VOID or else DEPTH > 8 then return FALSE; end if;
+		    if SRC = TGT then return TRUE; end if;
+		    GS := D(SM_SPEC, SRC);
+		    if GS /= CONST_VOID and then KIND(GS) = DN_PACKAGE_SPEC then
+			if SCAN_DS(D(AS_DECL_S1, GS)) or else SCAN_DS(D(AS_DECL_S2, GS)) then
+			    return TRUE;
+			end if;
+		    end if;
+		    for I in 1 .. GEN_BODY_CNT loop
+			if GEN_BODY_ID(I) = SRC and then GEN_BODY_NODE(I) /= CONST_VOID
+			and then D(AS_BODY, GEN_BODY_NODE(I)) /= CONST_VOID
+			and then KIND(D(AS_BODY, GEN_BODY_NODE(I))) = DN_BLOCK_BODY then
+			    if SCAN_DS(D(AS_ITEM_S, D(AS_BODY, GEN_BODY_NODE(I)))) then
+				return TRUE;
+			    end if;
+			end if;
+		    end loop;
+		    return FALSE;
+		end GEN_REACHES;
+	    begin
+		for STEP in 1 .. 16 loop
+		    exit when RDEF = CONST_VOID;
+		    if D(XD_SOURCE_NAME, RDEF) /= CONST_VOID
+		    and then KIND(D(XD_SOURCE_NAME, RDEF)) = DN_GENERIC_ID then
+			ENC_GEN := D(XD_SOURCE_NAME, RDEF);
+			exit;
+		    end if;
+		    RDEF := D(XD_REGION_DEF, RDEF);
+		end loop;
+		if ENC_GEN /= CONST_VOID and then GEN_REACHES(GENERIC_ID, ENC_GEN, 0) then
+		    ERROR(D(LX_SRCPOS, INSTANTIATION), "Recursive generic instantiation not allowed");
+		    return;
+		end if;
+	    end;
+	end;
+
+        -- substitute instance name for generic name
+        INSERT_NODE_HASH(NODE_HASH, UNIT_ID, GENERIC_ID);
+
+	-- within the new region
+	declare
+	    H: H_TYPE := WALK_INSTANTIATION.H;
+	    S: S_TYPE;
+	begin
+	    ENTER_REGION(UNIT_DEF, H, S);
+	    H.IS_IN_SPEC := FALSE;
+
+	    -- but region name not visible as enclosing region while
+	    -- ... resolving formals
+	    DI(XD_LEX_LEVEL, UNIT_DEF, 0);
+
+	    -- resolve formal parameters
+	    RESOLVE_GENERIC_FORMALS
+			( NODE_HASH
+			, D(SM_GENERIC_PARAM_S, GENERIC_ID)
+			, GEN_ASSOC_S
+			, NEW_DECL_S
+			, H );
+	    D(SM_DECL_S, INSTANTIATION, NEW_DECL_S );
+
+	    -- construct new unit spec
+	    UNIT_SPEC := D(SM_SPEC, GENERIC_ID);
+	    if KIND(UNIT_SPEC) = DN_PACKAGE_SPEC then
+	  	declare
+		    DECL_S1: TREE := D(AS_DECL_S1,UNIT_SPEC);
+		    DECL_S2: TREE := D(AS_DECL_S2,UNIT_SPEC);
+		begin
+	    	    -- restore visibility of new unit
+	    	    DI(XD_LEX_LEVEL, UNIT_DEF, H.LEX_LEVEL);
+		    MAKE_DEF_VISIBLE(UNIT_DEF);
+
+		    H.IS_IN_SPEC := TRUE;
+		    FIX_DECLS_AND_SUBSTITUTE(DECL_S1, NODE_HASH, H);
+		    H.IS_IN_SPEC := FALSE;
+		    FIX_DECLS_AND_SUBSTITUTE(DECL_S2, NODE_HASH, H);
+		end;
+	    elsif KIND(UNIT_SPEC) = DN_TASK_SPEC then
+		H.IS_IN_SPEC := TRUE;
+	    end if;
+	    SUBSTITUTE(UNIT_SPEC, NODE_HASH, H);
+	    D(SM_SPEC, UNIT_ID, UNIT_SPEC);
+
+	    LEAVE_REGION(UNIT_DEF, S);
+	end;
+    end WALK_INSTANTIATION;
+
+
+    procedure RESOLVE_GENERIC_FORMALS
+		( NODE_HASH: in out NODE_HASH_TYPE
+		; GENERIC_PARAM_S: TREE
+		; GENERAL_ASSOC_S: TREE
+		; NEW_DECL_S: out TREE
+		; H: H_TYPE )
+    is    
+
+	FORMAL_COUNT:	    constant NATURAL
+		:= COUNT_GENERIC_FORMALS(GENERIC_PARAM_S);
+
+	ACTUAL_LIST: SEQ_TYPE := LIST(GENERAL_ASSOC_S);
+	ACTUAL: TREE;
+	ACTUAL_SYM: TREE;
+	ACTUAL_EXP: TREE;
+	ACTUAL_TYPESET: TYPESET_TYPE;
+	NEW_ACTUAL_LIST: SEQ_TYPE := MAKE;
+
+	ACTUAL_SUB: NATURAL := 0;
+	FORMAL_SUB: NATURAL := 0;
+	FIRST_NAMED_SUB: NATURAL := 0;
+	NEW_DECL_LIST: SEQ_TYPE := MAKE;
+	UNIT_DESC: TREE;
+
+	FORMAL:     FORMAL_ARRAY_TYPE(1 .. FORMAL_COUNT);
+	ACTUAL_TO_FORMAL: array (1 .. LENGTH(ACTUAL_LIST)) of NATURAL
+		:= (others => 0);
+    begin
+
+	-- spread the formal parameters
+	SPREAD_GENERIC_FORMALS(GENERIC_PARAM_S, FORMAL);
+
+	-- for each positional actual
+	while not IS_EMPTY(ACTUAL_LIST)
+	and then KIND(HEAD(ACTUAL_LIST)) /= DN_ASSOC loop
+	    POP(ACTUAL_LIST, ACTUAL);
+
+	    -- if there are too many positionals
+	    ACTUAL_SUB := ACTUAL_SUB + 1;
+            if ACTUAL_SUB > FORMAL'LAST then
+
+		-- put out error
+                ERROR(D(LX_SRCPOS,ACTUAL), "Too many actuals");
+
+	    -- else
+	    else
+
+		-- save actual
+		ACTUAL_TO_FORMAL(ACTUAL_SUB) := ACTUAL_SUB;
+		FORMAL(ACTUAL_SUB).ACTUAL := ACTUAL;
+	    end if;
+	end loop;
+	FIRST_NAMED_SUB := ACTUAL_SUB + 1;
+
+	-- for each actual following the positionals
+	while not IS_EMPTY(ACTUAL_LIST) loop
+	    POP(ACTUAL_LIST, ACTUAL);
+	    ACTUAL_SUB := ACTUAL_SUB + 1;
+
+	    -- check that it is named and get symbol
+	    if KIND(ACTUAL) /= DN_ASSOC then
+                ERROR(D(LX_SRCPOS, ACTUAL), "Positional parameter after named");
+	    else
+		ACTUAL_SYM := D(LX_SYMREP, D(AS_USED_NAME, ACTUAL));
+
+		-- search formals for (unique) matching id
+		FORMAL_SUB := 0;
+                for I in FIRST_NAMED_SUB .. FORMAL'LAST loop
+		    if ACTUAL_SYM = FORMAL(I).SYM then
+			if FORMAL_SUB = 0 then
+			    FORMAL_SUB := I;
+			else
+			    ERROR(D(LX_SRCPOS,ACTUAL)
+                                    , "Ambiguous generic argument assoc");
+			    FORMAL_SUB := 0;
+			    exit;
+			end if;
+		    end if;
+		end loop;
+
+		-- if ok match, save actual
+		if FORMAL_SUB = 0 then
+                    ERROR(D(LX_SRCPOS, ACTUAL), "No matching generic formal");
+		else
+		    ACTUAL_TO_FORMAL(ACTUAL_SUB) := FORMAL_SUB;
+		    FORMAL(FORMAL_SUB).ACTUAL := ACTUAL;
+		end if;
+	    end if;
+	end loop;
+
+	-- resolve the actual parameters
+	-- for each formal
+        for I in FORMAL'RANGE loop
+	    ACTUAL := FORMAL(I).ACTUAL;
+
+	    PUT("..."); PUT(INTEGER'IMAGE(I)); PUT(' ');
+	    PUT(PRINTNAME(FORMAL(I).SYM));PUT(' ');
+	    PUT_LINE(NODE_REP(ACTUAL));
+
+	    -- if an actual was explicitly given
+	    if ACTUAL /= CONST_VOID then
+
+		-- strip name from argument association
+		if KIND(ACTUAL) = DN_ASSOC then
+		    ACTUAL_EXP := D(AS_EXP, ACTUAL);
+		    -- fixup used_name_id
+		    declare
+			USED_NAME: TREE := D(AS_USED_NAME, ACTUAL);
+		    begin
+			if KIND(USED_NAME) = DN_USED_OBJECT_ID then
+		            D(AS_USED_NAME
+			    	    , ACTUAL
+			    	    , MAKE_USED_NAME_ID_FROM_OBJECT
+				        	( USED_NAME ));
+			elsif KIND(USED_NAME) = DN_STRING_LITERAL then
+		            D(AS_USED_NAME
+			    	    , ACTUAL
+			    	    , MAKE_USED_OP_FROM_STRING
+				        	( USED_NAME ));
+			end if;
+		    end;
+		    D(SM_DEFN, D(AS_USED_NAME, ACTUAL), CONST_VOID);
+		else
+		    ACTUAL_EXP := ACTUAL;
+		end if;
+
+		-- and resolve the actual
+		if KIND(ACTUAL_EXP) = DN_STRING_LITERAL
+		and then KIND(FORMAL(I).ID) in CLASS_SUBPROG_NAME then
+		    ACTUAL_EXP := MAKE_USED_OP_FROM_STRING(ACTUAL_EXP);
+		end if;
+		WALK_GENERIC_ACTUAL
+			    (NODE_HASH, FORMAL(I).ID, ACTUAL_EXP, H);
+
+	    -- else -- since no actual was given
+	    else
+
+		-- in case no default, use void actual_exp
+		ACTUAL_EXP := CONST_VOID;
+
+		-- if parameter is object with default
+		if KIND(FORMAL(I).ID) = DN_IN_ID
+		and then D(SM_INIT_EXP, FORMAL(I).ID) /= CONST_VOID then
+
+		    -- use the default
+		    ACTUAL_EXP := D(SM_INIT_EXP, FORMAL(I).ID);
+		    SUBSTITUTE(ACTUAL_EXP, NODE_HASH, H);
+
+		-- else if parameter is subprogram with default
+		elsif KIND(FORMAL(I).ID) in CLASS_SUBPROG_NAME
+		and then KIND(D(SM_UNIT_DESC, FORMAL(I).ID)) /= DN_NO_DEFAULT
+		then
+
+		    -- if it is a name default
+		    UNIT_DESC := D(SM_UNIT_DESC, FORMAL(I).ID);
+		    if KIND(UNIT_DESC) = DN_NAME_DEFAULT then
+
+			-- use the (already resolved) name
+			ACTUAL_EXP := D(AS_NAME, UNIT_DESC);
+			SUBSTITUTE(ACTUAL_EXP, NODE_HASH, H);
+
+		    -- else -- since it is a box default
+		    else
+
+			-- construct name to resolve
+			if KIND(FORMAL(I).ID) = DN_OPERATOR_ID then
+			    ACTUAL_EXP := MAKE_USED_OP
+				    ( LX_SYMREP => D(LX_SYMREP, FORMAL(I).ID)
+				    , LX_SRCPOS
+					    => D(LX_SRCPOS, GENERAL_ASSOC_S) );
+			else
+			    ACTUAL_EXP := MAKE_USED_OBJECT_ID
+				    ( LX_SYMREP => D(LX_SYMREP, FORMAL(I).ID)
+				    , LX_SRCPOS
+					    => D(LX_SRCPOS, GENERAL_ASSOC_S) );
+			end if;
+
+			-- and resolve it
+			WALK_GENERIC_ACTUAL
+				    (NODE_HASH, FORMAL(I).ID, ACTUAL_EXP, H);
+		    end if;
+
+		-- else -- since no default given
+		else
+		    ERROR(D(LX_SRCPOS, GENERAL_ASSOC_S)
+                            , "No value given for generic parameter - "
+			      & PRINTNAME(FORMAL(I).SYM) );
+		end if;
+	    end if;
+
+	    -- construct declaration for generic actual
+	    CONSTRUCT_INSTANCE_DECL
+		    ( NODE_HASH, FORMAL(I).ID, ACTUAL_EXP, NEW_DECL_LIST ,H );
+
+	    -- and update actual
+	    ACTUAL := FORMAL(I).ACTUAL;
+	    if KIND(ACTUAL) = DN_ASSOC then
+		D(AS_EXP, ACTUAL, ACTUAL_EXP);
+	    else
+		FORMAL(I).ACTUAL := ACTUAL_EXP;
+	    end if;
+	end loop;
+
+	-- construct and save list of resolved actuals
+        for I in ACTUAL_TO_FORMAL'RANGE loop
+	    if ACTUAL_TO_FORMAL(I) /= 0 then
+	        NEW_ACTUAL_LIST := APPEND
+			( NEW_ACTUAL_LIST
+			, FORMAL(ACTUAL_TO_FORMAL(I)).ACTUAL );
+	    end if;
+	end loop;
+	LIST(GENERAL_ASSOC_S, NEW_ACTUAL_LIST);
+
+	NEW_DECL_S := MAKE_DECL_S (LIST => NEW_DECL_LIST);
+    end RESOLVE_GENERIC_FORMALS;
+
+    function COUNT_GENERIC_FORMALS (ITEM_S: TREE) return NATURAL is
+	ITEM_LIST: SEQ_TYPE := LIST(ITEM_S);
+	ITEM: TREE;
+	ITEM_KIND: NODE_NAME;
+	ITEM_COUNT: NATURAL := 0;
+    begin
+
+	-- for each element of generic formal declaration list
+	while not IS_EMPTY(ITEM_LIST) loop
+	    POP(ITEM_LIST, ITEM);
+
+	    -- if it is an in or an in out declaration
+	    ITEM_KIND := KIND(ITEM);
+	    if ITEM_KIND = DN_IN or ITEM_KIND = DN_IN_OUT then
+
+		-- add the number of declared identifiers
+		ITEM_COUNT
+			:= ITEM_COUNT + LENGTH(LIST(D(AS_SOURCE_NAME_S,ITEM)));
+
+	    -- else if it is anything else other than a pragma
+	    elsif ITEM_KIND /= DN_PRAGMA then
+
+		-- add one declaration
+		ITEM_COUNT := ITEM_COUNT + 1;
+	    end if;
+	end loop;
+
+	-- return the count
+	return ITEM_COUNT;
+    end COUNT_GENERIC_FORMALS;
+
+
+    procedure SPREAD_GENERIC_FORMALS
+		( ITEM_S:	TREE
+		; FORMAL:	out FORMAL_ARRAY_TYPE )
+    is
+	ITEM_LIST: SEQ_TYPE := LIST(ITEM_S);
+	ITEM: TREE;
+	ITEM_KIND: NODE_NAME;
+	ID_LIST: SEQ_TYPE;
+	ID: TREE;
+	ITEM_COUNT: NATURAL := 0;
+
+    begin
+
+	-- for each element of generic formal declaration list
+	while not IS_EMPTY(ITEM_LIST) loop
+	    POP(ITEM_LIST, ITEM);
+
+	    -- if it is an in or an in-out declaration
+	    ITEM_KIND := KIND(ITEM);
+	    if ITEM_KIND = DN_IN or ITEM_KIND = DN_IN_OUT then
+
+		-- for each declared identifier
+		ID_LIST := LIST(D(AS_SOURCE_NAME_S, ITEM));
+		while not IS_EMPTY(ID_LIST) loop
+		    POP(ID_LIST, ID);
+
+		    -- fill in data for in or in-out parameter
+		    ITEM_COUNT := ITEM_COUNT + 1;
+		    FORMAL(ITEM_COUNT).ID := ID;
+		    FORMAL(ITEM_COUNT).SYM := D(LX_SYMREP,ID);
+		    FORMAL(ITEM_COUNT).ACTUAL := CONST_VOID;
+		end loop;
+
+	    -- else if it is anything else other than a pragma
+	    elsif ITEM_KIND /= DN_PRAGMA then
+
+		-- fill in data for formal type or formal subprogram
+		ITEM_COUNT := ITEM_COUNT + 1;
+		ID := D(AS_SOURCE_NAME, ITEM);
+		FORMAL(ITEM_COUNT).ID := ID;
+		FORMAL(ITEM_COUNT).SYM := D(LX_SYMREP,ID);
+		FORMAL(ITEM_COUNT).ACTUAL := CONST_VOID;
+	    end if;
+	end loop;
+    end SPREAD_GENERIC_FORMALS;
+
+
+    procedure WALK_GENERIC_ACTUAL
+		( NODE_HASH:	in out NODE_HASH_TYPE
+		; FORMAL_ID:	TREE
+		; ACTUAL_EXP:	in out TREE
+		; H: H_TYPE )
+    is
+	BASE_TYPE: TREE;
+	TYPESET: TYPESET_TYPE;
+	HEADER: TREE;
+    begin
+	case KIND(FORMAL_ID) is
+	when DN_IN_ID | DN_IN_OUT_ID =>
+	    BASE_TYPE := GET_BASE_TYPE(FORMAL_ID);
+	    SUBSTITUTE(BASE_TYPE, NODE_HASH, H);
+	    EVAL_EXP_TYPES(ACTUAL_EXP, TYPESET);
+	    REQUIRE_TYPE(GET_BASE_TYPE(BASE_TYPE), ACTUAL_EXP, TYPESET);
+	    ACTUAL_EXP := RESOLVE_EXP(ACTUAL_EXP, TYPESET);
+	    if ACTUAL_EXP /= CONST_VOID then
+		FREEZE_TYPE(D(SM_EXP_TYPE, ACTUAL_EXP));
+	    end if;
+	    if KIND(FORMAL_ID) = DN_IN_OUT_ID and then ACTUAL_EXP /= CONST_VOID then
+		-- LRM 12.3.1(2): generic formal IN OUT actual must be a variable, not parenthesized,
+		-- not an OUT parameter, and not a discriminant-dependent subcomponent of an unconstrained record
+		declare
+		    CUR: TREE := ACTUAL_EXP;
+		    BAD_IO: BOOLEAN := FALSE;
+		    HAS_SUBCOMP: BOOLEAN := FALSE;
+		    SUBCOMP_DEPENDS_DISCR: BOOLEAN := FALSE;
+		    UNCON_DEP: BOOLEAN := FALSE;
+		    function COMP_IS_VARIANT_OR_DISCR_DEP (REC_TS, COMP_ID: TREE) return BOOLEAN is
+			BT: constant TREE := GET_BASE_STRUCT(REC_TS);
+			CL: TREE;
+			CT: TREE;
+		    begin
+			if BT = CONST_VOID or else KIND(BT) /= DN_RECORD then
+			    return FALSE;
+			end if;
+			CL := D(SM_COMP_LIST, BT);
+			if CL /= CONST_VOID and then D(AS_VARIANT_PART, CL) /= CONST_VOID then
+			    -- Check if COMP_ID is in fixed part; if not, it's in a variant part!
+			    declare
+				DL: SEQ_TYPE := LIST(D(AS_DECL_S, CL));
+				DL_IT: TREE;
+				IN_FIXED: BOOLEAN := FALSE;
+			    begin
+				while not IS_EMPTY(DL) loop
+				    POP(DL, DL_IT);
+				    if KIND(DL_IT) = DN_VARIABLE_DECL then
+					declare
+					    NS: SEQ_TYPE := LIST(D(AS_SOURCE_NAME_S, DL_IT));
+					    SN: TREE;
+					begin
+					    while not IS_EMPTY(NS) loop
+						POP(NS, SN);
+						if SN = COMP_ID then
+						    IN_FIXED := TRUE;
+						    exit;
+						end if;
+					    end loop;
+					end;
+				    end if;
+				    exit when IN_FIXED;
+				end loop;
+				if not IN_FIXED then
+				    return TRUE;
+				end if;
+			    end;
+			end if;
+			CT := D(SM_OBJ_TYPE, COMP_ID);
+			if CT /= CONST_VOID
+			and then D(SM_DISCRIMINANT_S, BT) /= CONST_VOID
+			and then not IS_EMPTY(LIST(D(SM_DISCRIMINANT_S, BT))) then
+			    declare
+				function CT_DEP(T_IN: TREE) return BOOLEAN is
+				begin
+				    if T_IN = CONST_VOID then return FALSE; end if;
+				    if KIND(T_IN) = DN_CONSTRAINED_RECORD then
+					declare
+					    DS_N: constant TREE := D(SM_NORMALIZED_DSCRMT_S, T_IN);
+					    EL: SEQ_TYPE := MAKE;
+					    E: TREE;
+					begin
+					    if DS_N /= CONST_VOID then EL := LIST(DS_N); end if;
+					    while not IS_EMPTY(EL) loop
+						POP(EL, E);
+						if GET_STATIC_VALUE(E) = CONST_VOID then
+						    return TRUE;
+						end if;
+					    end loop;
+					end;
+				    elsif KIND(T_IN) = DN_CONSTRAINED_ARRAY then
+					declare
+					    IS_N: constant TREE := D(SM_INDEX_SUBTYPE_S, T_IN);
+					    IL: SEQ_TYPE := MAKE;
+					    IT: TREE;
+					begin
+					    if IS_N /= CONST_VOID then IL := LIST(IS_N); end if;
+					    while not IS_EMPTY(IL) loop
+						POP(IL, IT);
+						if IT /= CONST_VOID and then D(SM_RANGE, IT) /= CONST_VOID
+						and then KIND(D(SM_RANGE, IT)) = DN_RANGE then
+						    if GET_STATIC_VALUE(D(AS_EXP1, D(SM_RANGE, IT))) = CONST_VOID
+						    or else GET_STATIC_VALUE(D(AS_EXP2, D(SM_RANGE, IT))) = CONST_VOID then
+							return TRUE;
+						    end if;
+						end if;
+					    end loop;
+					end;
+				    elsif KIND(T_IN) = DN_CONSTRAINED_ACCESS then
+					return CT_DEP(D(SM_DESIG_TYPE, T_IN));
+				    end if;
+				    return FALSE;
+				end CT_DEP;
+			    begin
+				return CT_DEP(CT);
+			    end;
+			end if;
+			return FALSE;
+		    end COMP_IS_VARIANT_OR_DISCR_DEP;
+		begin
+		    while CUR /= CONST_VOID loop
+			case KIND(CUR) is
+			when DN_PARENTHESIZED | DN_FUNCTION_CALL | DN_NULLARY_CALL | DN_CONVERSION
+			   | DN_QUALIFIED | DN_ATTRIBUTE | DN_AGGREGATE | DN_NUMERIC_LITERAL
+			   | DN_STRING_LITERAL | DN_NULL_ACCESS =>
+			    BAD_IO := TRUE;
+			    exit;
+			when DN_INDEXED | DN_SLICE =>
+			    declare
+				PFX: constant TREE := D(AS_NAME, CUR);
+				PT: TREE := CONST_VOID;
+			    begin
+				if PFX /= CONST_VOID then PT := D(SM_EXP_TYPE, PFX); end if;
+				if PT /= CONST_VOID and then KIND(GET_BASE_STRUCT(PT)) = DN_ACCESS then
+				    exit; -- designated object is always constrained
+				end if;
+				HAS_SUBCOMP := TRUE;
+				CUR := PFX;
+			    end;
+			when DN_SELECTED =>
+			    declare
+				PFX: constant TREE := D(AS_NAME, CUR);
+				DES: constant TREE := D(AS_DESIGNATOR, CUR);
+				DF: TREE := CONST_VOID;
+			    begin
+				if DES /= CONST_VOID and then (KIND(DES) in CLASS_USED_NAME or else KIND(DES) in CLASS_USED_OBJECT) then
+				    DF := D(SM_DEFN, DES);
+				end if;
+				if DF /= CONST_VOID and then KIND(DF) = DN_DISCRIMINANT_ID then
+				    BAD_IO := TRUE;
+				    exit;
+				elsif DF /= CONST_VOID and then KIND(DF) = DN_COMPONENT_ID then
+				    if PFX /= CONST_VOID and then D(SM_EXP_TYPE, PFX) /= CONST_VOID then
+					declare
+					    PT: constant TREE := D(SM_EXP_TYPE, PFX);
+					    PB: constant TREE := GET_BASE_STRUCT(PT);
+					begin
+					    if KIND(PB) = DN_ACCESS then
+						exit; -- designated object is always constrained
+					    end if;
+					    if COMP_IS_VARIANT_OR_DISCR_DEP(PT, DF) then
+						SUBCOMP_DEPENDS_DISCR := TRUE;
+						if KIND(PT) /= DN_CONSTRAINED_RECORD
+						and then PB /= CONST_VOID and then KIND(PB) = DN_RECORD
+						and then D(SM_DISCRIMINANT_S, PB) /= CONST_VOID
+						and then not IS_EMPTY(LIST(D(SM_DISCRIMINANT_S, PB)))
+						and then D(AS_EXP, HEAD(LIST(D(SM_DISCRIMINANT_S, PB)))) /= CONST_VOID then
+						    UNCON_DEP := TRUE;
+						end if;
+					    end if;
+					end;
+				    end if;
+				    HAS_SUBCOMP := TRUE;
+				    CUR := PFX;
+				else
+				    CUR := DES;
+				end if;
+			    end;
+			when DN_ALL =>
+			    exit;
+			when DN_USED_OBJECT_ID =>
+			    declare
+				DF: constant TREE := D(SM_DEFN, CUR);
+			    begin
+				if DF /= CONST_VOID then
+				    if KIND(DF) = DN_CONSTANT_ID
+				    or else KIND(DF) = DN_IN_ID
+				    or else KIND(DF) = DN_OUT_ID
+				    or else KIND(DF) = DN_ITERATION_ID
+				    or else KIND(DF) = DN_NUMBER_ID
+				    or else KIND(DF) = DN_ENUMERATION_ID
+				    or else KIND(DF) = DN_CHARACTER_ID then
+					BAD_IO := TRUE;
+				    elsif KIND(DF) = DN_VARIABLE_ID
+				    and then DB(SM_RENAMES_OBJ, DF)
+				    and then D(SM_INIT_EXP, DF) /= CONST_VOID then
+					CUR := D(SM_INIT_EXP, DF);
+				    elsif SUBCOMP_DEPENDS_DISCR then
+					if UNCON_DEP
+					or else (KIND(DF) = DN_IN_OUT_ID
+						 and then D(XD_REGION, DF) /= CONST_VOID
+						 and then KIND(D(XD_REGION, DF)) = DN_GENERIC_ID) then
+					    BAD_IO := TRUE;
+					end if;
+					exit;
+				    else
+					exit;
+				    end if;
+				else
+				    exit;
+				end if;
+				if BAD_IO then exit; end if;
+			    end;
+			when others =>
+			    exit;
+			end case;
+		    end loop;
+		    if BAD_IO then
+			ERROR(D(LX_SRCPOS, ACTUAL_EXP), "Illegal actual for generic formal IN OUT object");
+		    end if;
+		end;
+	    end if;
+
+	when DN_TYPE_ID =>
+	    ACTUAL_EXP := WALK_TYPE_MARK(ACTUAL_EXP);
+	    declare
+		ACT_ID: TREE := CONST_VOID;
+		ACT_SUB: TREE := CONST_VOID;
+		ACT_BASE: TREE := CONST_VOID;
+		FRM_TS: constant TREE := D(SM_TYPE_SPEC, FORMAL_ID);
+		FRM_BASE: TREE := CONST_VOID;
+		SRC_POS: TREE := CONST_VOID;
+		DES: TREE := ACTUAL_EXP;
+	    begin
+		if ACTUAL_EXP /= CONST_VOID then
+		    SRC_POS := D(LX_SRCPOS, ACTUAL_EXP);
+		end if;
+		if DES /= CONST_VOID and then KIND(DES) = DN_SELECTED then
+		    DES := D(AS_DESIGNATOR, DES);
+		end if;
+		if DES /= CONST_VOID and then KIND(DES) = DN_USED_NAME_ID then
+		    ACT_ID := D(SM_DEFN, DES);
+		    if ACT_ID /= CONST_VOID and then KIND(ACT_ID) in CLASS_TYPE_NAME then
+			if CONTAINS_UNCOMPLETED_PRIVATE(D(SM_TYPE_SPEC, ACT_ID)) then
+			    ERROR(SRC_POS, "Premature use of uncompleted private type as generic actual");
+			end if;
+			FREEZE_TYPE(D(SM_TYPE_SPEC, ACT_ID));
+		    end if;
+		end if;
+		if ACT_ID /= CONST_VOID and then KIND(ACT_ID) in CLASS_TYPE_NAME
+		and then FRM_TS /= CONST_VOID then
+		    ACT_SUB  := D(SM_TYPE_SPEC, ACT_ID);
+		    ACT_BASE := GET_BASE_STRUCT(ACT_SUB);
+		    if KIND(ACT_SUB) in DN_PRIVATE .. DN_L_PRIVATE
+		    and then ACT_BASE /= ACT_SUB
+		    and then D(SM_TYPE_SPEC, ACT_SUB) /= CONST_VOID then
+			ACT_SUB := D(SM_TYPE_SPEC, ACT_SUB);
+		    end if;
+		    FRM_BASE := GET_BASE_STRUCT(FRM_TS);
+		    case KIND(FRM_BASE) is
+		    when DN_ENUMERATION =>
+			-- Generic formal discrete type: type T is (<>);
+			if not IS_DISCRETE_TYPE(ACT_BASE) then
+			    ERROR(SRC_POS, "Discrete type required for generic actual");
+			end if;
+		    when DN_INTEGER =>
+			-- Generic formal integer type: type T is range <>;
+			if KIND(ACT_BASE) /= DN_INTEGER then
+			    ERROR(SRC_POS, "Integer type required for generic actual");
+			end if;
+		    when DN_FLOAT =>
+			-- Generic formal float type: type T is digits <>;
+			if KIND(ACT_BASE) /= DN_FLOAT then
+			    ERROR(SRC_POS, "Floating point type required for generic actual");
+			end if;
+		    when DN_FIXED =>
+			-- Generic formal fixed type: type T is delta <>;
+			if KIND(ACT_BASE) /= DN_FIXED then
+			    ERROR(SRC_POS, "Fixed point type required for generic actual");
+			end if;
+		    when DN_ARRAY =>
+			-- Generic formal array type (LRM 12.3.4)
+			if KIND(ACT_BASE) /= DN_ARRAY then
+			    ERROR(SRC_POS, "Array type required for generic actual");
+			elsif (KIND(FRM_TS) = DN_CONSTRAINED_ARRAY)
+			   /= (KIND(ACT_SUB) = DN_CONSTRAINED_ARRAY)
+			then
+			    ERROR(SRC_POS, "Constrained/unconstrained array mismatch in generic actual");
+			else
+			    -- Check component base type, constrainedness, and index dimensionality + base types
+			    declare
+				F_CSUB: TREE := D(SM_COMP_TYPE, FRM_BASE);
+				A_CSUB: constant TREE := D(SM_COMP_TYPE, ACT_BASE);
+				F_COMP: TREE := GET_BASE_TYPE(F_CSUB);
+				A_COMP: constant TREE := GET_BASE_TYPE(A_CSUB);
+				F_IDXS: SEQ_TYPE := LIST(D(SM_INDEX_S, FRM_BASE));
+				A_IDXS: SEQ_TYPE := LIST(D(SM_INDEX_S, ACT_BASE));
+				FI, AI: TREE;
+				function NEEDS_CONSTR_MATCH (TS: TREE) return BOOLEAN is
+				    BS: constant TREE := GET_BASE_STRUCT(TS);
+				begin
+				    if BS = CONST_VOID then return FALSE; end if;
+				    if KIND(BS) = DN_ARRAY or else KIND(BS) = DN_ACCESS then
+					return TRUE;
+				    elsif (KIND(BS) = DN_RECORD or else KIND(BS) in CLASS_PRIVATE_SPEC)
+				    and then D(SM_DISCRIMINANT_S, BS) /= CONST_VOID
+				    and then not IS_EMPTY(LIST(D(SM_DISCRIMINANT_S, BS))) then
+					return TRUE;
+				    end if;
+				    return FALSE;
+				end NEEDS_CONSTR_MATCH;
+			    begin
+				SUBSTITUTE(F_CSUB, NODE_HASH, H);
+				SUBSTITUTE(F_COMP, NODE_HASH, H);
+				if GET_BASE_TYPE(F_COMP) /= A_COMP then
+				    ERROR(SRC_POS, "Array component type mismatch in generic actual");
+				elsif NEEDS_CONSTR_MATCH(A_CSUB)
+				and then (KIND(F_CSUB) in CLASS_CONSTRAINED) /= (KIND(A_CSUB) in CLASS_CONSTRAINED) then
+				    ERROR(SRC_POS, "Array component constraint mismatch in generic actual");
+				elsif LENGTH(F_IDXS) /= LENGTH(A_IDXS) then
+				    ERROR(SRC_POS, "Array dimensionality mismatch in generic actual");
+				else
+				    while not IS_EMPTY(F_IDXS) and then not IS_EMPTY(A_IDXS) loop
+					POP(F_IDXS, FI);
+					POP(A_IDXS, AI);
+					declare
+					    FT: TREE := GET_BASE_TYPE(D(SM_TYPE_SPEC, FI));
+					    ATY: constant TREE := GET_BASE_TYPE(D(SM_TYPE_SPEC, AI));
+					begin
+					    SUBSTITUTE(FT, NODE_HASH, H);
+					    if GET_BASE_TYPE(FT) /= ATY then
+						ERROR(SRC_POS, "Array index type mismatch in generic actual");
+						exit;
+					    end if;
+					end;
+				    end loop;
+				end if;
+			    end;
+			end if;
+		    when DN_ACCESS =>
+			-- Generic formal access type (LRM 12.3.5)
+			if KIND(ACT_BASE) /= DN_ACCESS then
+			    ERROR(SRC_POS, "Access type required for generic actual");
+			else
+			    declare
+				F_DES: TREE := D(SM_DESIG_TYPE, FRM_BASE);
+				A_DES: TREE := D(SM_DESIG_TYPE, ACT_BASE);
+				F_DB: TREE;
+				A_DB: TREE;
+				F_CON: Boolean;
+				A_CON: Boolean;
+			    begin
+				if KIND(FRM_TS) = DN_ACCESS or else KIND(FRM_TS) = DN_CONSTRAINED_ACCESS then
+				    F_DES := D(SM_DESIG_TYPE, FRM_TS);
+				end if;
+				if KIND(ACT_SUB) = DN_ACCESS or else KIND(ACT_SUB) = DN_CONSTRAINED_ACCESS then
+				    A_DES := D(SM_DESIG_TYPE, ACT_SUB);
+				end if;
+				F_DB := GET_BASE_TYPE(F_DES);
+				A_DB := GET_BASE_TYPE(A_DES);
+				SUBSTITUTE(F_DES, NODE_HASH, H);
+				SUBSTITUTE(F_DB, NODE_HASH, H);
+				if GET_BASE_TYPE(F_DB) /= A_DB then
+				    ERROR(SRC_POS, "Access designated type mismatch in generic actual");
+				elsif KIND(GET_BASE_STRUCT(A_DB)) = DN_ARRAY
+				   or else KIND(GET_BASE_STRUCT(A_DB)) = DN_ACCESS
+				   or else ((KIND(GET_BASE_STRUCT(A_DB)) = DN_RECORD
+					     or else KIND(GET_BASE_STRUCT(A_DB)) in CLASS_PRIVATE_SPEC)
+					    and then D(SM_DISCRIMINANT_S, GET_BASE_STRUCT(A_DB)) /= CONST_VOID
+					    and then not IS_EMPTY(LIST(D(SM_DISCRIMINANT_S, GET_BASE_STRUCT(A_DB)))))
+				then
+				    F_CON := KIND(F_DES) in CLASS_CONSTRAINED;
+				    A_CON := KIND(A_DES) in CLASS_CONSTRAINED;
+				    if F_CON /= A_CON then
+					ERROR(SRC_POS, "Access designated subtype constraint mismatch in generic actual");
+				    end if;
+				end if;
+			    end;
+			end if;
+		    when others =>
+			null;
+		    end case;
+		end if;
+	    end;
+
+	when DN_PRIVATE_TYPE_ID | DN_L_PRIVATE_TYPE_ID =>
+	    ACTUAL_EXP := WALK_TYPE_MARK(ACTUAL_EXP);
+	    declare
+		ACT_ID: TREE := CONST_VOID;
+		ACT_SUB: TREE := CONST_VOID;
+		SRC_POS: TREE := CONST_VOID;
+		DES: TREE := ACTUAL_EXP;
+	    begin
+		if ACTUAL_EXP /= CONST_VOID then
+		    SRC_POS := D(LX_SRCPOS, ACTUAL_EXP);
+		end if;
+		if DES /= CONST_VOID and then KIND(DES) = DN_SELECTED then
+		    DES := D(AS_DESIGNATOR, DES);
+		end if;
+		if DES /= CONST_VOID and then KIND(DES) = DN_USED_NAME_ID then
+		    ACT_ID := D(SM_DEFN, DES);
+		    if ACT_ID /= CONST_VOID and then KIND(ACT_ID) in CLASS_TYPE_NAME then
+			if CONTAINS_UNCOMPLETED_PRIVATE(D(SM_TYPE_SPEC, ACT_ID)) then
+			    ERROR(SRC_POS, "Premature use of uncompleted private type as generic actual");
+			end if;
+			FREEZE_TYPE(D(SM_TYPE_SPEC, ACT_ID));
+		    end if;
+		end if;
+		if ACT_ID /= CONST_VOID and then KIND(ACT_ID) in CLASS_TYPE_NAME then
+		    ACT_SUB := D(SM_TYPE_SPEC, ACT_ID);
+		    if KIND(FORMAL_ID) = DN_PRIVATE_TYPE_ID
+		    and then IS_LIMITED_TYPE(ACT_SUB) then
+			ERROR(SRC_POS, "Limited type not allowed for nonlimited private generic formal");
+		    end if;
+		    -- LRM 12.3.2(4): formal private type with discriminants must match unconstrained actual with same discriminant profile
+		    declare
+			FRM_TS: constant TREE := D(SM_TYPE_SPEC, FORMAL_ID);
+			FRM_DS: TREE := CONST_VOID;
+			ACT_BS: constant TREE := GET_BASE_STRUCT(ACT_SUB);
+			ACT_DS: TREE := CONST_VOID;
+		    begin
+			if FRM_TS /= CONST_VOID and then KIND(FRM_TS) in CLASS_PRIVATE_SPEC then
+			    FRM_DS := D(SM_DISCRIMINANT_S, FRM_TS);
+			end if;
+			if FRM_DS /= CONST_VOID and then not IS_EMPTY(LIST(FRM_DS)) then
+			    if KIND(ACT_SUB) in CLASS_CONSTRAINED then
+				ERROR(SRC_POS, "Constrained actual not allowed for formal private type with discriminants");
+			    else
+				if ACT_BS /= CONST_VOID
+				and then (KIND(ACT_BS) = DN_RECORD or else KIND(ACT_BS) in CLASS_PRIVATE_SPEC) then
+				    ACT_DS := D(SM_DISCRIMINANT_S, ACT_BS);
+				end if;
+				if ACT_DS = CONST_VOID or else IS_EMPTY(LIST(ACT_DS)) then
+				    ERROR(SRC_POS, "Actual for formal private type must have matching discriminants");
+				else
+				    -- Count and compare base types of discriminants
+				    declare
+					FL: SEQ_TYPE := LIST(FRM_DS);
+					AL: SEQ_TYPE := LIST(ACT_DS);
+					FD, AD: TREE;
+					FNS, ANS: SEQ_TYPE := MAKE;
+					FID, AID: TREE;
+					FT, ATY: TREE;
+					MISMATCH: BOOLEAN := FALSE;
+				    begin
+					loop
+					    if IS_EMPTY(FNS) then
+						if IS_EMPTY(FL) then
+						    if not IS_EMPTY(ANS) or else not IS_EMPTY(AL) then
+							MISMATCH := TRUE;
+						    end if;
+						    exit;
+						end if;
+						POP(FL, FD);
+						FNS := LIST(D(AS_SOURCE_NAME_S, FD));
+					    end if;
+					    if IS_EMPTY(ANS) then
+						if IS_EMPTY(AL) then
+						    MISMATCH := TRUE;
+						    exit;
+						end if;
+						POP(AL, AD);
+						ANS := LIST(D(AS_SOURCE_NAME_S, AD));
+					    end if;
+					    POP(FNS, FID);
+					    POP(ANS, AID);
+					    FT := GET_BASE_TYPE(D(SM_OBJ_TYPE, FID));
+					    SUBSTITUTE(FT, NODE_HASH, H);
+					    ATY := GET_BASE_TYPE(D(SM_OBJ_TYPE, AID));
+					    if GET_BASE_TYPE(FT) /= ATY then
+						MISMATCH := TRUE;
+						exit;
+					    end if;
+					end loop;
+					if MISMATCH then
+					    ERROR(SRC_POS, "Discriminant profile mismatch in generic actual");
+					end if;
+				    end;
+				end if;
+			    end if;
+			else
+			    -- Formal private type has NO discriminants (LRM 12.3.2(4), bc3204a..e, bc3205a..e):
+			    -- If actual is unconstrained array or unconstrained discriminated record/private without defaults,
+			    -- reject if the generic unit spec uses FORMAL_ID in a context requiring a constrained subtype!
+			    declare
+				IS_UNCON_NO_DEF: BOOLEAN := FALSE;
+				GEN_ID: constant TREE := D(XD_REGION, FORMAL_ID);
+				G_SPEC: TREE := CONST_VOID;
+
+				function TS_USES_FORMAL(TS: TREE) return BOOLEAN is
+				    CUR: TREE := TS;
+				begin
+				    for STEP in 1 .. 16 loop
+					exit when CUR = CONST_VOID;
+					CUR := GET_BASE_STRUCT(CUR);
+					exit when CUR = CONST_VOID;
+					if KIND(CUR) in CLASS_PRIVATE_SPEC and then D(XD_SOURCE_NAME, CUR) = FORMAL_ID then
+					    return TRUE;
+					end if;
+					if KIND(CUR) in CLASS_DERIVABLE_SPEC and then D(SM_DERIVED, CUR) /= CONST_VOID then
+					    CUR := D(SM_DERIVED, CUR);
+					else
+					    exit;
+					end if;
+				    end loop;
+				    return FALSE;
+				end TS_USES_FORMAL;
+
+				function EXP_HAS_BAD_ALLOC(E: TREE) return BOOLEAN is
+				begin
+				    if E = CONST_VOID then return FALSE; end if;
+				    case KIND(E) is
+				    when DN_SUBTYPE_ALLOCATOR =>
+					declare
+					    DT: constant TREE := D(SM_DESIG_TYPE, E);
+					begin
+					    if TS_USES_FORMAL(DT) then
+						return TRUE;
+					    end if;
+					end;
+				    when DN_PARENTHESIZED =>
+					return EXP_HAS_BAD_ALLOC(D(AS_EXP, E));
+				    when others =>
+					null;
+				    end case;
+				    return FALSE;
+				end EXP_HAS_BAD_ALLOC;
+
+				function COMP_LIST_USES_BAD(CL: TREE) return BOOLEAN is
+				    DL: SEQ_TYPE;
+				    IT: TREE;
+				    VP: TREE;
+				    VL: SEQ_TYPE;
+				    V: TREE;
+				begin
+				    if CL = CONST_VOID or else KIND(CL) /= DN_COMP_LIST then return FALSE; end if;
+				    if D(AS_DECL_S, CL) /= CONST_VOID then
+					DL := LIST(D(AS_DECL_S, CL));
+					while not IS_EMPTY(DL) loop
+					    POP(DL, IT);
+					    if KIND(IT) = DN_VARIABLE_DECL then
+						declare
+						    NS: constant SEQ_TYPE := LIST(D(AS_SOURCE_NAME_S, IT));
+						begin
+						    if not IS_EMPTY(NS) and then TS_USES_FORMAL(D(SM_OBJ_TYPE, HEAD(NS))) then
+							return TRUE;
+						    end if;
+						end;
+						if EXP_HAS_BAD_ALLOC(D(AS_EXP, IT)) then
+						    return TRUE;
+						end if;
+					    end if;
+					end loop;
+				    end if;
+				    VP := D(AS_VARIANT_PART, CL);
+				    if VP /= CONST_VOID and then KIND(VP) = DN_VARIANT_PART then
+					VL := LIST(D(AS_VARIANT_S, VP));
+					while not IS_EMPTY(VL) loop
+					    POP(VL, V);
+					    if KIND(V) = DN_VARIANT and then COMP_LIST_USES_BAD(D(AS_COMP_LIST, V)) then
+						return TRUE;
+					    end if;
+					end loop;
+				    end if;
+				    return FALSE;
+				end COMP_LIST_USES_BAD;
+
+				function DECL_S_USES_BAD(DS: TREE) return BOOLEAN is
+				    DL: SEQ_TYPE;
+				    IT: TREE;
+				begin
+				    if DS = CONST_VOID then return FALSE; end if;
+				    DL := LIST(DS);
+				    while not IS_EMPTY(DL) loop
+					POP(DL, IT);
+					case KIND(IT) is
+					when DN_VARIABLE_DECL =>
+					    declare
+						NS: constant SEQ_TYPE := LIST(D(AS_SOURCE_NAME_S, IT));
+					    begin
+						if not IS_EMPTY(NS) and then TS_USES_FORMAL(D(SM_OBJ_TYPE, HEAD(NS))) then
+						    return TRUE;
+						end if;
+					    end;
+					    if EXP_HAS_BAD_ALLOC(D(AS_EXP, IT)) then
+						return TRUE;
+					    end if;
+					when DN_CONSTANT_DECL =>
+					    if EXP_HAS_BAD_ALLOC(D(AS_EXP, IT)) then
+						return TRUE;
+					    end if;
+					when DN_TYPE_DECL =>
+					    declare
+						SN: constant TREE := D(AS_SOURCE_NAME, IT);
+						TS: TREE := CONST_VOID;
+						TD: constant TREE := D(AS_TYPE_DEF, IT);
+					    begin
+						if SN /= CONST_VOID and then KIND(SN) in CLASS_TYPE_NAME then
+						    TS := D(SM_TYPE_SPEC, SN);
+						end if;
+						if TS /= CONST_VOID then
+						    if KIND(TS) = DN_ARRAY or else KIND(TS) = DN_CONSTRAINED_ARRAY then
+							if TS_USES_FORMAL(D(SM_COMP_TYPE, GET_BASE_TYPE(TS))) then
+							    return TRUE;
+							end if;
+						    elsif KIND(TS) = DN_RECORD then
+							if COMP_LIST_USES_BAD(D(SM_COMP_LIST, TS)) then
+							    return TRUE;
+							end if;
+						    elsif KIND(TD) = DN_DERIVED_DEF
+						    and then KIND(SN) = DN_TYPE_ID
+						    and then D(SM_FIRST, SN) /= CONST_VOID
+						    and then KIND(D(SM_FIRST, SN)) in DN_PRIVATE_TYPE_ID .. DN_L_PRIVATE_TYPE_ID then
+							-- Full decl of a private type without discriminants derived from FORMAL_ID
+							declare
+							    PS: constant TREE := D(SM_TYPE_SPEC, D(SM_FIRST, SN));
+							begin
+							    if PS /= CONST_VOID
+							    and then (D(SM_DISCRIMINANT_S, PS) = CONST_VOID
+								      or else IS_EMPTY(LIST(D(SM_DISCRIMINANT_S, PS))))
+							    and then TS_USES_FORMAL(D(SM_DERIVED, GET_BASE_TYPE(TS))) then
+								return TRUE;
+							    end if;
+							end;
+						    end if;
+						end if;
+					    end;
+					when DN_PACKAGE_DECL =>
+					    declare
+						HDR: constant TREE := D(AS_HEADER, IT);
+					    begin
+						if HDR /= CONST_VOID and then KIND(HDR) = DN_PACKAGE_SPEC then
+						    if DECL_S_USES_BAD(D(AS_DECL_S1, HDR))
+						    or else DECL_S_USES_BAD(D(AS_DECL_S2, HDR)) then
+							return TRUE;
+						    end if;
+						end if;
+					    end;
+					when DN_SUBPROG_ENTRY_DECL =>
+					    declare
+						HDR: constant TREE := D(AS_HEADER, IT);
+					    begin
+						if HDR /= CONST_VOID and then KIND(HDR) in CLASS_SUBP_ENTRY_HEADER
+						and then D(AS_PARAM_S, HDR) /= CONST_VOID then
+						    declare
+							PL: SEQ_TYPE := LIST(D(AS_PARAM_S, HDR));
+							P: TREE;
+						    begin
+							while not IS_EMPTY(PL) loop
+							    POP(PL, P);
+							    if EXP_HAS_BAD_ALLOC(D(AS_EXP, P)) then
+								return TRUE;
+							    end if;
+							end loop;
+						    end;
+						end if;
+					    end;
+					when others =>
+					    null;
+					end case;
+				    end loop;
+				    return FALSE;
+				end DECL_S_USES_BAD;
+			    begin
+				if KIND(ACT_SUB) = DN_ARRAY then
+				    IS_UNCON_NO_DEF := TRUE;
+				elsif KIND(ACT_SUB) not in CLASS_CONSTRAINED
+				and then ACT_BS /= CONST_VOID
+				and then (KIND(ACT_BS) = DN_RECORD or else KIND(ACT_BS) in CLASS_PRIVATE_SPEC)
+				and then D(SM_DISCRIMINANT_S, ACT_BS) /= CONST_VOID
+				and then not IS_EMPTY(LIST(D(SM_DISCRIMINANT_S, ACT_BS)))
+				and then D(AS_EXP, HEAD(LIST(D(SM_DISCRIMINANT_S, ACT_BS)))) = CONST_VOID then
+				    IS_UNCON_NO_DEF := TRUE;
+				end if;
+				if IS_UNCON_NO_DEF and then GEN_ID /= CONST_VOID and then KIND(GEN_ID) = DN_GENERIC_ID then
+				    G_SPEC := D(SM_SPEC, GEN_ID);
+				    if G_SPEC /= CONST_VOID and then KIND(G_SPEC) = DN_PACKAGE_SPEC then
+					if DECL_S_USES_BAD(D(AS_DECL_S1, G_SPEC))
+					or else DECL_S_USES_BAD(D(AS_DECL_S2, G_SPEC)) then
+					    ERROR(SRC_POS, "Unconstrained actual without defaults not allowed for generic formal");
+					end if;
+				    elsif G_SPEC /= CONST_VOID and then KIND(G_SPEC) in CLASS_SUBP_ENTRY_HEADER
+				    and then D(AS_PARAM_S, G_SPEC) /= CONST_VOID then
+					declare
+					    PL: SEQ_TYPE := LIST(D(AS_PARAM_S, G_SPEC));
+					    P: TREE;
+					begin
+					    while not IS_EMPTY(PL) loop
+						POP(PL, P);
+						if EXP_HAS_BAD_ALLOC(D(AS_EXP, P)) then
+						    ERROR(SRC_POS, "Unconstrained actual without defaults not allowed for generic formal");
+						    exit;
+						end if;
+					    end loop;
+					end;
+				    end if;
+				    -- Also check generic body (immediately if already seen or in library, else defer across units!)
+				    declare
+					FOUND_B: BOOLEAN := FALSE;
+					LIB_B: constant TREE := D(SM_BODY, GEN_ID);
+				    begin
+					for BI in 1 .. GEN_BODY_CNT loop
+					    if GEN_BODY_ID(BI) = GEN_ID then
+						FOUND_B := TRUE;
+						CHECK_GEN_BODY_UNCON(GEN_ID, FORMAL_ID, GEN_BODY_NODE(BI), SRC_POS);
+						exit;
+					    end if;
+					end loop;
+					if not FOUND_B and then LIB_B /= CONST_VOID and then LIB_B /= CONST_VIRGIN then
+					    FOUND_B := TRUE;
+					    CHECK_GEN_BODY_UNCON(GEN_ID, FORMAL_ID, LIB_B, SRC_POS);
+					end if;
+					if not FOUND_B then
+					    if PEND_UNCON_CNT < 256 then
+						PEND_UNCON_CNT := PEND_UNCON_CNT + 1;
+						PEND_UNCON_GEN(PEND_UNCON_CNT) := GEN_ID;
+						PEND_UNCON_FRM(PEND_UNCON_CNT) := FORMAL_ID;
+						PEND_UNCON_POS(PEND_UNCON_CNT) := SRC_POS;
+					    end if;
+					    -- Persist cross-unit pending check to ADA__LIB/GEN_UNCON.TXT (bc3204c, bc3205d)
+					    declare
+						NEW_REC: constant STRING :=
+						    PRINTNAME(D(LX_SYMREP, GEN_ID)) & " " & PRINTNAME(D(LX_SYMREP, FORMAL_ID));
+						LINES: array (1 .. 128) of STRING(1 .. 160);
+						LENS: array (1 .. 128) of NATURAL := (others => 0);
+						LCNT: NATURAL := 0;
+						F: TEXT_IO.FILE_TYPE;
+						BUF: STRING(1 .. 160);
+						BLEN: NATURAL;
+						DUP: BOOLEAN := FALSE;
+					    begin
+						begin
+						    TEXT_IO.OPEN(F, TEXT_IO.IN_FILE, "ADA__LIB/GEN_UNCON.TXT");
+						    while not TEXT_IO.END_OF_FILE(F) and then LCNT < 128 loop
+							TEXT_IO.GET_LINE(F, BUF, BLEN);
+							if BLEN > 0 then
+							    if BLEN = NEW_REC'LENGTH and then BUF(1 .. BLEN) = NEW_REC then
+								DUP := TRUE;
+							    end if;
+							    LCNT := LCNT + 1;
+							    LENS(LCNT) := BLEN;
+							    LINES(LCNT)(1 .. BLEN) := BUF(1 .. BLEN);
+							end if;
+						    end loop;
+						    TEXT_IO.CLOSE(F);
+						exception
+						    when others =>
+							if TEXT_IO.IS_OPEN(F) then TEXT_IO.CLOSE(F); end if;
+						end;
+						if not DUP then
+						    begin
+							TEXT_IO.CREATE(F, TEXT_IO.OUT_FILE, "ADA__LIB/GEN_UNCON.TXT");
+							for LI in 1 .. LCNT loop
+							    TEXT_IO.PUT_LINE(F, LINES(LI)(1 .. LENS(LI)));
+							end loop;
+							TEXT_IO.PUT_LINE(F, NEW_REC);
+							TEXT_IO.CLOSE(F);
+						    exception
+							when others =>
+							    if TEXT_IO.IS_OPEN(F) then TEXT_IO.CLOSE(F); end if;
+						    end;
+						end if;
+					    end;
+					end if;
+				    end;
+				end if;
+			    end;
+			end if;
+		    end;
+		end if;
+	    end;
+
+	when CLASS_SUBPROG_NAME =>
+	    HEADER := D(SM_SPEC, FORMAL_ID);
+	    SUBSTITUTE(HEADER, NODE_HASH, H);
+	    ACTUAL_EXP := WALK_HOMOGRAPH_UNIT(ACTUAL_EXP, HEADER);
+
+	when others =>
+            QUIT("Bad generic actual id");
+	end case;
+    end WALK_GENERIC_ACTUAL;
+
+
+    procedure CONSTRUCT_INSTANCE_DECL
+		( NODE_HASH:	in out NODE_HASH_TYPE
+		; FORMAL_ID:	TREE
+		; ACTUAL_EXP:	TREE
+		; NEW_DECL_LIST:in out SEQ_TYPE
+		; H: H_TYPE )
+    is
+	SYMREP: TREE := D(LX_SYMREP, FORMAL_ID);
+	SRCPOS: TREE;
+	NEW_ID: TREE;
+	NEW_DEF: TREE;
+	NEW_DECL: TREE;
+	DEFN: TREE;
+	SUBTYPE_NODE: TREE;
+	HEADER: TREE;
+    begin
+	if ACTUAL_EXP /= CONST_VOID then
+	    SRCPOS := D(LX_SRCPOS, ACTUAL_EXP);
+	else
+	    SRCPOS := CONST_VOID;
+	end if;
+	if KIND(SYMREP) = DN_TXTREP then
+	    SYMREP := STORESYM(PRINTNAME(SYMREP));
+	    D(LX_SYMREP, FORMAL_ID, SYMREP);
+	end if;
+
+	case KIND(FORMAL_ID) is
+	when DN_IN_ID =>
+	    SUBTYPE_NODE := D(SM_OBJ_TYPE, FORMAL_ID);
+	    SUBSTITUTE(SUBTYPE_NODE, NODE_HASH, H);
+	    NEW_ID := MAKE_CONSTANT_ID
+			( SM_OBJ_TYPE => SUBTYPE_NODE
+			, SM_INIT_EXP => ACTUAL_EXP );
+	    D(SM_FIRST, NEW_ID, NEW_ID);
+	    NEW_DECL := MAKE_CONSTANT_DECL
+			( LX_SRCPOS => SRCPOS
+			, AS_SOURCE_NAME_S => MAKE_SOURCE_NAME_S
+				( LX_SRCPOS => SRCPOS
+				, LIST => SINGLETON(NEW_ID) )
+			, AS_TYPE_DEF => CONST_VOID
+			, AS_EXP => ACTUAL_EXP );
+
+	when DN_IN_OUT_ID =>
+	    SUBTYPE_NODE := D(SM_OBJ_TYPE, FORMAL_ID);
+	    SUBSTITUTE(SUBTYPE_NODE, NODE_HASH, H);
+	    NEW_ID := MAKE_VARIABLE_ID
+			( SM_OBJ_TYPE => SUBTYPE_NODE
+			, SM_INIT_EXP => ACTUAL_EXP
+			, SM_RENAMES_OBJ => TRUE );
+	    NEW_DECL := MAKE_RENAMES_OBJ_DECL
+			( LX_SRCPOS => SRCPOS
+			, AS_SOURCE_NAME => NEW_ID
+			, AS_TYPE_MARK_NAME => CONST_VOID
+			, AS_NAME => ACTUAL_EXP );
+
+	when CLASS_TYPE_NAME =>
+	    DEFN := GET_NAME_DEFN(ACTUAL_EXP);
+	    if DEFN /= CONST_VOID then
+		SUBTYPE_NODE := D(SM_TYPE_SPEC, DEFN);
+		declare
+		    F_TS: constant TREE := D(SM_TYPE_SPEC, FORMAL_ID);
+		    F_BS: constant TREE := GET_BASE_STRUCT(F_TS);
+		begin
+		    INSERT_NODE_HASH(NODE_HASH, SUBTYPE_NODE, F_TS);
+		    if F_BS /= F_TS then
+			INSERT_NODE_HASH(NODE_HASH, GET_BASE_TYPE(SUBTYPE_NODE), F_BS);
+		    end if;
+		    -- LRM 12.3.2(4): map formal discriminant IDs -> actual discriminant IDs
+		    declare
+			A_BS: constant TREE := GET_BASE_STRUCT(SUBTYPE_NODE);
+			F_DS: TREE := CONST_VOID;
+			A_DS: TREE := CONST_VOID;
+			FL, AL, FNL, ANL: SEQ_TYPE;
+			FD, AD, FID, AID: TREE;
+		    begin
+			if KIND(F_BS) = DN_PRIVATE or else KIND(F_BS) = DN_L_PRIVATE or else KIND(F_BS) = DN_RECORD then
+			    F_DS := D(SM_DISCRIMINANT_S, F_BS);
+			end if;
+			if A_BS /= CONST_VOID and then (KIND(A_BS) = DN_RECORD or else KIND(A_BS) = DN_PRIVATE or else KIND(A_BS) = DN_L_PRIVATE) then
+			    A_DS := D(SM_DISCRIMINANT_S, A_BS);
+			end if;
+			if F_DS /= CONST_VOID and then A_DS /= CONST_VOID then
+			    FL := LIST(F_DS);
+			    AL := LIST(A_DS);
+			    while not IS_EMPTY(FL) and then not IS_EMPTY(AL) loop
+				POP(FL, FD);
+				POP(AL, AD);
+				if KIND(FD) = DN_DSCRMT_DECL and then KIND(AD) = DN_DSCRMT_DECL then
+				    FNL := LIST(D(AS_SOURCE_NAME_S, FD));
+				    ANL := LIST(D(AS_SOURCE_NAME_S, AD));
+				    while not IS_EMPTY(FNL) and then not IS_EMPTY(ANL) loop
+					POP(FNL, FID);
+					POP(ANL, AID);
+					INSERT_NODE_HASH(NODE_HASH, AID, FID);
+				    end loop;
+				end if;
+			    end loop;
+			end if;
+		    end;
+		end;
+		SUBSTITUTE(SUBTYPE_NODE, NODE_HASH, H);
+		-- $$$$ check that dimension, index types and component type ok
+	    else
+		SUBTYPE_NODE := CONST_VOID;
+	    end if;
+
+	    NEW_ID := MAKE_SUBTYPE_ID
+			( SM_TYPE_SPEC => SUBTYPE_NODE );
+	    NEW_DECL := MAKE_SUBTYPE_DECL
+			( LX_SRCPOS => SRCPOS
+			, AS_SOURCE_NAME => NEW_ID
+			, AS_SUBTYPE_INDICATION => ACTUAL_EXP );
+
+	when DN_PROCEDURE_ID =>
+	    HEADER := D(SM_SPEC, FORMAL_ID);
+	    SUBSTITUTE (HEADER, NODE_HASH, H);
+	    NEW_ID := MAKE_PROCEDURE_ID
+			( SM_SPEC => HEADER
+			, SM_UNIT_DESC => CONST_VOID );
+	    D(SM_FIRST, NEW_ID, NEW_ID);
+	    NEW_DECL := MAKE_SUBPROG_ENTRY_DECL
+			( LX_SRCPOS => SRCPOS
+			, AS_SOURCE_NAME => NEW_ID
+			, AS_HEADER => HEADER
+			, AS_UNIT_KIND => MAKE_RENAMES_UNIT
+				( LX_SRCPOS => SRCPOS
+				, AS_NAME => ACTUAL_EXP ) );
+
+	when DN_FUNCTION_ID | DN_OPERATOR_ID =>
+	    HEADER := D(SM_SPEC, FORMAL_ID);
+	    SUBSTITUTE (HEADER, NODE_HASH, H);
+	    NEW_ID := MAKE_FUNCTION_ID
+			( SM_SPEC => HEADER
+			, SM_UNIT_DESC => CONST_VOID );
+	    D(SM_FIRST, NEW_ID, NEW_ID);
+	    NEW_DECL := MAKE_SUBPROG_ENTRY_DECL
+			( LX_SRCPOS => SRCPOS
+			, AS_SOURCE_NAME => NEW_ID
+			, AS_HEADER => HEADER
+			, AS_UNIT_KIND => MAKE_RENAMES_UNIT
+				( LX_SRCPOS => SRCPOS
+				, AS_NAME => ACTUAL_EXP ) );
+
+	when others =>
+            QUIT("Bad generic actual id");
+	end case;
+
+	D(LX_SRCPOS, NEW_ID, SRCPOS);
+	D(LX_SYMREP, NEW_ID, SYMREP);
+	NEW_DEF := MAKE_DEF_FOR_ID(NEW_ID, H);
+	if KIND(NEW_ID) in CLASS_SUBPROG_NAME then
+	    MAKE_DEF_VISIBLE(NEW_DEF, HEADER);
+	else
+	    MAKE_DEF_VISIBLE(NEW_DEF);
+	end if;
+	INSERT_NODE_HASH(NODE_HASH, NEW_ID, FORMAL_ID);
+	NEW_DECL_LIST := APPEND(NEW_DECL_LIST, NEW_DECL);
+    end CONSTRUCT_INSTANCE_DECL;
+
+
+    procedure FIX_DECLS_AND_SUBSTITUTE
+                (DECL_S: TREE; NODE_HASH: in out NODE_HASH_TYPE; H: H_TYPE)
+    is
+        DECL_LIST: SEQ_TYPE := LIST(DECL_S);
+        DECL: TREE;
+        TYPE_ID: TREE;
+        TYPE_SPEC: TREE;
+        BASE_TYPE: TREE;
+    begin
+        while not IS_EMPTY(DECL_LIST) loop
+            POP(DECL_LIST, DECL);
+            SUBSTITUTE(DECL, NODE_HASH, H);
+            if KIND(DECL) = DN_TYPE_DECL then
+                TYPE_ID := D(AS_SOURCE_NAME, DECL);
+                TYPE_SPEC := D(SM_TYPE_SPEC, TYPE_ID);
+                if KIND(TYPE_SPEC) = DN_ENUMERATION
+                and then D(SM_RANGE, TYPE_SPEC) = CONST_VOID then
+                    BASE_TYPE := GET_BASE_TYPE(TYPE_SPEC);
+                    if D(SM_RANGE, BASE_TYPE) = CONST_VOID
+                    and then D(SM_DERIVED, BASE_TYPE) /= CONST_VOID
+                    and then D(SM_RANGE, D(SM_DERIVED, BASE_TYPE))
+                                /= CONST_VOID
+                    then
+                        declare
+                            THE_RANGE: TREE
+                                    := D(SM_RANGE, D(SM_DERIVED, BASE_TYPE));
+                            ENUM_S: TREE
+                                    := D(SM_LITERAL_S
+                                        , D(SM_DERIVED,BASE_TYPE) );
+                            ENUM_LIST: SEQ_TYPE := LIST(ENUM_S);
+                            ENUM: TREE;
+                            NEW_LIST: SEQ_TYPE := MAKE;
+                        begin
+                            while not IS_EMPTY(ENUM_LIST) loop
+                                POP(ENUM_LIST, ENUM);
+                                NEWSNAM.REPLACE_SOURCE_NAME
+                                        (ENUM, NODE_HASH, H);
+                                NEW_LIST := INSERT(NEW_LIST, ENUM);
+                            end loop;
+                            SUBSTITUTE(ENUM_S, NODE_HASH, H);
+                            SUBSTITUTE(THE_RANGE, NODE_HASH, H);
+                            D(SM_LITERAL_S, BASE_TYPE, ENUM_S);
+                            D(SM_RANGE, BASE_TYPE, THE_RANGE);
+                            DI(CD_IMPL_SIZE, BASE_TYPE
+                                 , DI(CD_IMPL_SIZE, D(SM_DERIVED,BASE_TYPE)));
+                        end;
+                    end if;
+                    if TYPE_SPEC /= BASE_TYPE then
+                        D(SM_RANGE, TYPE_SPEC, D(SM_RANGE, BASE_TYPE));
+                        D(SM_LITERAL_S, TYPE_SPEC
+                                , D(SM_LITERAL_S, BASE_TYPE) );
+                        DI(CD_IMPL_SIZE, TYPE_SPEC, DI(CD_IMPL_SIZE, BASE_TYPE));
+                    end if;
+                end if;
+            end if;
+        end loop;
+    end;
+
+    procedure CHECK_GEN_BODY_UNCON
+	    ( GEN_ID: TREE
+	    ; FORMAL_ID: TREE
+	    ; BODY_NODE: TREE
+	    ; SRC_POS: TREE )
+    is
+	BB: TREE := CONST_VOID;
+	function TS_USES_F(TS: TREE) return BOOLEAN is
+	    CUR: TREE := TS;
+	begin
+	    for STEP in 1 .. 16 loop
+		exit when CUR = CONST_VOID;
+		CUR := GET_BASE_STRUCT(CUR);
+		exit when CUR = CONST_VOID;
+		if KIND(CUR) in CLASS_PRIVATE_SPEC and then D(XD_SOURCE_NAME, CUR) = FORMAL_ID then
+		    return TRUE;
+		end if;
+		if KIND(CUR) in CLASS_DERIVABLE_SPEC and then D(SM_DERIVED, CUR) /= CONST_VOID then
+		    CUR := D(SM_DERIVED, CUR);
+		else
+		    exit;
+		end if;
+	    end loop;
+	    return FALSE;
+	end TS_USES_F;
+
+	function EXP_BAD(E: TREE; DEPTH: NATURAL := 0) return BOOLEAN is
+	begin
+	    if E = CONST_VOID or else DEPTH > 12 then return FALSE; end if;
+	    case KIND(E) is
+	    when DN_SUBTYPE_ALLOCATOR =>
+		return TS_USES_F(D(SM_DESIG_TYPE, E));
+	    when DN_PARENTHESIZED | DN_CONVERSION | DN_QUALIFIED =>
+		return EXP_BAD(D(AS_EXP, E), DEPTH + 1);
+	    when DN_QUALIFIED_ALLOCATOR =>
+		return EXP_BAD(D(AS_QUALIFIED, E), DEPTH + 1);
+	    when DN_FUNCTION_CALL =>
+		if D(SM_NORMALIZED_PARAM_S, E) /= CONST_VOID then
+		    declare
+			PL: SEQ_TYPE := LIST(D(SM_NORMALIZED_PARAM_S, E));
+			IT: TREE;
+		    begin
+			while not IS_EMPTY(PL) loop
+			    POP(PL, IT);
+			    if EXP_BAD(IT, DEPTH + 1) then return TRUE; end if;
+			end loop;
+		    end;
+		end if;
+		return FALSE;
+	    when DN_AGGREGATE =>
+		if D(AS_GENERAL_ASSOC_S, E) /= CONST_VOID then
+		    declare
+			AL: SEQ_TYPE := LIST(D(AS_GENERAL_ASSOC_S, E));
+			IT: TREE;
+		    begin
+			while not IS_EMPTY(AL) loop
+			    POP(AL, IT);
+			    if KIND(IT) = DN_ASSOC or else KIND(IT) = DN_NAMED then
+				if EXP_BAD(D(AS_EXP, IT), DEPTH + 1) then return TRUE; end if;
+			    elsif EXP_BAD(IT, DEPTH + 1) then
+				return TRUE;
+			    end if;
+			end loop;
+		    end;
+		end if;
+		return FALSE;
+	    when others =>
+		return FALSE;
+	    end case;
+	end EXP_BAD;
+
+	function CL_BAD(CL: TREE) return BOOLEAN is
+	    DL: SEQ_TYPE;
+	    IT: TREE;
+	    VP: TREE;
+	    VL: SEQ_TYPE;
+	    VN: TREE;
+	begin
+	    if CL = CONST_VOID or else KIND(CL) /= DN_COMP_LIST then return FALSE; end if;
+	    if D(AS_DECL_S, CL) /= CONST_VOID then
+		DL := LIST(D(AS_DECL_S, CL));
+		while not IS_EMPTY(DL) loop
+		    POP(DL, IT);
+		    if KIND(IT) = DN_VARIABLE_DECL then
+			declare
+			    NS: constant SEQ_TYPE := LIST(D(AS_SOURCE_NAME_S, IT));
+			begin
+			    if not IS_EMPTY(NS) and then TS_USES_F(D(SM_OBJ_TYPE, HEAD(NS))) then
+				return TRUE;
+			    end if;
+			end;
+			if EXP_BAD(D(AS_EXP, IT)) then return TRUE; end if;
+		    end if;
+		end loop;
+	    end if;
+	    VP := D(AS_VARIANT_PART, CL);
+	    if VP /= CONST_VOID and then KIND(VP) = DN_VARIANT_PART and then D(AS_VARIANT_S, VP) /= CONST_VOID then
+		VL := LIST(D(AS_VARIANT_S, VP));
+		while not IS_EMPTY(VL) loop
+		    POP(VL, VN);
+		    if KIND(VN) = DN_VARIANT and then CL_BAD(D(AS_COMP_LIST, VN)) then return TRUE; end if;
+		end loop;
+	    end if;
+	    return FALSE;
+	end CL_BAD;
+
+	function STM_S_BAD(SS: TREE; DEPTH: NATURAL) return BOOLEAN;
+
+	function ITEM_S_BAD(IS_N: TREE; DEPTH: NATURAL) return BOOLEAN is
+	    DL: SEQ_TYPE;
+	    IT: TREE;
+	begin
+	    if IS_N = CONST_VOID or else DEPTH > 10 then return FALSE; end if;
+	    DL := LIST(IS_N);
+	    while not IS_EMPTY(DL) loop
+		POP(DL, IT);
+		case KIND(IT) is
+		when DN_VARIABLE_DECL =>
+		    declare
+			NS: constant SEQ_TYPE := LIST(D(AS_SOURCE_NAME_S, IT));
+		    begin
+			if not IS_EMPTY(NS) and then TS_USES_F(D(SM_OBJ_TYPE, HEAD(NS))) then
+			    return TRUE;
+			end if;
+		    end;
+		    if EXP_BAD(D(AS_EXP, IT)) then return TRUE; end if;
+		when DN_CONSTANT_DECL =>
+		    if EXP_BAD(D(AS_EXP, IT)) then return TRUE; end if;
+		when DN_TYPE_DECL =>
+		    declare
+			SN: constant TREE := D(AS_SOURCE_NAME, IT);
+			TD: constant TREE := D(AS_TYPE_DEF, IT);
+			TS: TREE := CONST_VOID;
+		    begin
+			if SN /= CONST_VOID and then KIND(SN) in CLASS_TYPE_NAME then
+			    TS := D(SM_TYPE_SPEC, SN);
+			end if;
+			if TS /= CONST_VOID then
+			    if KIND(TS) = DN_ARRAY or else KIND(TS) = DN_CONSTRAINED_ARRAY then
+				if TS_USES_F(D(SM_COMP_TYPE, GET_BASE_TYPE(TS))) then return TRUE; end if;
+			    elsif KIND(TS) = DN_RECORD then
+				if CL_BAD(D(SM_COMP_LIST, TS)) then return TRUE; end if;
+			    elsif KIND(TD) = DN_DERIVED_DEF
+			    and then KIND(SN) = DN_TYPE_ID
+			    and then D(SM_FIRST, SN) /= CONST_VOID
+			    and then KIND(D(SM_FIRST, SN)) in DN_PRIVATE_TYPE_ID .. DN_L_PRIVATE_TYPE_ID then
+				declare
+				    PS: constant TREE := D(SM_TYPE_SPEC, D(SM_FIRST, SN));
+				begin
+				    if PS /= CONST_VOID
+				    and then (D(SM_DISCRIMINANT_S, PS) = CONST_VOID
+					      or else IS_EMPTY(LIST(D(SM_DISCRIMINANT_S, PS))))
+				    and then TS_USES_F(D(SM_DERIVED, GET_BASE_TYPE(TS))) then
+					return TRUE;
+				    end if;
+				end;
+			    end if;
+			end if;
+		    end;
+		when DN_PACKAGE_DECL =>
+		    if D(AS_HEADER, IT) /= CONST_VOID and then KIND(D(AS_HEADER, IT)) = DN_PACKAGE_SPEC then
+			if ITEM_S_BAD(D(AS_DECL_S1, D(AS_HEADER, IT)), DEPTH + 1)
+			or else ITEM_S_BAD(D(AS_DECL_S2, D(AS_HEADER, IT)), DEPTH + 1) then
+			    return TRUE;
+			end if;
+		    end if;
+		when DN_PACKAGE_BODY | DN_SUBPROGRAM_BODY | DN_TASK_BODY =>
+		    if D(AS_BODY, IT) /= CONST_VOID and then KIND(D(AS_BODY, IT)) = DN_BLOCK_BODY then
+			if ITEM_S_BAD(D(AS_ITEM_S, D(AS_BODY, IT)), DEPTH + 1)
+			or else STM_S_BAD(D(AS_STM_S, D(AS_BODY, IT)), DEPTH + 1) then
+			    return TRUE;
+			end if;
+		    end if;
+		when others =>
+		    null;
+		end case;
+	    end loop;
+	    return FALSE;
+	end ITEM_S_BAD;
+
+	function STM_S_BAD(SS: TREE; DEPTH: NATURAL) return BOOLEAN is
+	    SL: SEQ_TYPE;
+	    S: TREE;
+	begin
+	    if SS = CONST_VOID or else DEPTH > 10 then return FALSE; end if;
+	    SL := LIST(SS);
+	    while not IS_EMPTY(SL) loop
+		POP(SL, S);
+		case KIND(S) is
+		when DN_ASSIGN =>
+		    if EXP_BAD(D(AS_EXP, S)) then return TRUE; end if;
+		when DN_PROCEDURE_CALL | DN_ENTRY_CALL =>
+		    if D(SM_NORMALIZED_PARAM_S, S) /= CONST_VOID then
+			declare
+			    PL: SEQ_TYPE := LIST(D(SM_NORMALIZED_PARAM_S, S));
+			    IT: TREE;
+			begin
+			    while not IS_EMPTY(PL) loop
+				POP(PL, IT);
+				if EXP_BAD(IT) then return TRUE; end if;
+			    end loop;
+			end;
+		    end if;
+		when DN_RETURN =>
+		    if EXP_BAD(D(AS_EXP, S)) then return TRUE; end if;
+		when DN_BLOCK =>
+		    if ITEM_S_BAD(D(AS_ITEM_S, S), DEPTH + 1)
+		    or else STM_S_BAD(D(AS_STM_S, S), DEPTH + 1) then
+			return TRUE;
+		    end if;
+		when DN_LOOP =>
+		    if STM_S_BAD(D(AS_STM_S, S), DEPTH + 1) then return TRUE; end if;
+		when DN_IF =>
+		    if D(AS_TEST_CLAUSE_ELEM_S, S) /= CONST_VOID then
+			declare
+			    TL: SEQ_TYPE := LIST(D(AS_TEST_CLAUSE_ELEM_S, S));
+			    TC: TREE;
+			begin
+			    while not IS_EMPTY(TL) loop
+				POP(TL, TC);
+				if KIND(TC) = DN_COND_CLAUSE then
+				    if EXP_BAD(D(AS_EXP, TC))
+				    or else STM_S_BAD(D(AS_STM_S, TC), DEPTH + 1) then
+					return TRUE;
+				    end if;
+				end if;
+			    end loop;
+			end;
+		    end if;
+		    if STM_S_BAD(D(AS_STM_S, S), DEPTH + 1) then return TRUE; end if;
+		when DN_LABELED =>
+		    if STM_S_BAD(D(AS_STM, S), DEPTH + 1) then return TRUE; end if;
+		when others =>
+		    null;
+		end case;
+	    end loop;
+	    return FALSE;
+	end STM_S_BAD;
+
+    begin
+	if GEN_ID = CONST_VOID or else FORMAL_ID = CONST_VOID or else BODY_NODE = CONST_VOID then
+	    return;
+	end if;
+	BB := D(AS_BODY, BODY_NODE);
+	if BB /= CONST_VOID and then KIND(BB) = DN_BLOCK_BODY then
+	    if ITEM_S_BAD(D(AS_ITEM_S, BB), 0) or else STM_S_BAD(D(AS_STM_S, BB), 0) then
+		ERROR(SRC_POS, "Unconstrained actual without defaults not allowed for generic formal");
+	    end if;
+	end if;
+    end CHECK_GEN_BODY_UNCON;
+
+end INSTANT;

@@ -8,8 +8,8 @@ package _standrd is
 
     type BOOLEAN is (FALSE, TRUE);
 
-    type SHORT_INTEGER is range - 16#8000# .. 16#7FFF#;
     type INTEGER is range - 16#8000_0000# .. 16#7FFF_FFFF#;
+    type SHORT_INTEGER is range - 16#8000# .. 16#7FFF#;
     type LONG_INTEGER is range - 16#8000_0000_0000_0000# .. 16#7FFF_FFFF_FFFF_FFFF#;
 
     type FLOAT is digits 6 range

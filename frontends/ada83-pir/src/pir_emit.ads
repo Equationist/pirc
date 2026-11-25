@@ -76,6 +76,7 @@ private
       Externs_Buf : Unbounded_String;
       Funcs_Buf   : Unbounded_String;
       Sym_Set     : Unbounded_String; -- pipe-delimited set of declared symbols
+      Def_Funcs   : Unbounded_String; -- pipe-delimited set of defined function symbols
       Type_Set    : Unbounded_String; -- pipe-delimited set of declared type names
       Cur         : Func_Buffer;
       Sym_Counter : Natural := 0;

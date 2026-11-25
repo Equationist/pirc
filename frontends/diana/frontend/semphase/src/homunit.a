@@ -1,0 +1,256 @@
+with DIANA, DIANAMAN, DIANATTR; use DIANA, DIANAMAN, DIANATTR;
+with VISUTIL; use VISUTIL;
+with defutil; use defutil;
+with REDSUBP; use REDSUBP;
+with setutil; use setutil;
+with exptype, expreso; use exptype, expreso;
+with attwalk; use attwalk;
+with makenod; use makenod;
+with CHKSTAT;
+with PRENAME;
+with SEMGLOB; use SEMGLOB;
+
+package body HOMUNIT is
+
+    function WALK_HOMOGRAPH_UNIT (UNIT_NAME: TREE; HEADER: TREE)
+	    return TREE
+    is
+	NEW_NAME: TREE := UNIT_NAME;
+	INDEX: TREE := CONST_VOID;
+	TYPESET: TYPESET_TYPE := EMPTY_TYPESET;
+	DEFSET: DEFSET_TYPE;
+	DEFINTERP: DEFINTERP_TYPE;
+	DEF: TREE;
+	DEF_HEADER: TREE;
+	NEW_DEFSET: DEFSET_TYPE := EMPTY_DEFSET;
+	index_ok: boolean := true;
+	extrainfo: extrainfo_type := null_extrainfo;
+	dummy_flag: boolean;
+    begin
+	if KIND(NEW_NAME) = DN_STRING_LITERAL then
+	    NEW_NAME := MAKE_USED_OP_FROM_STRING(NEW_NAME);
+	end if;
+
+	if KIND(NEW_NAME) = DN_FUNCTION_CALL
+	and then (KIND(D(AS_NAME, NEW_NAME)) = DN_USED_OBJECT_ID
+		or else KIND(D(AS_NAME, NEW_NAME)) = DN_SELECTED )
+	and then IS_EMPTY(TAIL(LIST(D(AS_GENERAL_ASSOC_S, NEW_NAME))))
+	and then KIND(HEAD(LIST(D(AS_GENERAL_ASSOC_S, NEW_NAME)))) /= DN_ASSOC
+	then
+	    INDEX := HEAD(LIST(D(AS_GENERAL_ASSOC_S, NEW_NAME)));
+	    NEW_NAME := D(AS_NAME, NEW_NAME);
+	    EVAL_EXP_TYPES(INDEX, TYPESET);
+	end if;
+
+	if KIND(NEW_NAME) = DN_ATTRIBUTE then
+	    EVAL_ATTRIBUTE(NEW_NAME, TYPESET, dummy_flag, is_function => true);
+	    -- $$$$ should check for valid attribute
+	    NEW_NAME := RESOLVE_ATTRIBUTE(NEW_NAME);
+	    -- LRM 8.5(7) / 4.3.2(6) (b85013d): 'VALUE has unconstrained STRING formal -> OTHERS illegal in default
+	    if KIND(NEW_NAME) = DN_ATTRIBUTE
+	    and then D(AS_USED_NAME_ID, NEW_NAME) /= CONST_VOID
+	    and then D(SM_DEFN, D(AS_USED_NAME_ID, NEW_NAME)) /= CONST_VOID
+	    and then KIND(D(SM_DEFN, D(AS_USED_NAME_ID, NEW_NAME))) = DN_ATTRIBUTE_ID
+	    and then DI(XD_POS, D(SM_DEFN, D(AS_USED_NAME_ID, NEW_NAME))) = PRENAME.DEFINED_ATTRIBUTES'POS(PRENAME.VALUE)
+	    and then HEADER /= CONST_VOID and then D(AS_PARAM_S, HEADER) /= CONST_VOID then
+		declare
+		    PC1: PARAM_CURSOR_TYPE;
+		    DEF_E: TREE;
+		    AL: SEQ_TYPE;
+		    IT, CH: TREE;
+		    CS: SEQ_TYPE;
+		begin
+		    INIT_PARAM_CURSOR(PC1, LIST(D(AS_PARAM_S, HEADER)));
+		    ADVANCE_PARAM_CURSOR(PC1);
+		    if PC1.ID /= CONST_VOID then
+			DEF_E := D(SM_INIT_EXP, PC1.ID);
+			if DEF_E /= CONST_VOID and then KIND(DEF_E) = DN_AGGREGATE then
+			    AL := LIST(D(AS_GENERAL_ASSOC_S, DEF_E));
+			    while not IS_EMPTY(AL) loop
+				POP(AL, IT);
+				if KIND(IT) = DN_ASSOC or else KIND(IT) = DN_NAMED then
+				    CS := LIST(D(AS_CHOICE_S, IT));
+				    while not IS_EMPTY(CS) loop
+					POP(CS, CH);
+					if KIND(CH) = DN_CHOICE_OTHERS then
+					    ERROR(D(LX_SRCPOS, DEF_E), "OTHERS not allowed in unconstrained array aggregate");
+					    exit;
+					end if;
+				    end loop;
+				end if;
+			    end loop;
+			end if;
+		    end if;
+		end;
+	    end if;
+	elsif KIND(NEW_NAME) = DN_USED_OBJECT_ID
+	or else KIND(NEW_NAME) = DN_USED_OP
+	or else KIND(NEW_NAME) = DN_USED_CHAR
+	or else KIND(NEW_NAME) = DN_SELECTED then
+	    FIND_VISIBILITY(NEW_NAME, DEFSET);
+	    if not IS_EMPTY(DEFSET) then
+		while not IS_EMPTY(DEFSET) loop
+		    POP(DEFSET, DEFINTERP);
+		    DEF := GET_DEF(DEFINTERP);
+		    DEF_HEADER := D(XD_HEADER, DEF);
+		    if INDEX = CONST_VOID then
+			if KIND(DEF_HEADER)
+				in DN_PROCEDURE_SPEC .. DN_FUNCTION_SPEC
+			or else ( KIND(DEF_HEADER) = DN_ENTRY
+				and then D(AS_DISCRETE_RANGE, DEF_HEADER)
+					= CONST_VOID )
+			then
+			    if ARE_HOMOGRAPH_HEADERS (HEADER, DEF_HEADER, CHECK_MODES => FALSE)
+			    then
+				ADD_TO_DEFSET(NEW_DEFSET, DEFINTERP);
+			    end if;
+			end if;
+		    else
+			-- retrieve the header for entry family member
+			if KIND(D(XD_SOURCE_NAME, DEF)) = DN_ENTRY_ID then
+			    DEF_HEADER := D(SM_SPEC, D(XD_SOURCE_NAME,DEF));
+			end if;
+
+			if KIND(DEF_HEADER) = DN_ENTRY
+			and then D(AS_DISCRETE_RANGE, DEF_HEADER) /= CONST_VOID
+			then
+			    CHECK_ACTUAL_TYPE
+				    ( GET_TYPE_OF_DISCRETE_RANGE
+					    ( D(AS_DISCRETE_RANGE, DEF_HEADER) )
+				    , TYPESET
+				    , INDEX_OK
+				    , EXTRAINFO );
+			    if INDEX_OK
+			    and then IS_SAME_PARAMETER_PROFILE
+				    ( D(AS_PARAM_S, HEADER)
+				    , D(AS_PARAM_S, DEF_HEADER)
+				    , CHECK_MODES => FALSE )
+			    then
+				ADD_EXTRAINFO(DEFINTERP, EXTRAINFO);
+				ADD_TO_DEFSET(NEW_DEFSET, DEFINTERP);
+			    end if;
+			end if;
+		    end if;
+		end loop;
+		DEFSET := NEW_DEFSET;
+		if IS_EMPTY(DEFSET) then
+		    if kind(new_name) = dn_selected then
+                        ERROR(D(LX_SRCPOS,UNIT_NAME)
+				, "No matching subprograms - "
+				  & PRINTNAME(D(LX_SYMREP
+					, d(as_designator,NEW_NAME) )) );
+		    else
+                        ERROR(D(LX_SRCPOS,UNIT_NAME)
+				, "No matching subprograms - "
+				  & PRINTNAME(D(LX_SYMREP,NEW_NAME)) );
+		    end if;
+		end if;
+		REQUIRE_UNIQUE_DEF(NEW_NAME, DEFSET);
+		-- LRM 8.5(7) & 12.3.6(5): modes do not disambiguate, check after unique resolution
+		if not IS_EMPTY(DEFSET) then
+		    declare
+			U_DEF: constant TREE := GET_DEF(HEAD(DEFSET));
+			U_HDR: TREE := D(XD_HEADER, U_DEF);
+		    begin
+			if INDEX = CONST_VOID then
+			    if not ARE_HOMOGRAPH_HEADERS(HEADER, U_HDR, CHECK_MODES => TRUE) then
+				ERROR(D(LX_SRCPOS, UNIT_NAME), "Parameter mode mismatch");
+			    end if;
+			else
+			    if KIND(D(XD_SOURCE_NAME, U_DEF)) = DN_ENTRY_ID then
+				U_HDR := D(SM_SPEC, D(XD_SOURCE_NAME, U_DEF));
+			    end if;
+			    if not IS_SAME_PARAMETER_PROFILE(D(AS_PARAM_S, HEADER), D(AS_PARAM_S, U_HDR), CHECK_MODES => TRUE) then
+				ERROR(D(LX_SRCPOS, UNIT_NAME), "Parameter mode mismatch");
+			    end if;
+			end if;
+			-- LRM 8.5(7) / 4.3.2(6) (b85013c/d): check renaming default aggregates against renamed formal subtypes
+			if HEADER /= CONST_VOID and then U_HDR /= CONST_VOID
+			and then D(AS_PARAM_S, HEADER) /= CONST_VOID and then D(AS_PARAM_S, U_HDR) /= CONST_VOID then
+			    declare
+				PC1, PC2: PARAM_CURSOR_TYPE;
+				DEF_E, REN_TS: TREE;
+				HAS_OTH, HAS_OTHER_CH, ALL_STATIC: BOOLEAN;
+				AL, CS, IL: SEQ_TYPE;
+				IT, CH, IDX_T: TREE;
+			    begin
+				INIT_PARAM_CURSOR(PC1, LIST(D(AS_PARAM_S, HEADER)));
+				INIT_PARAM_CURSOR(PC2, LIST(D(AS_PARAM_S, U_HDR)));
+				loop
+				    ADVANCE_PARAM_CURSOR(PC1);
+				    ADVANCE_PARAM_CURSOR(PC2);
+				    exit when PC1.ID = CONST_VOID or else PC2.ID = CONST_VOID;
+				    DEF_E := D(SM_INIT_EXP, PC1.ID);
+				    REN_TS := D(SM_OBJ_TYPE, PC2.ID);
+				    if DEF_E /= CONST_VOID and then KIND(DEF_E) = DN_AGGREGATE and then REN_TS /= CONST_VOID then
+					HAS_OTH := FALSE;
+					HAS_OTHER_CH := FALSE;
+					AL := LIST(D(AS_GENERAL_ASSOC_S, DEF_E));
+					while not IS_EMPTY(AL) loop
+					    POP(AL, IT);
+					    if KIND(IT) = DN_ASSOC or else KIND(IT) = DN_NAMED then
+						CS := LIST(D(AS_CHOICE_S, IT));
+						while not IS_EMPTY(CS) loop
+						    POP(CS, CH);
+						    if KIND(CH) = DN_CHOICE_OTHERS then
+							HAS_OTH := TRUE;
+						    else
+							HAS_OTHER_CH := TRUE;
+						    end if;
+						end loop;
+					    else
+						HAS_OTHER_CH := TRUE;
+					    end if;
+					end loop;
+					if HAS_OTH then
+					    if KIND(REN_TS) = DN_ARRAY then
+						ERROR(D(LX_SRCPOS, DEF_E), "OTHERS not allowed in unconstrained array aggregate");
+					    elsif KIND(REN_TS) = DN_CONSTRAINED_ARRAY and then HAS_OTHER_CH then
+						ALL_STATIC := TRUE;
+						if D(SM_INDEX_SUBTYPE_S, REN_TS) /= CONST_VOID then
+						    IL := LIST(D(SM_INDEX_SUBTYPE_S, REN_TS));
+						    while not IS_EMPTY(IL) loop
+							POP(IL, IDX_T);
+							if not CHKSTAT.IS_STATIC_SUBTYPE(IDX_T) then
+							    ALL_STATIC := FALSE;
+							end if;
+						    end loop;
+						end if;
+						if not ALL_STATIC then
+						    ERROR(D(LX_SRCPOS, DEF_E), "OTHERS with other choices requires static array subtype");
+						end if;
+					    end if;
+					end if;
+				    end if;
+				end loop;
+			    end;
+			end if;
+		    end;
+		end if;
+		NEW_NAME := RESOLVE_NAME(NEW_NAME, GET_THE_ID(DEFSET));
+		if INDEX /= CONST_VOID then
+		    if IS_EMPTY(DEFSET) then
+			INDEX := RESOLVE_EXP(INDEX, CONST_VOID);
+		    else
+			INDEX := RESOLVE_EXP(INDEX,
+				GET_TYPE_OF_DISCRETE_RANGE
+					( D(AS_DISCRETE_RANGE, DEF_HEADER) ));
+		    end if;
+		    NEW_NAME := MAKE_INDEXED
+			    ( AS_NAME => NEW_NAME
+			    , AS_EXP_S => MAKE_EXP_S
+				    ( LIST => SINGLETON(INDEX)
+				    , LX_SRCPOS => D(LX_SRCPOS
+					    , D(AS_GENERAL_ASSOC_S,UNIT_NAME) ))
+			    , LX_SRCPOS => D(LX_SRCPOS, UNIT_NAME) );
+		end if;
+	    end if;
+	else
+            ERROR(D(LX_SRCPOS,NEW_NAME), "Cannot be subprogram name");
+	    NEW_NAME := RESOLVE_EXP(NEW_NAME, CONST_VOID);
+	end if;
+
+	return NEW_NAME;
+    end WALK_HOMOGRAPH_UNIT;
+
+end HOMUNIT;

@@ -1,0 +1,14 @@
+package LOW_LEVEL_IO is
+
+    type DEVICE_TYPE is private;
+    type DATA_TYPE   is private;
+
+    procedure SEND_CONTROL    (DEVICE : in DEVICE_TYPE; DATA : in out DATA_TYPE);
+    procedure RECEIVE_CONTROL (DEVICE : in DEVICE_TYPE; DATA : in out DATA_TYPE);
+
+private
+
+    type DEVICE_TYPE is new INTEGER;
+    type DATA_TYPE   is new INTEGER;
+
+end LOW_LEVEL_IO;
