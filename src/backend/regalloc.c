@@ -757,7 +757,7 @@ static void lower_pcopy_bundle(const MFunc *mf, const MPCopyBundle *pc,
                                uint32_t loc, MInstVec *out) {
     if (pc->count == 0u) return;
     PirArch arch = mf->target->arch;
-    MPReg cyc_gp  = (arch == PIR_ARCH_X86_64) ? X64_SCRATCH_GP1 : A64_SCRATCH_GP1;
+    MPReg cyc_gp  = (arch == PIR_ARCH_X86_64) ? X64_SCRATCH_GP1 : A64_SCRATCH_GP0;
     MPReg slot_gp = (arch == PIR_ARCH_X86_64) ? X64_SCRATCH_GP0 : A64_SCRATCH_GP2;
     MPReg cyc_fp  = (arch == PIR_ARCH_X86_64) ? X64_SCRATCH_FP2 : A64_SCRATCH_FP2;
     MPReg slot_fp = (arch == PIR_ARCH_X86_64) ? X64_SCRATCH_FP1 : A64_SCRATCH_FP1;

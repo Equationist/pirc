@@ -586,7 +586,7 @@ static void emit_vec_splat(X64ISelCtx *c, MVReg dst, MVReg scalar, PirVecType vt
 
 static void emit_vec_all_ones(X64ISelCtx *c, MVReg dst, uint8_t vb, uint32_t loc) {
     MInst cm = minst_make(MI_X64_PCMPEQD, vb, loc);
-    cm.op_count = 2u; cm.ops[0] = mop_vreg_def(dst); cm.ops[1] = mop_vreg_use(dst);
+    cm.op_count = 1u; cm.ops[0] = mop_vreg_def(dst);
     emit(c, cm);
 }
 
@@ -737,21 +737,22 @@ static void emit_vec_cmp(X64ISelCtx *c, PirOpcode op, MVReg dst, MVReg a, MVReg 
  * Scalar Arithmetic, Div/Rem, Overflow, Bitops, Float Conversions
  * ========================================================================= */
 
-static void emit_scalar_div_rem(X64ISelCtx *c, const PirInst *inst, MVReg dst, uint32_t loc) {
-    bool is_signed = (inst->op == PIR_OP_DIV_S || inst->op == PIR_OP_REM_S);
-    bool is_rem    = (inst->op == PIR_OP_REM_S || inst->op == PIR_OP_REM_U);
-    uint8_t w      = pir_type_vreg_bytes(inst->ty);
-    MVReg a = normalize_int(c, mat_op(c, &inst->operands[0], loc), inst->ty, is_signed, loc);
-    MVReg b = normalize_int(c, mat_op(c, &inst->operands[1], loc), inst->ty, is_signed, loc);
+static void emit_scalar_div_rem_regs(X64ISelCtx *c, PirOpcode op, PirType ty, uint32_t flags,
+                                     MVReg a_raw, MVReg b_raw, MVReg dst, uint32_t loc) {
+    bool is_signed = (op == PIR_OP_DIV_S || op == PIR_OP_REM_S);
+    bool is_rem    = (op == PIR_OP_REM_S || op == PIR_OP_REM_U);
+    uint8_t w      = pir_type_vreg_bytes(ty);
+    MVReg a = normalize_int(c, a_raw, ty, is_signed, loc);
+    MVReg b = normalize_int(c, b_raw, ty, is_signed, loc);
 
-    if ((inst->flags & PIR_FLAG_TRAP) != 0u) {
+    if ((flags & PIR_FLAG_TRAP) != 0u) {
         MInst tz = minst_make(MI_X64_TEST_RR, w, loc);
         tz.op_count = 2u; tz.ops[0] = mop_vreg_use(b); tz.ops[1] = mop_vreg_use(b);
         emit(c, tz);
         emit_cond_trap(c, MCOND_EQ, loc);
 
         if (is_signed) {
-            uint32_t bits = pir_scalar_bits(inst->ty.u.scalar, 8u);
+            uint32_t bits = pir_scalar_bits(ty.u.scalar, 8u);
             uint64_t int_min = (bits == 64u) ? ((uint64_t)1u << 63u)
                                              : (uint64_t)(int64_t)(int32_t)(-(int32_t)(1u << (bits - 1u)));
             MInst cm1 = minst_make(MI_X64_CMP_RI, w, loc);
@@ -780,7 +781,7 @@ static void emit_scalar_div_rem(X64ISelCtx *c, const PirInst *inst, MVReg dst, u
     }
 
     uint32_t done_blk = MBLOCK_NONE;
-    if (is_signed && (inst->flags & (PIR_FLAG_TRAP | PIR_FLAG_UNSAFE)) == 0u) {
+    if (is_signed && (flags & (PIR_FLAG_TRAP | PIR_FLAG_UNSAFE)) == 0u) {
         /* x86-64 idiv raises SIGFPE on INT_MIN / -1, whereas PIR [wrap]/default
          * defines INT_MIN / -1 == INT_MIN and INT_MIN % -1 == 0.
          * Fast 1-branch guard: when divisor == -1, quotient is -a (wraps INT_MIN) and rem is 0! */
@@ -854,6 +855,12 @@ static void emit_scalar_div_rem(X64ISelCtx *c, const PirInst *inst, MVReg dst, u
     }
 }
 
+static void emit_scalar_div_rem(X64ISelCtx *c, const PirInst *inst, MVReg dst, uint32_t loc) {
+    MVReg a = mat_op(c, &inst->operands[0], loc);
+    MVReg b = mat_op(c, &inst->operands[1], loc);
+    emit_scalar_div_rem_regs(c, inst->op, inst->ty, inst->flags, a, b, dst, loc);
+}
+
 static void emit_scalar_ovf(X64ISelCtx *c, PirOpcode op, PirType ty,
                             MVReg a_raw, MVReg b_raw,
                             MVReg dst_val, MVReg dst_ovf, uint32_t loc) {
@@ -907,7 +914,9 @@ static void emit_scalar_ovf(X64ISelCtx *c, PirOpcode op, PirType ty,
         return;
     }
 
-    /* MUL_OVF_U: 1-op unsigned mul sets OF=CF=1 iff upper half (rdx) != 0! */
+    /* MUL_OVF_U: 1-op unsigned mul sets OF=CF=1 iff upper half (rdx) != 0!
+     * Copy RAX -> dst_val BEFORE seto dst_ovf (mov preserves OF/CF) so a dead dst_ovf
+     * allocated to RAX cannot clobber the low product! */
     MInst ma = minst_make(MI_COPY, w, loc);
     ma.op_count = 2u; ma.ops[0] = mop_preg_def(X64_RAX); ma.ops[1] = mop_vreg_use(a_raw);
     emit(c, ma);
@@ -917,12 +926,12 @@ static void emit_scalar_ovf(X64ISelCtx *c, PirOpcode op, PirType ty,
     ml.ops[1]   = mop_preg_defuse(X64_RAX);
     ml.ops[2]   = mop_preg_def(X64_RDX);
     emit(c, ml);
-    MInst sc = minst_make(MI_X64_SETCC, 4u, loc);
-    sc.op_count = 2u; sc.ops[0] = mop_vreg_def(dst_ovf); sc.ops[1] = mop_cond(MCOND_VS);
-    emit(c, sc);
     MInst cp = minst_make(MI_COPY, w, loc);
     cp.op_count = 2u; cp.ops[0] = mop_vreg_def(dst_val); cp.ops[1] = mop_preg_use(X64_RAX);
     emit(c, cp);
+    MInst sc = minst_make(MI_X64_SETCC, 4u, loc);
+    sc.op_count = 2u; sc.ops[0] = mop_vreg_def(dst_ovf); sc.ops[1] = mop_cond(MCOND_VS);
+    emit(c, sc);
 }
 
 static void emit_scalar_uitofp(X64ISelCtx *c, MVReg dst, MVReg src, PirType src_ty,
@@ -1443,6 +1452,14 @@ static void emit_call_inst(X64ISelCtx *c, const PirInst *inst, uint32_t loc) {
 
     if (stack_bytes > c->mf->max_out_args_bytes) {
         c->mf->max_out_args_bytes = stack_bytes;
+    }
+    for (uint32_t i = 0u; i < pass_nargs; ++i) {
+        if (!alocs[i].is_reg) {
+            uint32_t al = (byval_als[i] > arg_aligns[i]) ? byval_als[i] : arg_aligns[i];
+            if (al > c->mf->max_out_args_align) {
+                c->mf->max_out_args_align = al;
+            }
+        }
     }
 
     /* Materialize fn_ptr, hidden_out_v, and all arguments BEFORE touching ABI regs. */
@@ -2012,7 +2029,6 @@ static bool isel_inst(X64ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
                 uint8_t ew = (eb == 8u) ? 8u : 4u;
                 uint8_t vb = (uint8_t)(pir_vec_bits(vt) / 8u);
                 bool is_s = (inst->op == PIR_OP_DIV_S || inst->op == PIR_OP_REM_S);
-                bool is_r = (inst->op == PIR_OP_REM_S || inst->op == PIR_OP_REM_U);
                 MVReg va = mat_op(c, &inst->operands[0], loc);
                 MVReg vb_r = mat_op(c, &inst->operands[1], loc);
                 uint32_t sa = get_vec_tmp_slot(c, 0u), sb = get_vec_tmp_slot(c, 1u), sd = get_vec_tmp_slot(c, 2u);
@@ -2033,25 +2049,7 @@ static bool isel_inst(X64ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
                     ldb.ops[0] = mop_vreg_def(lb); ldb.ops[1] = mop_vreg_use(bb); ldb.ops[2] = mop_imm(off);
                     emit(c, ldb);
 
-                    MInst ma = minst_make(MI_COPY, ew, loc);
-                    ma.op_count = 2u; ma.ops[0] = mop_preg_def(X64_RAX); ma.ops[1] = mop_vreg_use(la);
-                    emit(c, ma);
-                    if (is_s) {
-                        MInst cqo = minst_make(MI_X64_CQO, ew, loc);
-                        cqo.op_count = 2u; cqo.ops[0] = mop_preg_def(X64_RDX); cqo.ops[1] = mop_preg_use(X64_RAX);
-                        emit(c, cqo);
-                    } else {
-                        MInst zd = minst_make(MI_X64_MOV_RI, 4u, loc);
-                        zd.op_count = 2u; zd.ops[0] = mop_preg_def(X64_RDX); zd.ops[1] = mop_imm(0);
-                        emit(c, zd);
-                    }
-                    MInst dv = minst_make(is_s ? MI_X64_IDIV : MI_X64_DIV, ew, loc);
-                    dv.op_count = 3u; dv.ops[0] = mop_vreg_use(lb);
-                    dv.ops[1] = mop_preg_defuse(X64_RAX); dv.ops[2] = mop_preg_defuse(X64_RDX);
-                    emit(c, dv);
-                    MInst res = minst_make(MI_COPY, ew, loc);
-                    res.op_count = 2u; res.ops[0] = mop_vreg_def(lr); res.ops[1] = mop_preg_use(is_r ? X64_RDX : X64_RAX);
-                    emit(c, res);
+                    emit_scalar_div_rem_regs(c, inst->op, el_ty, inst->flags, la, lb, lr, loc);
 
                     MInst st = minst_make(MI_X64_MOV_MR, eb, loc);
                     st.op_count = 3u; st.ops[0] = mop_vreg_use(lr); st.ops[1] = mop_vreg_use(bd); st.ops[2] = mop_imm(off);

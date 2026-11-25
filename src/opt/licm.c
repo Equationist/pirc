@@ -96,7 +96,8 @@ static bool loop_has_mem_barrier(const PirModule *mod, const PirFunction *fn, co
                 ins->op == PIR_OP_ATOMIC_LOAD || ins->op == PIR_OP_ATOMIC_STORE ||
                 ins->op == PIR_OP_ATOMIC_RMW || ins->op == PIR_OP_ATOMIC_CMPXCHG ||
                 ins->op == PIR_OP_MEMCPY || ins->op == PIR_OP_MEMMOVE || ins->op == PIR_OP_MEMSET ||
-                ins->op == PIR_OP_VA_START || ins->op == PIR_OP_STACKRESTORE) {
+                ins->op == PIR_OP_VA_START || ins->op == PIR_OP_VA_ARG || ins->op == PIR_OP_VA_ARG_BUF ||
+                ins->op == PIR_OP_VA_COPY || ins->op == PIR_OP_VA_END || ins->op == PIR_OP_STACKRESTORE) {
                 return true;
             }
             if (ins->op == PIR_OP_CALL) {

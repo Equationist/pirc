@@ -19,6 +19,8 @@ typedef enum {
 typedef struct {
     PirAbiClassKind kind;
     PirType         regs[4];
+    uint64_t        reg_offsets[4]; /* Explicit byte offset per reg when has_reg_offsets is true */
+    bool            has_reg_offsets;
     uint32_t        reg_count;
     uint32_t        gp_used;
     uint32_t        fp_used;

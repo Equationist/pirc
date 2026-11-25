@@ -136,9 +136,9 @@ static PirVecType vec_type_for_scalar_lane(PirScalarType sc, uint32_t vf) {
     return (sc == PIR_SCALAR_F64) ? PIR_VEC_V2F64 : PIR_VEC_V2I64;
 }
 
-/* Match `iv` or `add/sub iv, const_delta` (with optional sext/zext around it). */
+/* Match `iv` or `add/sub iv, const_delta` (with optional sext/zext matching `is_signed`). */
 static bool match_iv_plus_const(const PirFunction *fn, PirBlockId body_bid,
-                                PirValueId iv, PirOperand idx_op,
+                                PirValueId iv, bool is_signed, PirOperand idx_op,
                                 int64_t *out_delta, bool *out_narrow_shift,
                                 PirInstId *out_ext, PirInstId *out_adj) {
     *out_delta        = 0;
@@ -150,12 +150,13 @@ static bool match_iv_plus_const(const PirFunction *fn, PirBlockId body_bid,
     if (cur == iv) return true;
 
     bool saw_ext = false;
-    /* Unwrap optional sext/zext of i32 IV (or i32 IV + const) to i64. */
+    /* Unwrap optional sext/zext of i32 IV (or i32 IV + const) to i64; signedness must match loop IV! */
     if (cur < fn->values.len && fn->values.data[cur].def_inst != PIR_INVALID_ID &&
         fn->values.data[cur].def_block == body_bid) {
         PirInstId xid = fn->values.data[cur].def_inst;
         const PirInst *xins = &fn->insts.data[xid];
-        if ((xins->op == PIR_OP_SEXT || xins->op == PIR_OP_ZEXT) &&
+        PirOpcode expect_ext = is_signed ? PIR_OP_SEXT : PIR_OP_ZEXT;
+        if (xins->op == expect_ext &&
             xins->operand_count == 1u && xins->operands[0].kind == PIR_OPER_VAL) {
             *out_ext = xid;
             saw_ext  = true;
@@ -169,7 +170,7 @@ static bool match_iv_plus_const(const PirFunction *fn, PirBlockId body_bid,
         fn->values.data[cur].def_block == body_bid) {
         PirInstId aid = fn->values.data[cur].def_inst;
         const PirInst *ains = &fn->insts.data[aid];
-        if ((ains->flags & (PIR_FLAG_TRAP_S | PIR_FLAG_TRAP_U)) == 0u && ains->operand_count == 2u) {
+        if ((ains->flags & (PIR_FLAG_TRAP | PIR_FLAG_TRAP_S | PIR_FLAG_TRAP_U)) == 0u && ains->operand_count == 2u) {
             int64_t c = 0;
             if (ains->op == PIR_OP_ADD) {
                 if (ains->operands[0].kind == PIR_OPER_VAL && ains->operands[0].u.val == iv &&
@@ -202,7 +203,7 @@ static bool match_iv_plus_const(const PirFunction *fn, PirBlockId body_bid,
 
 /* Check if `off_op` equals `(iv + delta) * elem_bytes` (via `shl`/`mul`, or direct for 1-byte elem). */
 static bool match_unit_stride_offset(const PirFunction *fn, PirBlockId body_bid,
-                                     PirValueId iv, uint32_t elem_bytes,
+                                     PirValueId iv, bool is_signed, uint32_t elem_bytes,
                                      PirOperand off_op, int64_t *out_delta,
                                      bool *out_narrow_shift,
                                      PirInstId *out_inst1, PirInstId *out_inst2,
@@ -214,7 +215,7 @@ static bool match_unit_stride_offset(const PirFunction *fn, PirBlockId body_bid,
     *out_inst3        = PIR_INVALID_ID;
 
     if (elem_bytes == 1u) {
-        if (match_iv_plus_const(fn, body_bid, iv, off_op, out_delta, out_narrow_shift,
+        if (match_iv_plus_const(fn, body_bid, iv, is_signed, off_op, out_delta, out_narrow_shift,
                                 out_inst2, out_inst3)) {
             return true;
         }
@@ -227,6 +228,7 @@ static bool match_unit_stride_offset(const PirFunction *fn, PirBlockId body_bid,
     const PirValueDef *vd = &fn->values.data[ov];
     if (vd->def_inst == PIR_INVALID_ID || vd->def_block != body_bid) return false;
     const PirInst *ins = &fn->insts.data[vd->def_inst];
+    if ((ins->flags & (PIR_FLAG_TRAP | PIR_FLAG_TRAP_S | PIR_FLAG_TRAP_U)) != 0u) return false;
 
     uint32_t shift_expect = (elem_bytes == 2u) ? 1u : (elem_bytes == 4u) ? 2u : 3u;
     PirOperand idx_op;
@@ -250,13 +252,13 @@ static bool match_unit_stride_offset(const PirFunction *fn, PirBlockId body_bid,
     if (!matched) return false;
 
     *out_inst1 = vd->def_inst;
-    return match_iv_plus_const(fn, body_bid, iv, idx_op, out_delta, out_narrow_shift,
+    return match_iv_plus_const(fn, body_bid, iv, is_signed, idx_op, out_delta, out_narrow_shift,
                                out_inst2, out_inst3);
 }
 
 /* Match `ptr_add base, ((iv + delta) * elem_bytes)` where `base` is loop-invariant. */
 static bool match_unit_stride_ptr(const PirFunction *fn, const PirLoop *loop, PirBlockId body_bid,
-                                  PirValueId iv, uint32_t elem_bytes, PirOperand ptr_op,
+                                  PirValueId iv, bool is_signed, uint32_t elem_bytes, PirOperand ptr_op,
                                   PirOperand *out_base, int64_t *out_delta,
                                   bool *out_narrow_shift, PirInstId *out_pa,
                                   PirInstId *out_off1, PirInstId *out_off2,
@@ -268,8 +270,10 @@ static bool match_unit_stride_ptr(const PirFunction *fn, const PirLoop *loop, Pi
     if (vd->def_inst == PIR_INVALID_ID || vd->def_block != body_bid) return false;
     const PirInst *pa = &fn->insts.data[vd->def_inst];
     if (pa->op != PIR_OP_PTR_ADD || pa->operand_count != 2u) return false;
+    /* ptr_add.i32 sign-extends its i32 offset; reject for unsigned IV loops. */
+    if (pa->ty.kind == PIR_TYPE_SCALAR && pa->ty.u.scalar == PIR_SCALAR_I32 && !is_signed) return false;
     if (!operand_outside_loop(fn, loop, pa->operands[0])) return false;
-    if (!match_unit_stride_offset(fn, body_bid, iv, elem_bytes, pa->operands[1],
+    if (!match_unit_stride_offset(fn, body_bid, iv, is_signed, elem_bytes, pa->operands[1],
                                   out_delta, out_narrow_shift, out_off1, out_off2, out_off3)) {
         return false;
     }
@@ -582,7 +586,7 @@ static bool try_vectorize_loop(PirModule *mod, PirFunction *fn, const PirTargetS
             int64_t delta = 0;
             bool narrow_shift = false;
             PirInstId pa_id, off1, off2, off3;
-            if (!match_unit_stride_ptr(fn, loop, body_bid, iv, elem_bytes, pop,
+            if (!match_unit_stride_ptr(fn, loop, body_bid, iv, is_signed, elem_bytes, pop,
                                        &base, &delta, &narrow_shift, &pa_id, &off1, &off2, &off3)) {
                 legal = false; break;
             }

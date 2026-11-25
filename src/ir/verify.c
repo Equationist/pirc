@@ -128,7 +128,9 @@ static bool check_agg_cycles(Verifier *v, uint32_t id, uint8_t *color) {
     if (color[id] == 2u) return true;
     color[id] = 1u;
     const PirAggDef *a = &v->mod->agg_types.data[id];
-    if (a->kind == PIR_AGG_ARRAY) {
+    if (a->kind == PIR_AGG_PAD) {
+        /* Leaf padding block; no children */
+    } else if (a->kind == PIR_AGG_ARRAY) {
         if (a->elem_type.kind == PIR_TYPE_NAMED_AGG) {
             if (!check_agg_cycles(v, a->elem_type.u.agg_id, color)) return false;
         }
@@ -1506,7 +1508,11 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
                            a->name ? "'" : "");
             continue;
         }
-        if (a->kind == PIR_AGG_ARRAY) {
+        if (a->kind == PIR_AGG_PAD) {
+            if (a->array_len == 0u) {
+                pir_diag_error(diag, a->src_line, 0u, "pad type length must be > 0");
+            }
+        } else if (a->kind == PIR_AGG_ARRAY) {
             if (a->array_len == 0u) {
                 pir_diag_error(diag, a->src_line, 0u, "array type length must be > 0");
             }

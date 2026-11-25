@@ -629,9 +629,11 @@ static MacroContext read_macro_args(Token *tok, Macro *m) {
     bool is_va_arg = m->has_va_arg && (idx == m->arg_cnt - 1);
 
     MacroArg *ap = &ctx.args[idx];
-    if (is_va_arg && tok->kind == TK_RPAREN)
+    if (is_va_arg && tok->kind == TK_RPAREN) {
+      if (is_iso_std && opt_std < STD_C23 && idx > 0 && !tok->file->is_syshdr)
+        error_tok(tok, "too few arguments for variadic macro");
       ctx.omit_comma = !(is_iso_std && idx == 0);
-    else if (idx)
+    } else if (idx)
       tok = skip_tk(tok, TK_COMMA);
 
     ap->tok = read_macro_arg_one(&tok, tok, is_va_arg);
@@ -804,7 +806,7 @@ static Token *paste(Token *lhs, Token *rhs) {
   Token *tok = tokenize_buf(buf, lhs, NULL);
   align_token(tok, lhs);
 
-  if (tok->next->kind != TK_EOF)
+  if (tok->kind == TK_EOF || tok->next->kind != TK_EOF)
     error_tok(lhs, "pasting forms '%s', an invalid token", buf);
   if (tok->origin == lhs)
     tok->origin = copy_token(lhs);
@@ -843,8 +845,23 @@ static Token *subst(Token *tok, MacroContext *ctx) {
     }
 
     if (consume_tk(&tok, tok, TK_HASH2)) {
-      if (cur->kind == TK_PMARK)
+      if (cur->kind == TK_PMARK) {
+        if (tok->kind == TK_HASH) {
+          cur = cur->next = stringize(&tok, tok, ctx);
+          continue;
+        }
+        MacroArg *arg = find_arg(&tok, tok, ctx);
+        if (arg) {
+          if (arg->tok->kind == TK_EOF)
+            continue;
+          for (Token *t = arg->tok; t->kind != TK_EOF; t = t->next)
+            cur = cur->next = copy_token(t);
+          continue;
+        }
+        cur = cur->next = copy_token(tok);
+        tok = tok->next;
         continue;
+      }
 
       if (tok->kind == TK_HASH) {
         cur = paste(cur, stringize(&tok, tok, ctx));
@@ -1079,7 +1096,8 @@ static bool expand_macro(Token **rest, Token *tok, Macro *m, bool is_root) {
     push_macro_lock(m, stop_tok);
     align_token(*rest, tok);
   } else {
-    (*rest)->at_bol |= tok->at_bol;
+    if ((*rest)->kind != TK_HASH)
+      (*rest)->at_bol |= tok->at_bol;
     (*rest)->has_space |= tok->has_space;
   }
 
@@ -1312,16 +1330,22 @@ static Token *embed_file(Token *cont, Token *tok, const char *path, Token *start
 }
 
 // Read #line arguments
-static void read_line_marker(Token **rest, Token *tok) {
+static void read_line_marker(Token **rest, Token *tok, bool is_line_dir) {
   Token *start = tok;
   tok = expand_tok(split_line(rest, tok));
 
-  Node node = {.tok = start};
-  convert_pp_number(tok, &node);
-  if (node.ty->kind != TY_INT || (is_iso_std && node.num.val <= 0 && !start->file->is_syshdr))
+  int64_t line_no = 0;
+  if (tok->kind != TK_PP_NUM)
+    error_tok(tok, "invalid line marker");
+  for (int i = 0; i < tok->len; i++) {
+    if (!Isdigit(tok->loc[i]) || line_no > (INT64_MAX - 9) / 10)
+      error_tok(tok, "invalid line marker");
+    line_no = line_no * 10 + (tok->loc[i] - '0');
+  }
+  if (is_iso_std && is_line_dir && (line_no <= 0 || line_no > 2147483647) && !start->file->is_syshdr)
     error_tok(tok, "invalid line marker");
 
-  start->file->line_delta = node.num.val - start->line_no - 1;
+  start->file->line_delta = line_no - start->line_no - 1;
 
   tok = tok->next;
   if (tok->kind == TK_EOF)
@@ -1329,6 +1353,9 @@ static void read_line_marker(Token **rest, Token *tok) {
 
   if (tok->kind != TK_STR)
     error_tok(tok, "filename expected");
+
+  if (is_iso_std && is_line_dir && tok->next->kind != TK_EOF && !start->file->is_syshdr)
+    error_tok(tok->next, "extra tokens at end of #line directive");
 
   start->file->display_file_no = add_display_file(tok->str);
   *rest = add_fmark2(*rest, start->line_no + 1);
@@ -1544,12 +1571,12 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
   }
 
   if (equal(tok, "line")) {
-    read_line_marker(&tok, tok->next);
+    read_line_marker(&tok, tok->next, true);
     return tok;
   }
 
   if (tok->kind == TK_PP_NUM) {
-    read_line_marker(&tok, tok);
+    read_line_marker(&tok, tok, false);
     return tok;
   }
 
@@ -1749,7 +1776,21 @@ static Token *pragma_macro(Token *start) {
     }
     break;
   }
-  char *buf = arena_format(&cc1_arena, "#pragma %s", str_tok->str);
+  const char *s = str_tok->loc;
+  const char *e = s + str_tok->len;
+  if (s < e && *s == 'L') s++;
+  if (s < e && *s == '"') s++;
+  if (e > s && e[-1] == '"') e--;
+  char *buf = arena_malloc(&cc1_arena, (size_t)(e - s) + 16);
+  char *q = buf;
+  memcpy(q, "#pragma ", 8);
+  q += 8;
+  while (s < e) {
+    if (*s == '\\' && s + 1 < e && (s[1] == '"' || s[1] == '\\'))
+      s++;
+    *q++ = *s++;
+  }
+  *q = '\0';
 
   Token *end;
   Token *hash = tokenize_buf(buf, start, &end);
@@ -1882,13 +1923,23 @@ void init_macros(void) {
   define_macro("__CHAR_BIT__", "8");
   define_macro("__BITINT_MAXWIDTH__", "65535");
 
-  define_macro("__aarch64__", "1");
-  define_macro("__arm64__", "1");
-  define_macro("__arm64", "1");
-  define_macro("__ARM_64BIT_STATE", "1");
-  define_macro("__ARM_ARCH", "8");
-  define_macro("__LITTLE_ENDIAN__", "1");
-  define_macro("__AARCH64EL__", "1");
+  if (is_x64_pir_target()) {
+    define_macro("__x86_64__", "1");
+    define_macro("__x86_64", "1");
+    define_macro("__amd64__", "1");
+    define_macro("__amd64", "1");
+    define_macro("__SSE__", "1");
+    define_macro("__SSE2__", "1");
+    define_macro("__LITTLE_ENDIAN__", "1");
+  } else {
+    define_macro("__aarch64__", "1");
+    define_macro("__arm64__", "1");
+    define_macro("__arm64", "1");
+    define_macro("__ARM_64BIT_STATE", "1");
+    define_macro("__ARM_ARCH", "8");
+    define_macro("__LITTLE_ENDIAN__", "1");
+    define_macro("__AARCH64EL__", "1");
+  }
   define_macro("__SLIMCC_PIR__", "1");
 
   add_builtin("__DATE__", date_macro, true);
@@ -2134,6 +2185,8 @@ static Token *preprocess3(Token *tok) {
     }
 
     if (tok->kind == TK_LBRACK && consume_tk(&tok, tok->next, TK_LBRACK)) {
+      if (is_iso_std && opt_std < STD_C23 && !start->file->is_syshdr)
+        error_tok(start, "C23 '[[]]' attributes are not allowed in ISO C17");
       Token *list = split_bracket(&tok, tok);
       filter_attr(list, &attr_cur, true);
 
@@ -2236,10 +2289,14 @@ Token *preprocess(const char *file, StringArray *incls, StringArray *imacros) {
 Token *prepare_parse(Token *tok) {
   {
     Token *cur;
-    Token *head = tokenize(new_file("slimcc_builtins",
-                                    "typedef char *__builtin_va_list;"
-                                    "typedef struct { unsigned long long __lo, __hi; } __attribute__((aligned(16))) __uint128_t;"
-                                    "typedef struct { unsigned long long __lo, __hi; } __attribute__((aligned(16))) __int128_t;"),
+    const char *builtins_src = is_x64_pir_target()
+      ? "typedef struct { unsigned int gp_offset; unsigned int fp_offset; void *overflow_arg_area; void *reg_save_area; } __builtin_va_list[1];"
+        "typedef struct { unsigned long long __lo, __hi; } __attribute__((aligned(16))) __uint128_t;"
+        "typedef struct { unsigned long long __lo, __hi; } __attribute__((aligned(16))) __int128_t;"
+      : "typedef char *__builtin_va_list;"
+        "typedef struct { unsigned long long __lo, __hi; } __attribute__((aligned(16))) __uint128_t;"
+        "typedef struct { unsigned long long __lo, __hi; } __attribute__((aligned(16))) __int128_t;";
+    Token *head = tokenize(new_file("slimcc_builtins", builtins_src),
                            NULL, &cur);
 
     for (Token *t = head; t; t = t->next)

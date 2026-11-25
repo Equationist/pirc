@@ -564,6 +564,7 @@ typedef struct {
     uint32_t              va_fixed_fp;
     uint64_t              va_fixed_stack_bytes; /* Offset of first vararg on stack */
     uint64_t              max_out_args_bytes;   /* Max outgoing stack arg bytes across calls */
+    uint32_t              max_out_args_align;   /* Max outgoing stack arg alignment (>16 requires RSP realignment) */
 
     /* Filled by regalloc */
     uint32_t              used_callee_gp_mask;  /* Bitmask of GP regs 19..28 */

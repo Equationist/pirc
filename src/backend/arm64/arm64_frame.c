@@ -232,7 +232,7 @@ static bool a64_collect_leaf_ret_path(const MFunc *mf, uint32_t start_bid,
                 return false;
             }
             clobbered |= def_m;
-            if (ins.op == MI_A64_MOV_RR && ins.ops[0].u.preg == ins.ops[1].u.preg) {
+            if (ins.op == MI_A64_MOV_RR && ins.width == 8u && ins.ops[0].u.preg == ins.ops[1].u.preg) {
                 continue;
             }
             if (n_out >= 7u) return false;
@@ -446,7 +446,7 @@ static bool try_arm64_shrink_wrap(MFunc *mf,
         uint32_t def_m = 0u;
         if (!a64_rewrite_fastpath_inst(&ins, cs_map, cs_map_w, 0u, &def_m)) return false;
         if ((def_m & src_pinned_mask) != 0u) return false;
-        if (ins.op == MI_A64_MOV_RR && ins.ops[0].u.preg == ins.ops[1].u.preg) continue;
+        if (ins.op == MI_A64_MOV_RR && ins.width == 8u && ins.ops[0].u.preg == ins.ops[1].u.preg) continue;
         prefix[n_prefix++] = ins;
     }
 
@@ -471,7 +471,7 @@ static bool try_arm64_shrink_wrap(MFunc *mf,
             uint32_t def_m = 0u;
             if (!a64_rewrite_fastpath_inst(&ins, cs_map, cs_map_w, 0u, &def_m)) return false;
             if ((def_m & src_pinned_mask) != 0u) return false;
-            if (ins.op == MI_A64_MOV_RR && ins.ops[0].u.preg == ins.ops[1].u.preg) continue;
+            if (ins.op == MI_A64_MOV_RR && ins.width == 8u && ins.ops[0].u.preg == ins.ops[1].u.preg) continue;
             prefix[n_prefix++] = ins;
         }
     }

@@ -540,6 +540,7 @@ typedef enum {
   DF_VLA_DEALLOC,
   DF_CLEANUP_FN,
   DF_DEFER_STMT,
+  DF_VM_BARRIER,
 } DeferKind;
 
 typedef struct DeferStmt DeferStmt;
@@ -959,6 +960,8 @@ bool is_bitfield(Node *node);
 bool is_redundant_cast(Node *expr, Type *ty);
 bool is_compatible(Type *t1, Type *t2);
 bool is_compatible2(Type *t1, Type *t2);
+Type *composite_type(Type *t1, Type *t2);
+void int_promotion(Node **node);
 bool is_record_compat(Type *t1, Type *t2, bool is_redecl);
 bool is_null_ptr_constant(Node *node);
 bool is_ptr(Type *ty);
@@ -1068,6 +1071,12 @@ extern const char *dumpmachine_str;
 extern const char *opt_isysroot;
 extern const char *opt_pirc;
 extern const char *opt_pir_target;
+
+static inline bool is_x64_pir_target(void) {
+  return opt_pir_target &&
+         (strncmp(opt_pir_target, "x86_64", 6) == 0 ||
+          strncmp(opt_pir_target, "amd64", 5) == 0);
+}
 extern int opt_pir_opt_level;
 
 #endif

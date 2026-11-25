@@ -46,7 +46,7 @@ static void walk_hfa(const PirModule *mod, const PirTargetSpec *target,
         return;
     }
     const PirAggDef *agg = &mod->agg_types.data[ty.u.agg_id];
-    if (agg->kind == PIR_AGG_PACKED_STRUCT) {
+    if (agg->kind == PIR_AGG_PACKED_STRUCT || agg->kind == PIR_AGG_PAD) {
         w->valid = false;
         return;
     }
@@ -148,11 +148,14 @@ bool pir_abi_aapcs64_param(const PirModule *mod, const PirTargetSpec *target,
         if (out->kind == PIR_ABI_DIRECT) {
             if (out->fp_used > 0u) {
                 if (st->fp_used + out->fp_used > 8u) {
-                    /* AAPCS64 all-or-nothing spill: consume remaining FP regs and pass by value on stack. */
+                    /* AAPCS64 all-or-nothing spill: consume remaining FP regs and pass by value on stack.
+                     * On Darwin ARM64, fixed HFA stack alignment is the HFA base element alignment
+                     * (4 for float, 8 for double), ignoring user _Alignas overrides. */
+                    PirTypeLayout bl = pir_type_layout(mod, target, out->regs[0]);
                     out->pad_fp_before = 8u - st->fp_used;
                     st->fp_used = 8u;
                     out->stack_align = (target->os == PIR_OS_MACOS)
-                                       ? ly.align : (ly.align > 8u ? ly.align : 8u);
+                                       ? bl.align : (ly.align > 8u ? ly.align : 8u);
                 } else {
                     st->fp_used += out->fp_used;
                 }

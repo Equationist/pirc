@@ -93,7 +93,8 @@ static bool op_exact_eq(PirOperand a, PirOperand b) {
     switch (a.kind) {
         case PIR_OPER_VAL:       return a.u.val == b.u.val;
         case PIR_OPER_IMM_INT:
-            return a.u.imm_int.lo == b.u.imm_int.lo &&
+            return pir_type_eq(a.type, b.type) &&
+                   a.u.imm_int.lo == b.u.imm_int.lo &&
                    a.u.imm_int.hi == b.u.imm_int.hi &&
                    a.u.imm_int.is_negative == b.u.imm_int.is_negative;
         case PIR_OPER_IMM_FLOAT: return a.u.imm_float.bits == b.u.imm_float.bits;
@@ -569,7 +570,10 @@ static bool try_simplify_identity(GvnCtx *ctx, PirInst *ins) {
                 ctx->alias[res] = chosen.u.val;
                 return true;
             } else if (chosen.kind == PIR_OPER_IMM_INT) {
-                uint64_t v = chosen.u.imm_int.is_negative ? (0u - chosen.u.imm_int.lo) : chosen.u.imm_int.lo;
+                uint32_t sbits = scalar_int_bits(ins->ty);
+                if (sbits == 0u) return false;
+                uint64_t v = (chosen.u.imm_int.is_negative ? (0u - chosen.u.imm_int.lo) : chosen.u.imm_int.lo)
+                             & mask_bits(sbits);
                 rewrite_to_const_int(ctx, ins, v, ins->ty);
                 return true;
             }

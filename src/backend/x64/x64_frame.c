@@ -152,9 +152,18 @@ bool pir_x64_frame_lower(MFunc *mf, PirDiag *diag) {
         }
     }
 
+    int64_t vla_out_sp_off = 0;
+    bool need_vla_out_realign = (mf->has_alloca_dyn && mf->max_out_args_align > 16u);
+    if (need_vla_out_realign) {
+        cur += 8u;
+        cur = align_up_u64(cur, 8u);
+        vla_out_sp_off = -(int64_t)cur;
+    }
+
+    uint32_t out_al = (mf->max_out_args_align > 16u) ? mf->max_out_args_align : 16u;
     if (!mf->has_alloca_dyn && mf->max_out_args_bytes > 0u) {
         cur = align_up_u64(cur, 16u);
-        cur += align_up_u64(mf->max_out_args_bytes, 16u);
+        cur += align_up_u64(mf->max_out_args_bytes, (uint64_t)out_al);
     }
 
     mf->local_frame_size = align_up_u64(cur, 16u);
@@ -180,6 +189,14 @@ bool pir_x64_frame_lower(MFunc *mf, PirDiag *diag) {
 
             /* Allocate local frame (with ____chkstk_darwin on macOS if >= 4KB) */
             emit_x64_sp_adjust(&out, true, mf->local_frame_size, need_chkstk, ploc);
+            if (!mf->has_alloca_dyn && mf->max_out_args_align > 16u) {
+                /* Realign RSP down for >16B-aligned outgoing SysV stack arguments (e.g. _Alignas(32)). */
+                MInst al_sp = minst_make(MI_X64_AND_RI, 8u, ploc);
+                al_sp.op_count = 2u;
+                al_sp.ops[0]   = mop_preg_defuse(X64_RSP);
+                al_sp.ops[1]   = mop_imm(-(int64_t)mf->max_out_args_align);
+                PIR_VEC_PUSH(&out, al_sp);
+            }
 
             /* Save callee-saved GP registers at fixed negative rbp offsets */
             for (uint32_t i = 0u; i < n_cs_gp; ++i) {
@@ -286,15 +303,38 @@ bool pir_x64_frame_lower(MFunc *mf, PirDiag *diag) {
             }
             if (ins.op == MI_CALL_ADJ_DOWN) {
                 if (mf->has_alloca_dyn) {
-                    uint64_t bytes = align_up_u64((uint64_t)ins.ops[0].u.imm, 16u);
-                    emit_x64_sp_adjust(&out, true, bytes, false, loc);
+                    if (need_vla_out_realign) {
+                        uint64_t bytes = align_up_u64((uint64_t)ins.ops[0].u.imm, (uint64_t)out_al);
+                        MInst gsp = minst_make(MI_X64_MOV_RSP, 8u, loc);
+                        gsp.aux_id = 0u; gsp.op_count = 1u; gsp.ops[0] = mop_preg_def(X64_SCRATCH_GP0);
+                        PIR_VEC_PUSH(&out, gsp);
+                        emit_x64_mem(&out, false, X64_SCRATCH_GP0, X64_RBP, vla_out_sp_off,
+                                     8u, false, X64_SCRATCH_GP1, loc);
+                        emit_x64_sp_adjust(&out, true, bytes, false, loc);
+                        MInst al_sp = minst_make(MI_X64_AND_RI, 8u, loc);
+                        al_sp.op_count = 2u;
+                        al_sp.ops[0]   = mop_preg_defuse(X64_RSP);
+                        al_sp.ops[1]   = mop_imm(-(int64_t)out_al);
+                        PIR_VEC_PUSH(&out, al_sp);
+                    } else {
+                        uint64_t bytes = align_up_u64((uint64_t)ins.ops[0].u.imm, 16u);
+                        emit_x64_sp_adjust(&out, true, bytes, false, loc);
+                    }
                 }
                 continue;
             }
             if (ins.op == MI_CALL_ADJ_UP) {
                 if (mf->has_alloca_dyn) {
-                    uint64_t bytes = align_up_u64((uint64_t)ins.ops[0].u.imm, 16u);
-                    emit_x64_sp_adjust(&out, false, bytes, false, loc);
+                    if (need_vla_out_realign) {
+                        emit_x64_mem(&out, true, X64_SCRATCH_GP0, X64_RBP, vla_out_sp_off,
+                                     8u, false, X64_SCRATCH_GP1, loc);
+                        MInst ssp = minst_make(MI_X64_MOV_RSP, 8u, loc);
+                        ssp.aux_id = 1u; ssp.op_count = 1u; ssp.ops[0] = mop_preg_use(X64_SCRATCH_GP0);
+                        PIR_VEC_PUSH(&out, ssp);
+                    } else {
+                        uint64_t bytes = align_up_u64((uint64_t)ins.ops[0].u.imm, 16u);
+                        emit_x64_sp_adjust(&out, false, bytes, false, loc);
+                    }
                 }
                 continue;
             }

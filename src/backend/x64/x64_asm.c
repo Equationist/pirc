@@ -683,7 +683,7 @@ static void emit_inst(X64AsmCtx *ctx, const MFunc *mf, const MInst *ins) {
                           : (ins->op == MI_X64_PUNPCKLQDQ)? "punpcklqdq"
                           : (ins->op == MI_X64_CVTDQ2PS)  ? "cvtdq2ps" : "cvttps2dq";
             fmt_xmm(x0, sizeof(x0), ins->ops[0].u.preg);
-            fmt_xmm(x1, sizeof(x1), ins->ops[1].u.preg);
+            fmt_xmm(x1, sizeof(x1), ins->op_count >= 2u ? ins->ops[1].u.preg : ins->ops[0].u.preg);
             fprintf(out, "\t%s %s, %s\n", m, x0, x1);
             return;
         }

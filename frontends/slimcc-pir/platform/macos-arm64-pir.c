@@ -137,6 +137,8 @@ void run_assembler(const char *input, const char *output) {
 void run_linker(StringArray *paths, StringArray *inputs, const char *output) {
   StringArray arr = {0};
   strarray_push(&arr, "cc");
+  strarray_push(&arr, "-arch");
+  strarray_push(&arr, is_x64_pir_target() ? "x86_64" : "arm64");
   strarray_push(&arr, "-o");
   strarray_push(&arr, output);
 

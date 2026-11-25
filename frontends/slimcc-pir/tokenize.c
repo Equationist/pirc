@@ -483,7 +483,8 @@ static bool read_ucn(const char **new_pos, const char *p, uint32_t *val, bool *i
     chk_delimit_end(&p, invalid);
   else if (p != end)
     *invalid = true;
-  if ((c >= 0xD800 && c <= 0xDFFF) || (c > 0x10FFFF))
+  if ((c >= 0xD800 && c <= 0xDFFF) || (c > 0x10FFFF) ||
+      (is_iso_std && c < 0xA0 && c != 0x24 && c != 0x40 && c != 0x60))
     *invalid = true;
 
   *val = *invalid ? 0 : c;
@@ -559,7 +560,15 @@ static uint32_t read_escape_seq(const char **new_pos, const char *p, bool *inval
     if (is_iso_std)
       *invalid = true;
     return 27;
-  default:  return *p;
+  case '\'':
+  case '"':
+  case '?':
+  case '\\':
+    return *p;
+  default:
+    if (is_iso_std)
+      *invalid = true;
+    return *p;
   }
 }
 
@@ -685,7 +694,7 @@ static Token *read_char_literal(const char *start) {
   bool is_multi = false;
   bool invalid = false;
   for (;;) {
-    if (*p == '\0')
+    if (*p == '\0' || *p == '\n')
       error_at(start, "unclosed character literal");
 
     uint32_t c, lim;
@@ -719,7 +728,7 @@ static Token *read_char_literal(const char *start) {
 static Token *read_unicode_char_literal(const char *start, const char *quote, Type *ty) {
   bool invalid = false;
   const char *p = quote + 1;
-  if (*p == '\0')
+  if (*p == '\0' || *p == '\n')
     error_at(start, "unclosed character literal");
 
   uint32_t c;
@@ -860,7 +869,9 @@ static bool convert_pp_int(const char *loc, int len, Node *node) {
   }
 
   const char *digit_begin = p;
+  errno = 0;
   uint64_t val = strtoull(p, (char **)&p, base);
+  bool overflow = (errno == ERANGE);
   const char *digit_end = p;
 
   bool u = false;
@@ -889,6 +900,8 @@ static bool convert_pp_int(const char *loc, int len, Node *node) {
     return true;
   if (wb)
     return convert_pp_bitint(digit_begin, digit_end, node, base, u);
+  if (overflow && is_iso_std)
+    return false;
 
   Type *ty;
   Type *max_ty = (base == 10) ? ty_ullong : ty_ulong;
@@ -1059,9 +1072,7 @@ void convert_ucn_ident(Token *tok) {
   tok->origin = orig;
   tok->loc = buf;
   tok->len = q - buf;
-
-  static File file = {.name = "<ucn_buffer>", .is_placeholder = true};
-  tok->file = &file;
+  tok->has_ucn = false;
 }
 
 Token *tokenize(File *file, SlashDelta *delta, Token **end) {
@@ -1094,7 +1105,7 @@ Token *tokenize(File *file, SlashDelta *delta, Token **end) {
     // Skip line comments.
     if (Startswith2(p, '/', '/')) {
       p += 2;
-      while (*p != '\n')
+      while (*p && *p != '\n')
         p++;
       has_space = true;
       continue;
@@ -1227,6 +1238,10 @@ Token *tokenize(File *file, SlashDelta *delta, Token **end) {
   cur->next = new_token(TK_EOF, p, p);
   cur->next->at_bol = true;
   add_line_numbers(head.next, file, delta);
+  for (Token *t = head.next; t->kind != TK_EOF; t = t->next) {
+    if (t->kind == TK_IDENT && t->has_ucn)
+      convert_ucn_ident(t);
+  }
   return head.next;
 }
 

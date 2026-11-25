@@ -112,7 +112,8 @@ typedef enum {
     PIR_AGG_STRUCT = 0,
     PIR_AGG_PACKED_STRUCT,
     PIR_AGG_UNION,
-    PIR_AGG_ARRAY
+    PIR_AGG_ARRAY,
+    PIR_AGG_PAD
 } PirAggKind;
 
 typedef struct {
@@ -125,6 +126,8 @@ typedef struct {
     /* For ARRAY */
     PirType     elem_type;
     uint64_t    array_len;
+    /* Optional minimum alignment override (0 = natural alignment) */
+    uint32_t    min_align;
 } PirAggDef;
 
 /* =========================================================================
@@ -407,6 +410,7 @@ typedef struct {
     PirType         call_abi_type;
     uint64_t        call_byval_size;  /* SysV x64 variadic inline stack byval size (0 = none) */
     uint32_t        call_byval_align; /* SysV x64 variadic inline stack byval alignment */
+    uint32_t        call_stack_align; /* Call-site outgoing stack alignment override (0 = default) */
     union {
         PirValueId val;
         struct {

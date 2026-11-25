@@ -121,6 +121,7 @@ typedef struct {
 
 static HashMap pir_sym_cache;
 static int anon_static_seq;
+static bool need_atomic_lock_helpers;
 
 /* =========================================================================
  * 2. Alignment & Interface Helpers
@@ -343,6 +344,8 @@ static void check_hfa_walk(Type *ty, int64_t base_off, HfaCheck *hc) {
   }
   if (ty->kind == TY_STRUCT) {
     for (Member *m = ty->members; m && hc->valid; m = m->next) {
+      if (m->is_bitfield && m->bit_width == 0)
+        continue;
       if (m->is_bitfield || m->is_packed) {
         hc->valid = false;
         return;
@@ -358,6 +361,8 @@ static void check_hfa_walk(Type *ty, int64_t base_off, HfaCheck *hc) {
     }
     int max_cnt = 0;
     for (Member *m = ty->members; m && hc->valid; m = m->next) {
+      if (m->is_bitfield && m->bit_width == 0)
+        continue;
       if (m->is_bitfield || m->is_packed) {
         hc->valid = false;
         return;
@@ -377,6 +382,10 @@ static void check_hfa_walk(Type *ty, int64_t base_off, HfaCheck *hc) {
       }
       if (mc.count > max_cnt)
         max_cnt = mc.count;
+    }
+    if (max_cnt == 0) {
+      hc->valid = false;
+      return;
     }
     if (hc->valid) {
       hc->count += max_cnt;
@@ -406,11 +415,194 @@ static const char *register_pir_type_def(const char *def_str) {
   return name;
 }
 
-/* Build a PIR structural type `@T_N` whose size, alignment, and AAPCS64 HFA
- * classification match C's `Type *ty` byte-for-byte. */
+/* SysV AMD64 §3.2.3 eightbyte classification for <=16B structs/unions. */
+typedef struct {
+  int cls[2];     /* 0 = NO_CLASS, 1 = SSE, 2 = INTEGER */
+  int f32_cnt[2];
+  int f64_cnt[2];
+  bool unaligned;
+} SysvX64Walk;
+
+static int sysv_merge_cls(int a, int b) {
+  if (a == b) return a;
+  if (a == 0) return b;
+  if (b == 0) return a;
+  if (a == 2 || b == 2) return 2;
+  return 1;
+}
+
+static void walk_sysv_x64_agg(Type *ty, int64_t base_off, SysvX64Walk *w) {
+  if (w->unaligned || !ty)
+    return;
+  if (ty->kind == TY_FLOAT) {
+    if ((base_off % 4) != 0) {
+      w->unaligned = true;
+      return;
+    }
+    int64_t eb = base_off / 8;
+    if (eb < 2) {
+      w->cls[eb] = sysv_merge_cls(w->cls[eb], 1);
+      w->f32_cnt[eb]++;
+    }
+    return;
+  }
+  if (ty->kind == TY_DOUBLE || ty->kind == TY_LDOUBLE) {
+    if ((base_off % 8) != 0) {
+      w->unaligned = true;
+      return;
+    }
+    int64_t eb = base_off / 8;
+    if (eb < 2) {
+      w->cls[eb] = sysv_merge_cls(w->cls[eb], 1);
+      w->f64_cnt[eb]++;
+    }
+    return;
+  }
+  if (ty->kind == TY_ARRAY) {
+    if (ty->array_len <= 0 || !ty->base || ty->base->size <= 0)
+      return;
+    for (int64_t i = 0; i < ty->array_len && !w->unaligned; i++)
+      walk_sysv_x64_agg(ty->base, base_off + i * ty->base->size, w);
+    return;
+  }
+  if (ty->kind == TY_STRUCT || ty->kind == TY_UNION) {
+    for (Member *m = ty->members; m && !w->unaligned; m = m->next) {
+      if (m->is_bitfield) {
+        if (m->bit_width > 0 && m->name) {
+          int64_t b_start = base_off + m->offset + (m->bit_offset / 8);
+          int64_t b_end = base_off + m->offset + ((m->bit_offset + m->bit_width - 1) / 8);
+          for (int64_t eb = b_start / 8; eb <= b_end / 8 && eb < 2; eb++)
+            w->cls[eb] = sysv_merge_cls(w->cls[eb], 2);
+        }
+        continue;
+      }
+      walk_sysv_x64_agg(m->ty, base_off + m->offset, w);
+    }
+    return;
+  }
+  /* Scalar integer / pointer / bool / enum */
+  int64_t sz = ty->size > 0 ? ty->size : 1;
+  int64_t al = ty->align > 0 ? ty->align : 1;
+  if (al > 1 && (base_off % al) != 0) {
+    w->unaligned = true;
+    return;
+  }
+  int64_t eb0 = base_off / 8;
+  int64_t eb1 = (base_off + sz - 1) / 8;
+  for (int64_t eb = eb0; eb <= eb1 && eb < 2; eb++)
+    w->cls[eb] = sysv_merge_cls(w->cls[eb], 2);
+}
+
+/* Build a PIR structural type `@T_N` whose size, alignment, and target C ABI
+ * classification (AAPCS64 HFA or SysV AMD64 eightbytes) match C's `Type *ty`. */
 static const char *get_pir_agg_type_name(Type *ty) {
   int64_t sz = ty->size > 0 ? ty->size : 1;
   int32_t al = ty->align > 0 ? ty->align : 1;
+
+  /* 0. On SysV AMD64, <=16B aggregates with any SSE or NO_CLASS eightbyte
+   *    (including mixed [INTEGER, SSE], [SSE, INTEGER], [NO_CLASS, SSE],
+   *    [SSE, NO_CLASS], [INTEGER, NO_CLASS], and unnamed bitfield padding)
+   *    must preserve exact eightbyte classification, size, and alignment. */
+  if (is_x64_pir_target() && (ty->kind == TY_STRUCT || ty->kind == TY_UNION) &&
+      ty->size > 0 && ty->size <= 16) {
+    SysvX64Walk w = {0};
+    walk_sysv_x64_agg(ty, 0, &w);
+    bool has_special_eb = (w.cls[0] == 1 || w.cls[1] == 1 ||
+                           w.cls[0] == 0 || (sz > 8 && w.cls[1] == 0));
+    if (!w.unaligned && has_special_eb) {
+      SBuf sb;
+      sb_init(&sb);
+      sb_printf(&sb, "{ ");
+      int32_t nat_al = 1;
+      if (sz <= 8) {
+        if (w.cls[0] == 0) {
+          sb_printf(&sb, "pad %" PRIi64, sz);
+        } else if (w.cls[0] == 1) {
+          if (sz == 4) {
+            sb_printf(&sb, "f32");
+            nat_al = 4;
+          } else if (al < 8) {
+            if (w.f64_cnt[0] == 0 && w.f32_cnt[0] >= 2)
+              sb_printf(&sb, "f32, f32");
+            else
+              sb_printf(&sb, "f32, pad %" PRIi64, sz - 4);
+            nat_al = 4;
+          } else {
+            sb_printf(&sb, "f64");
+            nat_al = 8;
+          }
+        } else {
+          if (sz == 8 && al >= 8) { sb_printf(&sb, "i64"); nat_al = 8; }
+          else if (sz == 8 && al >= 4) { sb_printf(&sb, "i32, i32"); nat_al = 4; }
+          else if (sz == 4 && al >= 4) { sb_printf(&sb, "i32"); nat_al = 4; }
+          else if (sz == 2 && al >= 2) { sb_printf(&sb, "i16"); nat_al = 2; }
+          else { sb_printf(&sb, "[%" PRIi64 " x i8]", sz); }
+        }
+      } else {
+        /* Eightbyte 0: occupies exact bytes 0..7 */
+        if (w.cls[0] == 0) {
+          sb_printf(&sb, "pad 8");
+        } else if (w.cls[0] == 1) {
+          if (al < 8) {
+            sb_printf(&sb, "f32, f32");
+            if (4 > nat_al) nat_al = 4;
+          } else {
+            sb_printf(&sb, "f64");
+            if (8 > nat_al) nat_al = 8;
+          }
+        } else {
+          if (al >= 8) {
+            sb_printf(&sb, "i64");
+            if (8 > nat_al) nat_al = 8;
+          } else if (al >= 4) {
+            sb_printf(&sb, "i32, i32");
+            if (4 > nat_al) nat_al = 4;
+          } else if (al >= 2) {
+            sb_printf(&sb, "[4 x i16]");
+            if (2 > nat_al) nat_al = 2;
+          } else {
+            sb_printf(&sb, "[8 x i8]");
+          }
+        }
+        sb_printf(&sb, ", ");
+        /* Eightbyte 1: occupies exact remaining bytes 8..(sz-1) */
+        int64_t rem = sz - 8;
+        if (w.cls[1] == 0) {
+          sb_printf(&sb, "pad %" PRIi64, rem);
+        } else if (w.cls[1] == 1) {
+          if (rem == 4) {
+            sb_printf(&sb, "f32");
+            if (4 > nat_al) nat_al = 4;
+          } else if (al < 8) {
+            if (w.f64_cnt[1] == 0 && w.f32_cnt[1] >= 2)
+              sb_printf(&sb, "f32, f32");
+            else
+              sb_printf(&sb, "f32, pad %" PRIi64, rem - 4);
+            if (4 > nat_al) nat_al = 4;
+          } else {
+            sb_printf(&sb, "f64");
+            if (8 > nat_al) nat_al = 8;
+          }
+        } else {
+          if (rem == 8 && al >= 8) { sb_printf(&sb, "i64"); if (8 > nat_al) nat_al = 8; }
+          else if (rem == 8 && al >= 4) { sb_printf(&sb, "i32, i32"); if (4 > nat_al) nat_al = 4; }
+          else if (rem == 4 && al >= 4) { sb_printf(&sb, "i32"); if (4 > nat_al) nat_al = 4; }
+          else if (rem == 2 && al >= 2) { sb_printf(&sb, "i16"); if (2 > nat_al) nat_al = 2; }
+          else { sb_printf(&sb, "[%" PRIi64 " x i8]", rem); }
+        }
+      }
+      sb_printf(&sb, " }");
+      if (al > nat_al) {
+        int32_t p2al = 1;
+        while (p2al < al && p2al < 4096)
+          p2al <<= 1;
+        sb_printf(&sb, ", align %d", p2al);
+      }
+      const char *res = register_pir_type_def(sb.buf);
+      sb_free(&sb);
+      return res;
+    }
+  }
 
   /* 1. Check for HFA (1..4 float or double elements, exact packed size) */
   if ((ty->kind == TY_STRUCT || ty->kind == TY_UNION) && ty->size > 0) {
@@ -428,6 +620,12 @@ static const char *get_pir_agg_type_name(Type *ty) {
         sb_printf(&sb, "%s", et);
       }
       sb_printf(&sb, " }");
+      if (al > esz) {
+        int32_t p2al = 1;
+        while (p2al < al && p2al < 4096)
+          p2al <<= 1;
+        sb_printf(&sb, ", align %d", p2al);
+      }
       const char *res = register_pir_type_def(sb.buf);
       sb_free(&sb);
       return res;
@@ -439,16 +637,28 @@ static const char *get_pir_agg_type_name(Type *ty) {
    *    solely on size (<=16B -> 1..2 GP regs, >16B -> indirect ptr) and alignment. */
   SBuf sb;
   sb_init(&sb);
+  int32_t nat_al = 1;
   if (al >= 16 && (sz % 16) == 0) {
     sb_printf(&sb, "[%" PRIi64 " x i128]", sz / 16);
+    nat_al = 16;
   } else if (al >= 8 && (sz % 8) == 0) {
     sb_printf(&sb, "[%" PRIi64 " x i64]", sz / 8);
+    nat_al = 8;
   } else if (al >= 4 && (sz % 4) == 0) {
     sb_printf(&sb, "[%" PRIi64 " x i32]", sz / 4);
+    nat_al = 4;
   } else if (al >= 2 && (sz % 2) == 0) {
     sb_printf(&sb, "[%" PRIi64 " x i16]", sz / 2);
+    nat_al = 2;
   } else {
     sb_printf(&sb, "[%" PRIi64 " x i8]", sz);
+    nat_al = 1;
+  }
+  if (al > nat_al) {
+    int32_t p2al = 1;
+    while (p2al < al && p2al < 4096)
+      p2al <<= 1;
+    sb_printf(&sb, ", align %d", p2al);
   }
   const char *res = register_pir_type_def(sb.buf);
   sb_free(&sb);
@@ -692,14 +902,14 @@ static int emit_entry_alloca(int64_t bytes, int32_t align) {
   return id;
 }
 
-static int emit_entry_scalar_alloca(const char *pir_ty, int32_t align) {
+static int emit_entry_scalar_alloca(const char *pir_ty, int64_t bytes, int32_t align) {
   if (align <= 0)
     align = 1;
   int32_t al = 1;
   while (al < align)
     al <<= 1;
   if (al > 16)
-    return emit_entry_alloca(8, al);
+    return emit_entry_alloca(bytes > 0 ? bytes : 8, al);
   int id = fc->next_loc_id++;
   sb_printf(&fc->entry_sb, "    %%loc_%d = alloca %s, align %d\n", id, pir_ty, al);
   return id;
@@ -748,7 +958,7 @@ static LocalInfo *register_local(Obj *var, bool is_param) {
     if (al < min_al)
       al = min_al;
     li->align = al;
-    li->slot_id = emit_entry_scalar_alloca(li->pir_ty, al);
+    li->slot_id = emit_entry_scalar_alloca(li->pir_ty, li->size, al);
   }
   return li;
 }
@@ -1236,6 +1446,20 @@ static PirVal emit_load_node(Node *node, PirVal addr) {
       PirVal v = {tmp, "ptr"};
       return v;
     }
+    if (node->ty->size > 0) {
+      need_atomic_lock_helpers = true;
+      ensure_open_block();
+      int32_t al = node->ty->align > 0 ? node->ty->align : 1;
+      int slot = emit_entry_alloca(node->ty->size, al);
+      int tmp = new_tid();
+      int sz_id = new_tid();
+      sb_printf(&fc->body_sb, "    %%t%d = ptr_add.i64 %%loc_%d, 0\n", tmp, slot);
+      sb_printf(&fc->body_sb, "    %%t%d = const.i64 %" PRIi64 "\n", sz_id, node->ty->size);
+      sb_printf(&fc->body_sb, "    call @__pir_atomic_load_n(%%t%d, %%t%d, %%t%d)\n",
+                tmp, addr.id, sz_id);
+      PirVal v = {tmp, "ptr"};
+      return v;
+    }
   }
   if (is_mem_val_ty(node->ty) || node->ty->kind == TY_ARRAY ||
       node->ty->kind == TY_VLA || node->ty->kind == TY_FUNC)
@@ -1263,6 +1487,14 @@ static PirVal emit_store_node(Node *lhs, PirVal val, PirVal addr) {
       int raw = new_tid();
       sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", raw, it, val.id, p2);
       sb_printf(&fc->body_sb, "    atomic_store.%s %%t%d, %%t%d [seq_cst]\n", it, raw, addr.id);
+      return addr;
+    }
+    if (lhs->ty->size > 0) {
+      need_atomic_lock_helpers = true;
+      int sz_id = new_tid();
+      sb_printf(&fc->body_sb, "    %%t%d = const.i64 %" PRIi64 "\n", sz_id, lhs->ty->size);
+      sb_printf(&fc->body_sb, "    call @__pir_atomic_store_n(%%t%d, %%t%d, %%t%d)\n",
+                addr.id, val.id, sz_id);
       return addr;
     }
   }
@@ -1994,6 +2226,20 @@ static PirVal gen_expr(Node *node) {
         PirVal v = {tmp, "ptr"};
         return v;
       }
+      need_atomic_lock_helpers = true;
+      int64_t sz = ty->size > 0 ? ty->size : 1;
+      int32_t tmp_al = ty->align > 0 ? ty->align : 1;
+      int slot = emit_entry_alloca(sz, tmp_al);
+      int tmp = new_tid();
+      sb_printf(&fc->body_sb, "    %%t%d = ptr_add.i64 %%loc_%d, 0\n", tmp, slot);
+      if (ty->size > 0) {
+        int sz_id = new_tid();
+        sb_printf(&fc->body_sb, "    %%t%d = const.i64 %" PRIi64 "\n", sz_id, ty->size);
+        sb_printf(&fc->body_sb, "    call @__pir_atomic_exch_n(%%t%d, %%t%d, %%t%d, %%t%d)\n",
+                  addr.id, val.id, tmp, sz_id);
+      }
+      PirVal v = {tmp, "ptr"};
+      return v;
     }
     if (is_flonum(ty)) {
       const char *it = (ty->kind == TY_FLOAT) ? "i32" : "i64";
@@ -2028,6 +2274,21 @@ static PirVal gen_expr(Node *node) {
     const char *it = is_agg_cas ? atomic_int_ty_for_size(ty->size)
                    : is_fp ? ((ty->kind == TY_FLOAT) ? "i32" : "i64")
                    : pir_scalar_ty_name(ty);
+    if (is_agg_cas && !it) {
+      need_atomic_lock_helpers = true;
+      int ok = new_tid();
+      if (ty->size > 0) {
+        int sz_id = new_tid();
+        sb_printf(&fc->body_sb, "    %%t%d = const.i64 %" PRIi64 "\n", sz_id, ty->size);
+        sb_printf(&fc->body_sb,
+                  "    %%t%d = call.i8 @__pir_atomic_cas_n(%%t%d, %%t%d, %%t%d, %%t%d)\n",
+                  ok, addr.id, old_ptr.id, new_v.id, sz_id);
+      } else {
+        sb_printf(&fc->body_sb, "    %%t%d = const.i8 1\n", ok);
+      }
+      PirVal v = {ok, "i8"};
+      return v;
+    }
     if (!it)
       it = "i64";
     int32_t old_al = is_agg_cas
@@ -2076,14 +2337,20 @@ static PirVal gen_expr(Node *node) {
   }
 
   case ND_VA_START: {
-    PirVal ap_ptr = gen_addr(node->m.lhs);
+    PirVal ap_ptr = (is_x64_pir_target() && node->m.lhs->ty->kind == TY_PTR)
+                    ? gen_expr(node->m.lhs)
+                    : gen_addr(node->m.lhs);
     sb_printf(&fc->body_sb, "    va_start %%t%d\n", ap_ptr.id);
     return pir_void_val();
   }
 
   case ND_VA_COPY: {
-    PirVal dst_ptr = gen_addr(node->m.lhs);
-    PirVal src_ptr = gen_addr(node->m.rhs);
+    PirVal dst_ptr = (is_x64_pir_target() && node->m.lhs->ty->kind == TY_PTR)
+                     ? gen_expr(node->m.lhs)
+                     : gen_addr(node->m.lhs);
+    PirVal src_ptr = (is_x64_pir_target() && node->m.rhs->ty->kind == TY_PTR)
+                     ? gen_expr(node->m.rhs)
+                     : gen_addr(node->m.rhs);
     sb_printf(&fc->body_sb, "    va_copy %%t%d, %%t%d\n", dst_ptr.id, src_ptr.id);
     return pir_void_val();
   }
@@ -2091,7 +2358,9 @@ static PirVal gen_expr(Node *node) {
   case ND_VA_ARG: {
     /* ND_VA_ARG has type `T*` (wrapped by an outer ND_DEREF in parse.c).
      * Allocate a local buffer for T, fill it via va_arg / va_arg_buf, return ptr. */
-    PirVal ap_ptr = gen_addr(node->m.lhs);
+    PirVal ap_ptr = (is_x64_pir_target() && node->m.lhs->ty->kind == TY_PTR)
+                    ? gen_expr(node->m.lhs)
+                    : gen_addr(node->m.lhs);
     Type *ty = node->ty->base;
     ensure_open_block();
     if (is_mem_val_ty(ty)) {
@@ -2105,7 +2374,7 @@ static PirVal gen_expr(Node *node) {
     } else {
       const char *pt = pir_scalar_ty_name(ty);
       int32_t al = pir_scalar_align(ty);
-      int slot = emit_entry_scalar_alloca(pt, al);
+      int slot = emit_entry_scalar_alloca(pt, ty->size > 0 ? ty->size : al, al);
       int val = new_tid();
       int p = new_tid();
       sb_printf(&fc->body_sb, "    %%t%d = va_arg.%s %%t%d\n", val, pt, ap_ptr.id);
@@ -2305,6 +2574,10 @@ static void gen_defr(Node *node) {
         }
         sb_printf(&fc->body_sb, "    stackrestore %%t%d\n", sp);
       }
+      defr = defr->next;
+      continue;
+    }
+    if (defr->kind == DF_VM_BARRIER) {
       defr = defr->next;
       continue;
     }
@@ -2664,7 +2937,7 @@ void emit_text(Obj *fn) {
 
   /* Save stack pointer in entry if function deallocates VLAs */
   if (fn->dealloc_vla) {
-    ctx.vla_sp_slot = emit_entry_scalar_alloca("ptr", 8);
+    ctx.vla_sp_slot = emit_entry_scalar_alloca("ptr", 8, 8);
     int sp = new_tid();
     sb_printf(&ctx.entry_sb, "    %%t%d = stacksave\n", sp);
     sb_printf(&ctx.entry_sb, "    store.ptr %%t%d, %%loc_%d, align 8\n", sp, ctx.vla_sp_slot);
@@ -2980,6 +3253,10 @@ int codegen(Obj *prog, FILE *out) {
       sb_append(&glob_sb, var->output->static_lvars_buf, var->output->static_lvars_len);
   }
 
+  if (need_atomic_lock_helpers) {
+    sb_printf(&glob_sb, "weak @__pir_atomic_locks = global [256 x i8] = zeroinit, align 64\n");
+  }
+
   /* 4. Emit final PIR HIR module in canonical order! */
   fprintf(out, "target \"%s\"\n", opt_pir_target ? opt_pir_target : "aarch64-apple-darwin");
 
@@ -3020,6 +3297,147 @@ int codegen(Obj *prog, FILE *out) {
     if (!var->is_live || !var->is_definition || var->ty->kind != TY_FUNC || !var->output)
       continue;
     fwrite(var->output->buf, 1, var->output->buflen, out);
+  }
+
+  if (need_atomic_lock_helpers) {
+    static const char *atomic_helpers =
+      "\n"
+      "func @__pir_atomic_lock(%addr: ptr) -> ptr {\n"
+      ".entry:\n"
+      "    %pi = ptrtoint.i64 %addr\n"
+      "    %sh = shr.i64 %pi, 4 [mask]\n"
+      "    %idx = and.i64 %sh, 63\n"
+      "    %off = shl.i64 %idx, 2 [mask]\n"
+      "    %tbl = addr.ptr @__pir_atomic_locks\n"
+      "    %lp = ptr_add.i64 %tbl, %off\n"
+      "    %c1 = const.i32 1\n"
+      "    jmp .spin\n"
+      ".spin:\n"
+      "    %old = atomic_rmw.xchg.i32 %lp, %c1 [acquire]\n"
+      "    %busy = cmp_ne.i32 %old, 0\n"
+      "    br %busy, .spin, .done\n"
+      ".done:\n"
+      "    ret %lp\n"
+      "}\n"
+      "\n"
+      "func @__pir_atomic_load_n(%dst: ptr, %src: ptr, %sz: i64) -> void {\n"
+      ".entry:\n"
+      "    %lp = call.ptr @__pir_atomic_lock(%src)\n"
+      "    %z = const.i64 0\n"
+      "    jmp .loop(%z)\n"
+      ".loop(%i: i64):\n"
+      "    %done = cmp_ge_u.i64 %i, %sz\n"
+      "    br %done, .unlock, .step\n"
+      ".step:\n"
+      "    %ps = ptr_add.i64 %src, %i\n"
+      "    %pd = ptr_add.i64 %dst, %i\n"
+      "    %b = load.i8 %ps, align 1\n"
+      "    store.i8 %b, %pd, align 1\n"
+      "    %ni = add.i64 %i, 1 [wrap]\n"
+      "    jmp .loop(%ni)\n"
+      ".unlock:\n"
+      "    %c0 = const.i32 0\n"
+      "    atomic_store.i32 %c0, %lp [release]\n"
+      "    ret\n"
+      "}\n"
+      "\n"
+      "func @__pir_atomic_store_n(%dst: ptr, %src: ptr, %sz: i64) -> void {\n"
+      ".entry:\n"
+      "    %lp = call.ptr @__pir_atomic_lock(%dst)\n"
+      "    %z = const.i64 0\n"
+      "    jmp .loop(%z)\n"
+      ".loop(%i: i64):\n"
+      "    %done = cmp_ge_u.i64 %i, %sz\n"
+      "    br %done, .unlock, .step\n"
+      ".step:\n"
+      "    %ps = ptr_add.i64 %src, %i\n"
+      "    %pd = ptr_add.i64 %dst, %i\n"
+      "    %b = load.i8 %ps, align 1\n"
+      "    store.i8 %b, %pd, align 1\n"
+      "    %ni = add.i64 %i, 1 [wrap]\n"
+      "    jmp .loop(%ni)\n"
+      ".unlock:\n"
+      "    %c0 = const.i32 0\n"
+      "    atomic_store.i32 %c0, %lp [release]\n"
+      "    ret\n"
+      "}\n"
+      "\n"
+      "func @__pir_atomic_exch_n(%addr: ptr, %newp: ptr, %oldp: ptr, %sz: i64) -> void {\n"
+      ".entry:\n"
+      "    %lp = call.ptr @__pir_atomic_lock(%addr)\n"
+      "    %z = const.i64 0\n"
+      "    jmp .loop(%z)\n"
+      ".loop(%i: i64):\n"
+      "    %done = cmp_ge_u.i64 %i, %sz\n"
+      "    br %done, .unlock, .step\n"
+      ".step:\n"
+      "    %pa = ptr_add.i64 %addr, %i\n"
+      "    %pn = ptr_add.i64 %newp, %i\n"
+      "    %po = ptr_add.i64 %oldp, %i\n"
+      "    %bo = load.i8 %pa, align 1\n"
+      "    %bn = load.i8 %pn, align 1\n"
+      "    store.i8 %bo, %po, align 1\n"
+      "    store.i8 %bn, %pa, align 1\n"
+      "    %ni = add.i64 %i, 1 [wrap]\n"
+      "    jmp .loop(%ni)\n"
+      ".unlock:\n"
+      "    %c0 = const.i32 0\n"
+      "    atomic_store.i32 %c0, %lp [release]\n"
+      "    ret\n"
+      "}\n"
+      "\n"
+      "func @__pir_atomic_cas_n(%addr: ptr, %exp: ptr, %des: ptr, %sz: i64) -> i8 {\n"
+      ".entry:\n"
+      "    %lp = call.ptr @__pir_atomic_lock(%addr)\n"
+      "    %z = const.i64 0\n"
+      "    jmp .cmploop(%z)\n"
+      ".cmploop(%i: i64):\n"
+      "    %done = cmp_ge_u.i64 %i, %sz\n"
+      "    br %done, .eq_init, .chk\n"
+      ".chk:\n"
+      "    %pa = ptr_add.i64 %addr, %i\n"
+      "    %pe = ptr_add.i64 %exp, %i\n"
+      "    %ba = load.i8 %pa, align 1\n"
+      "    %be = load.i8 %pe, align 1\n"
+      "    %same = cmp_eq.i8 %ba, %be\n"
+      "    %ni = add.i64 %i, 1 [wrap]\n"
+      "    br %same, .cmploop(%ni), .ne_init\n"
+      ".eq_init:\n"
+      "    jmp .eqloop(%z)\n"
+      ".eqloop(%j: i64):\n"
+      "    %edone = cmp_ge_u.i64 %j, %sz\n"
+      "    br %edone, .ok_ret, .eqstep\n"
+      ".eqstep:\n"
+      "    %pd = ptr_add.i64 %des, %j\n"
+      "    %pda = ptr_add.i64 %addr, %j\n"
+      "    %bd = load.i8 %pd, align 1\n"
+      "    store.i8 %bd, %pda, align 1\n"
+      "    %nj = add.i64 %j, 1 [wrap]\n"
+      "    jmp .eqloop(%nj)\n"
+      ".ok_ret:\n"
+      "    %c0a = const.i32 0\n"
+      "    atomic_store.i32 %c0a, %lp [release]\n"
+      "    %r1 = const.i8 1\n"
+      "    ret %r1\n"
+      ".ne_init:\n"
+      "    jmp .neloop(%z)\n"
+      ".neloop(%k: i64):\n"
+      "    %ndone = cmp_ge_u.i64 %k, %sz\n"
+      "    br %ndone, .fail_ret, .nestep\n"
+      ".nestep:\n"
+      "    %pna = ptr_add.i64 %addr, %k\n"
+      "    %pne = ptr_add.i64 %exp, %k\n"
+      "    %bna = load.i8 %pna, align 1\n"
+      "    store.i8 %bna, %pne, align 1\n"
+      "    %nk = add.i64 %k, 1 [wrap]\n"
+      "    jmp .neloop(%nk)\n"
+      ".fail_ret:\n"
+      "    %c0b = const.i32 0\n"
+      "    atomic_store.i32 %c0b, %lp [release]\n"
+      "    %r0 = const.i8 0\n"
+      "    ret %r0\n"
+      "}\n";
+    fputs(atomic_helpers, out);
   }
 
   sb_free(&ext_sb);

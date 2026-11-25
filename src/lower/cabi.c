@@ -74,13 +74,26 @@ static PirValueId cabi_padd(PirModule *mod, PirFunction *fn, PirBlockId blk, Pir
     return pa.results[0];
 }
 
+static uint64_t abi_reg_offset(const PirModule *mod, const PirTargetSpec *target,
+                               const PirAbiArgInfo *info, uint32_t k) {
+    if (info->has_reg_offsets) {
+        return info->reg_offsets[k];
+    }
+    uint64_t off = 0u;
+    for (uint32_t i = 0u; i < k; ++i) {
+        off += pir_type_layout(mod, target, info->regs[i]).size;
+    }
+    return off;
+}
+
 static uint32_t reg_bundle_info(const PirModule *mod, const PirTargetSpec *target,
                                 const PirAbiArgInfo *info, uint64_t *out_total, uint32_t *out_max_al) {
     uint64_t tot = 0u;
     uint32_t mal = 1u;
     for (uint32_t k = 0u; k < info->reg_count; ++k) {
         PirTypeLayout rl = pir_type_layout(mod, target, info->regs[k]);
-        tot += rl.size;
+        uint64_t end = abi_reg_offset(mod, target, info, k) + rl.size;
+        if (end > tot) tot = end;
         if (rl.align > mal) mal = rl.align;
     }
     *out_total  = tot;
@@ -154,9 +167,9 @@ static void pack_byval_arg(PirModule *mod, const PirTargetSpec *target,
         load_base = pir_op_val(stg.results[0], tptr);
     }
 
-    uint64_t off = 0u;
     for (uint32_t k = 0u; k < info->reg_count; ++k) {
         PirTypeLayout rl = pir_type_layout(mod, target, info->regs[k]);
+        uint64_t off = abi_reg_offset(mod, target, info, k);
         PirValueId lp = cabi_padd(mod, fn, blk, out, load_base, off, idx_ty, ln, lc);
         PirInst ld = pir_make_inst(PIR_OP_LOAD, info->regs[k], ln, lc);
         ld.align = rl.align;
@@ -164,8 +177,11 @@ static void pack_byval_arg(PirModule *mod, const PirTargetSpec *target,
         ld.operands[0] = pir_op_val(lp, tptr);
         ld.results[0]  = pir_fn_new_val(mod, fn, "byv_r", info->regs[k], blk, PIR_INVALID_ID, 0u);
         pir_fn_append_inst(fn, out, ld);
-        PIR_VEC_PUSH(call_args, pir_op_val(ld.results[0], info->regs[k]));
-        off += rl.size;
+        PirOperand vop = pir_op_val(ld.results[0], info->regs[k]);
+        if (k == 0u && info->stack_align > 0u) {
+            vop.call_stack_align = info->stack_align;
+        }
+        PIR_VEC_PUSH(call_args, vop);
     }
 }
 
@@ -182,7 +198,7 @@ static void rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
     PIR_VEC_PUSH(&new_ops, inst->operands[0]); /* callee symbol or fn_ptr */
 
     bool direct_retbuf = plan->has_retbuf && plan->ret_info.kind == PIR_ABI_DIRECT &&
-                         plan->ret_info.reg_count == 1u;
+                         plan->ret_info.reg_count <= 1u;
     PirOperand retbuf_out_ptr;
     memset(&retbuf_out_ptr, 0, sizeof(retbuf_out_ptr));
 
@@ -216,6 +232,9 @@ static void rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
                 pack_byval_arg(mod, target, fn, blk, out, arg, orig_params[pi].abi_type,
                                info, &new_ops, ln, lc);
             } else {
+                if (info->stack_align > 0u) {
+                    arg.call_stack_align = info->stack_align;
+                }
                 PIR_VEC_PUSH(&new_ops, arg);
             }
         } else if (is_variadic && arg.call_abi == PIR_PARAM_BYVAL) {
@@ -228,17 +247,34 @@ static void rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
             PirAbiArgInfo vinfo;
             pir_abi_classify_param(mod, target, &vpd, &va_st, &vinfo);
             if (target->arch == PIR_ARCH_ARM64 && target->os == PIR_OS_MACOS &&
-                vinfo.kind == PIR_ABI_DIRECT && vinfo.fp_used > 0u &&
-                vinfo.regs[0].kind == PIR_TYPE_SCALAR && vinfo.regs[0].u.scalar == PIR_SCALAR_F32) {
-                /* Darwin ARM64 passes all variadic args on 8B stack slots without promoting
-                 * aggregate f32 members to f64; pack raw aggregate bytes into i64 words. */
+                vinfo.kind == PIR_ABI_DIRECT) {
                 PirTypeLayout vly = pir_type_layout(mod, target, vpd.abi_type);
-                uint32_t nw = (vly.size <= 8u) ? 1u : 2u;
-                vinfo.reg_count = nw;
-                vinfo.fp_used   = 0u;
-                vinfo.gp_used   = nw;
-                for (uint32_t w = 0u; w < nw; ++w) {
-                    vinfo.regs[w] = ti64;
+                if (vinfo.fp_used > 0u &&
+                    vinfo.regs[0].kind == PIR_TYPE_SCALAR &&
+                    vinfo.regs[0].u.scalar == PIR_SCALAR_F32) {
+                    /* Darwin ARM64 passes all variadic args on 8B stack slots without promoting
+                     * aggregate f32 members to f64; pack raw aggregate bytes into i64 words. */
+                    uint32_t nw = (vly.size <= 8u) ? 1u : 2u;
+                    vinfo.reg_count = nw;
+                    vinfo.fp_used   = 0u;
+                    vinfo.gp_used   = nw;
+                    for (uint32_t w = 0u; w < nw; ++w) {
+                        vinfo.regs[w] = ti64;
+                    }
+                }
+                if (vly.align > 8u) {
+                    vinfo.stack_align = (vly.align > 16u) ? 16u : vly.align;
+                }
+            } else if (target->arch == PIR_ARCH_X86_64 && target->os != PIR_OS_WINDOWS &&
+                       vinfo.kind == PIR_ABI_DIRECT && vinfo.fp_used > 0u) {
+                /* SysV AMD64: variadic aggregate f32 eightbytes must NOT undergo C default
+                 * float->double promotion (cvtss2sd). Widen f32 pieces to v2f32 so the raw
+                 * 32-bit float bits land in the low lane of XMM (upper 32 bits zero-padded). */
+                for (uint32_t k = 0u; k < vinfo.reg_count; ++k) {
+                    if (vinfo.regs[k].kind == PIR_TYPE_SCALAR &&
+                        vinfo.regs[k].u.scalar == PIR_SCALAR_F32) {
+                        vinfo.regs[k] = pir_type_vec(PIR_VEC_V2F32);
+                    }
                 }
             }
             arg.call_abi          = PIR_PARAM_NORMAL;
@@ -252,6 +288,10 @@ static void rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
                 vpd.type     = arg.type;
                 PirAbiArgInfo vinfo;
                 pir_abi_classify_param(mod, target, &vpd, &va_st, &vinfo);
+                if (target->arch == PIR_ARCH_ARM64 && target->os == PIR_OS_MACOS &&
+                    arg.type.kind == PIR_TYPE_SCALAR && arg.type.u.scalar == PIR_SCALAR_I128) {
+                    arg.call_stack_align = 16u;
+                }
             }
             PIR_VEC_PUSH(&new_ops, arg);
         }
@@ -263,19 +303,25 @@ static void rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
     memcpy(call.operands, new_ops.data, new_ops.len * sizeof(PirOperand));
     PIR_VEC_FREE(&new_ops);
 
-    if (direct_retbuf) {
+    if (direct_retbuf && plan->ret_info.reg_count == 0u) {
+        call.ty         = pir_type_scalar(PIR_SCALAR_VOID);
+        call.results[0] = PIR_INVALID_ID;
+        pir_fn_append_inst(fn, out, call);
+    } else if (direct_retbuf) {
         PirType rty = plan->ret_info.regs[0];
+        uint64_t roff = abi_reg_offset(mod, target, &plan->ret_info, 0u);
         call.ty         = rty;
         call.results[0] = pir_fn_new_val(mod, fn, "rb_rv", rty, blk, PIR_INVALID_ID, 0u);
         pir_fn_append_inst(fn, out, call);
 
         PirTypeLayout ly = pir_type_layout(mod, target, plan->retbuf_agg_ty);
         PirTypeLayout rl = pir_type_layout(mod, target, rty);
-        if (ly.size == rl.size && ly.align >= rl.align) {
+        if (ly.size >= roff + rl.size && ly.align >= rl.align && (roff % rl.align) == 0u) {
+            PirValueId dp = cabi_padd(mod, fn, blk, out, retbuf_out_ptr, roff, idx_ty, ln, lc);
             PirInst st = pir_make_inst(PIR_OP_STORE, rty, ln, lc);
             st.align = rl.align; st.operand_count = 2u; st.operands = pir_alloc_ops(mod, 2u);
             st.operands[0] = pir_op_val(call.results[0], rty);
-            st.operands[1] = retbuf_out_ptr;
+            st.operands[1] = pir_op_val(dp, tptr);
             pir_fn_append_inst(fn, out, st);
         } else {
             PirInst stg = pir_make_inst(PIR_OP_ALLOCA_PTR, tptr, ln, lc);
@@ -289,13 +335,18 @@ static void rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
             st.operands[1] = pir_op_val(stg.results[0], tptr);
             pir_fn_append_inst(fn, out, st);
 
-            PirInst mc = pir_make_inst(PIR_OP_MEMCPY, pir_type_scalar(PIR_SCALAR_VOID), ln, lc);
-            mc.align = ly.align > 0u ? ly.align : 1u;
-            mc.operand_count = 3u; mc.operands = pir_alloc_ops(mod, 3u);
-            mc.operands[0] = retbuf_out_ptr;
-            mc.operands[1] = pir_op_val(stg.results[0], tptr);
-            mc.operands[2] = pir_op_imm_i(ly.size, false, idx_ty);
-            pir_fn_append_inst(fn, out, mc);
+            uint64_t copy_sz = (ly.size > roff) ? (ly.size - roff) : 0u;
+            if (copy_sz > rl.size) copy_sz = rl.size;
+            if (copy_sz > 0u) {
+                PirValueId dp = cabi_padd(mod, fn, blk, out, retbuf_out_ptr, roff, idx_ty, ln, lc);
+                PirInst mc = pir_make_inst(PIR_OP_MEMCPY, pir_type_scalar(PIR_SCALAR_VOID), ln, lc);
+                mc.align = 1u;
+                mc.operand_count = 3u; mc.operands = pir_alloc_ops(mod, 3u);
+                mc.operands[0] = pir_op_val(dp, tptr);
+                mc.operands[1] = pir_op_val(stg.results[0], tptr);
+                mc.operands[2] = pir_op_imm_i(copy_sz, false, idx_ty);
+                pir_fn_append_inst(fn, out, mc);
+            }
         }
     } else {
         pir_fn_append_inst(fn, out, call);
@@ -306,7 +357,7 @@ static void populate_cabi_ret(const PirModule *mod, const PirTargetSpec *target,
                               const CabiPlan *plan, PirCabiRetInfo *out) {
     memset(out, 0, sizeof(*out));
     if (!plan->has_retbuf) return;
-    if (plan->ret_info.kind == PIR_ABI_DIRECT && plan->ret_info.reg_count == 1u) {
+    if (plan->ret_info.kind == PIR_ABI_DIRECT && plan->ret_info.reg_count <= 1u) {
         out->kind = PIR_CABI_RET_NONE;
         return;
     }
@@ -345,11 +396,11 @@ static void rewrite_param_decls(PirModule *mod, const PirTargetSpec *target, con
 
     PIR_VEC(PirParamDecl) np = {0};
     bool direct_retbuf = plan->has_retbuf && plan->ret_info.kind == PIR_ABI_DIRECT &&
-                         plan->ret_info.reg_count == 1u;
+                         plan->ret_info.reg_count <= 1u;
     uint32_t start = 0u;
     if (plan->has_retbuf) {
         if (direct_retbuf) {
-            *ret_ty_io = plan->ret_info.regs[0];
+            *ret_ty_io = (plan->ret_info.reg_count == 1u) ? plan->ret_info.regs[0] : tvoid;
         } else {
             PirParamDecl sret = old_p[0];
             sret.abi_kind = PIR_PARAM_NORMAL;
@@ -453,14 +504,19 @@ static void rewrite_defined_callee(PirModule *mod, const PirTargetSpec *target,
 
     PirInstIdVec prologue = {0};
     bool direct_retbuf = plan->has_retbuf && plan->ret_info.kind == PIR_ABI_DIRECT &&
-                         plan->ret_info.reg_count == 1u;
+                         plan->ret_info.reg_count <= 1u;
     PirValueId retbuf_local = PIR_INVALID_ID;
     if (direct_retbuf) {
-        PirType rty = plan->ret_info.regs[0];
         PirTypeLayout ly = pir_type_layout(mod, target, plan->retbuf_agg_ty);
-        PirTypeLayout rl = pir_type_layout(mod, target, rty);
-        uint64_t sz = rl.size > ly.size ? rl.size : ly.size;
-        uint32_t al = rl.align > ly.align ? rl.align : ly.align;
+        uint64_t sz = ly.size > 0u ? ly.size : 1u;
+        uint32_t al = ly.align > 0u ? ly.align : 1u;
+        if (plan->ret_info.reg_count == 1u) {
+            PirType rty = plan->ret_info.regs[0];
+            uint64_t roff = abi_reg_offset(mod, target, &plan->ret_info, 0u);
+            PirTypeLayout rl = pir_type_layout(mod, target, rty);
+            if (roff + rl.size > sz) sz = roff + rl.size;
+            if (rl.align > al) al = rl.align;
+        }
 
         retbuf_local = old_params[0].val_id;
         fn->values.data[retbuf_local].def_block = 0u;
@@ -492,6 +548,7 @@ static void rewrite_defined_callee(PirModule *mod, const PirTargetSpec *target,
             reg_bundle_info(mod, target, info, &reg_bytes, &max_al);
             PirTypeLayout ly = pir_type_layout(mod, target, old_params[i].abi_type);
             uint64_t sz = reg_bytes > ly.size ? reg_bytes : ly.size;
+            if (sz == 0u) sz = 1u;
             uint32_t al = max_al > ly.align ? max_al : ly.align;
 
             PirValueId loc_v = old_params[i].val_id;
@@ -500,16 +557,15 @@ static void rewrite_defined_callee(PirModule *mod, const PirTargetSpec *target,
             al_i.imm_u64 = sz; al_i.align = al; al_i.results[0] = loc_v;
             pir_fn_append_inst(fn, &prologue, al_i);
 
-            uint64_t off = 0u;
             for (uint32_t k = 0u; k < info->reg_count; ++k) {
                 PirTypeLayout rl = pir_type_layout(mod, target, info->regs[k]);
+                uint64_t off = abi_reg_offset(mod, target, info, k);
                 PirValueId sp = cabi_padd(mod, fn, 0u, &prologue, pir_op_val(loc_v, tptr), off, idx_ty, ln, 0u);
                 PirInst st = pir_make_inst(PIR_OP_STORE, info->regs[k], ln, 0u);
                 st.align = rl.align; st.operand_count = 2u; st.operands = pir_alloc_ops(mod, 2u);
                 st.operands[0] = pir_op_val(fn->params[new_p_idx + k].val_id, info->regs[k]);
                 st.operands[1] = pir_op_val(sp, tptr);
                 pir_fn_append_inst(fn, &prologue, st);
-                off += rl.size;
             }
             new_p_idx += info->reg_count;
         } else {
@@ -526,8 +582,9 @@ static void rewrite_defined_callee(PirModule *mod, const PirTargetSpec *target,
     }
 
     /* For direct retbuf: load return register from retbuf_local before every `ret`. */
-    if (direct_retbuf) {
+    if (direct_retbuf && plan->ret_info.reg_count == 1u) {
         PirType rty = plan->ret_info.regs[0];
+        uint64_t roff = abi_reg_offset(mod, target, &plan->ret_info, 0u);
         PirTypeLayout rl = pir_type_layout(mod, target, rty);
         for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
             PirInstIdVec *bi = &fn->blocks.data[b].insts;
@@ -538,9 +595,10 @@ static void rewrite_defined_callee(PirModule *mod, const PirTargetSpec *target,
             uint32_t rlc = fn->insts.data[tid].loc_idx;
             bi->len--; /* pop ret */
 
+            PirValueId lp = cabi_padd(mod, fn, b, bi, pir_op_val(retbuf_local, tptr), roff, idx_ty, rln, rlc);
             PirInst ld = pir_make_inst(PIR_OP_LOAD, rty, rln, rlc);
             ld.align = rl.align; ld.operand_count = 1u; ld.operands = pir_alloc_ops(mod, 1u);
-            ld.operands[0] = pir_op_val(retbuf_local, tptr);
+            ld.operands[0] = pir_op_val(lp, tptr);
             ld.results[0]  = pir_fn_new_val(mod, fn, "rb_ret", rty, b, PIR_INVALID_ID, 0u);
             pir_fn_append_inst(fn, bi, ld);
 

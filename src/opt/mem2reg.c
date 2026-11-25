@@ -595,6 +595,17 @@ void pir_opt_mem2reg(PirModule *mod, PirFunction *fn) {
         }
     }
     if (has_zero_pa) {
+        /* Resolve transitive zero-offset chains regardless of block order. */
+        for (uint32_t v = 0u; v < nvals; ++v) {
+            if (zero_alias[v] != PIR_INVALID_ID) {
+                PirValueId base = zero_alias[v];
+                uint32_t guard = 0u;
+                while (base < nvals && zero_alias[base] != PIR_INVALID_ID && guard++ < 64u) {
+                    base = zero_alias[base];
+                }
+                zero_alias[v] = base;
+            }
+        }
         for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
             PirBlock *blk = &fn->blocks.data[b];
             uint32_t out_j = 0u;

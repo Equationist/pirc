@@ -64,7 +64,7 @@ PirTypeLayout pir_type_layout(const PirModule *mod, const PirTargetSpec *target,
                     }
                     res.size  = align_up_u64(off, max_al);
                     res.align = max_al;
-                    return res;
+                    break;
                 }
                 case PIR_AGG_PACKED_STRUCT: {
                     uint64_t off = 0u;
@@ -74,7 +74,7 @@ PirTypeLayout pir_type_layout(const PirModule *mod, const PirTargetSpec *target,
                     }
                     res.size  = off;
                     res.align = 1u;
-                    return res;
+                    break;
                 }
                 case PIR_AGG_UNION: {
                     uint64_t max_sz = 0u;
@@ -86,7 +86,7 @@ PirTypeLayout pir_type_layout(const PirModule *mod, const PirTargetSpec *target,
                     }
                     res.size  = align_up_u64(max_sz, max_al);
                     res.align = max_al;
-                    return res;
+                    break;
                 }
                 case PIR_AGG_ARRAY: {
                     PirTypeLayout el = pir_type_layout(mod, target, agg->elem_type);
@@ -94,8 +94,16 @@ PirTypeLayout pir_type_layout(const PirModule *mod, const PirTargetSpec *target,
                     res.size   = stride * agg->array_len;
                     res.align  = el.align;
                     res.stride = stride;
-                    return res;
+                    break;
                 }
+                case PIR_AGG_PAD:
+                    res.size  = agg->array_len;
+                    res.align = 1u;
+                    break;
+            }
+            if (agg->min_align > res.align) {
+                res.align = agg->min_align;
+                res.size  = align_up_u64(res.size, res.align);
             }
             return res;
         }

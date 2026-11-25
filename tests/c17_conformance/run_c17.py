@@ -165,7 +165,7 @@ def build_compile_cmd(
 
     cmd = [compiler, f"-std={std}", "-pedantic-errors", opt]
     if "clang" in Path(compiler).name:
-        cmd.append("-Wno-unused-function")
+        cmd.extend(["-target", target, "-Wno-unused-function"])
     for inc in include_dirs:
         cmd.extend(["-I", str(inc)])
     cmd.extend(extra_flags)

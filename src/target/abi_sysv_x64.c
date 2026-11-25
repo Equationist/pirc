@@ -74,6 +74,9 @@ static void walk_sysv(const PirModule *mod, const PirTargetSpec *target,
         return;
     }
     const PirAggDef *agg = &mod->agg_types.data[ty.u.agg_id];
+    if (agg->kind == PIR_AGG_PAD) {
+        return; /* Explicit padding is NO_CLASS (EB_NONE) */
+    }
     if (agg->kind == PIR_AGG_ARRAY) {
         PirTypeLayout el = pir_type_layout(mod, target, agg->elem_type);
         uint64_t stride = el.size;
@@ -118,10 +121,15 @@ static void classify_sysv_agg(const PirModule *mod, const PirTargetSpec *target,
     }
     uint32_t neb = (ly.size <= 8u) ? 1u : 2u;
     out->kind = PIR_ABI_DIRECT;
+    out->has_reg_offsets = true;
     for (uint32_t i = 0u; i < neb; ++i) {
+        if (w.cls[i] == EB_NONE) {
+            continue;
+        }
+        out->reg_offsets[out->reg_count] = (uint64_t)i * 8u;
         if (w.cls[i] == EB_SSE) {
             PirType st = pir_type_scalar(PIR_SCALAR_F64);
-            if (w.f64_cnt[i] == 0u && w.f32_cnt[i] == 1u && ((uint64_t)i * 8u + 4u >= ly.size)) {
+            if (w.f64_cnt[i] == 0u && w.f32_cnt[i] >= 1u && ((uint64_t)i * 8u + 4u >= ly.size)) {
                 st = pir_type_scalar(PIR_SCALAR_F32);
             } else if (w.f64_cnt[i] == 0u && w.f32_cnt[i] >= 2u) {
                 st = pir_type_vec(PIR_VEC_V2F32);
@@ -160,11 +168,12 @@ bool pir_abi_sysv_x64_param(const PirModule *mod, const PirTargetSpec *target,
     out->reg_count = 1u;
     out->regs[0]   = pd->type;
     if (pd->type.kind == PIR_TYPE_SCALAR && pd->type.u.scalar == PIR_SCALAR_I128) {
-        out->gp_used = 2u;
         if (st->gp_used + 2u <= 6u) {
+            out->gp_used = 2u;
             st->gp_used += 2u;
         } else {
             /* SysV AMD64: i128 does not split across r9 and stack; 16-byte aligned on stack. */
+            out->gp_used     = 0u;
             out->stack_align = 16u;
             out->force_stack = true;
         }

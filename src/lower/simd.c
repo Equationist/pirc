@@ -107,21 +107,33 @@ static bool is_cmp_op(PirOpcode op) {
            (op >= PIR_OP_FCMP_OEQ && op <= PIR_OP_FCMP_UGE);
 }
 
-static void legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirFuncId fi) {
+static bool is_vec_cast_op(PirOpcode op) {
+    return op == PIR_OP_TRUNC  || op == PIR_OP_SEXT   || op == PIR_OP_ZEXT   ||
+           op == PIR_OP_FPTRUNC || op == PIR_OP_FPEXT ||
+           op == PIR_OP_SITOFP || op == PIR_OP_UITOFP ||
+           op == PIR_OP_FPTOSI || op == PIR_OP_FPTOUI;
+}
+
+static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirFuncId fi, PirDiag *diag) {
     PirFunction *fn = &mod->funcs.data[fi];
-    if (!fn->is_defined) return;
+    if (!fn->is_defined) return true;
     uint16_t max_bits = target->caps.max_simd_bits;
 
-    bool has_oversized = false;
-    for (uint32_t v = 0u; v < fn->values.len; ++v) {
-        if (needs_split(fn->values.data[v].type, max_bits)) { has_oversized = true; break; }
+    bool has_oversized = needs_split(fn->ret_type, max_bits);
+    for (uint32_t v = 0u; v < fn->values.len && !has_oversized; ++v) {
+        if (needs_split(fn->values.data[v].type, max_bits)) { has_oversized = true; }
     }
-    if (!has_oversized) {
-        for (uint32_t i = 0u; i < fn->insts.len; ++i) {
-            if (needs_split(fn->insts.data[i].ty, max_bits)) { has_oversized = true; break; }
-        }
+    for (uint32_t i = 0u; i < fn->insts.len && !has_oversized; ++i) {
+        if (needs_split(fn->insts.data[i].ty, max_bits)) { has_oversized = true; }
     }
-    if (!has_oversized) return;
+    if (!has_oversized) return true;
+
+    if (needs_split(fn->ret_type, max_bits)) {
+        pir_diag_error(diag, fn->src_line, 0u,
+                       "oversized vector return type exceeds target SIMD width (%u bits)",
+                       (unsigned)max_bits);
+        return false;
+    }
 
     PirType t8     = pir_type_scalar(PIR_SCALAR_I8);
     PirType tptr   = pir_type_scalar(PIR_SCALAR_PTR);
@@ -510,8 +522,136 @@ static void legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
                         pir_fn_append_inst(fn, &new_insts, c);
                     }
                 }
+            } else if (is_vec_cast_op(copy.op) && copy.ty.kind == PIR_TYPE_VECTOR &&
+                       copy.operand_count == 1u && copy.operands[0].kind == PIR_OPER_VAL &&
+                       copy.operands[0].type.kind == PIR_TYPE_VECTOR) {
+                PirValueId src_v = copy.operands[0].u.val;
+                const VecSplit *ssp = (src_v < orig_vals && splits[src_v].count > 0u) ? &splits[src_v] : NULL;
+                if (ssp && rsp && ssp->count == rsp->count) {
+                    for (uint32_t p = 0u; p < rsp->count; ++p) {
+                        PirInst ni = pir_make_inst(copy.op, rsp->piece_ty, ln, lc);
+                        ni.flags         = copy.flags;
+                        ni.operand_count = 1u;
+                        ni.operands      = pir_alloc_ops(mod, 1u);
+                        ni.operands[0]   = pir_op_val(ssp->ids[p], ssp->piece_ty);
+                        ni.results[0]    = rsp->ids[p];
+                        pir_fn_append_inst(fn, &new_insts, ni);
+                    }
+                } else {
+                    /* Cross-width vector cast where one side is split (2x128b) and the other is <=128b. */
+                    PirVecType svt = copy.operands[0].type.u.vec;
+                    PirVecType dvt = copy.ty.u.vec;
+                    uint32_t lanes = pir_vec_lanes(dvt);
+                    PirType sel_ty = pir_type_scalar(pir_vec_elem_scalar(svt));
+                    PirType del_ty = pir_type_scalar(pir_vec_elem_scalar(dvt));
+                    uint32_t half_lanes = lanes / 2u;
+
+                    PirValueId dst_cur[2] = { PIR_INVALID_ID, PIR_INVALID_ID };
+                    for (uint32_t l = 0u; l < lanes; ++l) {
+                        PirValueId src_lane_v = PIR_INVALID_ID;
+                        if (ssp == NULL) {
+                            PirInst ex = pir_make_inst(PIR_OP_EXTRACT, copy.operands[0].type, ln, lc);
+                            ex.imm_u64 = l;
+                            ex.operand_count = 1u; ex.operands = pir_alloc_ops(mod, 1u);
+                            ex.operands[0] = copy.operands[0];
+                            ex.results[0]  = pir_fn_new_val(mod, fn, "vc_e", sel_ty, b, PIR_INVALID_ID, 0u);
+                            pir_fn_append_inst(fn, &new_insts, ex);
+                            src_lane_v = ex.results[0];
+                        } else if (max_bits == 0u) {
+                            src_lane_v = ssp->ids[l];
+                        } else {
+                            uint32_t sh = l / half_lanes;
+                            uint32_t sl = l % half_lanes;
+                            PirInst ex = pir_make_inst(PIR_OP_EXTRACT, ssp->piece_ty, ln, lc);
+                            ex.imm_u64 = sl;
+                            ex.operand_count = 1u; ex.operands = pir_alloc_ops(mod, 1u);
+                            ex.operands[0] = pir_op_val(ssp->ids[sh], ssp->piece_ty);
+                            ex.results[0]  = pir_fn_new_val(mod, fn, "vc_e", sel_ty, b, PIR_INVALID_ID, 0u);
+                            pir_fn_append_inst(fn, &new_insts, ex);
+                            src_lane_v = ex.results[0];
+                        }
+
+                        PirInst cv = pir_make_inst(copy.op, del_ty, ln, lc);
+                        cv.flags = copy.flags;
+                        cv.operand_count = 1u; cv.operands = pir_alloc_ops(mod, 1u);
+                        cv.operands[0] = pir_op_val(src_lane_v, sel_ty);
+                        cv.results[0]  = (rsp && max_bits == 0u)
+                                         ? rsp->ids[l]
+                                         : pir_fn_new_val(mod, fn, "vc_c", del_ty, b, PIR_INVALID_ID, 0u);
+                        pir_fn_append_inst(fn, &new_insts, cv);
+
+                        if (rsp && max_bits == 0u) {
+                            continue;
+                        }
+                        if (rsp == NULL) {
+                            if (l == 0u) {
+                                PirInst sp = pir_make_inst(PIR_OP_SPLAT, copy.ty, ln, lc);
+                                sp.operand_count = 1u; sp.operands = pir_alloc_ops(mod, 1u);
+                                sp.operands[0] = pir_op_val(cv.results[0], del_ty);
+                                sp.results[0]  = (lanes == 1u) ? r0
+                                                               : pir_fn_new_val(mod, fn, "vc_v", copy.ty, b, PIR_INVALID_ID, 0u);
+                                pir_fn_append_inst(fn, &new_insts, sp);
+                                dst_cur[0] = sp.results[0];
+                            } else {
+                                PirInst ins = pir_make_inst(PIR_OP_INSERT, copy.ty, ln, lc);
+                                ins.imm_u64 = l;
+                                ins.operand_count = 2u; ins.operands = pir_alloc_ops(mod, 2u);
+                                ins.operands[0] = pir_op_val(dst_cur[0], copy.ty);
+                                ins.operands[1] = pir_op_val(cv.results[0], del_ty);
+                                ins.results[0]  = (l + 1u == lanes) ? r0
+                                                                    : pir_fn_new_val(mod, fn, "vc_v", copy.ty, b, PIR_INVALID_ID, 0u);
+                                pir_fn_append_inst(fn, &new_insts, ins);
+                                dst_cur[0] = ins.results[0];
+                            }
+                        } else {
+                            uint32_t dh = l / half_lanes;
+                            uint32_t dl = l % half_lanes;
+                            if (dl == 0u) {
+                                PirInst sp = pir_make_inst(PIR_OP_SPLAT, rsp->piece_ty, ln, lc);
+                                sp.operand_count = 1u; sp.operands = pir_alloc_ops(mod, 1u);
+                                sp.operands[0] = pir_op_val(cv.results[0], del_ty);
+                                sp.results[0]  = (half_lanes == 1u) ? rsp->ids[dh]
+                                                                    : pir_fn_new_val(mod, fn, "vc_h", rsp->piece_ty, b, PIR_INVALID_ID, 0u);
+                                pir_fn_append_inst(fn, &new_insts, sp);
+                                dst_cur[dh] = sp.results[0];
+                            } else {
+                                PirInst ins = pir_make_inst(PIR_OP_INSERT, rsp->piece_ty, ln, lc);
+                                ins.imm_u64 = dl;
+                                ins.operand_count = 2u; ins.operands = pir_alloc_ops(mod, 2u);
+                                ins.operands[0] = pir_op_val(dst_cur[dh], rsp->piece_ty);
+                                ins.operands[1] = pir_op_val(cv.results[0], del_ty);
+                                ins.results[0]  = (dl + 1u == half_lanes) ? rsp->ids[dh]
+                                                                          : pir_fn_new_val(mod, fn, "vc_h", rsp->piece_ty, b, PIR_INVALID_ID, 0u);
+                                pir_fn_append_inst(fn, &new_insts, ins);
+                                dst_cur[dh] = ins.results[0];
+                            }
+                        }
+                    }
+                }
             } else {
-                /* Generic lane-wise unary or binary op (arith, bitwise, shift, float, casts). */
+                /* Generic lane-wise unary or binary op (arith, bitwise, shift, float). */
+                if (!rsp || copy.op == PIR_OP_RET || copy.op == PIR_OP_CALL ||
+                    copy.op == PIR_OP_CALL_INDIRECT || copy.op == PIR_OP_INVOKE) {
+                    pir_diag_error(diag, ln, 0u,
+                                   "oversized vector exceeds target SIMD width (%u bits) in unsupported op",
+                                   (unsigned)max_bits);
+                    PIR_VEC_FREE(&new_insts);
+                    PIR_VEC_FREE(&aliases);
+                    free(splits);
+                    return false;
+                }
+                for (uint32_t k = 0u; k < copy.operand_count; ++k) {
+                    if (copy.operands[k].kind != PIR_OPER_VAL ||
+                        copy.operands[k].u.val >= orig_vals ||
+                        splits[copy.operands[k].u.val].count != rsp->count) {
+                        pir_diag_error(diag, ln, 0u,
+                                       "mismatched oversized vector operand in SIMD legalization");
+                        PIR_VEC_FREE(&new_insts);
+                        PIR_VEC_FREE(&aliases);
+                        free(splits);
+                        return false;
+                    }
+                }
                 for (uint32_t p = 0u; p < rsp->count; ++p) {
                     PirInst ni = pir_make_inst(copy.op, rsp->piece_ty, ln, lc);
                     ni.flags         = copy.flags;
@@ -546,15 +686,17 @@ static void legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
     }
     PIR_VEC_FREE(&aliases);
     free(splits);
+    return true;
 }
 
 bool pir_legalize_simd(PirModule *mod, const PirTargetSpec *target, PirDiag *diag) {
-    (void)diag;
     if (target->caps.max_simd_bits >= 256u) {
         return true;
     }
     for (uint32_t fi = 0u; fi < mod->funcs.len; ++fi) {
-        legalize_simd_func(mod, target, fi);
+        if (!legalize_simd_func(mod, target, fi, diag)) {
+            return false;
+        }
     }
     return true;
 }

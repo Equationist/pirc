@@ -151,6 +151,8 @@ void pir_print_type(const PirModule *mod, PirType ty, FILE *out) {
             const PirAggDef *agg = &mod->agg_types.data[ty.u.agg_id];
             if (agg->name) {
                 print_global_sym(agg->name, out);
+            } else if (agg->kind == PIR_AGG_PAD) {
+                fprintf(out, "pad %" PRIu64, agg->array_len);
             } else {
                 fprintf(out, "[%" PRIu64 " x ", agg->array_len);
                 pir_print_type(mod, agg->elem_type, out);
@@ -793,14 +795,23 @@ void pir_print_module(const PirModule *mod, FILE *out) {
             case PIR_AGG_ARRAY:
                 fprintf(out, "[%" PRIu64 " x ", a->array_len);
                 pir_print_type(mod, a->elem_type, out);
-                fputs("]\n", out);
+                fputc(']', out);
+                if (a->min_align > 0u) fprintf(out, ", align %u", a->min_align);
+                fputc('\n', out);
+                continue;
+            case PIR_AGG_PAD:
+                fprintf(out, "pad %" PRIu64, a->array_len);
+                if (a->min_align > 0u) fprintf(out, ", align %u", a->min_align);
+                fputc('\n', out);
                 continue;
         }
         for (uint32_t f = 0u; f < a->field_count; ++f) {
             if (f > 0u) fputs(", ", out);
             pir_print_type(mod, a->fields[f], out);
         }
-        fputs(" }\n", out);
+        fputs(" }", out);
+        if (a->min_align > 0u) fprintf(out, ", align %u", a->min_align);
+        fputc('\n', out);
     }
 
     if (mod->sigs.len > 0u) fputc('\n', out);

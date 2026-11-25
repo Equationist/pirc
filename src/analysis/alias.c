@@ -50,8 +50,16 @@ static uint64_t extract_var_stride(const PirFunction *fn, PirOperand off_op) {
     const PirInst *ins = &fn->insts.data[did];
     if (ins->op == PIR_OP_MUL && ins->operand_count == 2u) {
         int64_t c = 0;
-        if (get_const_i64(fn, ins->operands[0], &c) && c > 1 && c <= 65536) return (uint64_t)c;
-        if (get_const_i64(fn, ins->operands[1], &c) && c > 1 && c <= 65536) return (uint64_t)c;
+        bool found = (get_const_i64(fn, ins->operands[0], &c) && c > 1 && c <= 65536) ||
+                     (get_const_i64(fn, ins->operands[1], &c) && c > 1 && c <= 65536);
+        if (found) {
+            uint64_t u = (uint64_t)c;
+            if ((ins->flags & (PIR_FLAG_UNSAFE_S | PIR_FLAG_UNSAFE_U)) != 0u) {
+                return u;
+            }
+            /* Wrapping mul mod 2^64 only guarantees alignment to the largest pow2 factor of c. */
+            return u & (0u - u);
+        }
     } else if (ins->op == PIR_OP_SHL && ins->operand_count == 2u) {
         int64_t sh = 0;
         if (get_const_i64(fn, ins->operands[1], &sh) && sh >= 1 && sh <= 16) {

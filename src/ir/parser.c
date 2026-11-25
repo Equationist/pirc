@@ -176,8 +176,41 @@ static PirTypeId intern_anon_array(Parser *p, uint64_t len, PirType elem, uint32
     return id;
 }
 
+static PirTypeId intern_anon_pad(Parser *p, uint64_t len, uint32_t line) {
+    for (uint32_t i = 0u; i < p->mod->agg_types.len; ++i) {
+        const PirAggDef *d = &p->mod->agg_types.data[i];
+        if (!d->name && d->kind == PIR_AGG_PAD && d->array_len == len) {
+            return i;
+        }
+    }
+    PirAggDef def;
+    memset(&def, 0, sizeof(def));
+    def.name      = NULL;
+    def.src_line  = line;
+    def.kind      = PIR_AGG_PAD;
+    def.array_len = len;
+    PirTypeId id  = p->mod->agg_types.len;
+    PIR_VEC_PUSH(&p->mod->agg_types, def);
+    if (id < 4096u) {
+        p->agg_defined[id] = true;
+    }
+    return id;
+}
+
 static bool parse_type(Parser *p, PirType *out) {
     if (p->cur.kind == TOK_IDENT) {
+        if (strcmp(p->cur.text, "pad") == 0) {
+            uint32_t line = p->cur.line;
+            advance_tok(p);
+            if (p->cur.kind != TOK_INT || p->cur.int_neg || p->cur.int_hi != 0u || p->cur.int_lo == 0u) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected positive integer byte count after 'pad'");
+                return false;
+            }
+            uint64_t plen = p->cur.int_lo;
+            advance_tok(p);
+            *out = pir_type_agg(intern_anon_pad(p, plen, line));
+            return true;
+        }
         if (parse_builtin_type_name(p->cur.text, out)) {
             advance_tok(p);
             return true;
@@ -1516,6 +1549,24 @@ static bool parse_type_decl(Parser *p) {
             memcpy(def->fields, fields.data, fields.len * sizeof(PirType));
         }
         PIR_VEC_FREE(&fields);
+    }
+
+    if (match_tok(p, TOK_COMMA)) {
+        if (!is_ident(p, "align")) {
+            pir_diag_error(p->diag, p->cur.line, p->cur.col,
+                           "expected 'align' after ',' in type declaration");
+            return false;
+        }
+        advance_tok(p);
+        if (p->cur.kind != TOK_INT || p->cur.int_neg || p->cur.int_hi != 0u ||
+            p->cur.int_lo == 0u || (p->cur.int_lo & (p->cur.int_lo - 1u)) != 0u ||
+            p->cur.int_lo > 4096u) {
+            pir_diag_error(p->diag, p->cur.line, p->cur.col,
+                           "expected power-of-two alignment in type declaration");
+            return false;
+        }
+        p->mod->agg_types.data[id].min_align = (uint32_t)p->cur.int_lo;
+        advance_tok(p);
     }
 
     if (id < 4096u) {

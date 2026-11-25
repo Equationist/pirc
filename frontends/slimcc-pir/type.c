@@ -511,7 +511,7 @@ bool is_compatible(Type *t1, Type *t2) {
     int64_t *len2 = get_arr_len(t2);
 
     if (!len1 || !len2 || *len1 == *len2)
-      return is_compatible(t1->base, t2->base);
+      return is_compatible2(t1->base, t2->base);
     return false;
   }
 
@@ -537,10 +537,21 @@ bool is_compatible(Type *t1, Type *t2) {
     return t1->is_unsigned == t2->is_unsigned;
   case TY_PTR:  return is_compatible2(t1->base, t2->base);
   case TY_FUNC: {
-    if (!is_compatible(t1->return_ty, t2->return_ty))
+    if (!is_compatible2(t1->return_ty, t2->return_ty))
       return false;
-    if (t1->is_oldstyle || t2->is_oldstyle)
+    if (t1->is_oldstyle || t2->is_oldstyle) {
+      if (t1->is_oldstyle && t2->is_oldstyle)
+        return true;
+      Type *proto = t1->is_oldstyle ? t2 : t1;
+      if (proto->is_variadic)
+        return false;
+      for (Obj *p = proto->param_list; p; p = p->param_next) {
+        Type *pt = p->ty;
+        if ((is_integer(pt) && pt->size < ty_int->size) || pt->kind == TY_FLOAT)
+          return false;
+      }
       return true;
+    }
     if (t1->is_variadic != t2->is_variadic)
       return false;
     Obj *p1 = t1->param_list;
@@ -595,18 +606,63 @@ void ptr_convert(Node **node) {
     *node = new_cast(*node, ty);
 }
 
+Type *composite_type(Type *t1, Type *t2) {
+  if (!t1 || !t2 || t1 == t2)
+    return t1 ? t1 : t2;
+  if (is_array(t1) && is_array(t2)) {
+    Type *base = composite_type(t1->base, t2->base);
+    if (t1->kind == TY_ARRAY && t1->size >= 0)
+      return array_of(base, t1->array_len);
+    if (t2->kind == TY_ARRAY && t2->size >= 0)
+      return array_of(base, t2->array_len);
+    if (t1->kind == TY_VLA)
+      return vla_of(base, t1->vla_len_expr, t1->array_len);
+    if (t2->kind == TY_VLA)
+      return vla_of(base, t2->vla_len_expr, t2->array_len);
+    return array_of(base, -1);
+  }
+  if (t1->kind == TY_PTR && t2->kind == TY_PTR) {
+    Type *res = copy_type(t1);
+    res->base = composite_type(t1->base, t2->base);
+    return res;
+  }
+  if (t1->kind == TY_FUNC && t2->kind == TY_FUNC) {
+    Type *ret = composite_type(t1->return_ty, t2->return_ty);
+    if (t1->is_oldstyle && !t2->is_oldstyle) {
+      Type *res = copy_type(t2);
+      res->return_ty = ret;
+      return res;
+    }
+    if (!t1->is_oldstyle && t2->is_oldstyle) {
+      Type *res = copy_type(t1);
+      res->return_ty = ret;
+      return res;
+    }
+    Type *res = copy_type(t1);
+    res->return_ty = ret;
+    if (!t1->is_oldstyle && !t2->is_oldstyle) {
+      Obj head = {0};
+      Obj *cur = &head;
+      for (Obj *p1 = t1->param_list, *p2 = t2->param_list; p1 && p2;
+           p1 = p1->param_next, p2 = p2->param_next) {
+        Obj *np = arena_calloc(&cc1_arena, sizeof(Obj));
+        *np = *p1;
+        np->ty = composite_type(p1->ty, p2->ty);
+        np->param_next = NULL;
+        cur = cur->param_next = np;
+      }
+      res->param_list = head.param_next;
+    }
+    return res;
+  }
+  return t1;
+}
+
 void unqual_rtn_ty(Type *ty, Token *tok) {
   Type *return_ty = ty->return_ty;
 
   if (is_decay_ty(return_ty))
     error_tok(tok, "invalid function return type");
-
-  if (return_ty->qual) {
-    if (return_ty->origin->align != return_ty->align)
-      ty->return_ty = aligned_type(return_ty->align, return_ty->origin);
-    else
-      ty->return_ty = return_ty->origin;
-  }
 }
 
 Type *func_type(TypeKind kind, Type *return_ty) {
@@ -661,6 +717,17 @@ Type *vla_of(Type *base, Node *len, int64_t arr_len) {
   return ty;
 }
 
+static bool is_compatible_assign_ptr_target(Type *t1, Type *t2) {
+  if (is_array(t1) && is_array(t2)) {
+    int64_t *len1 = get_arr_len(t1);
+    int64_t *len2 = get_arr_len(t2);
+    if (!len1 || !len2 || *len1 == *len2)
+      return is_compatible_assign_ptr_target(t1->base, t2->base);
+    return false;
+  }
+  return is_compatible(t1, t2);
+}
+
 Node *assign_cast(Type *to_ty, Node *expr) {
   add_type(expr);
 
@@ -674,11 +741,23 @@ Node *assign_cast(Type *to_ty, Node *expr) {
         if ((to_ty->base->kind == TY_VOID && ex_fn) ||
             (expr->ty->base->kind == TY_VOID && to_fn) ||
             (to_ty->base->kind != TY_VOID && expr->ty->base->kind != TY_VOID &&
-             !is_compatible(to_ty->base, expr->ty->base)))
+             !is_compatible_assign_ptr_target(to_ty->base, expr->ty->base)))
           error_tok(expr->tok, "incompatible pointer types");
-        if ((!expr->tok || !expr->tok->file || !expr->tok->file->is_syshdr) &&
-            (expr->ty->base->qual & ~to_ty->base->qual & (Q_CONST | Q_VOLATILE | Q_RESTRICT)))
-          error_tok(expr->tok, "assignment discards qualifiers from pointer target type");
+        if ((!expr->tok || !expr->tok->file || !expr->tok->file->is_syshdr)) {
+          Type *tb = to_ty->base, *eb = expr->ty->base;
+          if ((tb->qual & Q_ATOMIC) != (eb->qual & Q_ATOMIC))
+            error_tok(expr->tok, "incompatible pointer types");
+          if (eb->qual & ~tb->qual & (Q_CONST | Q_VOLATILE | Q_RESTRICT))
+            error_tok(expr->tok, "assignment discards qualifiers from pointer target type");
+          while (is_array(tb) && is_array(eb)) {
+            tb = tb->base;
+            eb = eb->base;
+            if ((tb->qual & Q_ATOMIC) != (eb->qual & Q_ATOMIC))
+              error_tok(expr->tok, "incompatible pointer types");
+            if (eb->qual & ~tb->qual & (Q_CONST | Q_VOLATILE | Q_RESTRICT))
+              error_tok(expr->tok, "assignment discards qualifiers from pointer target type");
+          }
+        }
       }
       return expr;
     }
@@ -727,7 +806,7 @@ bool is_null_ptr_constant(Node *node) {
   return is_integer(node->ty) && is_const_expr_strict(node, &val) && val == 0;
 }
 
-static void int_promotion(Node **node) {
+void int_promotion(Node **node) {
   Type *ty = (*node)->ty;
   int bit_width;
 
@@ -776,10 +855,10 @@ static Type *cond_ptr_conv2(Type *ty1, Type *ty2, Node **cond, Obj **cond_var) {
   if (ty1->kind == TY_PTR) {
     Type *newty = copy_type(ty1);
     newty->base = cond_ptr_conv2(ty1->base, ty2->base, cond, cond_var);
-    return newty;
+    return add_qual(ty2->qual, newty, NULL);
   }
   if (ty1->kind == TY_FUNC) {
-    Type *newty = copy_type(ty1);
+    Type *newty = composite_type(ty1, ty2);
     newty->return_ty = cond_ptr_conv2(ty1->return_ty, ty2->return_ty, cond, cond_var);
     return newty;
   }
@@ -799,8 +878,11 @@ static Type *cond_ptr_conv(Node **lhs, Node **rhs, Node **cond) {
     if (ty2->kind == TY_PTR && is_null_ptr_constant(*lhs))
       return ty2;
 
-    if (ty1->base->kind == TY_VOID || ty2->base->kind == TY_VOID)
+    if (ty1->base->kind == TY_VOID || ty2->base->kind == TY_VOID) {
+      if (is_iso_std && (ty1->base->kind == TY_FUNC || ty2->base->kind == TY_FUNC))
+        error_tok((*lhs)->tok, "incompatible pointer types in conditional expression");
       return pointer_to(add_qual(ty1->base->qual | ty2->base->qual, ty_void, NULL));
+    }
 
     if (is_compatible(ty1->base, ty2->base))
       return pointer_to(cond_ptr_conv2(ty1->base, ty2->base, cond, &(Obj *){0}));
@@ -810,9 +892,9 @@ static Type *cond_ptr_conv(Node **lhs, Node **rhs, Node **cond) {
     return pointer_to(ty_void);
   }
 
-  if (ty1->kind == TY_PTR && int_to_ptr(rhs))
+  if (ty1->kind == TY_PTR && (!is_iso_std || is_null_ptr_constant(*rhs)) && int_to_ptr(rhs))
     return ty1;
-  if (ty2->kind == TY_PTR && int_to_ptr(lhs))
+  if (ty2->kind == TY_PTR && (!is_iso_std || is_null_ptr_constant(*lhs)) && int_to_ptr(lhs))
     return ty2;
 
   error_tok((is_ptr(ty1) ? *rhs : *lhs)->tok, "invalid operand");

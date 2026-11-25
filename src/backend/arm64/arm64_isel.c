@@ -881,14 +881,15 @@ static void emit_vec_cmp(ISelCtx *c, PirOpcode op, MVReg dst, MVReg a, MVReg b,
  * Scalar Arithmetic / Div / Shift / Ovf / Carry / Bitops / Conversions
  * ========================================================================= */
 
-static void emit_scalar_div_rem(ISelCtx *c, const PirInst *inst, MVReg dst, uint32_t loc) {
-    bool is_signed = (inst->op == PIR_OP_DIV_S || inst->op == PIR_OP_REM_S);
-    bool is_rem    = (inst->op == PIR_OP_REM_S || inst->op == PIR_OP_REM_U);
-    uint8_t w      = pir_type_vreg_bytes(inst->ty);
-    MVReg a = normalize_int(c, mat_op(c, &inst->operands[0], loc), inst->ty, is_signed, loc);
-    MVReg b = normalize_int(c, mat_op(c, &inst->operands[1], loc), inst->ty, is_signed, loc);
+static void emit_scalar_div_rem_regs(ISelCtx *c, PirOpcode op, PirType ty, uint32_t flags,
+                                     MVReg a_raw, MVReg b_raw, MVReg dst, uint32_t loc) {
+    bool is_signed = (op == PIR_OP_DIV_S || op == PIR_OP_REM_S);
+    bool is_rem    = (op == PIR_OP_REM_S || op == PIR_OP_REM_U);
+    uint8_t w      = pir_type_vreg_bytes(ty);
+    MVReg a = normalize_int(c, a_raw, ty, is_signed, loc);
+    MVReg b = normalize_int(c, b_raw, ty, is_signed, loc);
 
-    if ((inst->flags & PIR_FLAG_TRAP) != 0u) {
+    if ((flags & PIR_FLAG_TRAP) != 0u) {
         /* Trap on divisor == 0 */
         MInst cz = minst_make(MI_A64_CMP_RI, w, loc);
         cz.op_count = 2u; cz.ops[0] = mop_vreg_use(b); cz.ops[1] = mop_imm(0);
@@ -897,7 +898,7 @@ static void emit_scalar_div_rem(ISelCtx *c, const PirInst *inst, MVReg dst, uint
 
         if (is_signed) {
             /* Trap on INT_MIN / -1 */
-            uint32_t bits = pir_scalar_bits(inst->ty.u.scalar, 8u);
+            uint32_t bits = pir_scalar_bits(ty.u.scalar, 8u);
             uint64_t int_min = (bits == 64u) ? ((uint64_t)1u << 63u)
                                              : (uint64_t)(int64_t)(int32_t)(-(int32_t)(1u << (bits - 1u)));
             MVReg m1 = new_gp(c, w);
@@ -944,6 +945,74 @@ static void emit_scalar_div_rem(ISelCtx *c, const PirInst *inst, MVReg dst, uint
         ms.ops[3] = mop_vreg_use(a);
         emit(c, ms);
     }
+}
+
+static void emit_scalar_div_rem(ISelCtx *c, const PirInst *inst, MVReg dst, uint32_t loc) {
+    MVReg a = mat_op(c, &inst->operands[0], loc);
+    MVReg b = mat_op(c, &inst->operands[1], loc);
+    emit_scalar_div_rem_regs(c, inst->op, inst->ty, inst->flags, a, b, dst, loc);
+}
+
+static void emit_scalar_fptoi_regs(ISelCtx *c, bool is_signed, PirType src_ty, PirType dst_ty,
+                                   uint32_t flags, MVReg src, MVReg dst, uint32_t loc) {
+    uint8_t fw    = pir_type_vreg_bytes(src_ty);
+    uint32_t bits = pir_scalar_bits(dst_ty.u.scalar, 8u);
+    uint8_t dw    = pir_type_vreg_bytes(dst_ty);
+
+    if ((flags & PIR_FLAG_TRAP) != 0u) {
+        /* Trap if NaN (fcmp src, src -> vs) */
+        MInst fn = minst_make(MI_A64_FCMP, fw, loc);
+        fn.op_count = 2u; fn.ops[0] = mop_vreg_use(src); fn.ops[1] = mop_vreg_use(src);
+        emit(c, fn);
+        emit_cond_trap(c, MCOND_VS, loc);
+    }
+
+    /* ARM64 fcvtzs/fcvtzu natively saturate at 32/64-bit bounds and map NaN -> 0! */
+    MVReg raw = (bits < 32u && (flags & PIR_FLAG_SAT) != 0u) ? new_gp(c, 4u) : dst;
+    MInst cv = minst_make(is_signed ? MI_A64_FCVTZS : MI_A64_FCVTZU, dw, loc);
+    cv.aux_width = fw;
+    cv.op_count = 2u; cv.ops[0] = mop_vreg_def(raw); cv.ops[1] = mop_vreg_use(src);
+    emit(c, cv);
+
+    if (bits < 32u && (flags & PIR_FLAG_SAT) != 0u) {
+        /* Clamp 32-bit result to [lo_bound, hi_bound] for i8/i16 [sat]. */
+        int64_t lo_b = is_signed ? -(int64_t)(1ULL << (bits - 1u)) : 0;
+        int64_t hi_b = is_signed ? (int64_t)((1ULL << (bits - 1u)) - 1ULL) : (int64_t)((1ULL << bits) - 1ULL);
+        MVReg r_hi = new_gp(c, 4u), c1 = new_gp(c, 4u);
+        emit_imm_gp(c, r_hi, (uint64_t)hi_b, 4u, loc);
+        MInst cm1 = minst_make(MI_A64_CMP_RR, 4u, loc);
+        cm1.op_count = 2u; cm1.ops[0] = mop_vreg_use(raw); cm1.ops[1] = mop_vreg_use(r_hi);
+        emit(c, cm1);
+        MInst s1 = minst_make(MI_A64_CSEL, 4u, loc);
+        s1.op_count = 4u; s1.ops[0] = mop_vreg_def(c1); s1.ops[1] = mop_vreg_use(r_hi);
+        s1.ops[2] = mop_vreg_use(raw); s1.ops[3] = mop_cond(is_signed ? MCOND_GT : MCOND_HI);
+        emit(c, s1);
+
+        if (is_signed) {
+            MVReg r_lo = new_gp(c, 4u);
+            emit_imm_gp(c, r_lo, (uint64_t)lo_b, 4u, loc);
+            MInst cm2 = minst_make(MI_A64_CMP_RR, 4u, loc);
+            cm2.op_count = 2u; cm2.ops[0] = mop_vreg_use(c1); cm2.ops[1] = mop_vreg_use(r_lo);
+            emit(c, cm2);
+            MInst s2 = minst_make(MI_A64_CSEL, 4u, loc);
+            s2.op_count = 4u; s2.ops[0] = mop_vreg_def(dst); s2.ops[1] = mop_vreg_use(r_lo);
+            s2.ops[2] = mop_vreg_use(c1); s2.ops[3] = mop_cond(MCOND_LT);
+            emit(c, s2);
+        } else {
+            MInst cp = minst_make(MI_COPY, 4u, loc);
+            cp.op_count = 2u; cp.ops[0] = mop_vreg_def(dst); cp.ops[1] = mop_vreg_use(c1);
+            emit(c, cp);
+        }
+    }
+}
+
+static void emit_vec_splat_scalar(ISelCtx *c, MVReg dst, MVReg scalar, PirVecType vt, uint32_t loc) {
+    uint8_t vb = (uint8_t)(pir_vec_bits(vt) / 8u);
+    MOpcode mop = pir_scalar_is_float(pir_vec_elem_scalar(vt)) ? MI_A64_VDUP_LANE : MI_A64_VDUP_GP;
+    MInst dp = minst_make(mop, vb, loc);
+    dp.arr = pir_vec_to_arr(vt);
+    dp.op_count = 2u; dp.ops[0] = mop_vreg_def(dst); dp.ops[1] = mop_vreg_use(scalar);
+    emit(c, dp);
 }
 
 static bool op_is_uimm12(const PirOperand *op, int64_t *out_imm) {
@@ -1106,8 +1175,10 @@ static void plan_call_args(const PirTargetSpec *target,
         locs[i].mem_bytes = mb;
 
         if (is_darwin && is_va_arg) {
-            /* Darwin ARM64: ALL variadic arguments pass strictly on the stack in 8B-aligned slots! */
-            st_off = align_up_u64(st_off, 8u);
+            /* Darwin ARM64: ALL variadic arguments pass strictly on the stack (min 8B; 16B if over-aligned). */
+            uint64_t al = 8u;
+            if (arg_aligns && arg_aligns[i] > al) al = arg_aligns[i];
+            st_off = align_up_u64(st_off, al);
             locs[i].is_reg    = false;
             locs[i].stack_off = (int64_t)st_off;
             if (ty.kind == PIR_TYPE_SCALAR && ty.u.scalar == PIR_SCALAR_F32) {
@@ -1282,6 +1353,9 @@ static void emit_call_inst(ISelCtx *c, const PirInst *inst, uint32_t loc) {
         arg_tys[i] = inst->operands[i + 1u + arg_skip].type;
         if (cal_params && (i + arg_skip) < cal_param_count) {
             arg_aligns[i] = cal_params[i + arg_skip].abi_stack_align;
+        }
+        if (inst->operands[i + 1u + arg_skip].call_stack_align > arg_aligns[i]) {
+            arg_aligns[i] = inst->operands[i + 1u + arg_skip].call_stack_align;
         }
     }
     uint64_t stack_bytes = 0u;
@@ -1701,27 +1775,10 @@ static bool isel_inst(ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
                     MVReg la = new_gp(c, ew), lb = new_gp(c, ew), lr = new_gp(c, ew);
                     emit_vec_lane_extract(c, la, va, vt, l, loc);
                     emit_vec_lane_extract(c, lb, vb_r, vt, l, loc);
-                    PirInst tmp = *inst;
-                    tmp.ty = el_ty;
-                    PirOperand tops[2];
-                    memset(tops, 0, sizeof(tops));
-                    /* Perform scalar div/rem directly on la, lb */
-                    bool is_s = (inst->op == PIR_OP_DIV_S || inst->op == PIR_OP_REM_S);
-                    bool is_r = (inst->op == PIR_OP_REM_S || inst->op == PIR_OP_REM_U);
-                    MVReg na = normalize_int(c, la, el_ty, is_s, loc);
-                    MVReg nb = normalize_int(c, lb, el_ty, is_s, loc);
-                    MVReg q = is_r ? new_gp(c, ew) : lr;
-                    MInst dv = minst_make(is_s ? MI_A64_SDIV : MI_A64_UDIV, ew, loc);
-                    dv.op_count = 3u; dv.ops[0] = mop_vreg_def(q); dv.ops[1] = mop_vreg_use(na); dv.ops[2] = mop_vreg_use(nb);
-                    emit(c, dv);
-                    if (is_r) {
-                        MInst ms = minst_make(MI_A64_MSUB, ew, loc);
-                        ms.op_count = 4u; ms.ops[0] = mop_vreg_def(lr); ms.ops[1] = mop_vreg_use(q);
-                        ms.ops[2] = mop_vreg_use(nb); ms.ops[3] = mop_vreg_use(na);
-                        emit(c, ms);
-                    }
+                    emit_scalar_div_rem_regs(c, inst->op, el_ty, inst->flags, la, lb, lr, loc);
                     MVReg nxt = (l + 1u == lanes) ? dst0 : new_fp(c, vb);
-                    emit_vec_lane_insert(c, nxt, acc, lr, vt, l, loc);
+                    if (l == 0u) emit_vec_splat_scalar(c, nxt, lr, vt, loc);
+                    else         emit_vec_lane_insert(c, nxt, acc, lr, vt, l, loc);
                     acc = nxt;
                 }
                 return true;
@@ -2279,7 +2336,7 @@ static bool isel_inst(ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
                 PirType del_ty = pir_type_scalar(pir_vec_elem_scalar(dvt));
                 uint32_t lanes = pir_vec_lanes(dvt);
                 uint8_t dvb = (uint8_t)(pir_vec_bits(dvt) / 8u);
-                MVReg acc = new_fp(c, dvb);
+                MVReg acc = MVREG_NONE;
                 for (uint32_t l = 0u; l < lanes; ++l) {
                     MVReg ls = new_gp(c, pir_type_vreg_bytes(sel_ty));
                     emit_vec_lane_extract(c, ls, src, svt, l, loc);
@@ -2302,7 +2359,8 @@ static bool isel_inst(ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
                         emit(c, mv);
                     }
                     MVReg nxt = (l + 1u == lanes) ? dst0 : new_fp(c, dvb);
-                    emit_vec_lane_insert(c, nxt, acc, ld, dvt, l, loc);
+                    if (l == 0u) emit_vec_splat_scalar(c, nxt, ld, dvt, loc);
+                    else         emit_vec_lane_insert(c, nxt, acc, ld, dvt, l, loc);
                     acc = nxt;
                 }
                 return true;
@@ -2349,7 +2407,7 @@ static bool isel_inst(ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
                 uint8_t dvb = (uint8_t)(pir_vec_bits(dvt) / 8u);
                 uint8_t sw  = (inst->op == PIR_OP_FPEXT) ? 4u : 8u;
                 uint8_t dw  = (inst->op == PIR_OP_FPEXT) ? 8u : 4u;
-                MVReg acc = new_fp(c, dvb);
+                MVReg acc = MVREG_NONE;
                 for (uint32_t l = 0u; l < lanes; ++l) {
                     MVReg ls = new_fp(c, sw), ld = new_fp(c, dw);
                     emit_vec_lane_extract(c, ls, src, svt, l, loc);
@@ -2357,7 +2415,8 @@ static bool isel_inst(ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
                     cv.op_count = 2u; cv.ops[0] = mop_vreg_def(ld); cv.ops[1] = mop_vreg_use(ls);
                     emit(c, cv);
                     MVReg nxt = (l + 1u == lanes) ? dst0 : new_fp(c, dvb);
-                    emit_vec_lane_insert(c, nxt, acc, ld, dvt, l, loc);
+                    if (l == 0u) emit_vec_splat_scalar(c, nxt, ld, dvt, loc);
+                    else         emit_vec_lane_insert(c, nxt, acc, ld, dvt, l, loc);
                     acc = nxt;
                 }
                 return true;
@@ -2390,7 +2449,7 @@ static bool isel_inst(ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
                 uint8_t dvb = (uint8_t)(pir_vec_bits(dvt) / 8u);
                 PirType sel_ty = pir_type_scalar(pir_vec_elem_scalar(svt));
                 uint8_t dw = (uint8_t)(dbits / 8u);
-                MVReg acc = new_fp(c, dvb);
+                MVReg acc = MVREG_NONE;
                 for (uint32_t l = 0u; l < lanes; ++l) {
                     MVReg ls = new_gp(c, pir_type_vreg_bytes(sel_ty));
                     emit_vec_lane_extract(c, ls, src, svt, l, loc);
@@ -2401,7 +2460,8 @@ static bool isel_inst(ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
                     cv.op_count = 2u; cv.ops[0] = mop_vreg_def(ld); cv.ops[1] = mop_vreg_use(ls);
                     emit(c, cv);
                     MVReg nxt = (l + 1u == lanes) ? dst0 : new_fp(c, dvb);
-                    emit_vec_lane_insert(c, nxt, acc, ld, dvt, l, loc);
+                    if (l == 0u) emit_vec_splat_scalar(c, nxt, ld, dvt, loc);
+                    else         emit_vec_lane_insert(c, nxt, acc, ld, dvt, l, loc);
                     acc = nxt;
                 }
                 return true;
@@ -2421,9 +2481,12 @@ static bool isel_inst(ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
             MVReg src = mat_op(c, &inst->operands[0], loc);
             if (inst->ty.kind == PIR_TYPE_VECTOR) {
                 PirVecType svt = src_ty.u.vec, dvt = inst->ty.u.vec;
-                uint32_t sbits = pir_scalar_bits(pir_vec_elem_scalar(svt), 8u);
-                uint32_t dbits = pir_scalar_bits(pir_vec_elem_scalar(dvt), 8u);
-                if (sbits == dbits && (sbits == 32u || sbits == 64u)) {
+                PirType sel_ty = pir_type_scalar(pir_vec_elem_scalar(svt));
+                PirType del_ty = pir_type_scalar(pir_vec_elem_scalar(dvt));
+                uint32_t sbits = pir_scalar_bits(sel_ty.u.scalar, 8u);
+                uint32_t dbits = pir_scalar_bits(del_ty.u.scalar, 8u);
+                if (sbits == dbits && (sbits == 32u || sbits == 64u) &&
+                    (inst->flags & PIR_FLAG_TRAP) == 0u) {
                     MInst cv = minst_make(is_s ? MI_A64_VFCVTZS : MI_A64_VFCVTZU,
                                           pir_type_vreg_bytes(inst->ty), loc);
                     cv.arr = pir_vec_to_arr(dvt);
@@ -2435,69 +2498,19 @@ static bool isel_inst(ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
                 uint8_t dvb = (uint8_t)(pir_vec_bits(dvt) / 8u);
                 uint8_t sw  = (uint8_t)(sbits / 8u);
                 uint8_t dw  = (dbits == 64u) ? 8u : 4u;
-                MVReg acc = new_fp(c, dvb);
+                MVReg acc = MVREG_NONE;
                 for (uint32_t l = 0u; l < lanes; ++l) {
                     MVReg ls = new_fp(c, sw), ld = new_gp(c, dw);
                     emit_vec_lane_extract(c, ls, src, svt, l, loc);
-                    MInst cv = minst_make(is_s ? MI_A64_FCVTZS : MI_A64_FCVTZU, dw, loc);
-                    cv.aux_width = sw;
-                    cv.op_count = 2u; cv.ops[0] = mop_vreg_def(ld); cv.ops[1] = mop_vreg_use(ls);
-                    emit(c, cv);
+                    emit_scalar_fptoi_regs(c, is_s, sel_ty, del_ty, inst->flags, ls, ld, loc);
                     MVReg nxt = (l + 1u == lanes) ? dst0 : new_fp(c, dvb);
-                    emit_vec_lane_insert(c, nxt, acc, ld, dvt, l, loc);
+                    if (l == 0u) emit_vec_splat_scalar(c, nxt, ld, dvt, loc);
+                    else         emit_vec_lane_insert(c, nxt, acc, ld, dvt, l, loc);
                     acc = nxt;
                 }
                 return true;
             }
-            uint8_t fw = pir_type_vreg_bytes(src_ty);
-            uint32_t bits = pir_scalar_bits(inst->ty.u.scalar, 8u);
-            uint8_t dw = pir_type_vreg_bytes(inst->ty);
-
-            if ((inst->flags & PIR_FLAG_TRAP) != 0u) {
-                /* Trap if NaN (fcmp src, src -> vs) */
-                MInst fn = minst_make(MI_A64_FCMP, fw, loc);
-                fn.op_count = 2u; fn.ops[0] = mop_vreg_use(src); fn.ops[1] = mop_vreg_use(src);
-                emit(c, fn);
-                emit_cond_trap(c, MCOND_VS, loc);
-            }
-
-            /* ARM64 fcvtzs/fcvtzu natively saturate at 32/64-bit bounds and map NaN -> 0! */
-            MVReg raw = (bits < 32u && (inst->flags & PIR_FLAG_SAT) != 0u) ? new_gp(c, 4u) : dst0;
-            MInst cv = minst_make(is_s ? MI_A64_FCVTZS : MI_A64_FCVTZU, dw, loc);
-            cv.aux_width = fw;
-            cv.op_count = 2u; cv.ops[0] = mop_vreg_def(raw); cv.ops[1] = mop_vreg_use(src);
-            emit(c, cv);
-
-            if (bits < 32u && (inst->flags & PIR_FLAG_SAT) != 0u) {
-                /* Clamp 32-bit result to [lo_bound, hi_bound] for i8/i16 [sat]. */
-                int64_t lo_b = is_s ? -(int64_t)(1ULL << (bits - 1u)) : 0;
-                int64_t hi_b = is_s ? (int64_t)((1ULL << (bits - 1u)) - 1ULL) : (int64_t)((1ULL << bits) - 1ULL);
-                MVReg r_hi = new_gp(c, 4u), c1 = new_gp(c, 4u);
-                emit_imm_gp(c, r_hi, (uint64_t)hi_b, 4u, loc);
-                MInst cm1 = minst_make(MI_A64_CMP_RR, 4u, loc);
-                cm1.op_count = 2u; cm1.ops[0] = mop_vreg_use(raw); cm1.ops[1] = mop_vreg_use(r_hi);
-                emit(c, cm1);
-                MInst s1 = minst_make(MI_A64_CSEL, 4u, loc);
-                s1.op_count = 4u; s1.ops[0] = mop_vreg_def(c1); s1.ops[1] = mop_vreg_use(r_hi);
-                s1.ops[2] = mop_vreg_use(raw); s1.ops[3] = mop_cond(is_s ? MCOND_GT : MCOND_HI);
-                emit(c, s1);
-
-                if (is_s) {
-                    MVReg r_lo = new_gp(c, 4u);
-                    emit_imm_gp(c, r_lo, (uint64_t)lo_b, 4u, loc);
-                    MInst cm2 = minst_make(MI_A64_CMP_RR, 4u, loc);
-                    cm2.op_count = 2u; cm2.ops[0] = mop_vreg_use(c1); cm2.ops[1] = mop_vreg_use(r_lo);
-                    emit(c, cm2);
-                    MInst s2 = minst_make(MI_A64_CSEL, 4u, loc);
-                    s2.op_count = 4u; s2.ops[0] = mop_vreg_def(dst0); s2.ops[1] = mop_vreg_use(r_lo);
-                    s2.ops[2] = mop_vreg_use(c1); s2.ops[3] = mop_cond(MCOND_LT);
-                    emit(c, s2);
-                } else {
-                    MInst cp = minst_make(MI_COPY, 4u, loc);
-                    cp.op_count = 2u; cp.ops[0] = mop_vreg_def(dst0); cp.ops[1] = mop_vreg_use(c1);
-                    emit(c, cp);
-                }
-            }
+            emit_scalar_fptoi_regs(c, is_s, src_ty, inst->ty, inst->flags, src, dst0, loc);
             return true;
         }
 
