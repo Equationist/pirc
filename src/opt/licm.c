@@ -12,6 +12,7 @@
 #include "analysis/cfg.h"
 #include "analysis/dom.h"
 #include "analysis/loops.h"
+#include "lower/lower.h"
 
 static bool op_is_invariant(const PirFunction *fn, const PirLoop *lp, PirOperand op) {
     if (op.kind != PIR_OPER_VAL) return true;
@@ -94,6 +95,7 @@ static bool loop_has_mem_barrier(const PirModule *mod, const PirFunction *fn, co
             if (ins->op == PIR_OP_CALL_INDIRECT || ins->op == PIR_OP_FENCE ||
                 ins->op == PIR_OP_ATOMIC_LOAD || ins->op == PIR_OP_ATOMIC_STORE ||
                 ins->op == PIR_OP_ATOMIC_RMW || ins->op == PIR_OP_ATOMIC_CMPXCHG ||
+                ins->op == PIR_OP_MEMCPY || ins->op == PIR_OP_MEMMOVE || ins->op == PIR_OP_MEMSET ||
                 ins->op == PIR_OP_VA_START || ins->op == PIR_OP_STACKRESTORE) {
                 return true;
             }
@@ -141,7 +143,7 @@ static bool loop_has_real_call(const PirFunction *fn, const PirLoop *lp) {
     return false;
 }
 
-static bool load_is_safe_to_hoist(const PirFunction *fn,
+static bool load_is_safe_to_hoist(const PirModule *mod, const PirFunction *fn,
                                   const PirTargetSpec *target, const PirLoop *lp,
                                   PirBlockId b, const PirInst *ins, bool has_barrier) {
     if (ins->op != PIR_OP_LOAD || (ins->flags & PIR_FLAG_VOLATILE) || has_barrier) return false;
@@ -164,10 +166,24 @@ static bool load_is_safe_to_hoist(const PirFunction *fn,
         }
     }
 
-    /* Dereference safety: header executes unconditionally, or base is known valid/noalias object. */
+    /* Dereference safety: header executes unconditionally (including post-rotation loop
+     * headers guarded against 0 trips). Otherwise, only provably in-bounds loads from
+     * known stack allocas or defined globals are safe to speculate; `restrict` (noalias)
+     * pointer parameters may be NULL or out-of-bounds on untaken branches! */
     if (b == lp->header) return true;
     PirPtrInfo pi = pir_alias_decompose(fn, ins->operands[0]);
-    if (pi.kind == PIR_PTR_PARAM_NOALIAS || pi.kind == PIR_PTR_GLOBAL) return true;
+    if (pi.kind == PIR_PTR_GLOBAL && pi.has_offset && pi.offset >= 0 && pi.global_name) {
+        for (uint32_t gi = 0u; gi < mod->globals.len; ++gi) {
+            const PirGlobal *g = &mod->globals.data[gi];
+            if (g->name && strcmp(g->name, pi.global_name) == 0) {
+                PirTypeLayout gly = pir_type_layout(mod, target, g->type);
+                if (gly.size > 0u && (uint64_t)pi.offset + (uint64_t)lsz <= gly.size) {
+                    return true;
+                }
+                break;
+            }
+        }
+    }
     if (pi.kind == PIR_PTR_ALLOCA && pi.has_offset && pi.offset >= 0 &&
         pi.obj_id < fn->insts.len && fn->insts.data[pi.obj_id].op == PIR_OP_ALLOCA_PTR &&
         (uint64_t)pi.offset + (uint64_t)lsz <= fn->insts.data[pi.obj_id].imm_u64) {
@@ -256,7 +272,7 @@ void pir_opt_licm(PirModule *mod, PirFunction *fn, const PirTargetSpec *target) 
                             if (!(has_call && (ins->ty.kind == PIR_TYPE_VECTOR || ins->op == PIR_OP_CONST))) {
                                 can_hoist = true;
                             }
-                        } else if (load_is_safe_to_hoist(fn, target, lp, b, ins, has_barrier)) {
+                        } else if (load_is_safe_to_hoist(mod, fn, target, lp, b, ins, has_barrier)) {
                             can_hoist = true;
                         }
 

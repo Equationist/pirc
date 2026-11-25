@@ -67,6 +67,8 @@ static void undef_macro2(Token *tok);
 static Token *skip_line(Token *tok) {
   if (tok->at_bol)
     return tok;
+  if (is_iso_std && !tok->file->is_syshdr)
+    error_tok(tok, "extra tokens at end of preprocessor directive");
   warn_tok(tok, "extra token");
   while (!tok->at_bol)
     tok = tok->next;
@@ -484,6 +486,8 @@ static Macro *new_funclike_macro(char *name, Token **rest, Token *tok) {
 static Macro *read_macro_name(Token **rest, Token *tok) {
   if (tok->kind != TK_IDENT)
     error_tok(tok, "macro name must be an identifier");
+  if (is_iso_std && equal(tok, "defined") && !tok->file->is_syshdr)
+    error_tok(tok, "'defined' cannot be used as a macro name");
   char *name = arena_copy_string(&pp_arena, tok->loc, tok->len);
   tok = tok->next;
 
@@ -505,12 +509,66 @@ static void chk_macro_startend(Token *first, Token *last) {
   }
 }
 
+static bool macros_identical(Macro *a, Macro *b) {
+  if (a->is_objlike != b->is_objlike || a->arg_cnt != b->arg_cnt ||
+      a->has_va_arg != b->has_va_arg)
+    return false;
+  Token *pa = a->params, *pb = b->params;
+  for (; pa && pb; pa = pa->next, pb = pb->next)
+    if (!equal_tok(pa, pb))
+      return false;
+  if (pa || pb)
+    return false;
+  Token *ta = a->body, *tb = b->body;
+  bool first = true;
+  for (; ta && tb && ta->kind != TK_EOF && tb->kind != TK_EOF;
+       ta = ta->next, tb = tb->next, first = false) {
+    if (!first && ta->has_space != tb->has_space)
+      return false;
+    if (!equal_tok(ta, tb))
+      return false;
+  }
+  return (!ta || ta->kind == TK_EOF) && (!tb || tb->kind == TK_EOF);
+}
+
+static void chk_macro_hash(Macro *m) {
+  if (m->is_objlike)
+    return;
+  for (Token *t = m->body; t && t->kind != TK_EOF; t = t->next) {
+    if (t->kind == TK_HASH) {
+      Token *nxt = t->next;
+      bool found = false;
+      if (nxt && nxt->kind == TK_IDENT) {
+        for (Token *p = m->params; p; p = p->next) {
+          if (equal_tok(p, nxt)) {
+            found = true;
+            break;
+          }
+        }
+        if (!found && m->has_va_arg && equal(nxt, "__VA_ARGS__"))
+          found = true;
+      }
+      if (!found)
+        error_tok(t, "'#' is not followed by a macro parameter");
+    }
+  }
+}
+
 static void read_macro_definition(Token **rest, Token *tok) {
+  Token *name_tok = tok;
+  Macro *old = (name_tok->kind == TK_IDENT)
+                   ? hashmap_get2(&macros, name_tok->loc, name_tok->len)
+                   : NULL;
   Macro *m = read_macro_name(&tok, tok);
   Token *last;
   m->body = split_line2(rest, tok, &last);
 
   chk_macro_startend(m->body, last);
+  chk_macro_hash(m);
+  if (is_iso_std && old && !old->handler && !name_tok->file->is_syshdr &&
+      !(old->body && old->body->file && old->body->file->is_placeholder) &&
+      !macros_identical(old, m))
+    error_tok(name_tok, "macro '%.*s' redefined", name_tok->len, name_tok->loc);
 }
 
 static void read_macro_definition2(Token **rest, Token *tok) {
@@ -1260,7 +1318,7 @@ static void read_line_marker(Token **rest, Token *tok) {
 
   Node node = {.tok = start};
   convert_pp_number(tok, &node);
-  if (node.ty->kind != TY_INT)
+  if (node.ty->kind != TY_INT || (is_iso_std && node.num.val <= 0 && !start->file->is_syshdr))
     error_tok(tok, "invalid line marker");
 
   start->file->line_delta = node.num.val - start->line_no - 1;
@@ -1385,6 +1443,8 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
     tok = tok->next;
     if (tok->kind != TK_IDENT)
       error_tok(tok, "macro name must be an identifier");
+    if (is_iso_std && equal(tok, "defined") && !tok->file->is_syshdr)
+      error_tok(tok, "'defined' cannot be used as a macro name");
     undef_macro2(tok);
     return skip_line(tok->next);
   }
@@ -1890,7 +1950,7 @@ typedef enum {
 } StringKind;
 
 static StringKind getStringKind(Token *tok) {
-  if (!strcmp(tok->loc, "u8"))
+  if (tok->len >= 2 && !strncmp(tok->loc, "u8", 2))
     return STR_UTF8;
 
   switch (tok->loc[0]) {
@@ -2101,6 +2161,10 @@ static Token *preprocess3(Token *tok) {
           end = free_line(end, end);
         }
         tok = end;
+        continue;
+      }
+      if (tok->at_bol) {
+        to_freelist(start, start->next);
         continue;
       }
       if (equal(tok, "message"))

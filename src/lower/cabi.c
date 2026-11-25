@@ -227,6 +227,20 @@ static void rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
             vpd.type     = tptr;
             PirAbiArgInfo vinfo;
             pir_abi_classify_param(mod, target, &vpd, &va_st, &vinfo);
+            if (target->arch == PIR_ARCH_ARM64 && target->os == PIR_OS_MACOS &&
+                vinfo.kind == PIR_ABI_DIRECT && vinfo.fp_used > 0u &&
+                vinfo.regs[0].kind == PIR_TYPE_SCALAR && vinfo.regs[0].u.scalar == PIR_SCALAR_F32) {
+                /* Darwin ARM64 passes all variadic args on 8B stack slots without promoting
+                 * aggregate f32 members to f64; pack raw aggregate bytes into i64 words. */
+                PirTypeLayout vly = pir_type_layout(mod, target, vpd.abi_type);
+                uint32_t nw = (vly.size <= 8u) ? 1u : 2u;
+                vinfo.reg_count = nw;
+                vinfo.fp_used   = 0u;
+                vinfo.gp_used   = nw;
+                for (uint32_t w = 0u; w < nw; ++w) {
+                    vinfo.regs[w] = ti64;
+                }
+            }
             arg.call_abi          = PIR_PARAM_NORMAL;
             arg.has_explicit_type = false;
             pack_byval_arg(mod, target, fn, blk, out, arg, vpd.abi_type, &vinfo, &new_ops, ln, lc);

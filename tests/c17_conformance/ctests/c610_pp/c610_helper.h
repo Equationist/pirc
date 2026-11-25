@@ -1,0 +1,4 @@
+#ifndef C610_HELPER_H
+#define C610_HELPER_H
+#define C610_COMPUTED_INCLUDE_VAL 2026
+#endif

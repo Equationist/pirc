@@ -286,9 +286,18 @@ typedef struct {
     SroaSlice  slices[SROA_MAX_SLICES];
 } SroaCand;
 
+static int64_t sroa_imm_to_i64(const PirOperand *c) {
+    if (c->type.kind == PIR_TYPE_SCALAR && c->type.u.scalar == PIR_SCALAR_I32 &&
+        !c->u.imm_int.is_negative) {
+        return (int64_t)(int32_t)(uint32_t)c->u.imm_int.lo;
+    }
+    return c->u.imm_int.is_negative ? (int64_t)(UINT64_C(0) - c->u.imm_int.lo)
+                                    : (int64_t)c->u.imm_int.lo;
+}
+
 static bool sroa_const_i64(const PirFunction *fn, PirOperand op, int64_t *out) {
     if (op.kind == PIR_OPER_IMM_INT) {
-        *out = op.u.imm_int.is_negative ? -(int64_t)op.u.imm_int.lo : (int64_t)op.u.imm_int.lo;
+        *out = sroa_imm_to_i64(&op);
         return true;
     }
     if (op.kind == PIR_OPER_VAL && op.u.val < fn->values.len) {
@@ -296,8 +305,7 @@ static bool sroa_const_i64(const PirFunction *fn, PirOperand op, int64_t *out) {
         if (did != PIR_INVALID_ID && fn->insts.data[did].op == PIR_OP_CONST &&
             fn->insts.data[did].operand_count == 1u &&
             fn->insts.data[did].operands[0].kind == PIR_OPER_IMM_INT) {
-            const PirOperand *c = &fn->insts.data[did].operands[0];
-            *out = c->u.imm_int.is_negative ? -(int64_t)c->u.imm_int.lo : (int64_t)c->u.imm_int.lo;
+            *out = sroa_imm_to_i64(&fn->insts.data[did].operands[0]);
             return true;
         }
     }

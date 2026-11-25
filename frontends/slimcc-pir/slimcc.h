@@ -491,6 +491,7 @@ struct Obj {
   bool is_used;
   bool is_compound_lit;
   bool is_string_lit;
+  bool is_register;
   int alt_align;
 
   // Local variable

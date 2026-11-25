@@ -56,8 +56,41 @@ static void walk_hfa(const PirModule *mod, const PirTargetSpec *target,
             walk_hfa(mod, target, agg->elem_type, base_off + i * el.size, w);
         }
     } else if (agg->kind == PIR_AGG_UNION) {
-        /* Union is HFA only if all members are identical HFA type; simplify: non-HFA. */
-        w->valid = false;
+        if (agg->field_count == 0u) {
+            w->valid = false;
+            return;
+        }
+        uint32_t max_cnt = 0u;
+        for (uint32_t i = 0u; i < agg->field_count && w->valid; ++i) {
+            HfaWalk mw = { true, false, pir_type_scalar(PIR_SCALAR_VOID), 0u };
+            walk_hfa(mod, target, agg->fields[i], base_off, &mw);
+            if (!mw.valid || !mw.has_base || mw.count < 1u || mw.count > 4u) {
+                w->valid = false;
+                return;
+            }
+            PirTypeLayout ml = pir_type_layout(mod, target, agg->fields[i]);
+            PirTypeLayout bl = pir_type_layout(mod, target, mw.base_ty);
+            if (ml.size != bl.size * (uint64_t)mw.count) {
+                w->valid = false;
+                return;
+            }
+            if (!w->has_base) {
+                w->has_base = true;
+                w->base_ty  = mw.base_ty;
+            } else if (!pir_type_eq(w->base_ty, mw.base_ty)) {
+                w->valid = false;
+                return;
+            }
+            if (mw.count > max_cnt) {
+                max_cnt = mw.count;
+            }
+        }
+        if (w->valid) {
+            w->count += max_cnt;
+            if (w->count > 4u) {
+                w->valid = false;
+            }
+        }
     } else {
         for (uint32_t i = 0u; i < agg->field_count && w->valid; ++i) {
             uint64_t foff = pir_field_offset(mod, target, ty.u.agg_id, i);

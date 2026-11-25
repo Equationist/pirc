@@ -40,12 +40,15 @@ typedef struct {
   bool is_gnu_inline;
   bool is_always_inline;
   bool is_noreturn;
+  bool has_noreturn_kw;
   bool is_returns_twice;
   bool is_used;
+  bool has_alignas;
   Obj *cleanup_fn;
   char *alias;
   char *section;
   int align;
+  int alignas_val;
 } VarAttr;
 
 typedef struct Initializer Initializer;
@@ -976,6 +979,8 @@ static void chk_vardecl(Type *ty, Token *name, Token *tok) {
 static void chk_inline(VarAttr *attr, Token *tok) {
   if (attr->strg & SC_INLINE)
     error_tok(tok, "only function declarations can be 'inline'");
+  if (attr->has_noreturn_kw)
+    error_tok(tok, "only function declarations can be '_Noreturn'");
 }
 
 static void chk_local_tls(VarAttr *attr, Token *tok) {
@@ -1044,7 +1049,7 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr, StorageClass ctx)
     case TK_thread_local: attr->strg |= SC_THREAD; continue;
     case TK_inline:       attr->strg |= SC_INLINE; continue;
     case TK_constexpr:    attr->strg |= SC_CONSTEXPR; continue;
-    case TK_Noreturn:     attr->is_noreturn = true; continue;
+    case TK_Noreturn:     attr->is_noreturn = true; attr->has_noreturn_kw = true; continue;
     case TK_alignas: {
       tok = skip_tk(tok, TK_LPAREN);
       int align;
@@ -1055,6 +1060,8 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr, StorageClass ctx)
       } else {
         align = align_expr(&tok, tok);
       }
+      attr->has_alignas = true;
+      attr->alignas_val = MAX(attr->alignas_val, align);
       attr->align = MAX(attr->align, align);
       tok = skip_tk(tok, TK_RPAREN);
       continue;
@@ -1071,6 +1078,8 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr, StorageClass ctx)
         if (ty)
           error_tok(tok, "invalid type");
         ty = typename(&tok, tok);
+        if (is_array(ty) || ty->kind == TY_FUNC || ty->kind == TY_VOID || ty->qual)
+          error_tok(tok, "invalid type for '_Atomic'");
         tok = skip_tk(tok, TK_RPAREN);
         counter |= OTHER;
       }
@@ -1219,6 +1228,8 @@ static void func_params(Token *tok, Type *fn_ty, bool is_def) {
   fn_ty->kind = TY_FUNC;
 
   if (tok->kind == TK_DOT3 && tok->next->kind == TK_RPAREN) {
+    if (is_iso_std && opt_std < STD_C23 && !tok->file->is_syshdr)
+      error_tok(tok, "ISO C requires a named argument before '...'");
     fn_ty->is_variadic = true;
     return;
   }
@@ -1246,18 +1257,26 @@ static void func_params(Token *tok, Type *fn_ty, bool is_def) {
       }
       VarAttr attr = {0};
       Type *basety = declspec(&tok, tok, &attr, SC_REGISTER);
+      if (attr.has_alignas)
+        error_tok(tok, "_Alignas cannot be applied to a parameter");
+      if (attr.has_noreturn_kw)
+        error_tok(tok, "'_Noreturn' cannot be applied to a parameter");
 
       if (is_def)
         chain_expr(&expr, calc_vla2(basety, tok, &attr));
 
       Token *name = NULL;
       Type *raw_ty = declarator2(&tok, tok, basety, &name);
+      if (cur == &head && !name && raw_ty == basety && basety->kind == TY_VOID &&
+          !basety->qual && attr.strg == SC_NONE && tok->kind == TK_RPAREN)
+        break;
       Type *param_ty = param_declarator(basety, raw_ty, tok, is_def);
 
       if (is_def)
         chain_expr(&expr, calc_vla(raw_ty, tok));
 
       cur = cur->param_next = new_param(NULL, param_ty);
+      cur->is_register = !!(attr.strg & SC_REGISTER);
       if (name)
         push_var_name(name, cur);
     }
@@ -1310,6 +1329,8 @@ static void array_dimension2(Type *ty, Token *tok, Node *expr) {
   Type *basety = ty->base;
   if (basety->size < 0 || basety->kind == TY_VOID || basety->kind == TY_FUNC)
     error_tok(tok, "invalid array element type");
+  if (is_iso_std && basety->is_flexible && !tok->file->is_syshdr)
+    error_tok(tok, "array of structs with flexible array member is not allowed in ISO C");
 
   if (!expr) {
     array_setty(ty, basety, -1);
@@ -1323,6 +1344,8 @@ static void array_dimension2(Type *ty, Token *tok, Node *expr) {
   if (is_const_expr_strict(expr, &array_len)) {
     if (array_len < 0)
       error_tok(expr->tok, "size of array is negative");
+    if (is_iso_std && array_len == 0 && !expr->tok->file->is_syshdr)
+      error_tok(expr->tok, "zero-size array is not allowed in ISO C");
     if (basety->kind == TY_VLA) {
       vla_setty(ty, NULL, array_len);
       return;
@@ -1538,7 +1561,11 @@ static Type *enum_specifier(Token **rest, Token *tok) {
   if (tag) {
     if (tok->kind != TK_LCURLY && !is_fixed) {
       *rest = tok;
-      return enum_ty_tag(tag, find_tag(tag));
+      Type *found = find_tag(tag);
+      if (is_iso_std && !tag->file->is_syshdr &&
+          (!found || found->kind == TY_ENUM_INCMP))
+        error_tok(tag, "ISO C forbids forward references to 'enum' types");
+      return enum_ty_tag(tag, found);
     }
 
     if ((tag_ty = find_tag_in_scope(tag)))
@@ -1619,6 +1646,8 @@ static Type *enum_specifier(Token **rest, Token *tok) {
           dyn_ty = ty_int;
           ovf_val = (uint64_t)INT32_MAX + 1;
         } else {
+          if (is_iso_std && opt_std < STD_C23 && !name->file->is_syshdr)
+            error_tok(name, "enumerator value is not representable as 'int'");
           dyn_ty = unqual(val_ty);
           ovf_val = enum_ovf_val(dyn_ty);
         }
@@ -1632,6 +1661,8 @@ static Type *enum_specifier(Token **rest, Token *tok) {
 
       if (val == ovf_val) {
         if (dyn_ty) {
+          if (is_iso_std && opt_std < STD_C23 && !name->file->is_syshdr)
+            error_tok(name, "enumerator value overflows 'int'");
           // assume 32-bit int
           if (!dyn_ty->is_unsigned && (ovf_val - 1 < INT64_MAX))
             dyn_ty = enum_ty[ETY_I64], ovf_val = (uint64_t)INT64_MAX + 1;
@@ -1787,6 +1818,8 @@ static Node *vla_size(Type *ty, Token *tok) {
 static Node *ptr_base_size(Type *ty, Token *tok) {
   if (ty->base->kind == TY_VLA)
     return vla_size(ty->base, tok);
+  if (is_iso_std && (ty->base->kind == TY_VOID || ty->base->kind == TY_FUNC))
+    error_tok(tok, "arithmetic on pointer to void or function type");
   if (ty->base->size < 0)
     error_tok(tok, "pointer has incomplete type");
   return new_size_t(ty->base->size, tok);
@@ -1849,6 +1882,8 @@ static Node *declaration2(Token **rest, Token *tok, Type *basety, VarAttr *attr,
     if (attr->strg & SC_THREAD)
       var->kind = OBJ_TLS;
     assembler_name(&tok, tok, var);
+    if (attr->alignas_val > 0 && ty->align > 0 && attr->alignas_val < ty->align)
+      error_tok(name, "_Alignas cannot reduce natural alignment");
     aligned_attr(name, tok, attr, &var->alt_align);
     symbol_attr(name, tok, attr, var);
 
@@ -1867,12 +1902,16 @@ static Node *declaration2(Token **rest, Token *tok, Type *basety, VarAttr *attr,
 
   chk_local_tls(attr, tok);
 
+  if ((attr->strg & SC_REGISTER) && attr->has_alignas)
+    error_tok(name, "_Alignas cannot be applied to a register variable");
+
   if (ty->kind == TY_VLA) {
     fnctx->use_vla = true;
 
     Obj *var = alloc_ast_var(ty);
     var->vptr = new_lvar2(ty_ptrdiff_t, decl_scope());
     var->kind = OBJ_INDIR;
+    var->is_register = !!(attr->strg & SC_REGISTER);
     push_var_name(name, var);
 
     Node *node = vla_size(ty, name);
@@ -1896,8 +1935,11 @@ static Node *declaration2(Token **rest, Token *tok, Type *basety, VarAttr *attr,
   }
 
   Obj *var = new_lvar2(ty, decl_scope());
+  var->is_register = !!(attr->strg & SC_REGISTER);
   push_var_name(name, var);
   assembler_name(&tok, tok, var);
+  if (attr->alignas_val > 0 && ty->align > 0 && attr->alignas_val < ty->align)
+    error_tok(name, "_Alignas cannot reduce natural alignment");
   aligned_attr(name, tok, attr, &var->alt_align);
   cleanup_attr(name, tok, attr, var);
 
@@ -1963,9 +2005,9 @@ static Node *cond_declaration(Token **rest, Token *tok, TokenKind stopper, int c
   }
 }
 
-static Node *declaration(Token **rest, Token *tok) {
+static Node *declaration_sc(Token **rest, Token *tok, StorageClass allow_sc) {
   VarAttr attr = {0};
-  Type *basety = declspec(&tok, tok, &attr, SC_ALL | SC_INLINE);
+  Type *basety = declspec(&tok, tok, &attr, allow_sc);
 
   if (attr.strg & SC_EXTERN) {
     global_declaration(rest, tok, basety, &attr);
@@ -1993,7 +2035,13 @@ static Node *declaration(Token **rest, Token *tok) {
   return expr;
 }
 
+static Node *declaration(Token **rest, Token *tok) {
+  return declaration_sc(rest, tok, SC_ALL | SC_INLINE);
+}
+
 static Token *skip_excess_element(Token *tok) {
+  if (is_iso_std && !tok->file->is_syshdr)
+    error_tok(tok, "excess elements in initializer");
   if (tok->kind == TK_LCURLY) {
     tok = tok->next;
 
@@ -2022,6 +2070,8 @@ static void string_initializer(Token *tok, Initializer *init) {
 
   if (init->kind == INIT_FLEX)
     init->ty = array_of(init->ty->base, tok->ty->array_len);
+  else if (is_iso_std && tok->ty->array_len - 1 > init->ty->array_len && !tok->file->is_syshdr)
+    error_tok(tok, "initializer-string for array is too long");
 
   set_init(init, INIT_STR_ARRAY);
   init->tok = tok;
@@ -2034,6 +2084,8 @@ static void array_designator(Token **rest, Token *tok, Type *ty, int *begin, int
     error_tok(tok, "array designator index exceeds array bounds");
 
   if (tok->kind == TK_DOT3) {
+    if (is_iso_std && !tok->file->is_syshdr)
+      error_tok(tok, "GNU array designator range is not allowed in ISO C");
     *end = const_expr(&tok, tok->next);
     if (*end >= ty->array_len)
       error_tok(tok, "array designator index exceeds array bounds");
@@ -2118,10 +2170,12 @@ static void designation(Token **rest, Token *tok, Initializer *init, bool post_b
     return;
   }
 
-  if (post_bracket)
-    consume_tk(&tok, tok, TK_EQ);
-  else
+  if (post_bracket) {
+    if (!consume_tk(&tok, tok, TK_EQ) && is_iso_std && !tok->file->is_syshdr)
+      error_tok(tok, "GNU array designator without '=' is not allowed in ISO C");
+  } else {
     tok = skip_tk(tok, TK_EQ);
+  }
 
   initializer2(rest, tok, init);
 }
@@ -2222,6 +2276,8 @@ static bool is_num_seq(Token **rest, Token *tok, int32_t *val) {
 static void initializer3(Token **rest, Token *tok, Initializer *init, Node *expr) {
   bool has_brace = !expr && consume_tk(&tok, tok, TK_LCURLY);
   if (has_brace && consume_tk(rest, tok, TK_RCURLY)) {
+    if (is_iso_std && opt_std < STD_C23 && !tok->file->is_syshdr)
+      error_tok(tok, "empty initializer braces are a C23 extension");
     if (init->kind == INIT_FLEX)
       init->ty = array_of(init->ty->base, 0);
     set_init(init, INIT_NONE);
@@ -2240,6 +2296,8 @@ static void initializer3(Token **rest, Token *tok, Initializer *init, Node *expr
       if (is_num_seq(rest, tok, &len)) {
         if (init->kind == INIT_FLEX)
           init->ty = array_of(init->ty->base, len);
+        else if (is_iso_std && len > init->ty->array_len && !tok->file->is_syshdr)
+          error_tok(tok, "excess elements in array initializer");
 
         init->kind = INIT_NUM_SEQ;
         init->numseq.start = tok;
@@ -2356,6 +2414,9 @@ static void initializer(Token **rest, Token *tok, Initializer *init, Obj *var) {
     ty = new_derived_type(NULL, ty->qual, ty);
 
     Initializer *i = &init->list.data[init->list.cnt - 1];
+    if (i->kind != INIT_FLEX && i->kind != INIT_FLEX_NESTED &&
+        is_iso_std && !start->file->is_syshdr)
+      error_tok(start, "initialization of flexible array member is not allowed in ISO C");
     if (i->ty->size > 0)
       ty->size += i->ty->size;
     var->ty = ty;
@@ -2829,6 +2890,8 @@ static void eval_static_assert(Token **rest, Token *tok) {
     if (tok->next->kind != TK_STR)
       error_tok(tok, "expected string literal");
     tok = tok->next->next;
+  } else if (is_iso_std && opt_std < STD_C23 && !tok->file->is_syshdr) {
+    error_tok(tok, "_Static_assert with no message is a C23 extension");
   }
   *rest = skip_tk(tok, TK_RPAREN);
 }
@@ -2857,10 +2920,13 @@ static void push_goto(Node *node) {
 static void case_range(Token **rest, Token *tok, Node *sw, Node *case_node) {
   int64_t lo = const_expr(&tok, tok);
   int64_t hi;
-  if (consume_tk(&tok, tok, TK_DOT3))
+  if (consume_tk(&tok, tok, TK_DOT3)) {
+    if (is_iso_std && !tok->file->is_syshdr)
+      error_tok(tok, "GNU case range is not allowed in ISO C");
     hi = const_expr(&tok, tok);
-  else
+  } else {
     hi = lo;
+  }
 
   Type *ty = sw->ctrl.cond->ty;
   if (ty->size <= 4) {
@@ -2940,6 +3006,9 @@ static Token *label_stmt(Token **rest, Token *tok, Node **stmt) {
       }
 
       if (!fnctx->defr_ctx) {
+        for (Node *lbl = fnctx->labels; lbl; lbl = lbl->lbl.next)
+          if (equal_tok(lbl->tok, start))
+            error_tok(start, "duplicated label");
         Node *node = new_label(ND_LABEL, start);
         node->lbl.next = fnctx->labels;
         (*stmt) = (*stmt)->next = fnctx->labels = node;
@@ -3040,14 +3109,21 @@ static Node *stmt(Token **rest, Token *tok, Token *label_list) {
 
     Node *node = new_node(ND_RETURN, tok);
     node->dfr_from = fnctx->defr;
-    if (consume_tk(rest, tok->next, TK_SEMI))
+    if (consume_tk(rest, tok->next, TK_SEMI)) {
+      if (is_iso_std && fnctx->fn->ty->return_ty->kind != TY_VOID)
+        error_tok(tok, "non-void function should return a value");
       return node;
+    }
 
     Node *n = expression(&tok, tok->next);
     add_type(n);
 
-    if (fnctx->fn->ty->return_ty->kind != TY_VOID)
+    if (fnctx->fn->ty->return_ty->kind == TY_VOID) {
+      if (is_iso_std || n->ty->kind != TY_VOID)
+        error_tok(tok, "void function should not return a value");
+    } else {
       n = assign_cast(fnctx->fn->ty->return_ty, n);
+    }
 
     node->m.lhs = n;
     *rest = skip_tk(tok, TK_SEMI);
@@ -3098,7 +3174,10 @@ static Node *stmt(Token **rest, Token *tok, Token *label_list) {
     tok = skip_tk(tok->next, TK_LPAREN);
 
     if (is_typename(tok)) {
-      Node *expr = declaration(&tok, tok);
+      StorageClass for_sc = is_iso_std
+          ? (SC_AUTO | SC_REGISTER | (opt_std >= STD_C23 ? SC_CONSTEXPR : SC_NONE))
+          : (SC_ALL | SC_INLINE);
+      Node *expr = declaration_sc(&tok, tok, for_sc);
       if (expr)
         node->ctrl.for_init = new_unary(ND_EXPR_STMT, expr, tok);
     } else {
@@ -3208,10 +3287,14 @@ static Node *compound_stmt2(Token **rest, Token *tok, NodeKind kind) {
   Node *cur = &head;
   Node *result = NULL;
   for (;;) {
+    Node *prev_cur = cur;
     Token *label_list = label_stmt(&tok, tok, &cur);
 
-    if (tok->kind == TK_RCURLY)
+    if (tok->kind == TK_RCURLY) {
+      if (cur != prev_cur && opt_std < STD_C23)
+        error_tok(tok, "label at end of compound statement requires C23");
       break;
+    }
     if (consume_tk(&tok, tok, TK_SEMI))
       continue;
     if (tok->kind == TK_PRAGMA) {
@@ -3221,6 +3304,8 @@ static Node *compound_stmt2(Token **rest, Token *tok, NodeKind kind) {
 
     Node *node;
     if (is_typename(tok)) {
+      if (cur != prev_cur && is_iso_std && opt_std < STD_C23 && !tok->file->is_syshdr)
+        error_tok(tok, "label followed by a declaration is a C23 extension");
       Node *expr = declaration(&tok, tok);
       if (!expr)
         continue;
@@ -4334,6 +4419,8 @@ static Node *conditional(Token **rest, Token *tok) {
   if (!consume_tk(&tok, tok->next, TK_COLON)) {
     node->ctrl.then = expression(&tok, tok->next);
     tok = skip_tk(tok, TK_COLON);
+  } else if (is_iso_std && !tok->file->is_syshdr) {
+    error_tok(tok, "GNU omitted conditional operand is not allowed in ISO C");
   }
   node->ctrl.els = conditional(rest, tok);
 
@@ -4580,6 +4667,11 @@ static Node *unary(Token **rest, Token *tok) {
     Node *lhs = unary(rest, tok->next);
     if (is_bitfield(lhs))
       error_tok(tok, "cannot take address of bitfield");
+    Node *base = lhs;
+    while (base->kind == ND_MEMBER)
+      base = base->m.lhs;
+    if (base->kind == ND_VAR && base->m.var->is_register)
+      error_tok(tok, "cannot take address of register variable");
     return new_unary(ND_ADDR, lhs, tok);
   }
 
@@ -4626,6 +4718,9 @@ static Node *unary(Token **rest, Token *tok) {
     if (is_typename_paren(rest, tok->next, &ty, &attr)) {
       attr_align = attr.align;
     } else {
+      if (is_iso_std && !tok->file->is_syshdr &&
+          (equal(tok, "_Alignof") || equal(tok, "alignof")))
+        error_tok(tok, "'_Alignof' applied to an expression is a GNU extension");
       Node *node = unary(rest, tok->next);
       switch (node->kind) {
       case ND_MEMBER:
@@ -4638,6 +4733,9 @@ static Node *unary(Token **rest, Token *tok) {
       add_type(node);
       ty = node->ty;
     }
+    if (ty->kind == TY_VOID || ty->kind == TY_FUNC ||
+        (ty->kind != TY_VLA && ty->size < 0))
+      error_tok(tok, "alignof applied to invalid or incomplete type");
     ty = get_elem(ty);
     if (ty->size < 0)
       error_tok(tok, "alignof applied to incomplete type");
@@ -4666,6 +4764,10 @@ static Node *unary(Token **rest, Token *tok) {
     Node *expr = NULL;
     Type *ty = sizeof_arg(rest, tok->next, &expr);
 
+    if (expr && is_bitfield(expr))
+      error_tok(tok, "sizeof applied to bitfield");
+    if (is_iso_std && (ty->kind == TY_VOID || ty->kind == TY_FUNC))
+      error_tok(tok, "invalid application of 'sizeof' to void or function type");
     if (ty->kind == TY_VLA) {
       chain_expr(&expr, vla_size(ty, tok));
       return expr;
@@ -4703,6 +4805,8 @@ static Node *unary(Token **rest, Token *tok) {
     }
 
     if (tok->kind == TK_LCURLY) {
+      if (is_iso_std && !tok->file->is_syshdr)
+        error_tok(tok, "GNU statement expression is not allowed in ISO C");
       if (!fnctx)
         error_tok(tok, "statement expression not in a function");
 
@@ -4753,8 +4857,12 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
   bool has_const = false;
 
   while (tok->kind != TK_RCURLY) {
-    if (consume_tk(&tok, tok, TK_SEMI))
+    if (tok->kind == TK_SEMI) {
+      if (is_iso_std && !tok->file->is_syshdr)
+        error_tok(tok, "extra ';' inside struct or union is not allowed in ISO C");
+      tok = tok->next;
       continue;
+    }
     if (tok->kind == TK_PRAGMA) {
       pragma_pack(&tok, tok);
       continue;
@@ -4772,6 +4880,8 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
     if (tok->kind == TK_SEMI && (basety->kind == TY_STRUCT || basety->kind == TY_UNION)) {
       if (basety->size < 0)
         error_tok(tok, "member has incomplete type");
+      if (is_iso_std && basety->is_flexible && !tok->file->is_syshdr)
+        error_tok(tok, "struct with flexible array member cannot be a member in ISO C");
       if (basety->tag && !opt_ms_anon_struct)
         error_tok(tok,
                   "enable MSVC anonymous struct extension with `-fms-anonymous-structs`");
@@ -4797,10 +4907,14 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
       }
       if (is_vm_ty(mem->ty) || mem->ty->kind == TY_FUNC || mem->ty->kind == TY_VOID)
         error_tok(tok, "invalid member type");
+      if (is_iso_std && mem->ty->is_flexible && !tok->file->is_syshdr)
+        error_tok(tok, "struct with flexible array member cannot be a member in ISO C");
 
       if (consume_tk(&tok, tok, TK_COLON)) {
         if (!is_int_class(mem->ty))
           error_tok(tok, "bit-field not integer");
+        if (mem->ty->qual & Q_ATOMIC)
+          error_tok(tok, "bit-field cannot have '_Atomic' type");
 
         int64_t width = const_expr(&tok, tok);
         if (chk_bitfield_width(width, mem))
@@ -4812,6 +4926,10 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
         error_tok(tok, "expected member name");
       }
 
+      if (mem->is_bitfield && attr.has_alignas)
+        error_tok(tok, "_Alignas cannot be applied to a bit-field");
+      if (attr.alignas_val > 0 && mem->ty->align > 0 && attr.alignas_val < mem->ty->align)
+        error_tok(tok, "_Alignas cannot reduce natural alignment");
       aligned_attr(mem->name, tok, &attr, &mem->alt_align);
       mem_attr(mem->name, tok, &attr, mem);
       cur = cur->next = mem;
@@ -4834,8 +4952,21 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
   if (flex_tok) {
     if (cur->ty->size >= 0)
       error_tok(flex_tok, "member has incomplete type");
+    if (is_iso_std) {
+      bool has_named = false;
+      for (Member *m = head.next; m != cur; m = m->next) {
+        if (m->name || (!m->is_bitfield && (m->ty->kind == TY_STRUCT || m->ty->kind == TY_UNION))) {
+          has_named = true;
+          break;
+        }
+      }
+      if (!has_named)
+        error_tok(flex_tok, "flexible array member in struct with no named members");
+    }
     ty->is_flexible = true;
   }
+  if (is_iso_std && !head.next && !tok->file->is_syshdr)
+    error_tok(tok, "empty struct/union is not allowed in ISO C");
   ty->members = head.next;
   ty->has_const_member = has_const;
 }
@@ -5174,12 +5305,30 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
   return node;
 }
 
+static bool is_variably_modified(Type *ty) {
+  for (; ty; ty = ty->base) {
+    if (ty->kind == TY_VLA)
+      return true;
+    if (ty->kind == TY_FUNC) {
+      if (is_variably_modified(ty->return_ty))
+        return true;
+      for (Obj *p = ty->param_list; p; p = p->param_next)
+        if (is_variably_modified(p->ty))
+          return true;
+      return false;
+    }
+    if (ty->kind != TY_PTR && ty->kind != TY_ARRAY)
+      break;
+  }
+  return false;
+}
+
 static Node *generic_selection(Token **rest, Token *tok) {
   Token *start = tok;
   tok = skip_tk(tok, TK_LPAREN);
 
   Type *t1;
-  if (is_typename(tok)) {
+  if (opt_std >= STD_C23 && is_typename(tok)) {
     t1 = typename(&tok, tok);
   } else {
     Node *ctrl = assign(&tok, tok);
@@ -5209,6 +5358,10 @@ static Node *generic_selection(Token **rest, Token *tok) {
     Type *basety = declspec(&tok, tok, &(VarAttr){0}, SC_NONE);
     Type *t2 = declarator2(&tok, tok, basety, NULL);
     declarator3(basety, t2, true, false);
+
+    if (t2->kind == TY_VOID || t2->kind == TY_FUNC || t2->size < 0 ||
+        is_variably_modified(t2))
+      error_tok(ty_tok, "'_Generic' association type must be a complete object type");
 
     for (int32_t i = 0; i < types.len; i++)
       if (is_compatible2(types.data[i], t2))
@@ -5265,7 +5418,10 @@ static Node *checked_arith(Token **rest, Token *tok, NodeKind kind) {
 static Node *compound_literal(Token **rest, Token *tok) {
   Token *start = tok;
   VarAttr attr = {0};
-  Type *ty = declspec(&tok, tok, &attr, SC_CONSTEXPR | SC_REGISTER | SC_STATIC | SC_THREAD);
+  StorageClass cl_sc = (opt_std >= STD_C23)
+      ? (SC_CONSTEXPR | SC_REGISTER | SC_STATIC | SC_THREAD)
+      : SC_NONE;
+  Type *ty = declspec(&tok, tok, &attr, cl_sc);
 
   ty = declarator(&tok, tok, ty, NULL);
 
@@ -5666,6 +5822,8 @@ static Node *parse_typedef(Token **rest, Token *tok, Type *basety, VarAttr *attr
       error_tok(tok, "variably-modified type at file scope");
 
     int align = 0;
+    if (attr->has_alignas)
+      error_tok(name, "_Alignas cannot appear in a typedef");
     aligned_attr(name, tok, attr, &align);
 
     HashEntry *ent = hashmap_get_or_insert(&decl_scope()->vars, name->loc, name->len);
@@ -5790,6 +5948,8 @@ static Node *func_old_style_param(Token **rest, Token *tok, Type *prot_ty, Type 
   while (is_typename(tok)) {
     VarAttr attr = {0};
     Type *basety = declspec(&tok, tok, &attr, SC_REGISTER);
+    if (attr.has_alignas)
+      error_tok(tok, "_Alignas cannot be applied to a parameter");
 
     chain_expr(&expr, calc_vla2(basety, tok, &attr));
 
@@ -5943,6 +6103,8 @@ static Obj *func_prototype(Token *tok, Token *name, Type *ty, VarAttr *attr, boo
 
   bool is_gnu_inline = false;
   if (attr->strg & SC_INLINE) {
+    if (equal(name, "main"))
+      error_tok(name, "'main' cannot be declared 'inline'");
     is_gnu_inline = attr->is_gnu_inline || opt_gnu89_inline || opt_std < STD_C99;
     DeclAttr(bool_attr, "gnu_inline", &is_gnu_inline);
   }
@@ -6018,6 +6180,8 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
     declarator3(basety, ty, false, is_fndef);
 
     if (ty->kind == TY_FUNC) {
+      if (attr->has_alignas)
+        error_tok(name ? name : tok, "_Alignas cannot be applied to a function");
       Obj *fn = func_prototype(tok, name, ty, attr, is_fndef);
       func_exportness(fn, attr, is_fndef);
 
@@ -6067,6 +6231,8 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
     push_gvar_name(name, var);
 
     assembler_name(&tok, tok, var);
+    if (attr->alignas_val > 0 && ty->align > 0 && attr->alignas_val < ty->align)
+      error_tok(name, "_Alignas cannot reduce natural alignment");
     aligned_attr(name, tok, attr, &var->alt_align);
     symbol_attr(name, tok, attr, var);
 
@@ -6083,6 +6249,8 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
       constexpr_initializer(&tok, skip_tk(tok, TK_EQ), var, var);
     else if (tok->kind == TK_EQ)
       gvar_initializer(&tok, tok->next, var);
+    else if (is_iso_std && var->is_static && var->ty->size < 0)
+      error_tok(name, "tentative definition with internal linkage has incomplete type");
   }
   *rest = tok;
 }
@@ -6118,8 +6286,12 @@ Obj *parse(Token *tok) {
     if (free_alloc)
       free_head = free_parsed_tok(free_head, tok);
 
-    if (consume_tk(&tok, tok, TK_SEMI))
+    if (tok->kind == TK_SEMI) {
+      if (is_iso_std && !tok->file->is_syshdr)
+        error_tok(tok, "extra ';' outside of a function is not allowed in ISO C");
+      tok = tok->next;
       continue;
+    }
 
     if (tok->kind == TK_asm)
       error_tok(tok, "top-level inline assembly is not supported by PIR backend");
@@ -6140,7 +6312,12 @@ Obj *parse(Token *tok) {
     }
 
     VarAttr attr = {0};
-    Type *basety = declspec(&tok, tok, &attr, SC_ALL | SC_INLINE);
+    StorageClass file_sc = SC_EXTERN | SC_STATIC | SC_THREAD | SC_TYPEDEF | SC_INLINE | SC_CONSTEXPR;
+    if (opt_std >= STD_C23)
+      file_sc |= SC_AUTO;
+    if (!is_iso_std)
+      file_sc |= SC_REGISTER;
+    Type *basety = declspec(&tok, tok, &attr, file_sc);
 
     if (tok->kind == TK_SEMI) {
       chk_inline(&attr, tok);

@@ -1,0 +1,14 @@
+/*
+ * Copyright (c) 2026 Ummon Karpe
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * ISO/IEC 9899:2018 (C17) §6.7.2.1p3 — A structure containing a flexible array
+ * member shall not be an element of an array.
+ * EXPECT-ERROR
+ */
+struct fam {
+    int n;
+    int a[];
+};
+
+struct fam arr[2];

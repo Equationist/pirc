@@ -221,7 +221,12 @@ static Type *add_qual2(QualMask msk, Type *ty, Token *tok) {
   if (tok && chk_qual_type(msk, ty))
     error_tok(tok, "invalid qualifier for type");
 
-  return new_derived_type(NULL, msk | ty->qual, ty);
+  Type *ret = new_derived_type(NULL, msk | ty->qual, ty);
+  if ((msk & Q_ATOMIC) &&
+      (ret->size == 2 || ret->size == 4 || ret->size == 8) &&
+      ret->align < ret->size)
+    ret->align = (int32_t)ret->size;
+  return ret;
 }
 
 Type *add_qual(QualMask msk, Type *ty, Token *tok) {
@@ -246,7 +251,7 @@ bool chk_qual_type(QualMask qual, Type *ty) {
     if (ty->kind != TY_PTR || ty->base->kind == TY_FUNC || ty->base->kind == TY_FUNC_INCMP)
       return true;
   if (qual & Q_ATOMIC)
-    if (is_decay_ty(ty))
+    if (is_decay_ty(ty) || ty->kind == TY_VOID)
       return true;
   return false;
 }
@@ -578,6 +583,13 @@ Type *ptr_decay(Type *ty) {
 void ptr_convert(Node **node) {
   add_type(*node);
   Type *orig = (*node)->ty;
+  if (is_iso_std && is_array(orig)) {
+    Node *base = *node;
+    while (base->kind == ND_MEMBER)
+      base = base->m.lhs;
+    if (base->kind == ND_VAR && base->m.var->is_register)
+      error_tok((*node)->tok, "cannot compute address of register array");
+  }
   Type *ty = ptr_decay(orig);
   if (ty != orig)
     *node = new_cast(*node, ty);
@@ -654,14 +666,33 @@ Node *assign_cast(Type *to_ty, Node *expr) {
 
   if (is_ptr(to_ty)) {
     ptr_convert(&expr);
-    if (is_ptr(expr->ty))
+    if (is_ptr(expr->ty)) {
+      if (is_iso_std && to_ty->kind == TY_PTR && expr->ty->kind == TY_PTR &&
+          !is_null_ptr_constant(expr)) {
+        bool to_fn = (to_ty->base->kind == TY_FUNC || to_ty->base->kind == TY_FUNC_INCMP);
+        bool ex_fn = (expr->ty->base->kind == TY_FUNC || expr->ty->base->kind == TY_FUNC_INCMP);
+        if ((to_ty->base->kind == TY_VOID && ex_fn) ||
+            (expr->ty->base->kind == TY_VOID && to_fn) ||
+            (to_ty->base->kind != TY_VOID && expr->ty->base->kind != TY_VOID &&
+             !is_compatible(to_ty->base, expr->ty->base)))
+          error_tok(expr->tok, "incompatible pointer types");
+        if ((!expr->tok || !expr->tok->file || !expr->tok->file->is_syshdr) &&
+            (expr->ty->base->qual & ~to_ty->base->qual & (Q_CONST | Q_VOLATILE | Q_RESTRICT)))
+          error_tok(expr->tok, "assignment discards qualifiers from pointer target type");
+      }
       return expr;
+    }
     if (is_null_ptr_constant(expr))
       return new_cast(expr, to_ty);
   } else if (is_compatible(to_ty, expr->ty)) {
     if (to_ty->kind != TY_VOID && to_ty->size >= 0)
       return expr;
   } else if (is_numeric(to_ty)) {
+    if (is_iso_std && to_ty->kind != TY_BOOL) {
+      ptr_convert(&expr);
+      if (is_ptr(expr->ty))
+        error_tok(expr->tok, "incompatible pointer to integer conversion");
+    }
     return new_cast(expr, to_ty);
   }
   error_tok(expr->tok, "invalid assignment");
@@ -774,6 +805,8 @@ static Type *cond_ptr_conv(Node **lhs, Node **rhs, Node **cond) {
     if (is_compatible(ty1->base, ty2->base))
       return pointer_to(cond_ptr_conv2(ty1->base, ty2->base, cond, &(Obj *){0}));
 
+    if (is_iso_std)
+      error_tok((*lhs)->tok, "incompatible pointer types in conditional expression");
     return pointer_to(ty_void);
   }
 
@@ -913,16 +946,45 @@ void _add_type(Node *node) {
   case ND_LT:
   case ND_LE:
   case ND_GT:
-  case ND_GE:
+  case ND_GE: {
     node->ty = ty_eval_int;
     ptr_convert(&node->m.lhs);
     ptr_convert(&node->m.rhs);
-    if ((is_ptr(node->m.lhs->ty) && is_ptr(node->m.rhs->ty)) ||
-        (is_ptr(node->m.lhs->ty) && int_to_ptr(&node->m.rhs)) ||
-        (is_ptr(node->m.rhs->ty) && int_to_ptr(&node->m.lhs)))
+    bool is_rel = (node->kind != ND_EQ && node->kind != ND_NE);
+    if (is_ptr(node->m.lhs->ty) && is_ptr(node->m.rhs->ty)) {
+      if (is_iso_std &&
+          node->m.lhs->ty->kind == TY_PTR && node->m.rhs->ty->kind == TY_PTR) {
+        Type *lb = node->m.lhs->ty->base;
+        Type *rb = node->m.rhs->ty->base;
+        bool lfn = (lb->kind == TY_FUNC || lb->kind == TY_FUNC_INCMP);
+        bool rfn = (rb->kind == TY_FUNC || rb->kind == TY_FUNC_INCMP);
+        if (is_rel) {
+          if (lfn || rfn || !is_compatible(lb, rb))
+            error_tok(node->tok, "invalid relational pointer comparison");
+        } else if (!is_null_ptr_constant(node->m.lhs) &&
+                   !is_null_ptr_constant(node->m.rhs)) {
+          bool void_obj = (lb->kind == TY_VOID && !rfn) || (rb->kind == TY_VOID && !lfn);
+          if (!void_obj && !is_compatible(lb, rb))
+            error_tok(node->tok, "comparison of distinct pointer types");
+        }
+      }
       return;
+    }
+    if (is_ptr(node->m.lhs->ty) && is_int_class(node->m.rhs->ty)) {
+      if (is_iso_std && (is_rel || !is_null_ptr_constant(node->m.rhs)))
+        error_tok(node->tok, "invalid comparison between pointer and integer");
+      int_to_ptr(&node->m.rhs);
+      return;
+    }
+    if (is_ptr(node->m.rhs->ty) && is_int_class(node->m.lhs->ty)) {
+      if (is_iso_std && (is_rel || !is_null_ptr_constant(node->m.lhs)))
+        error_tok(node->tok, "invalid comparison between pointer and integer");
+      int_to_ptr(&node->m.lhs);
+      return;
+    }
     usual_arith_conv(&node->m.lhs, &node->m.rhs);
     return;
+  }
   case ND_NOT:
     add_type(node->m.lhs);
     node->ty = ty_eval_int;
@@ -959,9 +1021,11 @@ void _add_type(Node *node) {
     ptr_convert(lhs);
     ptr_convert(rhs);
 
-    if ((*lhs)->ty->kind == TY_VOID || (*rhs)->ty->kind == TY_VOID)
+    if ((*lhs)->ty->kind == TY_VOID || (*rhs)->ty->kind == TY_VOID) {
+      if (is_iso_std && (*lhs)->ty->kind != (*rhs)->ty->kind)
+        error_tok(node->tok, "invalid operands to conditional expression");
       node->ty = ty_void;
-    else if (is_ptr((*lhs)->ty) || is_ptr((*rhs)->ty))
+    } else if (is_ptr((*lhs)->ty) || is_ptr((*rhs)->ty))
       node->ty = unqual(cond_ptr_conv(lhs, rhs, &node->ctrl.cond));
     else if (!is_numeric((*lhs)->ty) &&
              (*lhs)->ty->size >= 0 &&
@@ -993,6 +1057,9 @@ void _add_type(Node *node) {
     add_type(node->m.lhs);
     if (!node->m.lhs->ty->base)
       error_tok(node->tok, "invalid pointer dereference");
+    if (is_iso_std && node->m.lhs->ty->base->kind == TY_VOID &&
+        (!node->tok || !node->tok->file || !node->tok->file->is_syshdr))
+      error_tok(node->tok, "dereferencing 'void *' pointer");
 
     node->ty = node->m.lhs->ty->base;
     return;

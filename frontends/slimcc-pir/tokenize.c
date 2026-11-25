@@ -555,7 +555,10 @@ static uint32_t read_escape_seq(const char **new_pos, const char *p, bool *inval
   case 'f': return '\f';
   case 'r': return '\r';
   // [GNU] \e for the ASCII escape character is a GNU C extension.
-  case 'e': return 27;
+  case 'e':
+    if (is_iso_std)
+      *invalid = true;
+    return 27;
   default:  return *p;
   }
 }
@@ -842,11 +845,16 @@ static bool convert_pp_int(const char *loc, int len, Node *node) {
       p += 2;
       base = 16;
     } else if (Casecmp(p[1], 'b') && (p[2] == '0' || p[2] == '1')) {
+      if (is_iso_std && opt_std < STD_C23)
+        return false;
       p += 2;
       base = 2;
     } else {
-      if (Casecmp(p[1], 'o') && Inrange(p[2], '0', '7'))
+      if (Casecmp(p[1], 'o') && Inrange(p[2], '0', '7')) {
+        if (is_iso_std)
+          return false;
         p += 2;
+      }
       base = 8;
     }
   }
@@ -955,6 +963,10 @@ void convert_pp_number(Token *tok, Node *node) {
     return;
 
   // If it's not an integer, it must be a floating point constant.
+  if (len >= 2 && p[0] == '0' && (p[1] == 'x' || p[1] == 'X') &&
+      !memchr(p, 'p', len) && !memchr(p, 'P', len))
+    error_tok(tok, "hexadecimal floating constant requires an exponent");
+
   char *end;
   long_double_t val = strtod(p, &end);
   Type *ty;
@@ -1034,14 +1046,10 @@ void convert_ucn_ident(Token *tok) {
     }
     bool invalid = false;
     uint32_t c;
-    if (read_ucn(&p, p + 1, &c, &invalid) && !invalid) {
-      if (c <= 0x7F)
-        break;
-      if (q == buf ? is_ident1(c) : is_ident2(c)) {
-        q += encode_utf8(q, c);
-        continue;
-      }
-    }
+    if (!read_ucn(&p, p + 1, &c, &invalid) || invalid || c < 0xA0 ||
+        !(q == buf ? is_ident1(c) : is_ident2(c)))
+      error_tok(tok, "invalid universal character name");
+    q += encode_utf8(q, c);
   }
   Token *orig = tok->origin;
   if (!orig) {
@@ -1265,6 +1273,36 @@ Token *tokenize_file(const char *path, Token *tok, Token **end) {
     buf[0] = buf[1] = buf[2] = ' ';
 
   canonicalize_newline(buf);
+
+  if (is_iso_std && opt_std < STD_C23) {
+    char *p = strstr(buf, "??");
+    if (p) {
+      char *q = p;
+      while (*p) {
+        if (p[0] == '?' && p[1] == '?') {
+          char rep = 0;
+          switch (p[2]) {
+          case '=':  rep = '#';  break;
+          case '/':  rep = '\\'; break;
+          case '\'': rep = '^';  break;
+          case '(':  rep = '[';  break;
+          case ')':  rep = ']';  break;
+          case '!':  rep = '|';  break;
+          case '<':  rep = '{';  break;
+          case '>':  rep = '}';  break;
+          case '-':  rep = '~';  break;
+          }
+          if (rep) {
+            *q++ = rep;
+            p += 3;
+            continue;
+          }
+        }
+        *q++ = *p++;
+      }
+      *q = '\0';
+    }
+  }
 
   SlashDelta dlt = {0};
   remove_backslash_newline(buf, &dlt);

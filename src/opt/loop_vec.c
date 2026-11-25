@@ -67,21 +67,34 @@ static bool op_is_imm_u64(PirOperand op, uint64_t *out) {
     return true;
 }
 
+static bool lv_small_imm_to_i64(const PirOperand *c, int64_t *out) {
+    if (c->u.imm_int.hi != 0u) return false;
+    int64_t v;
+    if (c->type.kind == PIR_TYPE_SCALAR && c->type.u.scalar == PIR_SCALAR_I32 &&
+        !c->u.imm_int.is_negative) {
+        v = (int64_t)(int32_t)(uint32_t)c->u.imm_int.lo;
+    } else if (c->u.imm_int.is_negative) {
+        if (c->u.imm_int.lo > 1048576u) return false;
+        v = -(int64_t)c->u.imm_int.lo;
+    } else {
+        if (c->u.imm_int.lo > 1048576u) return false;
+        v = (int64_t)c->u.imm_int.lo;
+    }
+    if (v < -1048576 || v > 1048576) return false;
+    *out = v;
+    return true;
+}
+
 static bool op_is_imm_i64(const PirFunction *fn, PirOperand op, int64_t *out) {
     if (op.kind == PIR_OPER_IMM_INT) {
-        if (op.u.imm_int.hi != 0u || op.u.imm_int.lo > 1048576u) return false;
-        *out = op.u.imm_int.is_negative ? -(int64_t)op.u.imm_int.lo : (int64_t)op.u.imm_int.lo;
-        return true;
+        return lv_small_imm_to_i64(&op, out);
     }
     if (op.kind == PIR_OPER_VAL && op.u.val < fn->values.len) {
         PirInstId did = fn->values.data[op.u.val].def_inst;
         if (did != PIR_INVALID_ID && fn->insts.data[did].op == PIR_OP_CONST &&
             fn->insts.data[did].operand_count == 1u &&
             fn->insts.data[did].operands[0].kind == PIR_OPER_IMM_INT) {
-            const PirOperand *c = &fn->insts.data[did].operands[0];
-            if (c->u.imm_int.hi != 0u || c->u.imm_int.lo > 1048576u) return false;
-            *out = c->u.imm_int.is_negative ? -(int64_t)c->u.imm_int.lo : (int64_t)c->u.imm_int.lo;
-            return true;
+            return lv_small_imm_to_i64(&fn->insts.data[did].operands[0], out);
         }
     }
     return false;
@@ -306,6 +319,55 @@ static bool op_same_base(PirOperand a, PirOperand b) {
                strcmp(a.u.sym.name, b.u.sym.name) == 0;
     }
     return false;
+}
+
+typedef enum {
+    LV_ALIAS_NONE = 0,       /* Provably disjoint base objects */
+    LV_ALIAS_EXACT_SAME = 1, /* Identical element address every iteration (safe RMW) */
+    LV_ALIAS_DIFF_OFF = 2,   /* Same base object, close different offset (unsafe recurrence) */
+    LV_ALIAS_MAY = 3         /* May alias across iterations -> requires runtime overlap guard */
+} LoopVecAlias;
+
+/* Classify whole-array aliasing between two loop base pointers across ALL iterations.
+ * Unlike single-element pir_alias_query(base_a, elem_bytes, base_b, elem_bytes) — which
+ * wrongly returns NO for `buf + 4` vs `buf` when checking only i=0 — this decomposes to
+ * the underlying base object so inlined overlapping slices (e.g. dst = buf + 1, src = buf)
+ * are never mis-vectorized! */
+static LoopVecAlias classify_loop_pair(const PirFunction *fn,
+                                       PirOperand a_base, int64_t a_delta,
+                                       PirOperand b_base, int64_t b_delta,
+                                       uint32_t elem_bytes) {
+    if (op_same_base(a_base, b_base)) {
+        return (a_delta == b_delta) ? LV_ALIAS_EXACT_SAME : LV_ALIAS_DIFF_OFF;
+    }
+    PirPtrInfo pa = pir_alias_decompose(fn, a_base);
+    PirPtrInfo pb = pir_alias_decompose(fn, b_base);
+    bool same_obj = (pa.kind != PIR_PTR_UNKNOWN && pa.kind == pb.kind) &&
+                    ((pa.kind == PIR_PTR_GLOBAL)
+                     ? (pa.global_name && pb.global_name && strcmp(pa.global_name, pb.global_name) == 0)
+                     : (pa.obj_id == pb.obj_id));
+    if (same_obj) {
+        if (pa.has_offset && pb.has_offset) {
+            int64_t oa = pa.offset + a_delta * (int64_t)elem_bytes;
+            int64_t ob = pb.offset + b_delta * (int64_t)elem_bytes;
+            if (oa == ob) return LV_ALIAS_EXACT_SAME;
+            int64_t dist = (oa > ob) ? (oa - ob) : (ob - oa);
+            /* Distance < 2 elements is guaranteed to overlap in any vectorized loop;
+             * larger offsets (e.g. disjoint array fields in one struct) use runtime guard. */
+            if (dist < (int64_t)elem_bytes * 2) return LV_ALIAS_DIFF_OFF;
+            return LV_ALIAS_MAY;
+        }
+        return LV_ALIAS_MAY;
+    }
+    if ((pa.kind == PIR_PTR_ALLOCA && pb.kind == PIR_PTR_ALLOCA) ||
+        (pa.kind == PIR_PTR_ALLOCA && pb.kind == PIR_PTR_GLOBAL) ||
+        (pa.kind == PIR_PTR_GLOBAL && pb.kind == PIR_PTR_ALLOCA) ||
+        (pa.kind == PIR_PTR_GLOBAL && pb.kind == PIR_PTR_GLOBAL) ||
+        (pa.kind == PIR_PTR_PARAM_NOALIAS && pb.kind != PIR_PTR_UNKNOWN) ||
+        (pb.kind == PIR_PTR_PARAM_NOALIAS && pa.kind != PIR_PTR_UNKNOWN)) {
+        return LV_ALIAS_NONE;
+    }
+    return LV_ALIAS_MAY;
 }
 
 static bool check_no_external_uses(const PirFunction *fn, PirBlockId body_bid, const bool *in_body) {
@@ -558,47 +620,42 @@ static bool try_vectorize_loop(PirModule *mod, PirFunction *fn, const PirTargetS
 
     for (uint32_t si = 0u; si < store_cnt && legal; ++si) {
         for (uint32_t sj = si + 1u; sj < store_cnt; ++sj) {
-            if (op_same_base(store_descs[si].base, store_descs[sj].base)) {
-                if (store_descs[si].delta == store_descs[sj].delta) continue;
-                legal = false; break;
+            LoopVecAlias al = classify_loop_pair(fn, store_descs[si].base, store_descs[si].delta,
+                                                 store_descs[sj].base, store_descs[sj].delta,
+                                                 elem_bytes);
+            if (al == LV_ALIAS_NONE || al == LV_ALIAS_EXACT_SAME) continue;
+            if (al == LV_ALIAS_DIFF_OFF) { legal = false; break; }
+            if (rt_pair_cnt >= 4u) { legal = false; break; }
+            rt_pairs[rt_pair_cnt].a_base  = store_descs[si].base;
+            rt_pairs[rt_pair_cnt].a_delta = store_descs[si].delta;
+            rt_pairs[rt_pair_cnt].b_base  = store_descs[sj].base;
+            rt_pairs[rt_pair_cnt].b_delta = store_descs[sj].delta;
+            rt_pair_cnt++;
+        }
+        for (uint32_t li = 0u; li < load_cnt && legal; ++li) {
+            LoopVecAlias al = classify_loop_pair(fn, store_descs[si].base, store_descs[si].delta,
+                                                 load_descs[li].base, load_descs[li].delta,
+                                                 elem_bytes);
+            /* Exact same-index RMW (a[i+d] = f(a[i+d])) or disjoint bases have zero dependence! */
+            if (al == LV_ALIAS_NONE || al == LV_ALIAS_EXACT_SAME) continue;
+            if (al == LV_ALIAS_DIFF_OFF) { legal = false; break; }
+            /* Deduplicate identical runtime check pairs */
+            bool dup = false;
+            for (uint32_t r = 0u; r < rt_pair_cnt; ++r) {
+                if (op_same_base(rt_pairs[r].a_base, store_descs[si].base) &&
+                    rt_pairs[r].a_delta == store_descs[si].delta &&
+                    op_same_base(rt_pairs[r].b_base, load_descs[li].base) &&
+                    rt_pairs[r].b_delta == load_descs[li].delta) {
+                    dup = true; break;
+                }
             }
-            if (pir_alias_query(fn, store_descs[si].base, elem_bytes,
-                                store_descs[sj].base, elem_bytes) != PIR_ALIAS_NO) {
+            if (!dup) {
                 if (rt_pair_cnt >= 4u) { legal = false; break; }
                 rt_pairs[rt_pair_cnt].a_base  = store_descs[si].base;
                 rt_pairs[rt_pair_cnt].a_delta = store_descs[si].delta;
-                rt_pairs[rt_pair_cnt].b_base  = store_descs[sj].base;
-                rt_pairs[rt_pair_cnt].b_delta = store_descs[sj].delta;
+                rt_pairs[rt_pair_cnt].b_base  = load_descs[li].base;
+                rt_pairs[rt_pair_cnt].b_delta = load_descs[li].delta;
                 rt_pair_cnt++;
-            }
-        }
-        for (uint32_t li = 0u; li < load_cnt && legal; ++li) {
-            /* Exact same-index RMW (a[i+d] = f(a[i+d])) has zero loop-carried dependence! */
-            if (op_same_base(store_descs[si].base, load_descs[li].base)) {
-                if (store_descs[si].delta == load_descs[li].delta) continue;
-                /* Same base with different index offset (e.g. a[i] = a[i-1]) -> unsafe! */
-                legal = false; break;
-            }
-            if (pir_alias_query(fn, store_descs[si].base, elem_bytes,
-                                load_descs[li].base, elem_bytes) != PIR_ALIAS_NO) {
-                /* Deduplicate identical runtime check pairs */
-                bool dup = false;
-                for (uint32_t r = 0u; r < rt_pair_cnt; ++r) {
-                    if (op_same_base(rt_pairs[r].a_base, store_descs[si].base) &&
-                        rt_pairs[r].a_delta == store_descs[si].delta &&
-                        op_same_base(rt_pairs[r].b_base, load_descs[li].base) &&
-                        rt_pairs[r].b_delta == load_descs[li].delta) {
-                        dup = true; break;
-                    }
-                }
-                if (!dup) {
-                    if (rt_pair_cnt >= 4u) { legal = false; break; }
-                    rt_pairs[rt_pair_cnt].a_base  = store_descs[si].base;
-                    rt_pairs[rt_pair_cnt].a_delta = store_descs[si].delta;
-                    rt_pairs[rt_pair_cnt].b_base  = load_descs[li].base;
-                    rt_pairs[rt_pair_cnt].b_delta = load_descs[li].delta;
-                    rt_pair_cnt++;
-                }
             }
         }
     }
@@ -874,7 +931,17 @@ static bool try_vectorize_loop(PirModule *mod, PirFunction *fn, const PirTargetS
             if (iv_ty.u.scalar == PIR_SCALAR_I32) {
                 PirOpcode ext_op = is_signed ? PIR_OP_SEXT : PIR_OP_ZEXT;
                 if (iv_init.kind == PIR_OPER_IMM_INT) {
-                    iv0_64 = pir_op_imm_i(iv_init.u.imm_int.lo, iv_init.u.imm_int.is_negative, i64_ty);
+                    if (is_signed) {
+                        int64_t sv = iv_init.u.imm_int.is_negative
+                                     ? -(int64_t)(uint32_t)iv_init.u.imm_int.lo
+                                     : (int64_t)(int32_t)(uint32_t)iv_init.u.imm_int.lo;
+                        iv0_64 = pir_op_imm_i(sv < 0 ? (uint64_t)(-sv) : (uint64_t)sv, sv < 0, i64_ty);
+                    } else {
+                        uint64_t uv = iv_init.u.imm_int.is_negative
+                                      ? ((uint64_t)(0u - (uint32_t)iv_init.u.imm_int.lo))
+                                      : (iv_init.u.imm_int.lo & 0xFFFFFFFFULL);
+                        iv0_64 = pir_op_imm_i(uv, false, i64_ty);
+                    }
                 } else {
                     PirValueId v0 = pir_fn_new_val(mod, fn, "vg_i0", i64_ty, guard_bid, PIR_INVALID_ID, 0u);
                     PirInst e0 = pir_make_inst(ext_op, i64_ty, sline, 0u);
@@ -887,7 +954,17 @@ static bool try_vectorize_loop(PirModule *mod, PirFunction *fn, const PirTargetS
                 }
 
                 if (excl_limit.kind == PIR_OPER_IMM_INT) {
-                    lim_64 = pir_op_imm_i(excl_limit.u.imm_int.lo, excl_limit.u.imm_int.is_negative, i64_ty);
+                    if (is_signed) {
+                        int64_t sv = excl_limit.u.imm_int.is_negative
+                                     ? -(int64_t)(uint32_t)excl_limit.u.imm_int.lo
+                                     : (int64_t)(int32_t)(uint32_t)excl_limit.u.imm_int.lo;
+                        lim_64 = pir_op_imm_i(sv < 0 ? (uint64_t)(-sv) : (uint64_t)sv, sv < 0, i64_ty);
+                    } else {
+                        uint64_t uv = excl_limit.u.imm_int.is_negative
+                                      ? ((uint64_t)(0u - (uint32_t)excl_limit.u.imm_int.lo))
+                                      : (excl_limit.u.imm_int.lo & 0xFFFFFFFFULL);
+                        lim_64 = pir_op_imm_i(uv, false, i64_ty);
+                    }
                 } else {
                     PirValueId v1 = pir_fn_new_val(mod, fn, "vg_lm", i64_ty, guard_bid, PIR_INVALID_ID, 0u);
                     PirInst e1 = pir_make_inst(ext_op, i64_ty, sline, 0u);

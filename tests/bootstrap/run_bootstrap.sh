@@ -59,6 +59,9 @@ src/backend/regalloc.c
 src/backend/arm64/arm64_isel.c
 src/backend/arm64/arm64_frame.c
 src/backend/arm64/arm64_asm.c
+src/backend/x64/x64_isel.c
+src/backend/x64/x64_frame.c
+src/backend/x64/x64_asm.c
 "
 
 SLIMCC_SRCS="

@@ -523,7 +523,7 @@ static PirVal eval_operand(PirInterp *it, const CallFrame *fr, const PirOperand 
         case PIR_OPER_VAL:
             return fr->vals[op->u.val];
         case PIR_OPER_IMM_INT: {
-            uint64_t x = op->u.imm_int.is_negative ? (uint64_t)(-(int64_t)op->u.imm_int.lo)
+            uint64_t x = op->u.imm_int.is_negative ? (UINT64_C(0) - op->u.imm_int.lo)
                                                    : op->u.imm_int.lo;
             if (op->type.kind == PIR_TYPE_SCALAR && op->type.u.scalar == PIR_SCALAR_PTR) {
                 v.ptr = pir_interp_int_to_ptr(it, x);

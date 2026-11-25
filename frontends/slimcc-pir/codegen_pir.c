@@ -351,6 +351,40 @@ static void check_hfa_walk(Type *ty, int64_t base_off, HfaCheck *hc) {
     }
     return;
   }
+  if (ty->kind == TY_UNION) {
+    if (!ty->members) {
+      hc->valid = false;
+      return;
+    }
+    int max_cnt = 0;
+    for (Member *m = ty->members; m && hc->valid; m = m->next) {
+      if (m->is_bitfield || m->is_packed) {
+        hc->valid = false;
+        return;
+      }
+      HfaCheck mc = {.valid = true, .elem_kind = TY_VOID, .count = 0};
+      check_hfa_walk(m->ty, base_off + m->offset, &mc);
+      int64_t esz = (mc.elem_kind == TY_FLOAT) ? 4 : 8;
+      if (!mc.valid || mc.count < 1 || mc.count > 4 || m->ty->size != mc.count * esz) {
+        hc->valid = false;
+        return;
+      }
+      if (hc->count == 0 && max_cnt == 0)
+        hc->elem_kind = mc.elem_kind;
+      else if (hc->elem_kind != mc.elem_kind) {
+        hc->valid = false;
+        return;
+      }
+      if (mc.count > max_cnt)
+        max_cnt = mc.count;
+    }
+    if (hc->valid) {
+      hc->count += max_cnt;
+      if (hc->count > 4)
+        hc->valid = false;
+    }
+    return;
+  }
   hc->valid = false;
 }
 
@@ -379,11 +413,11 @@ static const char *get_pir_agg_type_name(Type *ty) {
   int32_t al = ty->align > 0 ? ty->align : 1;
 
   /* 1. Check for HFA (1..4 float or double elements, exact packed size) */
-  if (ty->kind == TY_STRUCT && ty->size > 0) {
+  if ((ty->kind == TY_STRUCT || ty->kind == TY_UNION) && ty->size > 0) {
     HfaCheck hc = {.valid = true, .elem_kind = TY_VOID, .count = 0};
     check_hfa_walk(ty, 0, &hc);
     int64_t esz = (hc.elem_kind == TY_FLOAT) ? 4 : 8;
-    if (hc.valid && hc.count >= 1 && hc.count <= 4 && sz == hc.count * esz && al == esz) {
+    if (hc.valid && hc.count >= 1 && hc.count <= 4 && sz == hc.count * esz) {
       const char *et = (hc.elem_kind == TY_FLOAT) ? "f32" : "f64";
       SBuf sb;
       sb_init(&sb);
@@ -997,8 +1031,9 @@ static PirVal emit_ptr_add_imm(PirVal base, int64_t off) {
  * 8. Bitfield Load / Store Lowering (Aligned & Unaligned)
  * ========================================================================= */
 
-static PirVal emit_bitfield_load(PirVal addr, Member *mem) {
+static PirVal emit_bitfield_load(PirVal addr, Member *mem, bool is_vol) {
   ensure_open_block();
+  const char *vsuf = is_vol ? " [volatile]" : "";
   int32_t fp = bitfield_footprint(mem);
   int32_t lo_bytes = fp > 8 ? 8 : fp;
   int acc = new_tid();
@@ -1009,7 +1044,7 @@ static PirVal emit_bitfield_load(PirVal addr, Member *mem) {
     PirVal bp = emit_ptr_add_imm(addr, i);
     int b = new_tid();
     int b64 = new_tid();
-    sb_printf(&fc->body_sb, "    %%t%d = load.i8 %%t%d, align 1\n", b, bp.id);
+    sb_printf(&fc->body_sb, "    %%t%d = load.i8 %%t%d, align 1%s\n", b, bp.id, vsuf);
     sb_printf(&fc->body_sb, "    %%t%d = zext.i64 %%t%d\n", b64, b);
     int sh = b64;
     if (i > 0) {
@@ -1033,7 +1068,7 @@ static PirVal emit_bitfield_load(PirVal addr, Member *mem) {
     int b64 = new_tid();
     int sh = new_tid();
     int nacc = new_tid();
-    sb_printf(&fc->body_sb, "    %%t%d = load.i8 %%t%d, align 1\n", b, bp8.id);
+    sb_printf(&fc->body_sb, "    %%t%d = load.i8 %%t%d, align 1%s\n", b, bp8.id, vsuf);
     sb_printf(&fc->body_sb, "    %%t%d = zext.i64 %%t%d\n", b64, b);
     sb_printf(&fc->body_sb, "    %%t%d = shl.i64 %%t%d, %d [mask]\n", sh, b64, 64 - mem->bit_offset);
     sb_printf(&fc->body_sb, "    %%t%d = or.i64 %%t%d, %%t%d\n", nacc, acc, sh);
@@ -1061,8 +1096,9 @@ static PirVal emit_bitfield_load(PirVal addr, Member *mem) {
   return res;
 }
 
-static PirVal emit_bitfield_store(PirVal val, PirVal addr, Member *mem) {
+static PirVal emit_bitfield_store(PirVal val, PirVal addr, Member *mem, bool is_vol) {
   ensure_open_block();
+  const char *vsuf = is_vol ? " [volatile]" : "";
   /* Widen val to i64 */
   int v64 = val.id;
   if (strcmp(val.ty, "i64") != 0) {
@@ -1085,7 +1121,7 @@ static PirVal emit_bitfield_store(PirVal val, PirVal addr, Member *mem) {
     PirVal bp = emit_ptr_add_imm(addr, i);
     int b = new_tid();
     int b64 = new_tid();
-    sb_printf(&fc->body_sb, "    %%t%d = load.i8 %%t%d, align 1\n", b, bp.id);
+    sb_printf(&fc->body_sb, "    %%t%d = load.i8 %%t%d, align 1%s\n", b, bp.id, vsuf);
     sb_printf(&fc->body_sb, "    %%t%d = zext.i64 %%t%d\n", b64, b);
     int sh = b64;
     if (i > 0) {
@@ -1124,7 +1160,7 @@ static PirVal emit_bitfield_store(PirVal val, PirVal addr, Member *mem) {
     }
     int b8 = new_tid();
     sb_printf(&fc->body_sb, "    %%t%d = trunc.i8 %%t%d\n", b8, src);
-    sb_printf(&fc->body_sb, "    store.i8 %%t%d, %%t%d, align 1\n", b8, bp.id);
+    sb_printf(&fc->body_sb, "    store.i8 %%t%d, %%t%d, align 1%s\n", b8, bp.id, vsuf);
   }
 
   /* If bitfield spans into 9th byte, update byte 8 */
@@ -1138,13 +1174,13 @@ static PirVal emit_bitfield_store(PirVal val, PirVal addr, Member *mem) {
     int vhi8 = new_tid();
     int mhi8 = new_tid();
     int nb8 = new_tid();
-    sb_printf(&fc->body_sb, "    %%t%d = load.i8 %%t%d, align 1\n", ob8, bp8.id);
+    sb_printf(&fc->body_sb, "    %%t%d = load.i8 %%t%d, align 1%s\n", ob8, bp8.id, vsuf);
     sb_printf(&fc->body_sb, "    %%t%d = and.i8 %%t%d, 0x%x\n", cb8, ob8, (~hi_mask) & 0xffu);
     sb_printf(&fc->body_sb, "    %%t%d = shr.i64 %%t%d, %d [mask]\n", vhi, masked, 64 - mem->bit_offset);
     sb_printf(&fc->body_sb, "    %%t%d = trunc.i8 %%t%d\n", vhi8, vhi);
     sb_printf(&fc->body_sb, "    %%t%d = and.i8 %%t%d, 0x%x\n", mhi8, vhi8, hi_mask & 0xffu);
     sb_printf(&fc->body_sb, "    %%t%d = or.i8 %%t%d, %%t%d\n", nb8, cb8, mhi8);
-    sb_printf(&fc->body_sb, "    store.i8 %%t%d, %%t%d, align 1\n", nb8, bp8.id);
+    sb_printf(&fc->body_sb, "    store.i8 %%t%d, %%t%d, align 1%s\n", nb8, bp8.id, vsuf);
   }
 
   /* Return bitfield-truncated value (signed or unsigned per mem->ty) */
@@ -1170,9 +1206,37 @@ static PirVal emit_bitfield_store(PirVal val, PirVal addr, Member *mem) {
   return res;
 }
 
+static const char *atomic_int_ty_for_size(int64_t sz) {
+  switch (sz) {
+  case 1: return "i8";
+  case 2: return "i16";
+  case 4: return "i32";
+  case 8: return "i64";
+  default: return NULL;
+  }
+}
+
 static PirVal emit_load_node(Node *node, PirVal addr) {
-  if (is_bitfield(node))
-    return emit_bitfield_load(addr, node->m.member);
+  if (is_bitfield(node)) {
+    bool is_vol = ((node->ty->qual & Q_VOLATILE) != 0) ||
+                  ((node->m.member->ty->qual & Q_VOLATILE) != 0);
+    return emit_bitfield_load(addr, node->m.member, is_vol);
+  }
+  if (is_mem_val_ty(node->ty) && (node->ty->qual & Q_ATOMIC)) {
+    const char *it = atomic_int_ty_for_size(node->ty->size);
+    if (it) {
+      ensure_open_block();
+      int raw = new_tid();
+      sb_printf(&fc->body_sb, "    %%t%d = atomic_load.%s %%t%d [seq_cst]\n", raw, it, addr.id);
+      int32_t al = (int32_t)node->ty->size;
+      int slot = emit_entry_alloca(node->ty->size, al);
+      int tmp = new_tid();
+      sb_printf(&fc->body_sb, "    %%t%d = ptr_add.i64 %%loc_%d, 0\n", tmp, slot);
+      sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d\n", it, raw, tmp, al);
+      PirVal v = {tmp, "ptr"};
+      return v;
+    }
+  }
   if (is_mem_val_ty(node->ty) || node->ty->kind == TY_ARRAY ||
       node->ty->kind == TY_VLA || node->ty->kind == TY_FUNC)
     return addr;
@@ -1184,8 +1248,24 @@ static PirVal emit_load_node(Node *node, PirVal addr) {
 
 static PirVal emit_store_node(Node *lhs, PirVal val, PirVal addr) {
   ensure_open_block();
-  if (is_bitfield(lhs))
-    return emit_bitfield_store(val, addr, lhs->m.member);
+  if (is_bitfield(lhs)) {
+    bool is_vol = ((lhs->ty->qual & Q_VOLATILE) != 0) ||
+                  ((lhs->m.member->ty->qual & Q_VOLATILE) != 0);
+    return emit_bitfield_store(val, addr, lhs->m.member, is_vol);
+  }
+  if (is_mem_val_ty(lhs->ty) && (lhs->ty->qual & Q_ATOMIC)) {
+    const char *it = atomic_int_ty_for_size(lhs->ty->size);
+    if (it) {
+      int32_t al = (lhs->ty->origin && lhs->ty->origin->align > 0) ? lhs->ty->origin->align : 1;
+      int32_t p2 = 1;
+      while (p2 * 2 <= al)
+        p2 *= 2;
+      int raw = new_tid();
+      sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", raw, it, val.id, p2);
+      sb_printf(&fc->body_sb, "    atomic_store.%s %%t%d, %%t%d [seq_cst]\n", it, raw, addr.id);
+      return addr;
+    }
+  }
   if (is_mem_val_ty(lhs->ty) || lhs->ty->kind == TY_ARRAY) {
     if (lhs->ty->size > 0) {
       int32_t al = lhs->ty->align > 0 ? lhs->ty->align : 1;
@@ -1840,7 +1920,20 @@ static PirVal gen_expr(Node *node) {
     if (strcmp(sz.ty, "i64") != 0)
       sz = emit_cast_val(sz, node->m.lhs->ty, ty_ulong);
     ensure_open_block();
-    int32_t al = (node->m.var && node->m.var->alt_align > 16) ? node->m.var->alt_align : 16;
+    int32_t al = 16;
+    if (node->m.var) {
+      if (node->m.var->alt_align > al)
+        al = node->m.var->alt_align;
+      Type *et = node->m.var->ty;
+      while (et) {
+        if (et->align > al)
+          al = et->align;
+        if (et->kind == TY_VLA || et->kind == TY_ARRAY)
+          et = et->base;
+        else
+          break;
+      }
+    }
     int32_t p2 = 16;
     while (p2 < al)
       p2 <<= 1;
@@ -1881,6 +1974,27 @@ static PirVal gen_expr(Node *node) {
     PirVal val = gen_expr(node->m.rhs);
     Type *ty = node->ty;
     ensure_open_block();
+    if (is_mem_val_ty(ty)) {
+      const char *it = atomic_int_ty_for_size(ty->size);
+      if (it) {
+        int32_t src_al = node->m.rhs->ty->align > 0 ? node->m.rhs->ty->align : 1;
+        int32_t p2 = 1;
+        while (p2 * 2 <= src_al)
+          p2 *= 2;
+        int new_raw = new_tid();
+        int old_raw = new_tid();
+        sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", new_raw, it, val.id, p2);
+        sb_printf(&fc->body_sb, "    %%t%d = atomic_rmw.xchg.%s %%t%d, %%t%d [seq_cst]\n",
+                  old_raw, it, addr.id, new_raw);
+        int32_t tmp_al = (int32_t)ty->size;
+        int slot = emit_entry_alloca(ty->size, tmp_al);
+        int tmp = new_tid();
+        sb_printf(&fc->body_sb, "    %%t%d = ptr_add.i64 %%loc_%d, 0\n", tmp, slot);
+        sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d\n", it, old_raw, tmp, tmp_al);
+        PirVal v = {tmp, "ptr"};
+        return v;
+      }
+    }
     if (is_flonum(ty)) {
       const char *it = (ty->kind == TY_FLOAT) ? "i32" : "i64";
       const char *ft = (ty->kind == TY_FLOAT) ? "f32" : "f64";
@@ -1909,14 +2023,31 @@ static PirVal gen_expr(Node *node) {
     Type *ty = node->cas.addr->ty->base;
     ensure_open_block();
 
+    bool is_agg_cas = is_mem_val_ty(ty);
     bool is_fp = is_flonum(ty);
-    const char *it = is_fp ? ((ty->kind == TY_FLOAT) ? "i32" : "i64") : pir_scalar_ty_name(ty);
-    int32_t al = pir_scalar_align(ty);
+    const char *it = is_agg_cas ? atomic_int_ty_for_size(ty->size)
+                   : is_fp ? ((ty->kind == TY_FLOAT) ? "i32" : "i64")
+                   : pir_scalar_ty_name(ty);
+    if (!it)
+      it = "i64";
+    int32_t old_al = is_agg_cas
+                     ? (node->cas.old_val->ty->base->align > 0 ? node->cas.old_val->ty->base->align : 1)
+                     : pir_scalar_align(ty);
+    int32_t p2_old = 1;
+    while (p2_old * 2 <= old_al)
+      p2_old *= 2;
 
     int exp_id = new_tid();
-    sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", exp_id, it, old_ptr.id, al);
+    sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", exp_id, it, old_ptr.id, p2_old);
     int new_id = new_v.id;
-    if (is_fp) {
+    if (is_agg_cas) {
+      int32_t new_al = node->cas.new_val->ty->align > 0 ? node->cas.new_val->ty->align : 1;
+      int32_t p2_new = 1;
+      while (p2_new * 2 <= new_al)
+        p2_new *= 2;
+      new_id = new_tid();
+      sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", new_id, it, new_v.id, p2_new);
+    } else if (is_fp) {
       new_id = new_tid();
       sb_printf(&fc->body_sb, "    %%t%d = bitcast.%s %%t%d\n", new_id, it, new_v.id);
     }
@@ -1934,7 +2065,7 @@ static PirVal gen_expr(Node *node) {
 
     sb_printf(&fc->body_sb, "\n.cas_fail_%d:\n", b_fail);
     fc->terminated = false;
-    sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d\n", it, actual, old_ptr.id, al);
+    sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d\n", it, actual, old_ptr.id, p2_old);
     sb_printf(&fc->body_sb, "    jmp .cas_ok_%d\n", b_done);
     fc->terminated = true;
 
@@ -2296,20 +2427,22 @@ static void gen_stmt(Node *node) {
     ensure_open_block();
 
     /* Assign case IDs & check if ranges are small enough to expand into native PIR switch. */
+    bool is_u = node->ctrl.cond->ty->is_unsigned;
     bool can_native_switch = true;
     uint64_t expanded_cases = 0;
     int case_cnt = 0;
     for (CaseRange *cr = node->ctrl.sw_cases; cr; cr = cr->next) {
       if (!cr->label->cases.id)
         cr->label->cases.id = ++case_cnt;
-      if (cr->hi < cr->lo) {
+      bool bad_order = is_u ? ((uint64_t)cr->hi < (uint64_t)cr->lo) : (cr->hi < cr->lo);
+      if (bad_order) {
         can_native_switch = false;
       } else {
-        uint64_t span = (uint64_t)(cr->hi - cr->lo) + 1;
-        if (span > 64 || expanded_cases + span > 256)
+        uint64_t diff = (uint64_t)cr->hi - (uint64_t)cr->lo;
+        if (diff >= 64 || expanded_cases + diff + 1 > 256)
           can_native_switch = false;
         else
-          expanded_cases += span;
+          expanded_cases += diff + 1;
       }
     }
 
@@ -2324,7 +2457,9 @@ static void gen_stmt(Node *node) {
       sb_printf(&fc->body_sb, "    switch.%s %%t%d, default .%s [\n", val.ty, val.id, def_lbl);
       bool first_case = true;
       for (CaseRange *cr = node->ctrl.sw_cases; cr; cr = cr->next) {
-        for (int64_t v = cr->lo; v <= cr->hi; v++) {
+        uint64_t diff = (uint64_t)cr->hi - (uint64_t)cr->lo;
+        for (uint64_t off = 0; off <= diff; off++) {
+          int64_t v = (int64_t)((uint64_t)cr->lo + off);
           if (!first_case) sb_printf(&fc->body_sb, ",\n");
           sb_printf(&fc->body_sb, "        %" PRIi64 " -> .sw_c_%d_%" PRIi64,
                     v, c, cr->label->cases.id);
@@ -2336,7 +2471,6 @@ static void gen_stmt(Node *node) {
       fc->terminated = true;
     } else {
       /* Emit range-supporting compare/branch chain */
-      bool is_u = node->ctrl.cond->ty->is_unsigned;
       for (CaseRange *cr = node->ctrl.sw_cases; cr; cr = cr->next) {
         int nxt = new_bid();
         if (cr->lo == cr->hi) {

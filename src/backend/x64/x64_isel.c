@@ -3356,7 +3356,14 @@ static bool isel_inst(X64ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
 
         case PIR_OP_SWITCH: {
             uint8_t w = pir_type_vreg_bytes(inst->ty);
-            MVReg val = normalize_int(c, mat_op(c, &inst->operands[0], loc), inst->ty, false, loc);
+            uint64_t type_mask = (inst->ty.u.scalar == PIR_SCALAR_I8)  ? UINT64_C(0xFF)
+                               : (inst->ty.u.scalar == PIR_SCALAR_I16) ? UINT64_C(0xFFFF)
+                               : (inst->ty.u.scalar == PIR_SCALAR_I32) ? UINT64_C(0xFFFFFFFF)
+                                                                       : ~UINT64_C(0);
+            int64_t signed_max = (inst->ty.u.scalar == PIR_SCALAR_I8)  ? INT64_C(127)
+                               : (inst->ty.u.scalar == PIR_SCALAR_I16) ? INT64_C(32767)
+                               : (inst->ty.u.scalar == PIR_SCALAR_I32) ? INT64_C(2147483647)
+                                                                       : INT64_MAX;
             uint32_t def_mblk = prepare_branch_edge(c, &inst->targets[0], loc);
             uint32_t nc = inst->switch_case_count;
 
@@ -3372,27 +3379,32 @@ static bool isel_inst(X64ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
                 use_jtable = true;
                 for (uint32_t i = 0u; i < nc; ++i) {
                     int64_t cv = inst->switch_cases[i].is_negative
-                                 ? -(int64_t)inst->switch_cases[i].case_lo
+                                 ? (int64_t)(UINT64_C(0) - inst->switch_cases[i].case_lo)
                                  : (int64_t)inst->switch_cases[i].case_lo;
                     if (i == 0u || cv < min_v) min_v = cv;
                     if (i == 0u || cv > max_v) max_v = cv;
                 }
-                if (max_v < min_v || (uint64_t)(max_v - min_v) > 255u ||
-                    (uint64_t)(max_v - min_v + 1) > (uint64_t)nc * 4u) {
+                uint64_t span = (uint64_t)max_v - (uint64_t)min_v;
+                if (max_v < min_v || span > 255u ||
+                    (span + 1u) > (uint64_t)nc * 4u ||
+                    (min_v < 0 && max_v > signed_max)) {
                     use_jtable = false;
                 }
             }
 
+            MVReg val = normalize_int(c, mat_op(c, &inst->operands[0], loc),
+                                      inst->ty, use_jtable && (min_v < 0), loc);
+
             if (use_jtable) {
-                uint32_t nent = (uint32_t)(max_v - min_v + 1);
+                uint32_t nent = (uint32_t)((uint64_t)max_v - (uint64_t)min_v + 1u);
                 uint32_t *tbl = (uint32_t *)malloc((size_t)nent * sizeof(uint32_t));
                 if (!tbl) abort();
                 for (uint32_t k = 0u; k < nent; ++k) tbl[k] = def_mblk;
                 for (uint32_t i = 0u; i < nc; ++i) {
                     int64_t cv = inst->switch_cases[i].is_negative
-                                 ? -(int64_t)inst->switch_cases[i].case_lo
+                                 ? (int64_t)(UINT64_C(0) - inst->switch_cases[i].case_lo)
                                  : (int64_t)inst->switch_cases[i].case_lo;
-                    tbl[(uint32_t)(cv - min_v)] = case_mblks[i];
+                    tbl[(uint32_t)((uint64_t)cv - (uint64_t)min_v)] = case_mblks[i];
                 }
                 uint32_t jt_id = mfunc_add_jtable(c->mf, min_v, nent, tbl, def_mblk);
                 free(tbl);
@@ -3423,9 +3435,9 @@ static bool isel_inst(X64ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
                 }
             } else {
                 for (uint32_t i = 0u; i < nc; ++i) {
-                    uint64_t cv = inst->switch_cases[i].is_negative
-                                  ? (uint64_t)(-(int64_t)inst->switch_cases[i].case_lo)
-                                  : inst->switch_cases[i].case_lo;
+                    uint64_t cv = (inst->switch_cases[i].is_negative
+                                   ? (UINT64_C(0) - inst->switch_cases[i].case_lo)
+                                   : inst->switch_cases[i].case_lo) & type_mask;
                     if (fits_simm32(cv, w)) {
                         MInst cmp = minst_make(MI_X64_CMP_RI, w, loc);
                         cmp.op_count = 2u; cmp.ops[0] = mop_vreg_use(val); cmp.ops[1] = mop_imm(sign_ext_imm(cv, w));

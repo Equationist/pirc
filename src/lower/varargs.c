@@ -4,6 +4,7 @@
  */
 
 #include "lower/lower.h"
+#include "target/abi.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +12,20 @@
 
 static uint64_t va_align_up(uint64_t v, uint64_t al) {
     return (v + al - 1u) & ~(al - 1u);
+}
+
+static bool va_agg_is_indirect(const PirModule *mod, const PirTargetSpec *target, PirType arg_ty) {
+    PirParamDecl pd;
+    memset(&pd, 0, sizeof(pd));
+    pd.abi_kind = PIR_PARAM_BYVAL;
+    pd.abi_type = arg_ty;
+    pd.type     = pir_type_scalar(PIR_SCALAR_PTR);
+    PirAbiRegState st = { 0u, 0u };
+    PirAbiArgInfo info;
+    if (!pir_abi_classify_param(mod, target, &pd, &st, &info)) {
+        return false;
+    }
+    return info.kind == PIR_ABI_INDIRECT && info.stack_byval_size == 0u;
 }
 
 static bool is_valist_type(PirType t) {
@@ -79,7 +94,8 @@ static PirBlockId lower_va_arg_sysv(PirModule *mod, const PirTargetSpec *target,
     PirType arg_ty = is_buf ? inst->aux_type : inst->ty;
     PirOperand ap  = is_buf ? inst->operands[1] : inst->operands[0];
     PirTypeLayout ly = pir_type_layout(mod, target, arg_ty);
-    uint64_t step = va_align_up(ly.size > 0u ? ly.size : 8u, 8u);
+    bool indirect = is_buf && va_agg_is_indirect(mod, target, arg_ty);
+    uint64_t step = indirect ? 8u : va_align_up(ly.size > 0u ? ly.size : 8u, 8u);
     bool is_fp = !is_buf && (pir_type_is_float(arg_ty) || arg_ty.kind == PIR_TYPE_VECTOR);
 
     PirBlockId reg_blk = va_add_block(mod, fn, "va_reg", ln);
@@ -188,11 +204,20 @@ static PirBlockId lower_va_arg_sysv(PirModule *mod, const PirTargetSpec *target,
     /* Prepend load / memcpy to cont_blk. */
     PirInstIdVec prep = {0};
     if (is_buf) {
+        PirValueId src_ptr = res_ptr;
+        if (indirect) {
+            PirInst lp = pir_make_inst(PIR_OP_LOAD, tptr, ln, lc);
+            lp.align = 8u; lp.operand_count = 1u; lp.operands = pir_alloc_ops(mod, 1u);
+            lp.operands[0] = pir_op_val(res_ptr, tptr);
+            lp.results[0]  = pir_fn_new_val(mod, fn, "vaindp", tptr, cont_blk, PIR_INVALID_ID, 0u);
+            pir_fn_append_inst(fn, &prep, lp);
+            src_ptr = lp.results[0];
+        }
         PirInst mc = pir_make_inst(PIR_OP_MEMCPY, tvoid, ln, lc);
         mc.align = ly.align < 8u ? ly.align : 8u;
         mc.operand_count = 3u; mc.operands = pir_alloc_ops(mod, 3u);
         mc.operands[0] = inst->operands[0];
-        mc.operands[1] = pir_op_val(res_ptr, tptr);
+        mc.operands[1] = pir_op_val(src_ptr, tptr);
         mc.operands[2] = pir_op_imm_i(ly.size, false, ti64);
         pir_fn_append_inst(fn, &prep, mc);
     } else {
@@ -226,7 +251,8 @@ static PirBlockId lower_va_arg_aapcs64_linux(PirModule *mod, const PirTargetSpec
     PirType arg_ty = is_buf ? inst->aux_type : inst->ty;
     PirOperand ap  = is_buf ? inst->operands[1] : inst->operands[0];
     PirTypeLayout ly = pir_type_layout(mod, target, arg_ty);
-    uint64_t step = va_align_up(ly.size > 0u ? ly.size : 8u, 8u);
+    bool indirect = is_buf && va_agg_is_indirect(mod, target, arg_ty);
+    uint64_t step = indirect ? 8u : va_align_up(ly.size > 0u ? ly.size : 8u, 8u);
     bool is_fp = !is_buf && (pir_type_is_float(arg_ty) || arg_ty.kind == PIR_TYPE_VECTOR);
 
     PirBlockId reg_blk = va_add_block(mod, fn, "va_reg", ln);
@@ -331,11 +357,20 @@ static PirBlockId lower_va_arg_aapcs64_linux(PirModule *mod, const PirTargetSpec
 
     PirInstIdVec prep = {0};
     if (is_buf) {
+        PirValueId src_ptr = res_ptr;
+        if (indirect) {
+            PirInst lp = pir_make_inst(PIR_OP_LOAD, tptr, ln, lc);
+            lp.align = 8u; lp.operand_count = 1u; lp.operands = pir_alloc_ops(mod, 1u);
+            lp.operands[0] = pir_op_val(res_ptr, tptr);
+            lp.results[0]  = pir_fn_new_val(mod, fn, "vaindp", tptr, cont_blk, PIR_INVALID_ID, 0u);
+            pir_fn_append_inst(fn, &prep, lp);
+            src_ptr = lp.results[0];
+        }
         PirInst mc = pir_make_inst(PIR_OP_MEMCPY, tvoid, ln, lc);
         mc.align = ly.align < 8u ? ly.align : 8u;
         mc.operand_count = 3u; mc.operands = pir_alloc_ops(mod, 3u);
         mc.operands[0] = inst->operands[0];
-        mc.operands[1] = pir_op_val(res_ptr, tptr);
+        mc.operands[1] = pir_op_val(src_ptr, tptr);
         mc.operands[2] = pir_op_imm_i(ly.size, false, ti64);
         pir_fn_append_inst(fn, &prep, mc);
     } else {
@@ -368,7 +403,8 @@ static void lower_va_arg_ptr_cursor(PirModule *mod, const PirTargetSpec *target,
     PirType arg_ty = is_buf ? inst->aux_type : inst->ty;
     PirOperand ap  = is_buf ? inst->operands[1] : inst->operands[0];
     PirTypeLayout ly = pir_type_layout(mod, target, arg_ty);
-    uint64_t step = va_align_up(ly.size > 0u ? ly.size : 8u, 8u);
+    bool indirect = is_buf && va_agg_is_indirect(mod, target, arg_ty);
+    uint64_t step = indirect ? 8u : va_align_up(ly.size > 0u ? ly.size : 8u, 8u);
 
     PirInst lcur = pir_make_inst(PIR_OP_LOAD, tptr, ln, lc);
     lcur.align = 8u; lcur.operand_count = 1u; lcur.operands = pir_alloc_ops(mod, 1u);
@@ -390,11 +426,20 @@ static void lower_va_arg_ptr_cursor(PirModule *mod, const PirTargetSpec *target,
     pir_fn_append_inst(fn, out, scur);
 
     if (is_buf) {
+        PirValueId src_ptr = lcur.results[0];
+        if (indirect) {
+            PirInst lp = pir_make_inst(PIR_OP_LOAD, tptr, ln, lc);
+            lp.align = 8u; lp.operand_count = 1u; lp.operands = pir_alloc_ops(mod, 1u);
+            lp.operands[0] = pir_op_val(lcur.results[0], tptr);
+            lp.results[0]  = pir_fn_new_val(mod, fn, "vaindp", tptr, b, PIR_INVALID_ID, 0u);
+            pir_fn_append_inst(fn, out, lp);
+            src_ptr = lp.results[0];
+        }
         PirInst mc = pir_make_inst(PIR_OP_MEMCPY, tvoid, ln, lc);
         mc.align = ly.align < 8u ? ly.align : 8u;
         mc.operand_count = 3u; mc.operands = pir_alloc_ops(mod, 3u);
         mc.operands[0] = inst->operands[0];
-        mc.operands[1] = pir_op_val(lcur.results[0], tptr);
+        mc.operands[1] = pir_op_val(src_ptr, tptr);
         mc.operands[2] = pir_op_imm_i(ly.size, false, ti64);
         pir_fn_append_inst(fn, out, mc);
     } else {

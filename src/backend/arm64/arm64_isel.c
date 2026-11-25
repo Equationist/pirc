@@ -2797,34 +2797,78 @@ static bool isel_inst(ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
 
         case PIR_OP_ATOMIC_RMW: {
             uint8_t mb = pir_type_mem_bytes(inst->ty);
+            uint8_t w  = pir_type_vreg_bytes(inst->ty);
             MVReg ptr = mat_op(c, &inst->operands[0], loc);
             MVReg val = mat_op(c, &inst->operands[1], loc);
+            /* Pin operands to caller-saved GP regs (x9..x11) so they never spill into
+             * x16/x17 which MI_A64_ATOMIC_RMW uses internally for its LL/SC loop. */
+            MVReg p_old = new_gp(c, w);  c->mf->vregs.data[p_old].fixed_preg = A64_GP(9u);
+            MVReg p_ptr = new_gp(c, 8u); c->mf->vregs.data[p_ptr].fixed_preg = A64_GP(10u);
+            MVReg p_val = new_gp(c, w);  c->mf->vregs.data[p_val].fixed_preg = A64_GP(11u);
+
+            MInst cp1 = minst_make(MI_COPY, 8u, loc);
+            cp1.op_count = 2u; cp1.ops[0] = mop_vreg_def(p_ptr); cp1.ops[1] = mop_vreg_use(ptr);
+            emit(c, cp1);
+            MInst cp2 = minst_make(MI_COPY, w, loc);
+            cp2.op_count = 2u; cp2.ops[0] = mop_vreg_def(p_val); cp2.ops[1] = mop_vreg_use(val);
+            emit(c, cp2);
+
             MInst rmw = minst_make(MI_A64_ATOMIC_RMW, mb, loc);
             rmw.aux_id   = (uint32_t)inst->rmw_op;
             rmw.aux_id2  = (uint32_t)inst->order;
             rmw.op_count = 3u;
-            rmw.ops[0]   = mop_vreg_def_ec(dst0); /* early-clobber so dst0 != ptr && dst0 != val */
-            rmw.ops[1]   = mop_vreg_use(ptr);
-            rmw.ops[2]   = mop_vreg_use(val);
+            rmw.ops[0]   = mop_vreg_def_ec(p_old);
+            rmw.ops[1]   = mop_vreg_use(p_ptr);
+            rmw.ops[2]   = mop_vreg_use(p_val);
             emit(c, rmw);
+
+            MInst co = minst_make(MI_COPY, w, loc);
+            co.op_count = 2u; co.ops[0] = mop_vreg_def(dst0); co.ops[1] = mop_vreg_use(p_old);
+            emit(c, co);
             return true;
         }
 
         case PIR_OP_ATOMIC_CMPXCHG: {
             uint8_t mb = pir_type_mem_bytes(inst->ty);
+            uint8_t w  = pir_type_vreg_bytes(inst->ty);
             MVReg ptr = mat_op(c, &inst->operands[0], loc);
             MVReg exp = normalize_int(c, mat_op(c, &inst->operands[1], loc), inst->ty, false, loc);
             MVReg des = mat_op(c, &inst->operands[2], loc);
+            /* Pin all 5 operands to distinct caller-saved GP regs (x9..x13) so high
+             * register pressure can never alias early-clobber defs or clobber w16. */
+            MVReg p_old = new_gp(c, w);  c->mf->vregs.data[p_old].fixed_preg = A64_GP(9u);
+            MVReg p_ptr = new_gp(c, 8u); c->mf->vregs.data[p_ptr].fixed_preg = A64_GP(10u);
+            MVReg p_exp = new_gp(c, w);  c->mf->vregs.data[p_exp].fixed_preg = A64_GP(11u);
+            MVReg p_des = new_gp(c, w);  c->mf->vregs.data[p_des].fixed_preg = A64_GP(12u);
+            MVReg p_ok  = new_gp(c, 4u); c->mf->vregs.data[p_ok].fixed_preg  = A64_GP(13u);
+
+            MInst cp1 = minst_make(MI_COPY, 8u, loc);
+            cp1.op_count = 2u; cp1.ops[0] = mop_vreg_def(p_ptr); cp1.ops[1] = mop_vreg_use(ptr);
+            emit(c, cp1);
+            MInst cp2 = minst_make(MI_COPY, w, loc);
+            cp2.op_count = 2u; cp2.ops[0] = mop_vreg_def(p_exp); cp2.ops[1] = mop_vreg_use(exp);
+            emit(c, cp2);
+            MInst cp3 = minst_make(MI_COPY, w, loc);
+            cp3.op_count = 2u; cp3.ops[0] = mop_vreg_def(p_des); cp3.ops[1] = mop_vreg_use(des);
+            emit(c, cp3);
+
             MInst cas = minst_make(MI_A64_ATOMIC_CAS, mb, loc);
             cas.aux_id   = (uint32_t)inst->order;
             cas.aux_id2  = (uint32_t)inst->fail_order;
             cas.op_count = 5u;
-            cas.ops[0]   = mop_vreg_def_ec(dst0);
-            cas.ops[1]   = mop_vreg_def_ec(dst1);
-            cas.ops[2]   = mop_vreg_use(ptr);
-            cas.ops[3]   = mop_vreg_use(exp);
-            cas.ops[4]   = mop_vreg_use(des);
+            cas.ops[0]   = mop_vreg_def_ec(p_old);
+            cas.ops[1]   = mop_vreg_def_ec(p_ok);
+            cas.ops[2]   = mop_vreg_use(p_ptr);
+            cas.ops[3]   = mop_vreg_use(p_exp);
+            cas.ops[4]   = mop_vreg_use(p_des);
             emit(c, cas);
+
+            MInst co1 = minst_make(MI_COPY, w, loc);
+            co1.op_count = 2u; co1.ops[0] = mop_vreg_def(dst0); co1.ops[1] = mop_vreg_use(p_old);
+            emit(c, co1);
+            MInst co2 = minst_make(MI_COPY, 4u, loc);
+            co2.op_count = 2u; co2.ops[0] = mop_vreg_def(dst1); co2.ops[1] = mop_vreg_use(p_ok);
+            emit(c, co2);
             return true;
         }
 
@@ -2921,7 +2965,14 @@ static bool isel_inst(ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
 
         case PIR_OP_SWITCH: {
             uint8_t w = pir_type_vreg_bytes(inst->ty);
-            MVReg val = normalize_int(c, mat_op(c, &inst->operands[0], loc), inst->ty, false, loc);
+            uint64_t type_mask = (inst->ty.u.scalar == PIR_SCALAR_I8)  ? UINT64_C(0xFF)
+                               : (inst->ty.u.scalar == PIR_SCALAR_I16) ? UINT64_C(0xFFFF)
+                               : (inst->ty.u.scalar == PIR_SCALAR_I32) ? UINT64_C(0xFFFFFFFF)
+                                                                       : ~UINT64_C(0);
+            int64_t signed_max = (inst->ty.u.scalar == PIR_SCALAR_I8)  ? INT64_C(127)
+                               : (inst->ty.u.scalar == PIR_SCALAR_I16) ? INT64_C(32767)
+                               : (inst->ty.u.scalar == PIR_SCALAR_I32) ? INT64_C(2147483647)
+                                                                       : INT64_MAX;
             uint32_t def_mblk = prepare_branch_edge(c, &inst->targets[0], loc);
             uint32_t nc = inst->switch_case_count;
 
@@ -2938,32 +2989,37 @@ static bool isel_inst(ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
                 use_jtable = true;
                 for (uint32_t i = 0u; i < nc; ++i) {
                     int64_t cv = inst->switch_cases[i].is_negative
-                                 ? -(int64_t)inst->switch_cases[i].case_lo
+                                 ? (int64_t)(UINT64_C(0) - inst->switch_cases[i].case_lo)
                                  : (int64_t)inst->switch_cases[i].case_lo;
                     if (i == 0u || cv < min_v) min_v = cv;
                     if (i == 0u || cv > max_v) max_v = cv;
                 }
-                if (max_v < min_v || (uint64_t)(max_v - min_v) > 255u ||
-                    (uint64_t)(max_v - min_v + 1) > (uint64_t)nc * 4u) {
+                uint64_t span = (uint64_t)max_v - (uint64_t)min_v;
+                if (max_v < min_v || span > 255u ||
+                    (span + 1u) > (uint64_t)nc * 4u ||
+                    (min_v < 0 && max_v > signed_max)) {
                     use_jtable = false;
                 }
             }
 
+            MVReg val = normalize_int(c, mat_op(c, &inst->operands[0], loc),
+                                      inst->ty, use_jtable && (min_v < 0), loc);
+
             if (use_jtable) {
-                uint32_t nent = (uint32_t)(max_v - min_v + 1);
+                uint32_t nent = (uint32_t)((uint64_t)max_v - (uint64_t)min_v + 1u);
                 uint32_t *tbl = (uint32_t *)malloc((size_t)nent * sizeof(uint32_t));
                 if (!tbl) abort();
                 for (uint32_t k = 0u; k < nent; ++k) tbl[k] = def_mblk;
                 for (uint32_t i = 0u; i < nc; ++i) {
                     int64_t cv = inst->switch_cases[i].is_negative
-                                 ? -(int64_t)inst->switch_cases[i].case_lo
+                                 ? (int64_t)(UINT64_C(0) - inst->switch_cases[i].case_lo)
                                  : (int64_t)inst->switch_cases[i].case_lo;
-                    tbl[(uint32_t)(cv - min_v)] = case_mblks[i];
+                    tbl[(uint32_t)((uint64_t)cv - (uint64_t)min_v)] = case_mblks[i];
                 }
                 uint32_t jt_id = mfunc_add_jtable(c->mf, min_v, nent, tbl, def_mblk);
                 free(tbl);
 
-                /* Ensure value is sign/zero-extended to 64-bit if i32 switch */
+                /* Ensure value is sign/zero-extended to 64-bit if i8/i16/i32 switch */
                 MVReg val64 = val;
                 if (w == 4u) {
                     val64 = new_gp(c, 8u);
@@ -2983,12 +3039,12 @@ static bool isel_inst(ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
                     mfunc_add_edge(c->mf, c->cur_mblk, case_mblks[i]);
                 }
             } else {
-                /* Linear compare-and-branch chain */
+                /* Linear compare-and-branch chain (mask case values to switch type width) */
                 for (uint32_t i = 0u; i < nc; ++i) {
-                    uint64_t cv = inst->switch_cases[i].is_negative
-                                  ? (uint64_t)(-(int64_t)inst->switch_cases[i].case_lo)
-                                  : inst->switch_cases[i].case_lo;
-                    if (!inst->switch_cases[i].is_negative && cv <= 4095u) {
+                    uint64_t cv = (inst->switch_cases[i].is_negative
+                                   ? (UINT64_C(0) - inst->switch_cases[i].case_lo)
+                                   : inst->switch_cases[i].case_lo) & type_mask;
+                    if (cv <= 4095u) {
                         MInst cmp = minst_make(MI_A64_CMP_RI, w, loc);
                         cmp.op_count = 2u; cmp.ops[0] = mop_vreg_use(val); cmp.ops[1] = mop_imm((int64_t)cv);
                         emit(c, cmp);

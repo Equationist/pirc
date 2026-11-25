@@ -36,6 +36,37 @@ static const char *sym_pfx(const PirTargetSpec *target) {
     return is_macho(target) ? "_" : "";
 }
 
+static bool is_bare_asm_sym_char(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_' || c == '$' || c == '.';
+}
+
+static const char *fmt_asm_sym(char *buf, size_t cap, const PirTargetSpec *target,
+                               const char *name, const char *suffix) {
+    const char *sp = sym_pfx(target);
+    bool bare = (name[0] != '\0');
+    for (const char *p = name; *p && bare; ++p) {
+        if (!is_bare_asm_sym_char((unsigned char)*p)) bare = false;
+    }
+    if (bare) {
+        snprintf(buf, cap, "%s%s%s", sp, name, suffix ? suffix : "");
+        return buf;
+    }
+    size_t pos = 0u;
+    if (pos + 2u < cap) buf[pos++] = '"';
+    for (const char *p = sp; *p && pos + 2u < cap; ++p) buf[pos++] = *p;
+    for (const char *p = name; *p && pos + 3u < cap; ++p) {
+        if (*p == '"' || *p == '\\') buf[pos++] = '\\';
+        buf[pos++] = *p;
+    }
+    if (suffix) {
+        for (const char *p = suffix; *p && pos + 2u < cap; ++p) buf[pos++] = *p;
+    }
+    if (pos + 1u < cap) buf[pos++] = '"';
+    buf[pos] = '\0';
+    return buf;
+}
+
 static const char *lbl_pfx(const PirTargetSpec *target) {
     return is_macho(target) ? "L" : ".L";
 }
@@ -249,7 +280,6 @@ static void emit_xmm_load_store(FILE *out, bool is_load, MPReg reg, const char *
 static void emit_inst(X64AsmCtx *ctx, const MFunc *mf, const MInst *ins) {
     FILE *out = ctx->out;
     const PirTargetSpec *target = ctx->target;
-    const char *sp = sym_pfx(target);
     const char *lp = lbl_pfx(target);
     char x0[16], x1[16], mem[64];
 
@@ -350,23 +380,27 @@ static void emit_inst(X64AsmCtx *ctx, const MFunc *mf, const MInst *ins) {
             const char *dst = gp_name(ins->ops[0].u.preg, 8u);
             const char *name = ins->ops[1].u.sym.name;
             bool use_got     = ins->ops[1].u.sym.use_got;
+            char sbuf[512];
+            const char *asym = fmt_asm_sym(sbuf, sizeof(sbuf), target, name, NULL);
             if (use_got) {
-                fprintf(out, "\tmov %s, qword ptr [rip + %s%s@GOTPCREL]\n", dst, sp, name);
+                fprintf(out, "\tmov %s, qword ptr [rip + %s@GOTPCREL]\n", dst, asym);
             } else {
-                fprintf(out, "\tlea %s, [rip + %s%s]\n", dst, sp, name);
+                fprintf(out, "\tlea %s, [rip + %s]\n", dst, asym);
             }
             return;
         }
 
         case MI_X64_TLS_ADDR: {
             const char *name = ins->ops[1].u.sym.name;
+            char sbuf[512];
+            const char *asym = fmt_asm_sym(sbuf, sizeof(sbuf), target, name, NULL);
             if (is_macho(target)) {
-                fprintf(out, "\tmov rdi, qword ptr [rip + %s%s@TLVP]\n", sp, name);
+                fprintf(out, "\tmov rdi, qword ptr [rip + %s@TLVP]\n", asym);
                 fprintf(out, "\tcall qword ptr [rdi]\n");
             } else {
                 const char *dst = gp_name(ins->ops[0].u.preg, 8u);
                 fprintf(out, "\tmov %s, qword ptr fs:[0]\n", dst);
-                fprintf(out, "\tlea %s, [%s + %s@TPOFF]\n", dst, dst, name);
+                fprintf(out, "\tlea %s, [%s + %s@TPOFF]\n", dst, dst, asym);
             }
             return;
         }
@@ -696,9 +730,11 @@ static void emit_inst(X64AsmCtx *ctx, const MFunc *mf, const MInst *ins) {
                     lp, mf->fn_index, redir_blk(ctx, ins->ops[1].u.block_id));
             return;
 
-        case MI_X64_CALL:
-            fprintf(out, "\tcall %s%s\n", sp, ins->ops[0].u.sym.name);
+        case MI_X64_CALL: {
+            char sbuf[512];
+            fprintf(out, "\tcall %s\n", fmt_asm_sym(sbuf, sizeof(sbuf), target, ins->ops[0].u.sym.name, NULL));
             return;
+        }
 
         case MI_X64_CALL_IND:
             fprintf(out, "\tcall %s\n", gp_name(ins->ops[0].u.preg, 8u));
@@ -790,8 +826,9 @@ static bool x64_emit_function(PirCodeEmitter *em, const PirModule *mod, const MF
     FILE *out = ctx->out;
     const PirTargetSpec *target = ctx->target;
     const PirFunction *fn = mf->pir_fn;
-    const char *sp = sym_pfx(target);
     const char *lp = lbl_pfx(target);
+    char fn_sbuf[512];
+    const char *fn_asym = fmt_asm_sym(fn_sbuf, sizeof(fn_sbuf), target, fn->name, NULL);
 
     if (fn->section && fn->section[0] != '\0') {
         emit_section_directive(out, target, fn->section, PIR_GSEG_RODATA, false, false);
@@ -802,20 +839,20 @@ static bool x64_emit_function(PirCodeEmitter *em, const PirModule *mod, const MF
     }
 
     if (fn->linkage == PIR_LINK_EXPORT) {
-        fprintf(out, "\t.globl %s%s\n", sp, fn->name);
+        fprintf(out, "\t.globl %s\n", fn_asym);
     } else if (fn->linkage == PIR_LINK_WEAK) {
         if (is_macho(target)) {
-            fprintf(out, "\t.globl %s%s\n", sp, fn->name);
-            fprintf(out, "\t.weak_definition %s%s\n", sp, fn->name);
+            fprintf(out, "\t.globl %s\n", fn_asym);
+            fprintf(out, "\t.weak_definition %s\n", fn_asym);
         } else {
-            fprintf(out, "\t.weak %s%s\n", sp, fn->name);
+            fprintf(out, "\t.weak %s\n", fn_asym);
         }
     }
     if (!is_macho(target)) {
-        fprintf(out, "\t.type %s, @function\n", fn->name);
+        fprintf(out, "\t.type %s, @function\n", fn_asym);
     }
     fprintf(out, "\t.p2align 4\n");
-    fprintf(out, "%s%s:\n", sp, fn->name);
+    fprintf(out, "%s:\n", fn_asym);
     if (mod->files.len > 0u && is_macho(target)) {
         fprintf(out, "%sfunc_begin%u:\n", lp, mf->fn_index);
     }
@@ -960,7 +997,6 @@ static bool global_is_all_zero(const PirGlobal *g) {
 
 static void emit_global_data_items(FILE *out, const PirModule *mod, const PirTargetSpec *target,
                                    const PirGlobal *g) {
-    const char *sp = sym_pfx(target);
     if (g->is_zeroinit) {
         uint64_t sz = compute_global_bytes(mod, target, g);
         fprintf(out, "\t.zero %" PRIu64 "\n", sz);
@@ -979,10 +1015,12 @@ static void emit_global_data_items(FILE *out, const PirModule *mod, const PirTar
             if (ly.size == 4u) fprintf(out, "\t.long %" PRIu64 "\n", gi->float_bits & 0xFFFFFFFFu);
             else               fprintf(out, "\t.quad %" PRIu64 "\n", gi->float_bits);
         } else if (gi->kind == PIR_GITEM_RELOC) {
+            char sbuf[512];
+            const char *asym = fmt_asm_sym(sbuf, sizeof(sbuf), target, gi->sym_name, NULL);
             if (gi->sym_offset != 0)
-                fprintf(out, "\t.quad %s%s + %" PRId64 "\n", sp, gi->sym_name, gi->sym_offset);
+                fprintf(out, "\t.quad %s + %" PRId64 "\n", asym, gi->sym_offset);
             else
-                fprintf(out, "\t.quad %s%s\n", sp, gi->sym_name);
+                fprintf(out, "\t.quad %s\n", asym);
         } else if (gi->kind == PIR_GITEM_ZERO) {
             fprintf(out, "\t.zero %" PRIu64 "\n", gi->len > 0u ? gi->len : ly.size);
         }
@@ -1008,12 +1046,15 @@ static void emit_global_data_items(FILE *out, const PirModule *mod, const PirTar
             case PIR_GITEM_FLOAT:
                 fprintf(out, "\t.quad %" PRIu64 "\n", gi->float_bits);
                 break;
-            case PIR_GITEM_RELOC:
+            case PIR_GITEM_RELOC: {
+                char sbuf[512];
+                const char *asym = fmt_asm_sym(sbuf, sizeof(sbuf), target, gi->sym_name, NULL);
                 if (gi->sym_offset != 0)
-                    fprintf(out, "\t.quad %s%s + %" PRId64 "\n", sp, gi->sym_name, gi->sym_offset);
+                    fprintf(out, "\t.quad %s + %" PRId64 "\n", asym, gi->sym_offset);
                 else
-                    fprintf(out, "\t.quad %s%s\n", sp, gi->sym_name);
+                    fprintf(out, "\t.quad %s\n", asym);
                 break;
+            }
         }
     }
 }
@@ -1022,7 +1063,6 @@ static bool x64_emit_globals(PirCodeEmitter *em, const PirModule *mod,
                              const PirTargetSpec *target) {
     X64AsmCtx *ctx = (X64AsmCtx *)em->ctx;
     FILE *out = ctx->out;
-    const char *sp = sym_pfx(target);
 
     for (uint32_t i = 0u; i < mod->globals.len; ++i) {
         const PirGlobal *g = &mod->globals.data[i];
@@ -1031,33 +1071,36 @@ static bool x64_emit_globals(PirCodeEmitter *em, const PirModule *mod,
         uint32_t p2 = log2_align(al);
         bool all_zero = global_is_all_zero(g);
         uint64_t sz = compute_global_bytes(mod, target, g);
+        char g_sbuf[512], t_sbuf[512];
+        const char *g_asym = fmt_asm_sym(g_sbuf, sizeof(g_sbuf), target, g->name, NULL);
 
         if (is_macho(target) && g->seg == PIR_GSEG_TLS) {
+            const char *t_asym = fmt_asm_sym(t_sbuf, sizeof(t_sbuf), target, g->name, "$tlv$init");
             if (all_zero) {
-                fprintf(out, "\t.tbss %s%s$tlv$init, %" PRIu64 ", %u\n", sp, g->name, sz, p2);
+                fprintf(out, "\t.tbss %s, %" PRIu64 ", %u\n", t_asym, sz, p2);
             } else {
                 fprintf(out, "\t.section __DATA,__thread_data,thread_local_regular\n");
                 if (p2 > 0u) fprintf(out, "\t.p2align %u\n", p2);
-                fprintf(out, "%s%s$tlv$init:\n", sp, g->name);
+                fprintf(out, "%s:\n", t_asym);
                 emit_global_data_items(out, mod, target, g);
             }
             fprintf(out, "\t.section __DATA,__thread_vars,thread_local_variables\n");
             if (g->linkage == PIR_LINK_EXPORT) {
-                fprintf(out, "\t.globl %s%s\n", sp, g->name);
+                fprintf(out, "\t.globl %s\n", g_asym);
             } else if (g->linkage == PIR_LINK_WEAK) {
-                fprintf(out, "\t.globl %s%s\n", sp, g->name);
-                fprintf(out, "\t.weak_definition %s%s\n", sp, g->name);
+                fprintf(out, "\t.globl %s\n", g_asym);
+                fprintf(out, "\t.weak_definition %s\n", g_asym);
             }
-            fprintf(out, "%s%s:\n", sp, g->name);
+            fprintf(out, "%s:\n", g_asym);
             fprintf(out, "\t.quad __tlv_bootstrap\n");
             fprintf(out, "\t.quad 0\n");
-            fprintf(out, "\t.quad %s%s$tlv$init\n\n", sp, g->name);
+            fprintf(out, "\t.quad %s\n\n", t_asym);
             continue;
         }
 
         if (is_macho(target) && g->seg == PIR_GSEG_DATA && all_zero &&
             (!g->section || g->section[0] == '\0') && g->linkage == PIR_LINK_INTERNAL) {
-            fprintf(out, "\t.zerofill __DATA,__bss,%s%s,%" PRIu64 ",%u\n\n", sp, g->name, sz, p2);
+            fprintf(out, "\t.zerofill __DATA,__bss,%s,%" PRIu64 ",%u\n\n", g_asym, sz, p2);
             continue;
         }
 
@@ -1065,17 +1108,17 @@ static bool x64_emit_globals(PirCodeEmitter *em, const PirModule *mod,
         emit_section_directive(out, target, g->section, g->seg, has_rel, all_zero);
 
         if (g->linkage == PIR_LINK_EXPORT) {
-            fprintf(out, "\t.globl %s%s\n", sp, g->name);
+            fprintf(out, "\t.globl %s\n", g_asym);
         } else if (g->linkage == PIR_LINK_WEAK) {
             if (is_macho(target)) {
-                fprintf(out, "\t.globl %s%s\n", sp, g->name);
-                fprintf(out, "\t.weak_definition %s%s\n", sp, g->name);
+                fprintf(out, "\t.globl %s\n", g_asym);
+                fprintf(out, "\t.weak_definition %s\n", g_asym);
             } else {
-                fprintf(out, "\t.weak %s%s\n", sp, g->name);
+                fprintf(out, "\t.weak %s\n", g_asym);
             }
         }
         if (p2 > 0u) fprintf(out, "\t.p2align %u\n", p2);
-        fprintf(out, "%s%s:\n", sp, g->name);
+        fprintf(out, "%s:\n", g_asym);
         emit_global_data_items(out, mod, target, g);
         fprintf(out, "\n");
     }

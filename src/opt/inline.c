@@ -236,7 +236,7 @@ static void inline_call_site(PirModule *mod, PirFunction *caller,
             PirValueId nv = caller_add_value(mod, caller, pty, caller_bid, ciid, 0u, seq);
             PirInst ci;
             memset(&ci, 0, sizeof(ci));
-            ci.op            = PIR_OP_CONST;
+            ci.op            = (arg.kind == PIR_OPER_SYM) ? PIR_OP_ADDR : PIR_OP_CONST;
             ci.ty            = pty;
             ci.operands      = pir_alloc_ops(mod, 1u);
             ci.operands[0]   = arg;
