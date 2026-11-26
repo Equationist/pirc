@@ -6,6 +6,7 @@ with REQUTIL; use REQUTIL;
 with UARITH;
 with MAKENOD;use MAKENOD;
 with SEMGLOB; use SEMGLOB;
+with CHKSTAT;
 
 package body AGGRESO is
 
@@ -154,6 +155,7 @@ package body AGGRESO is
 
 	    -- fill in fields of aggregate_array
 	    AGGREGATE_ARRAY(I).FIRST := ASSOC_CURSOR.FIRST_COUNT;
+	    AGGREGATE_ARRAY(I).ASSOC := ASSOC_CURSOR.ASSOC;
 	    AGGREGATE_ARRAY(I).CHOICE := ASSOC_CURSOR.CHOICE;
 	    AGGREGATE_ARRAY(I).SEEN := FALSE;
 	    AGGREGATE_ARRAY(I).RESOLVED := FALSE;
@@ -161,7 +163,6 @@ package body AGGRESO is
 
 	    -- fill in exp and evaluate types for first choice of assoc
 	    if I = ASSOC_CURSOR.FIRST_COUNT then
-		AGGREGATE_ARRAY(I).ASSOC := ASSOC_CURSOR.ASSOC;
 		AGGREGATE_ARRAY(I).EXP := ASSOC_CURSOR.EXP;
 		EVAL_EXP_TYPES
 			( AGGREGATE_ARRAY(I).EXP
@@ -347,7 +348,7 @@ package body AGGRESO is
 			ERROR(D(LX_SRCPOS,AGGREGATE_ARRAY(I).CHOICE)
                                 , "Simple name required");
 		    end if;
-		elsif KIND(AGGREGATE_ARRAY(I).CHOICE) = DN_CHOICE_EXP then
+		elsif KIND(AGGREGATE_ARRAY(I).CHOICE) = DN_CHOICE_RANGE then
 		    ERROR(D(LX_SRCPOS,AGGREGATE_ARRAY(I).CHOICE)
                                 , "Range not allowed");
 		else -- since kind(...) = dn_choice_others
@@ -409,11 +410,32 @@ package body AGGRESO is
 	    RESOLVE_RECORD_AGGREGATE(EXP, TYPE_STRUCT);
 	    D(SM_EXP_TYPE, EXP, TYPE_SPEC);
 	elsif KIND(TYPE_STRUCT) = DN_ARRAY then
-	    RESOLVE_ARRAY_SUBAGGREGATE
-		( EXP
-		, D(SM_COMP_TYPE, GET_BASE_STRUCT(TYPE_SPEC))
-		, LIST(D(SM_INDEX_S, GET_BASE_STRUCT(TYPE_SPEC)))
-		, SCALAR_LIST );
+	    declare
+		NAMED_OK: BOOLEAN := FALSE;
+	    begin
+		if KIND(TYPE_SPEC) = DN_CONSTRAINED_ARRAY
+		and then D(SM_INDEX_SUBTYPE_S, TYPE_SPEC) /= CONST_VOID then
+		    declare
+			IL: SEQ_TYPE := LIST(D(SM_INDEX_SUBTYPE_S, TYPE_SPEC));
+			IDX: TREE;
+		    begin
+			NAMED_OK := TRUE;
+			while not IS_EMPTY(IL) loop
+			    POP(IL, IDX);
+			    if not CHKSTAT.IS_STATIC_SUBTYPE(IDX) then
+				NAMED_OK := FALSE;
+				exit;
+			    end if;
+			end loop;
+		    end;
+		end if;
+		RESOLVE_ARRAY_SUBAGGREGATE
+		    ( EXP
+		    , D(SM_COMP_TYPE, GET_BASE_STRUCT(TYPE_SPEC))
+		    , LIST(D(SM_INDEX_S, GET_BASE_STRUCT(TYPE_SPEC)))
+		    , SCALAR_LIST
+		    , NAMED_OTHERS_OK => NAMED_OK );
+	    end;
 	    D(SM_EXP_TYPE, EXP, TYPE_SPEC);
 	else
 	    RESOLVE_ERRONEOUS_AGGREGATE(EXP);
@@ -721,14 +743,26 @@ package body AGGRESO is
 						( D(AS_EXP, CHOICE)
 						, GET_THE_TYPE(TYPESET) ));
 			AGGREGATE_ARRAY(I).CHOICE := CHOICE;
-			if AGGREGATE_ARRAY(I).FIRST = I
-			and then IS_EMPTY(TAIL(LIST(D(AS_CHOICE_S
-				, AGGREGATE_ARRAY(I).ASSOC))))
-			then
-			    -- replace singleton list
-			    LIST(D(AS_CHOICE_S,AGGREGATE_ARRAY(I).ASSOC)
-				    , SINGLETON(CHOICE) );
-			end if;
+			-- Replace the original DN_CHOICE_EXP inside AS_CHOICE_S even for multi-choice associations!
+			declare
+			    OLD_CL : SEQ_TYPE := LIST(D(AS_CHOICE_S, AGGREGATE_ARRAY(I).ASSOC));
+			    NEW_CL : SEQ_TYPE := MAKE;
+			    C_IT   : TREE;
+			    ORIG_C : constant TREE := AGGREGATE_ARRAY(I).CHOICE;
+			begin
+			    pragma Unreferenced (ORIG_C);
+			    while not IS_EMPTY(OLD_CL) loop
+				POP(OLD_CL, C_IT);
+				if KIND(C_IT) = DN_CHOICE_EXP
+				  and then D(LX_SRCPOS, C_IT) = D(LX_SRCPOS, CHOICE)
+				then
+				    NEW_CL := APPEND(NEW_CL, CHOICE);
+				else
+				    NEW_CL := APPEND(NEW_CL, C_IT);
+				end if;
+			    end loop;
+			    LIST(D(AS_CHOICE_S, AGGREGATE_ARRAY(I).ASSOC), NEW_CL);
+			end;
 		    else
 			D(AS_EXP
 				, CHOICE
@@ -1024,10 +1058,11 @@ package body AGGRESO is
 	    end loop;
 	end loop;
 
-	-- Check contiguous coverage when no OTHERS choice is present (LRM 4.3.2(4), b43201c)
-	if AGGREGATE_ARRAY'LENGTH > 1
-	and then AGGREGATE_ARRAY(AGGREGATE_ARRAY'LAST).EXP /= CONST_VOID then
+	-- Check duplicate/overlapping choices (always) and contiguous coverage when no OTHERS (LRM 4.3.2(4), b43201c)
+	if AGGREGATE_ARRAY'LENGTH > 1 then
 	    declare
+		NO_OTHERS: constant BOOLEAN :=
+		    AGGREGATE_ARRAY(AGGREGATE_ARRAY'LAST).EXP /= CONST_VOID;
 		CUR_MAX: TREE := CONST_VOID;
 		HI_VAL: TREE;
 		LO_VAL: TREE;
@@ -1036,6 +1071,7 @@ package body AGGRESO is
 	    begin
 		for II in AGGREGATE_ARRAY'RANGE loop
 		    LO_VAL := AGGREGATE_ARRAY(II).EXP;
+		    exit when LO_VAL = CONST_VOID; -- OTHERS at end
 		    CH := AGGREGATE_ARRAY(II).CHOICE;
 		    if KIND(CH) = DN_CHOICE_RANGE then
 			RN := D(AS_DISCRETE_RANGE, CH);
@@ -1049,9 +1085,13 @@ package body AGGRESO is
 		    end if;
 		    if LO_VAL /= CONST_VOID and then HI_VAL /= CONST_VOID
 		    and then UARITH."<="(LO_VAL, HI_VAL) then
-			if CUR_MAX /= CONST_VOID
-			and then UARITH.U_POS(UARITH."<"(UARITH."+"(CUR_MAX, UARITH.U_VAL(1)), LO_VAL)) /= 0 then
-			    ERROR(D(LX_SRCPOS, CH), "Non-contiguous choices in array aggregate");
+			if CUR_MAX /= CONST_VOID then
+			    if UARITH."<="(LO_VAL, CUR_MAX) then
+				ERROR(D(LX_SRCPOS, CH), "Duplicate or overlapping choice in array aggregate");
+			    elsif NO_OTHERS
+			    and then UARITH.U_POS(UARITH."<"(UARITH."+"(CUR_MAX, UARITH.U_VAL(1)), LO_VAL)) /= 0 then
+				ERROR(D(LX_SRCPOS, CH), "Non-contiguous choices in array aggregate");
+			    end if;
 			end if;
 			if CUR_MAX = CONST_VOID or else UARITH.U_POS(UARITH."<"(CUR_MAX, HI_VAL)) /= 0 then
 			    CUR_MAX := HI_VAL;

@@ -124,9 +124,32 @@ package body Lib_Binder is
       end if;
    end Parent_Chain_Str;
 
-   function Decl_List_Requires_Body (Decl_S : TREE) return Boolean is
+   function Decl_List_Requires_Body (Decl_S : TREE; Is_Private_Part : Boolean := False) return Boolean is
       L  : SEQ_TYPE;
       It : TREE;
+      function Has_Full_Type_In_List (List_N : TREE; TName : String) return Boolean is
+         L2 : SEQ_TYPE;
+         I2 : TREE;
+      begin
+         if Is_Void_Tree (List_N) then return False; end if;
+         L2 := LIST (List_N);
+         while not IS_EMPTY (L2) loop
+            POP (L2, I2);
+            if KIND (I2) = DN_TYPE_DECL then
+               declare
+                  ID2 : constant TREE := D (AS_SOURCE_NAME, I2);
+                  TS2 : constant TREE := (if not Is_Void_Tree (ID2) and then KIND (ID2) in CLASS_TYPE_NAME then D (SM_TYPE_SPEC, ID2) else CONST_VOID);
+               begin
+                  if not Is_Void_Tree (ID2) and then Sym_Name (ID2) = TName
+                    and then not Is_Void_Tree (TS2) and then KIND (TS2) /= DN_INCOMPLETE
+                  then
+                     return True;
+                  end if;
+               end;
+            end if;
+         end loop;
+         return False;
+      end Has_Full_Type_In_List;
    begin
       if Is_Void_Tree (Decl_S) then
          return False;
@@ -135,6 +158,22 @@ package body Lib_Binder is
       while not IS_EMPTY (L) loop
          POP (L, It);
          case KIND (It) is
+            when DN_TYPE_DECL =>
+               -- P3-5.18: Incomplete type in private part not completed in spec requires package body (LRM 3.8.1(3))
+               if Is_Private_Part then
+                  declare
+                     TID : constant TREE := D (AS_SOURCE_NAME, It);
+                     TS  : constant TREE :=
+                       (if not Is_Void_Tree (TID) and then KIND (TID) in CLASS_TYPE_NAME
+                        then D (SM_TYPE_SPEC, TID) else CONST_VOID);
+                  begin
+                     if not Is_Void_Tree (TS) and then KIND (TS) = DN_INCOMPLETE
+                       and then not Has_Full_Type_In_List (Decl_S, Sym_Name (TID))
+                     then
+                        return True;
+                     end if;
+                  end;
+               end if;
             when DN_SUBPROG_ENTRY_DECL =>
                declare
                   UK  : constant TREE := D (AS_UNIT_KIND, It);
@@ -149,16 +188,30 @@ package body Lib_Binder is
                      end if;
                   end if;
                end;
-            when DN_TASK_DECL | DN_GENERIC_DECL =>
+            when DN_TASK_DECL =>
                return True;
+            when DN_GENERIC_DECL =>
+               declare
+                  GHdr : constant TREE := D (AS_HEADER, It);
+               begin
+                  if not Is_Void_Tree (GHdr) and then KIND (GHdr) = DN_PACKAGE_SPEC then
+                     if Decl_List_Requires_Body (D (AS_DECL_S1, GHdr), False)
+                       or else Decl_List_Requires_Body (D (AS_DECL_S2, GHdr), True)
+                     then
+                        return True;
+                     end if;
+                  else
+                     return True;
+                  end if;
+               end;
             when DN_PACKAGE_DECL =>
                declare
                   UK  : constant TREE := D (AS_UNIT_KIND, It);
                   Hdr : constant TREE := D (AS_HEADER, It);
                begin
                   if Is_Void_Tree (UK) and then not Is_Void_Tree (Hdr) and then KIND (Hdr) = DN_PACKAGE_SPEC then
-                     if Decl_List_Requires_Body (D (AS_DECL_S1, Hdr))
-                       or else Decl_List_Requires_Body (D (AS_DECL_S2, Hdr))
+                     if Decl_List_Requires_Body (D (AS_DECL_S1, Hdr), False)
+                       or else Decl_List_Requires_Body (D (AS_DECL_S2, Hdr), True)
                      then
                         return True;
                      end if;
@@ -190,31 +243,59 @@ package body Lib_Binder is
          elsif Is_Record_Type (R) then
             declare
                BT : constant TREE := Base_Type_Spec (R);
-            begin
-               if not Is_Void_Tree (BT) and then KIND (BT) = DN_RECORD then
+
+               function Comp_List_Has_Task (CL : TREE; Dp : Natural) return Boolean is
+               begin
+                  if Is_Void_Tree (CL) or else Dp > 8 then
+                     return False;
+                  end if;
+                  if not Is_Void_Tree (D (AS_DECL_S, CL)) then
+                     declare
+                        DL : SEQ_TYPE := LIST (D (AS_DECL_S, CL));
+                        It : TREE;
+                     begin
+                        while not IS_EMPTY (DL) loop
+                           POP (DL, It);
+                           if KIND (It) = DN_VARIABLE_DECL then
+                              declare
+                                 CID : constant TREE := HEAD (LIST (D (AS_SOURCE_NAME_S, It)));
+                              begin
+                                 if Type_Has_Task (D (SM_OBJ_TYPE, CID), Dp + 1) then
+                                    return True;
+                                 end if;
+                              end;
+                           end if;
+                        end loop;
+                     end;
+                  end if;
                   declare
-                     CL : constant TREE := D (SM_COMP_LIST, BT);
+                     VP : constant TREE := D (AS_VARIANT_PART, CL);
                   begin
-                     if not Is_Void_Tree (CL) and then not Is_Void_Tree (D (AS_DECL_S, CL)) then
+                     if not Is_Void_Tree (VP) and then KIND (VP) = DN_VARIANT_PART
+                       and then not Is_Void_Tree (D (AS_VARIANT_S, VP))
+                     then
                         declare
-                           DL : SEQ_TYPE := LIST (D (AS_DECL_S, CL));
-                           It : TREE;
+                           VL : SEQ_TYPE := LIST (D (AS_VARIANT_S, VP));
+                           VN : TREE;
                         begin
-                           while not IS_EMPTY (DL) loop
-                              POP (DL, It);
-                              if KIND (It) = DN_VARIABLE_DECL then
-                                 declare
-                                    CID : constant TREE := HEAD (LIST (D (AS_SOURCE_NAME_S, It)));
-                                 begin
-                                    if Type_Has_Task (D (SM_OBJ_TYPE, CID), Depth + 1) then
-                                       return True;
-                                    end if;
-                                 end;
+                           while not IS_EMPTY (VL) loop
+                              POP (VL, VN);
+                              if KIND (VN) = DN_VARIANT
+                                and then Comp_List_Has_Task (D (AS_COMP_LIST, VN), Dp + 1)
+                              then
+                                 return True;
                               end if;
                            end loop;
                         end;
                      end if;
                   end;
+                  return False;
+               end Comp_List_Has_Task;
+            begin
+               if not Is_Void_Tree (BT) and then KIND (BT) = DN_RECORD then
+                  if Comp_List_Has_Task (D (SM_COMP_LIST, BT), Depth) then
+                     return True;
+                  end if;
                end if;
             end;
          end if;
@@ -243,7 +324,11 @@ package body Lib_Binder is
                end;
             when DN_PACKAGE_DECL =>
                declare
-                  Hdr : constant TREE := D (AS_HEADER, It);
+                  UK  : constant TREE := D (AS_UNIT_KIND, It);
+                  Hdr : constant TREE :=
+                    (if not Is_Void_Tree (UK) and then KIND (UK) = DN_INSTANTIATION
+                     then D (SM_SPEC, Canonical_Def (D (AS_SOURCE_NAME, It)))
+                     else D (AS_HEADER, It));
                begin
                   if not Is_Void_Tree (Hdr) and then KIND (Hdr) = DN_PACKAGE_SPEC then
                      if Decl_List_Has_Tasks_AST (D (AS_DECL_S1, Hdr))
@@ -412,15 +497,106 @@ package body Lib_Binder is
    end Read_Max_Seq;
 
    procedure Record_Compilation_Units
-     (Comp_Node : TREE;
-      Obj_Path  : String;
-      Lib_Dir   : String := "ADA__LIB")
+     (Comp_Node  : TREE;
+      Obj_Path   : String;
+      Lib_Dir    : String := "ADA__LIB";
+      Per_CU_Obj : Boolean := False)
    is
       Idx_Path : constant String := Lib_Dir & "/UNITS.IDX";
       Seq      : Natural := Read_Max_Seq (Idx_Path);
       F        : Ada.Text_IO.File_Type;
       CL       : SEQ_TYPE := LIST (D (AS_COMPLTN_UNIT_S, Comp_Node));
       CU       : TREE;
+      CU_Idx   : Natural := 0;
+      Obj_Base : constant String :=
+        (if Obj_Path'Length > 2 and then Obj_Path (Obj_Path'Last - 1 .. Obj_Path'Last) = ".o"
+         then Obj_Path (Obj_Path'First .. Obj_Path'Last - 2) else Obj_Path);
+
+      procedure Append_CSV_Unique (CSV : in out Unbounded_String; Item : String) is
+         S : constant String := To_String (CSV);
+         P : Natural := S'First;
+         Q : Natural;
+      begin
+         if Item'Length = 0 then
+            return;
+         end if;
+         while P <= S'Last loop
+            Q := P;
+            while Q <= S'Last and then S (Q) /= ',' loop
+               Q := Q + 1;
+            end loop;
+            if S (P .. Q - 1) = Item then
+               return;
+            end if;
+            P := Q + 1;
+         end loop;
+         if Length (CSV) > 0 then
+            Append (CSV, ",");
+         end if;
+         Append (CSV, Item);
+      end Append_CSV_Unique;
+
+      procedure Collect_Insts (Node : TREE; Out_CSV : in out Unbounded_String; Depth : Natural := 0) is
+         K : NODE_NAME;
+      begin
+         if Is_Void_Tree (Node) or else Node.TPG <= 0 or else Node.TLN = 0 or else Depth > 40 then
+            return;
+         end if;
+         K := KIND (Node);
+         if K not in CLASS_ALL_SOURCE then
+            return;
+         end if;
+         if K = DN_INSTANTIATION then
+            declare
+               GN : constant TREE := Canonical_Def (Get_Name_Defn (D (AS_NAME, Node)));
+            begin
+               if not Is_Void_Tree (GN) and then KIND (GN) = DN_GENERIC_ID then
+                  declare
+                     Cur  : TREE := GN;
+                     Root : TREE := GN;
+                  begin
+                     for Hop in 1 .. 16 loop
+                        exit when Is_Void_Tree (Cur) or else KIND (Cur) not in CLASS_SOURCE_NAME;
+                        declare
+                           Reg : constant TREE := D (XD_REGION, Cur);
+                        begin
+                           exit when Is_Void_Tree (Reg) or else KIND (Reg) not in CLASS_SOURCE_NAME;
+                           declare
+                              RN : constant String := To_Lower (Sym_Name (Reg));
+                           begin
+                              exit when RN = "standard" or else RN = "_standrd";
+                           end;
+                           Root := Reg;
+                           Cur  := Reg;
+                        end;
+                     end loop;
+                     declare
+                        RL : constant String := To_Lower (Sym_Name (Root));
+                     begin
+                        if not Is_Std_Unit (RL) then
+                           Append_CSV_Unique (Out_CSV, RL);
+                        end if;
+                     end;
+                  end;
+               end if;
+            end;
+         end if;
+         if ARITY (Node) = ARBITRARY then
+            declare
+               L : SEQ_TYPE := LIST (Node);
+               It : TREE;
+            begin
+               while not IS_EMPTY (L) loop
+                  POP (L, It);
+                  Collect_Insts (It, Out_CSV, Depth + 1);
+               end loop;
+            end;
+         else
+            for I in 1 .. ARITIES'Pos (ARITY (Node)) loop
+               Collect_Insts (DABS (I, Node), Out_CSV, Depth + 1);
+            end loop;
+         end if;
+      end Collect_Insts;
    begin
       if not Ada.Directories.Exists (Lib_Dir) then
          Ada.Directories.Create_Path (Lib_Dir);
@@ -433,6 +609,7 @@ package body Lib_Binder is
 
       while not IS_EMPTY (CL) loop
          POP (CL, CU);
+         CU_Idx := CU_Idx + 1;
          declare
             Raw_AD       : constant TREE := D (AS_ALL_DECL, CU);
             Kind_Str     : Unbounded_String;
@@ -445,10 +622,14 @@ package body Lib_Binder is
             Withs_CSV    : Unbounded_String;
             Elabs_CSV    : Unbounded_String;
             Stubs_CSV    : Unbounded_String;
+            Insts_CSV    : Unbounded_String;
             Valid        : Boolean := False;
+            Unit_Obj     : constant String :=
+              (if Per_CU_Obj then Obj_Base & "__cu" & Trim_Img (CU_Idx) & ".o" else Obj_Path);
          begin
             if not Is_Void_Tree (Raw_AD) then
                Collect_Context_From_CU (CU, Withs_CSV, Elabs_CSV);
+               Collect_Insts (Raw_AD, Insts_CSV);
                case KIND (Raw_AD) is
                   when DN_SUBUNIT =>
                      declare
@@ -474,8 +655,8 @@ package body Lib_Binder is
                         Is_Gen := True;
                         if not Is_Void_Tree (Hdr) and then KIND (Hdr) = DN_PACKAGE_SPEC then
                            Kind_Str := To_Unbounded_String ("package_spec");
-                           Req_Body := Decl_List_Requires_Body (D (AS_DECL_S1, Hdr))
-                             or else Decl_List_Requires_Body (D (AS_DECL_S2, Hdr));
+                           Req_Body := Decl_List_Requires_Body (D (AS_DECL_S1, Hdr), False)
+                             or else Decl_List_Requires_Body (D (AS_DECL_S2, Hdr), True);
                         elsif not Is_Void_Tree (Hdr) and then KIND (Hdr) = DN_FUNCTION_SPEC then
                            Kind_Str := To_Unbounded_String ("function_spec");
                            Req_Body := True;
@@ -500,8 +681,8 @@ package body Lib_Binder is
                         else
                            Kind_Str := To_Unbounded_String ("package_spec");
                            if not Is_Void_Tree (Hdr) and then KIND (Hdr) = DN_PACKAGE_SPEC then
-                              Req_Body := Decl_List_Requires_Body (D (AS_DECL_S1, Hdr))
-                                or else Decl_List_Requires_Body (D (AS_DECL_S2, Hdr));
+                              Req_Body := Decl_List_Requires_Body (D (AS_DECL_S1, Hdr), False)
+                                or else Decl_List_Requires_Body (D (AS_DECL_S2, Hdr), True);
                               Has_Tasks := Decl_List_Has_Tasks_AST (D (AS_DECL_S1, Hdr))
                                 or else Decl_List_Has_Tasks_AST (D (AS_DECL_S2, Hdr));
                            end if;
@@ -550,7 +731,17 @@ package body Lib_Binder is
                            Kind_Str := To_Unbounded_String (if Is_Fn then "function_ren" else "procedure_ren");
                         else
                            Kind_Str := To_Unbounded_String (if Is_Fn then "function_spec" else "procedure_spec");
-                           Req_Body := True;
+                           declare
+                              Can_S : constant TREE := Canonical_Def (SID);
+                           begin
+                              if not Is_Void_Tree (Can_S) and then KIND (Can_S) in CLASS_SUBPROG_NAME
+                                and then not Is_Void_Tree (D (SM_INTERFACE, Can_S))
+                              then
+                                 Req_Body := False;
+                              else
+                                 Req_Body := True;
+                              end if;
+                           end;
                         end if;
                         Valid := True;
                      end;
@@ -591,10 +782,11 @@ package body Lib_Binder is
                     "|" & (if Req_Body then "1" else "0") &
                     "|" & (if Is_Main_Cand then "1" else "0") &
                     "|" & (if Has_Tasks then "1" else "0") &
-                    "|" & Obj_Path &
+                    "|" & Unit_Obj &
                     "|" & To_String (Withs_CSV) &
                     "|" & To_String (Elabs_CSV) &
-                    "|" & To_String (Stubs_CSV));
+                    "|" & To_String (Stubs_CSV) &
+                    "|" & To_String (Insts_CSV));
                end if;
             end if;
          end;
@@ -626,6 +818,7 @@ package body Lib_Binder is
       Withs        : Str_Vecs.Vector;
       Elabs        : Str_Vecs.Vector;
       Stubs        : Str_Vecs.Vector;
+      Insts        : Str_Vecs.Vector;
    end record;
 
    package Unit_Vecs is new Ada.Containers.Vectors (Natural, Unit_Rec);
@@ -734,12 +927,32 @@ package body Lib_Binder is
    is
       Idx_Path    : constant String := Lib_Dir & "/UNITS.IDX";
       All_Units   : Unit_Vecs.Vector;
-      Specs       : Unit_Maps.Map;
-      Bodies      : Unit_Maps.Map;
-      Subunits    : Unit_Maps.Map;
-      Gen_Names   : USet.Set;
-      Chosen_Main : Unbounded_String := To_Unbounded_String (To_Lower (Main_Unit));
-      Spec_Time   : Seq_Maps.Map;
+      Specs          : Unit_Maps.Map;
+      Bodies         : Unit_Maps.Map;
+      Subunits       : Unit_Maps.Map;
+      Gen_Body_Count : Seq_Maps.Map;
+      Gen_Body_Time  : Seq_Maps.Map;
+      Gen_Sub_Time   : Seq_Maps.Map;
+      Chosen_Main    : Unbounded_String := To_Unbounded_String (To_Lower (Main_Unit));
+      Spec_Time      : Seq_Maps.Map;
+      Reachable      : USet.Set;
+      Use_Reachable  : Boolean := False;
+
+      function Is_Reachable (UN : Unbounded_String) return Boolean is
+      begin
+         return (not Use_Reachable) or else Reachable.Contains (UN);
+      end Is_Reachable;
+
+      function Is_Active_Unit (U : Unit_Rec) return Boolean is
+         K : constant String := To_String (U.Kind);
+      begin
+         if Is_Spec_Kind (K) then
+            return Specs.Contains (U.Name) and then Specs.Element (U.Name).Seq = U.Seq;
+         elsif Is_Body_Kind (K) then
+            return Bodies.Contains (U.Name) and then Bodies.Element (U.Name).Seq = U.Seq;
+         end if;
+         return False;
+      end Is_Active_Unit;
 
       procedure Fail (Msg : String) is
       begin
@@ -764,15 +977,15 @@ package body Lib_Binder is
             Ada.Text_IO.Get_Line (F, Line, Last);
             if Last >= 3 and then Line (1 .. 2) = "U|" then
                declare
-                  Fields : array (1 .. 13) of Unbounded_String;
+                  Fields : array (1 .. 14) of Unbounded_String;
                   FIdx   : Natural := 1;
                   Pos    : Positive := 1;
                   U      : Unit_Rec;
                begin
-                  while Pos <= Last and then FIdx <= 13 loop
+                  while Pos <= Last and then FIdx <= 14 loop
                      declare
                         Sep : constant Natural :=
-                          (if FIdx < 13 then Ada.Strings.Fixed.Index (Line (Pos .. Last), "|") else 0);
+                          (if FIdx < 14 then Ada.Strings.Fixed.Index (Line (Pos .. Last), "|") else 0);
                         End_P : constant Natural := (if Sep > 0 then Sep - 1 else Last);
                      begin
                         Fields (FIdx) := To_Unbounded_String (Line (Pos .. End_P));
@@ -793,30 +1006,60 @@ package body Lib_Binder is
                   Split_CSV (To_String (Fields (11)), U.Withs);
                   Split_CSV (To_String (Fields (12)), U.Elabs);
                   Split_CSV (To_String (Fields (13)), U.Stubs);
+                  Split_CSV (To_String (Fields (14)), U.Insts);
                   All_Units.Append (U);
-
-                  if U.Is_Gen then
-                     Gen_Names.Include (U.Name);
-                  end if;
-                  if Length (Chosen_Main) = 0 and then U.Is_Main_Cand then
-                     null; -- picked from latest below
-                  end if;
 
                   declare
                      K : constant String := To_String (U.Kind);
                   begin
                      if K = "subunit" then
                         Subunits.Include (To_Unbounded_String (To_String (U.Parent) & "." & To_String (U.Name)), U);
+                        declare
+                           PR : constant Unbounded_String := To_Unbounded_String (Root_Of_Parent (To_String (U.Parent)));
+                        begin
+                           Gen_Sub_Time.Include (PR, U.Seq);
+                        end;
                      elsif Is_Spec_Kind (K) then
+                        -- P3-5.13: Evict incompatible stale Bodies when a library unit is replaced by a different spec kind!
+                        if Bodies.Contains (U.Name) then
+                           declare
+                              BK : constant String := To_String (Bodies.Element (U.Name).Kind);
+                              Compat : constant Boolean :=
+                                (K = "package_spec" and then BK = "package_body")
+                                or else (K = "procedure_spec" and then BK = "procedure_body")
+                                or else (K = "function_spec" and then BK = "function_body");
+                           begin
+                              if not Compat then
+                                 Bodies.Delete (U.Name);
+                              end if;
+                           end;
+                        end if;
                         Specs.Include (U.Name, U);
                      elsif Is_Body_Kind (K) then
-                        -- LRM 10.1 (ca1020d): standalone subprogram body replaces generic subprogram instantiation
-                        if (K = "procedure_body" or else K = "function_body")
-                          and then Specs.Contains (U.Name)
-                          and then (To_String (Specs.Element (U.Name).Kind) = "procedure_inst"
-                                    or else To_String (Specs.Element (U.Name).Kind) = "function_inst")
-                        then
-                           Specs.Delete (U.Name);
+                        -- P3-5.13: Evict incompatible stale Specs when a standalone subprogram body replaces a different unit kind!
+                        if (K = "procedure_body" or else K = "function_body") and then Specs.Contains (U.Name) then
+                           declare
+                              SK : constant String := To_String (Specs.Element (U.Name).Kind);
+                              Compat : constant Boolean :=
+                                (K = "procedure_body" and then SK = "procedure_spec")
+                                or else (K = "function_body" and then SK = "function_spec");
+                           begin
+                              if not Compat then
+                                 Specs.Delete (U.Name);
+                              end if;
+                           end;
+                        end if;
+                        if U.Is_Gen then
+                           declare
+                              Prev_C : constant Natural :=
+                                (if Gen_Body_Count.Contains (U.Name) then Gen_Body_Count.Element (U.Name) else 0);
+                           begin
+                              Gen_Body_Count.Include (U.Name, Prev_C + 1);
+                              Gen_Body_Time.Include (U.Name, U.Seq);
+                           end;
+                        elsif K = "package_body" then
+                           -- P3-5.14: A package body may contain nested generics; track its latest body time too!
+                           Gen_Body_Time.Include (U.Name, U.Seq);
                         end if;
                         Bodies.Include (U.Name, U);
                      end if;
@@ -827,20 +1070,81 @@ package body Lib_Binder is
          Ada.Text_IO.Close (F);
       end;
 
-      -- Auto-select main procedure if not specified: prefer candidate from Main_Obj, else latest candidate
+      -- Auto-select main procedure if not specified: prefer active candidate from Main_Obj, else latest active candidate
       if Length (Chosen_Main) = 0 and then Main_Obj'Length > 0 then
          for U of All_Units loop
-            if U.Is_Main_Cand and then To_String (U.Obj_Path) = Main_Obj then
+            if U.Is_Main_Cand and then Is_Active_Unit (U) and then To_String (U.Obj_Path) = Main_Obj then
                Chosen_Main := U.Name;
             end if;
          end loop;
       end if;
       if Length (Chosen_Main) = 0 then
          for U of All_Units loop
-            if U.Is_Main_Cand then
+            if U.Is_Main_Cand and then Is_Active_Unit (U) then
                Chosen_Main := U.Name;
             end if;
          end loop;
+      end if;
+
+      -- LRM 10.1(8): validate explicitly requested main unit is an active parameterless non-generic procedure
+      if Main_Unit'Length > 0 and then not Check_Only then
+         declare
+            Main_Ok : Boolean := False;
+         begin
+            if Bodies.Contains (Chosen_Main) and then Bodies.Element (Chosen_Main).Is_Main_Cand then
+               Main_Ok := True;
+            elsif Specs.Contains (Chosen_Main) and then Specs.Element (Chosen_Main).Is_Main_Cand then
+               Main_Ok := True;
+            end if;
+            if not Main_Ok then
+               Fail ("binder error: '" & To_String (Chosen_Main) & "' is not a valid main library procedure");
+               return;
+            end if;
+         end;
+      end if;
+
+      -- Compute transitive closure Reachable from Chosen_Main (LRM 10.1(8), 10.5(2))
+      if Length (Chosen_Main) > 0 then
+         declare
+            Queue : Str_Vecs.Vector;
+            QIdx  : Natural := 0;
+            procedure Enqueue (UN : Unbounded_String) is
+            begin
+               if Length (UN) > 0 and then not Reachable.Contains (UN) then
+                  Reachable.Include (UN);
+                  Queue.Append (UN);
+               end if;
+            end Enqueue;
+         begin
+            Use_Reachable := True;
+            Enqueue (Chosen_Main);
+            while QIdx < Natural (Queue.Length) loop
+               declare
+                  Cur : constant Unbounded_String := Queue.Element (QIdx);
+                  Cur_S : constant String := To_String (Cur);
+               begin
+                  QIdx := QIdx + 1;
+                  if Specs.Contains (Cur) then
+                     for W of Specs.Element (Cur).Withs loop Enqueue (W); end loop;
+                     for E of Specs.Element (Cur).Elabs loop Enqueue (E); end loop;
+                  end if;
+                  if Bodies.Contains (Cur) then
+                     for W of Bodies.Element (Cur).Withs loop Enqueue (W); end loop;
+                     for E of Bodies.Element (Cur).Elabs loop Enqueue (E); end loop;
+                  end if;
+                  for SC in Subunits.Iterate loop
+                     declare
+                        SU : constant Unit_Rec := Unit_Maps.Element (SC);
+                     begin
+                        if Root_Of_Parent (To_String (SU.Parent)) = Cur_S then
+                           for W of SU.Withs loop Enqueue (W); end loop;
+                           for E of SU.Elabs loop Enqueue (E); end loop;
+                        end if;
+                     end;
+                  end loop;
+               end;
+            end loop;
+         end;
       end if;
 
       -- Build Spec_Time map (LRM 10.3(5))
@@ -859,7 +1163,7 @@ package body Lib_Binder is
          end;
       end loop;
 
-      -- 2. LRM 10.3 & 10.5 Validation
+      -- 2. LRM 10.3 & 10.5 Validation (restricted to Reachable closure when Chosen_Main is known)
       if not Skip_Checks then
          -- 2a. Missing / obsolete required bodies
          for C in Specs.Iterate loop
@@ -867,7 +1171,7 @@ package body Lib_Binder is
                UN : constant String := To_String (Unit_Maps.Key (C));
                SP : constant Unit_Rec := Unit_Maps.Element (C);
             begin
-               if not Is_Std_Unit (UN) and then SP.Req_Body then
+               if Is_Reachable (Unit_Maps.Key (C)) and then not Is_Std_Unit (UN) and then SP.Req_Body then
                   if not Bodies.Contains (Unit_Maps.Key (C)) then
                      Fail ("binder error: missing body for library unit '" & UN & "'");
                      return;
@@ -879,16 +1183,35 @@ package body Lib_Binder is
             end;
          end loop;
 
-         -- 2b. LRM 10.3(5): obsolete specs, required/subp bodies, and subunits due to recompiled withed spec
+         -- 2b. LRM 10.3(5): obsolete specs, required/subp bodies, and subunits due to recompiled withed spec or generic body
          for C in Specs.Iterate loop
             declare
                UN : constant String := To_String (Unit_Maps.Key (C));
                SP : constant Unit_Rec := Unit_Maps.Element (C);
+               SK : constant String := To_String (SP.Kind);
+               Is_Inst_Unit : constant Boolean :=
+                 SK = "package_inst" or else SK = "procedure_inst" or else SK = "function_inst";
             begin
-               if not Is_Std_Unit (UN) then
+               if Is_Reachable (Unit_Maps.Key (C)) and then not Is_Std_Unit (UN) then
                   for W of SP.Withs loop
                      if Spec_Time.Contains (W) and then Spec_Time.Element (W) > SP.Seq then
                         Fail ("binder error: unit '" & UN & "' is obsolete (withed unit '" & To_String (W) & "' was recompiled)");
+                        return;
+                     end if;
+                     if Gen_Body_Time.Contains (W) and then Gen_Body_Time.Element (W) > SP.Seq
+                       and then (Is_Inst_Unit or else (Gen_Body_Count.Contains (W) and then Gen_Body_Count.Element (W) > 1))
+                     then
+                        Fail ("binder error: unit '" & UN & "' is obsolete (generic body '" & To_String (W) & "' was recompiled)");
+                        return;
+                     end if;
+                  end loop;
+                  for G of SP.Insts loop
+                     if Gen_Body_Time.Contains (G) and then Gen_Body_Time.Element (G) > SP.Seq then
+                        Fail ("binder error: unit '" & UN & "' is obsolete (instantiated generic body '" & To_String (G) & "' was compiled/recompiled)");
+                        return;
+                     end if;
+                     if Gen_Sub_Time.Contains (G) and then Gen_Sub_Time.Element (G) > SP.Seq then
+                        Fail ("binder error: unit '" & UN & "' is obsolete (subunit of instantiated generic '" & To_String (G) & "' was compiled/recompiled)");
                         return;
                      end if;
                   end loop;
@@ -907,10 +1230,26 @@ package body Lib_Binder is
             begin
                -- Per LRM 10.3(5) / ACVC ca3006d, an obsolete OPTIONAL package body is simply dropped;
                -- all required bodies and standalone subprogram bodies must not be obsolete.
-               if not Is_Std_Unit (UN) and then not Is_Optional_Pkg_Bdy then
+               if Is_Reachable (Unit_Maps.Key (C)) and then not Is_Std_Unit (UN) and then not Is_Optional_Pkg_Bdy then
                   for W of BD.Withs loop
                      if Spec_Time.Contains (W) and then Spec_Time.Element (W) > BD.Seq then
                         Fail ("binder error: unit '" & UN & "' is obsolete (withed unit '" & To_String (W) & "' was recompiled)");
+                        return;
+                     end if;
+                     if Gen_Body_Time.Contains (W) and then Gen_Body_Time.Element (W) > BD.Seq
+                       and then Gen_Body_Count.Contains (W) and then Gen_Body_Count.Element (W) > 1
+                     then
+                        Fail ("binder error: unit '" & UN & "' is obsolete (generic body '" & To_String (W) & "' was recompiled)");
+                        return;
+                     end if;
+                  end loop;
+                  for G of BD.Insts loop
+                     if Gen_Body_Time.Contains (G) and then Gen_Body_Time.Element (G) > BD.Seq then
+                        Fail ("binder error: unit '" & UN & "' is obsolete (instantiated generic body '" & To_String (G) & "' was compiled/recompiled)");
+                        return;
+                     end if;
+                     if Gen_Sub_Time.Contains (G) and then Gen_Sub_Time.Element (G) > BD.Seq then
+                        Fail ("binder error: unit '" & UN & "' is obsolete (subunit of instantiated generic '" & To_String (G) & "' was compiled/recompiled)");
                         return;
                      end if;
                   end loop;
@@ -920,15 +1259,37 @@ package body Lib_Binder is
 
          for C in Subunits.Iterate loop
             declare
-               SUB : constant Unit_Rec := Unit_Maps.Element (C);
+               SUB   : constant Unit_Rec := Unit_Maps.Element (C);
+               PRoot : constant Unbounded_String := To_Unbounded_String (Root_Of_Parent (To_String (SUB.Parent)));
             begin
-               for W of SUB.Withs loop
-                  if Spec_Time.Contains (W) and then Spec_Time.Element (W) > SUB.Seq then
-                     Fail ("binder error: subunit '" & To_String (SUB.Parent) & "." & To_String (SUB.Name) &
-                           "' is obsolete (withed unit '" & To_String (W) & "' was recompiled)");
-                     return;
-                  end if;
-               end loop;
+               if Is_Reachable (PRoot) then
+                  for W of SUB.Withs loop
+                     if Spec_Time.Contains (W) and then Spec_Time.Element (W) > SUB.Seq then
+                        Fail ("binder error: subunit '" & To_String (SUB.Parent) & "." & To_String (SUB.Name) &
+                              "' is obsolete (withed unit '" & To_String (W) & "' was recompiled)");
+                        return;
+                     end if;
+                     if Gen_Body_Time.Contains (W) and then Gen_Body_Time.Element (W) > SUB.Seq
+                       and then Gen_Body_Count.Contains (W) and then Gen_Body_Count.Element (W) > 1
+                     then
+                        Fail ("binder error: subunit '" & To_String (SUB.Parent) & "." & To_String (SUB.Name) &
+                              "' is obsolete (generic body '" & To_String (W) & "' was recompiled)");
+                        return;
+                     end if;
+                  end loop;
+                  for G of SUB.Insts loop
+                     if Gen_Body_Time.Contains (G) and then Gen_Body_Time.Element (G) > SUB.Seq then
+                        Fail ("binder error: subunit '" & To_String (SUB.Parent) & "." & To_String (SUB.Name) &
+                              "' is obsolete (instantiated generic body '" & To_String (G) & "' was compiled/recompiled)");
+                        return;
+                     end if;
+                     if Gen_Sub_Time.Contains (G) and then Gen_Sub_Time.Element (G) > SUB.Seq then
+                        Fail ("binder error: subunit '" & To_String (SUB.Parent) & "." & To_String (SUB.Name) &
+                              "' is obsolete (subunit of instantiated generic '" & To_String (G) & "' was compiled/recompiled)");
+                        return;
+                     end if;
+                  end loop;
+               end if;
             end;
          end loop;
 
@@ -949,6 +1310,7 @@ package body Lib_Binder is
                            SU : constant Unit_Rec := Unit_Maps.Element (SC);
                         begin
                            if To_String (SU.Name) = ST_Str
+                             and then Root_Of_Parent (To_String (SU.Parent)) = Root_Of_Parent (Parent_Name)
                              and then Ends_With_Unit (To_String (SU.Parent), Parent_Name)
                            then
                               Found := True;
@@ -972,20 +1334,25 @@ package body Lib_Binder is
             end Check_Stubs_E;
          begin
             for C in Specs.Iterate loop
-               Check_Stubs_E (Unit_Maps.Element (C), To_String (Unit_Maps.Key (C)));
+               if Is_Reachable (Unit_Maps.Key (C)) then
+                  Check_Stubs_E (Unit_Maps.Element (C), To_String (Unit_Maps.Key (C)));
+               end if;
                exit when Err_Found;
             end loop;
             for C in Bodies.Iterate loop
-               if not Err_Found then
+               if not Err_Found and then Is_Reachable (Unit_Maps.Key (C)) then
                   Check_Stubs_E (Unit_Maps.Element (C), To_String (Unit_Maps.Key (C)));
                end if;
             end loop;
             for C in Subunits.Iterate loop
                if not Err_Found then
                   declare
-                     SU : constant Unit_Rec := Unit_Maps.Element (C);
+                     SU    : constant Unit_Rec := Unit_Maps.Element (C);
+                     PRoot : constant Unbounded_String := To_Unbounded_String (Root_Of_Parent (To_String (SU.Parent)));
                   begin
-                     Check_Stubs_E (SU, To_String (SU.Parent) & "." & To_String (SU.Name));
+                     if Is_Reachable (PRoot) then
+                        Check_Stubs_E (SU, To_String (SU.Parent) & "." & To_String (SU.Name));
+                     end if;
                   end;
                end if;
             end loop;
@@ -1024,15 +1391,11 @@ package body Lib_Binder is
             end Get_Node;
 
             procedure Add_Edge (From_I, To_I : Natural) is
+               V : Nat_Vecs.Vector := Adj.Element (From_I);
             begin
-               if From_I /= To_I then
-                  declare
-                     V : Nat_Vecs.Vector := Adj.Element (From_I);
-                  begin
-                     V.Append (To_I);
-                     Adj.Replace_Element (From_I, V);
-                  end;
-               end if;
+               -- P3-5.15: Include self-edges (From_I = To_I) so self-ELABORATE cycles are caught!
+               V.Append (To_I);
+               Adj.Replace_Element (From_I, V);
             end Add_Edge;
          begin
             for C in Specs.Iterate loop
@@ -1041,7 +1404,7 @@ package body Lib_Binder is
                   SP : constant Unit_Rec := Unit_Maps.Element (C);
                   UI : Natural;
                begin
-                  if not Is_Std_Unit (UN) then
+                  if Is_Reachable (Unit_Maps.Key (C)) and then not Is_Std_Unit (UN) then
                      UI := Get_Node ("S", UN);
                      for W of SP.Withs loop
                         if not Is_Std_Unit (To_String (W)) then
@@ -1063,10 +1426,13 @@ package body Lib_Binder is
                   BD : constant Unit_Rec := Unit_Maps.Element (C);
                   UI : Natural;
                begin
-                  if not Is_Std_Unit (UN) then
+                  if Is_Reachable (Unit_Maps.Key (C)) and then not Is_Std_Unit (UN) then
                      UI := Get_Node ("B", UN);
                      if Specs.Contains (Unit_Maps.Key (C)) then
                         Add_Edge (UI, Get_Node ("S", UN));
+                     else
+                        -- Standalone subprogram body IS its own library declaration (LRM 10.5(2))
+                        Add_Edge (Get_Node ("S", UN), UI);
                      end if;
                      for W of BD.Withs loop
                         if not Is_Std_Unit (To_String (W)) then
@@ -1088,7 +1454,10 @@ package body Lib_Binder is
                   PRoot : constant String := Root_Of_Parent (To_String (SU.Parent));
                   UI    : Natural;
                begin
-                  if not Is_Std_Unit (PRoot) and then Bodies.Contains (To_Unbounded_String (PRoot)) then
+                  if Is_Reachable (To_Unbounded_String (PRoot))
+                    and then not Is_Std_Unit (PRoot)
+                    and then Bodies.Contains (To_Unbounded_String (PRoot))
+                  then
                      UI := Get_Node ("B", PRoot);
                      for W of SU.Withs loop
                         if not Is_Std_Unit (To_String (W)) then
@@ -1189,9 +1558,21 @@ package body Lib_Binder is
                               end if;
                            end if;
 
-                           if Alive and then not U.Is_Gen and then not Gen_Names.Contains (U.Name) then
-                              Has_Live_NonGen := True;
-                              exit;
+                           if Alive and then not U.Is_Gen then
+                              declare
+                                 Reach_Key : constant Unbounded_String :=
+                                   (if K = "subunit"
+                                    then To_Unbounded_String (Root_Of_Parent (To_String (U.Parent)))
+                                    else U.Name);
+                                 UN_S : constant String := To_String (U.Name);
+                              begin
+                                 if Is_Reachable (Reach_Key)
+                                   and then UN_S /= "length_check" and then UN_S /= "enum_check"
+                                 then
+                                    Has_Live_NonGen := True;
+                                    exit;
+                                 end if;
+                              end;
                            end if;
                         end;
                      end if;
@@ -1215,11 +1596,16 @@ package body Lib_Binder is
             User_Has_Standard : constant Boolean := Specs.Contains (To_Unbounded_String ("standard"));
             Pkg_Specs         : USet.Set;
             Pkg_Bodies        : USet.Set;
+            Graph_Units       : USet.Set;
+            Graph_Bodies      : USet.Set;
+            Gen_Units         : USet.Set;
             All_Withs         : USet.Set;
 
             type ENode is record
-               Is_Body : Boolean := False;
-               Name    : Unbounded_String;
+               Is_Body   : Boolean := False;
+               Emit_Call : Boolean := False;
+               Is_Gen    : Boolean := False;
+               Name      : Unbounded_String;
             end record;
             package ENode_Vecs is new Ada.Containers.Vectors (Natural, ENode);
             ENodes : ENode_Vecs.Vector;
@@ -1236,17 +1622,23 @@ package body Lib_Binder is
                   SP : constant Unit_Rec := Unit_Maps.Element (C);
                   K  : constant String := To_String (SP.Kind);
                begin
-                  if not Is_RTL_Unit (UN, User_Has_Standard) then
-                     if (K = "package_spec" or else K = "package_inst"
-                         or else K = "procedure_inst" or else K = "function_inst")
-                       and then not SP.Is_Gen
-                     then
-                        Pkg_Specs.Include (Unit_Maps.Key (C));
+                  if Is_Reachable (Unit_Maps.Key (C)) then
+                     if not Is_RTL_Unit (UN, User_Has_Standard) then
+                        Graph_Units.Include (Unit_Maps.Key (C));
+                        if SP.Is_Gen and then UN /= "length_check" and then UN /= "enum_check" then
+                           Gen_Units.Include (Unit_Maps.Key (C));
+                           Pkg_Specs.Include (Unit_Maps.Key (C));
+                        elsif (K = "package_spec" or else K = "package_inst"
+                               or else K = "procedure_inst" or else K = "function_inst")
+                          and then not SP.Is_Gen
+                        then
+                           Pkg_Specs.Include (Unit_Maps.Key (C));
+                        end if;
                      end if;
+                     for W of SP.Withs loop
+                        All_Withs.Include (W);
+                     end loop;
                   end if;
-                  for W of SP.Withs loop
-                     All_Withs.Include (W);
-                  end loop;
                end;
             end loop;
 
@@ -1255,37 +1647,64 @@ package body Lib_Binder is
                   UN : constant String := To_String (Unit_Maps.Key (C));
                   BD : constant Unit_Rec := Unit_Maps.Element (C);
                begin
-                  if not Is_RTL_Unit (UN, User_Has_Standard)
-                    and then To_String (BD.Kind) = "package_body"
-                    and then Pkg_Specs.Contains (Unit_Maps.Key (C))
-                    and then Specs.Contains (Unit_Maps.Key (C))
-                    and then BD.Seq > Specs.Element (Unit_Maps.Key (C)).Seq
-                  then
-                     -- LRM 10.3(5) (ca3006d): skip optional body obsoleted by recompiled withed spec
-                     declare
-                        Obs : Boolean := False;
-                     begin
-                        for W of BD.Withs loop
-                           if Spec_Time.Contains (W) and then Spec_Time.Element (W) > BD.Seq then
-                              Obs := True;
-                              exit;
+                  if Is_Reachable (Unit_Maps.Key (C)) then
+                     if not Is_RTL_Unit (UN, User_Has_Standard) then
+                        Graph_Units.Include (Unit_Maps.Key (C));
+                        Graph_Bodies.Include (Unit_Maps.Key (C));
+                        if BD.Is_Gen and then UN /= "length_check" and then UN /= "enum_check" then
+                           Gen_Units.Include (Unit_Maps.Key (C));
+                           if Specs.Contains (Unit_Maps.Key (C)) and then BD.Seq > Specs.Element (Unit_Maps.Key (C)).Seq then
+                              Pkg_Bodies.Include (Unit_Maps.Key (C));
                            end if;
-                        end loop;
-                        if not Obs then
-                           Pkg_Bodies.Include (Unit_Maps.Key (C));
+                        elsif To_String (BD.Kind) = "package_body"
+                          and then Pkg_Specs.Contains (Unit_Maps.Key (C))
+                          and then Specs.Contains (Unit_Maps.Key (C))
+                          and then BD.Seq > Specs.Element (Unit_Maps.Key (C)).Seq
+                        then
+                           -- LRM 10.3(5) (ca3006d): skip optional body obsoleted by recompiled withed spec
+                           declare
+                              Obs : Boolean := False;
+                           begin
+                              for W of BD.Withs loop
+                                 if Spec_Time.Contains (W) and then Spec_Time.Element (W) > BD.Seq then
+                                    Obs := True;
+                                    exit;
+                                 end if;
+                              end loop;
+                              if not Obs then
+                                 for G of BD.Insts loop
+                                    if (Gen_Body_Time.Contains (G) and then Gen_Body_Time.Element (G) > BD.Seq)
+                                      or else (Gen_Sub_Time.Contains (G) and then Gen_Sub_Time.Element (G) > BD.Seq)
+                                    then
+                                       Obs := True;
+                                       exit;
+                                    end if;
+                                 end loop;
+                              end if;
+                              if not Obs then
+                                 Pkg_Bodies.Include (Unit_Maps.Key (C));
+                              end if;
+                           end;
                         end if;
-                     end;
+                     end if;
+                     for W of BD.Withs loop
+                        All_Withs.Include (W);
+                     end loop;
                   end if;
-                  for W of BD.Withs loop
-                     All_Withs.Include (W);
-                  end loop;
                end;
             end loop;
 
             for C in Subunits.Iterate loop
-               for W of Unit_Maps.Element (C).Withs loop
-                  All_Withs.Include (W);
-               end loop;
+               declare
+                  SU    : constant Unit_Rec := Unit_Maps.Element (C);
+                  PRoot : constant Unbounded_String := To_Unbounded_String (Root_Of_Parent (To_String (SU.Parent)));
+               begin
+                  if Is_Reachable (PRoot) then
+                     for W of SU.Withs loop
+                        All_Withs.Include (W);
+                     end loop;
+                  end if;
+               end;
             end loop;
 
             -- Include support packages (REPORT, FCNDECL, SPPRT13) if withed
@@ -1297,19 +1716,21 @@ package body Lib_Binder is
             begin
                for Sup of Sup_Arr loop
                   if All_Withs.Contains (Sup) then
+                     Graph_Units.Include (Sup);
                      Pkg_Specs.Include (Sup);
                      if Support_Pkg_Has_Body (To_String (Sup)) then
+                        Graph_Bodies.Include (Sup);
                         Pkg_Bodies.Include (Sup);
                      end if;
                   end if;
                end loop;
             end;
 
-            -- Collect sorted node list
+            -- Collect sorted node list (includes subprograms & generics so transitive WITH/ELABORATE deps are preserved)
             declare
                Sorted_Pkgs : Str_Vecs.Vector;
             begin
-               for P of Pkg_Specs loop
+               for P of Graph_Units loop
                   Sorted_Pkgs.Append (P);
                end loop;
                -- Insertion sort alphabetically for deterministic ordering
@@ -1328,10 +1749,16 @@ package body Lib_Binder is
 
                for P of Sorted_Pkgs loop
                   EN_Idx.Insert (EKey (False, To_String (P)), Natural (ENodes.Length));
-                  ENodes.Append ((Is_Body => False, Name => P));
-                  if Pkg_Bodies.Contains (P) then
+                  ENodes.Append ((Is_Body   => False,
+                                  Emit_Call => Pkg_Specs.Contains (P),
+                                  Is_Gen    => Gen_Units.Contains (P),
+                                  Name      => P));
+                  if Graph_Bodies.Contains (P) then
                      EN_Idx.Insert (EKey (True, To_String (P)), Natural (ENodes.Length));
-                     ENodes.Append ((Is_Body => True, Name => P));
+                     ENodes.Append ((Is_Body   => True,
+                                     Emit_Call => Pkg_Bodies.Contains (P),
+                                     Is_Gen    => Gen_Units.Contains (P),
+                                     Name      => P));
                   end if;
                end loop;
             end;
@@ -1366,17 +1793,22 @@ package body Lib_Binder is
                   SA : constant String := To_String (NA.Name);
                   SB : constant String := To_String (NB.Name);
                   RA : constant Natural :=
-                    (if SA = "report" then 0 elsif Is_Support_Pkg (SA) then 1 else 2);
+                    (if SA = "report" then 0 elsif Is_Support_Pkg (SA) then 1 elsif NA.Is_Gen then 2 else 3);
                   RB : constant Natural :=
-                    (if SB = "report" then 0 elsif Is_Support_Pkg (SB) then 1 else 2);
+                    (if SB = "report" then 0 elsif Is_Support_Pkg (SB) then 1 elsif NB.Is_Gen then 2 else 3);
                begin
                   if RA /= RB then return RA < RB; end if;
                   if NA.Is_Body /= NB.Is_Body then return not NA.Is_Body; end if;
                   return SA < SB;
                end Prio_Less;
             begin
-               for P of Pkg_Bodies loop
-                  Add_Prereq (EKey (True, To_String (P)), EKey (False, To_String (P)));
+               for P of Graph_Bodies loop
+                  if Specs.Contains (P) or else Is_Support_Pkg (To_String (P)) then
+                     Add_Prereq (EKey (True, To_String (P)), EKey (False, To_String (P)));
+                  else
+                     -- Standalone subprogram body: S:P depends on B:P so WITH P transitively orders B:P's WITHs before callers
+                     Add_Prereq (EKey (False, To_String (P)), EKey (True, To_String (P)));
+                  end if;
                end loop;
 
                for C in Specs.Iterate loop
@@ -1385,13 +1817,15 @@ package body Lib_Binder is
                      SP : constant Unit_Rec := Unit_Maps.Element (C);
                      UK : constant Unbounded_String := EKey (False, UN);
                   begin
-                     for W of SP.Withs loop
-                        Add_Prereq (UK, EKey (False, To_String (W)));
-                     end loop;
-                     for E of SP.Elabs loop
-                        Add_Prereq (UK, EKey (False, To_String (E)));
-                        Add_Prereq (UK, EKey (True, To_String (E)));
-                     end loop;
+                     if Is_Reachable (Unit_Maps.Key (C)) then
+                        for W of SP.Withs loop
+                           Add_Prereq (UK, EKey (False, To_String (W)));
+                        end loop;
+                        for E of SP.Elabs loop
+                           Add_Prereq (UK, EKey (False, To_String (E)));
+                           Add_Prereq (UK, EKey (True, To_String (E)));
+                        end loop;
+                     end if;
                   end;
                end loop;
 
@@ -1401,13 +1835,15 @@ package body Lib_Binder is
                      BD : constant Unit_Rec := Unit_Maps.Element (C);
                      UK : constant Unbounded_String := EKey (True, UN);
                   begin
-                     for W of BD.Withs loop
-                        Add_Prereq (UK, EKey (False, To_String (W)));
-                     end loop;
-                     for E of BD.Elabs loop
-                        Add_Prereq (UK, EKey (False, To_String (E)));
-                        Add_Prereq (UK, EKey (True, To_String (E)));
-                     end loop;
+                     if Is_Reachable (Unit_Maps.Key (C)) then
+                        for W of BD.Withs loop
+                           Add_Prereq (UK, EKey (False, To_String (W)));
+                        end loop;
+                        for E of BD.Elabs loop
+                           Add_Prereq (UK, EKey (False, To_String (E)));
+                           Add_Prereq (UK, EKey (True, To_String (E)));
+                        end loop;
+                     end if;
                   end;
                end loop;
 
@@ -1417,18 +1853,20 @@ package body Lib_Binder is
                      PRoot : constant String := Root_Of_Parent (To_String (SU.Parent));
                      UK    : constant Unbounded_String := EKey (True, PRoot);
                   begin
-                     for W of SU.Withs loop
-                        Add_Prereq (UK, EKey (False, To_String (W)));
-                     end loop;
-                     for E of SU.Elabs loop
-                        Add_Prereq (UK, EKey (False, To_String (E)));
-                        Add_Prereq (UK, EKey (True, To_String (E)));
-                     end loop;
+                     if Is_Reachable (To_Unbounded_String (PRoot)) then
+                        for W of SU.Withs loop
+                           Add_Prereq (UK, EKey (False, To_String (W)));
+                        end loop;
+                        for E of SU.Elabs loop
+                           Add_Prereq (UK, EKey (False, To_String (E)));
+                           Add_Prereq (UK, EKey (True, To_String (E)));
+                        end loop;
+                     end if;
                   end;
                end loop;
 
                -- Support packages elaborate before user packages when unconstrained
-               for P of Pkg_Specs loop
+               for P of Graph_Units loop
                   declare
                      PN : constant String := To_String (P);
                   begin
@@ -1503,13 +1941,22 @@ package body Lib_Binder is
                   Ada.Text_IO.Put_Line (PF, "extern func @__ada_unhandled_exception(%e: ptr) -> void cc ""c""");
                   Ada.Text_IO.Put_Line (PF, "extern func @ada__" & Main_Low & "() -> void cc ""internal""");
 
+                  for G of Gen_Units loop
+                     Ada.Text_IO.Put_Line (PF, "export @ada_gelab__" & To_String (G) & " = global i8 = 0, align 1");
+                  end loop;
+
                   for K in 1 .. O_Cnt loop
                      declare
-                        EN  : constant ENode := ENodes.Element (Order (K));
-                        Sfx : constant String := (if EN.Is_Body then "elab_body" else "elab_spec");
-                        Sym : constant String := "@ada__" & To_String (EN.Name) & "__" & Sfx;
+                        EN : constant ENode := ENodes.Element (Order (K));
                      begin
-                        Ada.Text_IO.Put_Line (PF, "extern func " & Sym & "() -> void cc ""internal""");
+                        if EN.Emit_Call and then not EN.Is_Gen then
+                           declare
+                              Sfx : constant String := (if EN.Is_Body then "elab_body" else "elab_spec");
+                              Sym : constant String := "@ada__" & To_String (EN.Name) & "__" & Sfx;
+                           begin
+                              Ada.Text_IO.Put_Line (PF, "extern func " & Sym & "() -> void cc ""internal""");
+                           end;
+                        end if;
                      end;
                   end loop;
 
@@ -1519,23 +1966,34 @@ package body Lib_Binder is
 
                   for K in 1 .. O_Cnt loop
                      declare
-                        EN  : constant ENode := ENodes.Element (Order (K));
-                        Sfx : constant String := (if EN.Is_Body then "elab_body" else "elab_spec");
-                        Sym : constant String := "@ada__" & To_String (EN.Name) & "__" & Sfx;
+                        EN : constant ENode := ENodes.Element (Order (K));
                      begin
-                        Step_No := Step_No + 1;
-                        Ada.Text_IO.Put_Line (PF, "  invoke " & Sym & "() then .el_" & Trim_Img (Step_No) & " unwind .unhandled(exn)");
-                        Ada.Text_IO.Put_Line (PF, ".el_" & Trim_Img (Step_No) & ":");
-                        -- LRM 9.3(2): for a bodyless library package spec declaring tasks, activate its group right after elab_spec!
-                        if not EN.Is_Body and then not Pkg_Bodies.Contains (EN.Name)
-                          and then Specs.Contains (EN.Name) and then Specs.Element (EN.Name).Has_Tasks
-                        then
-                           Step_No := Step_No + 1;
-                           Ada.Text_IO.Put_Line (PF,
-                             "  invoke @__ada_master_activate_group(%__gm, " &
-                             Trim_Img64 (Lib_Pkg_Task_Group_Id (To_String (EN.Name))) &
-                             ") then .el_" & Trim_Img (Step_No) & " unwind .unhandled(exn)");
-                           Ada.Text_IO.Put_Line (PF, ".el_" & Trim_Img (Step_No) & ":");
+                        if EN.Emit_Call and then EN.Is_Gen then
+                           if EN.Is_Body then
+                              Step_No := Step_No + 1;
+                              Ada.Text_IO.Put_Line (PF, "  %ge_" & Trim_Img (Step_No) & " = addr @ada_gelab__" & To_String (EN.Name));
+                              Ada.Text_IO.Put_Line (PF, "  store.i8 1, %ge_" & Trim_Img (Step_No) & ", align 1");
+                           end if;
+                        elsif EN.Emit_Call then
+                           declare
+                              Sfx : constant String := (if EN.Is_Body then "elab_body" else "elab_spec");
+                              Sym : constant String := "@ada__" & To_String (EN.Name) & "__" & Sfx;
+                           begin
+                              Step_No := Step_No + 1;
+                              Ada.Text_IO.Put_Line (PF, "  invoke " & Sym & "() then .el_" & Trim_Img (Step_No) & " unwind .unhandled(exn)");
+                              Ada.Text_IO.Put_Line (PF, ".el_" & Trim_Img (Step_No) & ":");
+                              -- LRM 9.3(2): for a bodyless library package spec declaring tasks, activate its group right after elab_spec!
+                              if not EN.Is_Body and then not Pkg_Bodies.Contains (EN.Name)
+                                and then Specs.Contains (EN.Name) and then Specs.Element (EN.Name).Has_Tasks
+                              then
+                                 Step_No := Step_No + 1;
+                                 Ada.Text_IO.Put_Line (PF,
+                                   "  invoke @__ada_master_activate_group(%__gm, " &
+                                   Trim_Img64 (Lib_Pkg_Task_Group_Id (To_String (EN.Name))) &
+                                   ") then .el_" & Trim_Img (Step_No) & " unwind .unhandled(exn)");
+                                 Ada.Text_IO.Put_Line (PF, ".el_" & Trim_Img (Step_No) & ":");
+                              end if;
+                           end;
                         end if;
                      end;
                   end loop;

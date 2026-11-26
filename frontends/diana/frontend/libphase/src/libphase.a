@@ -360,29 +360,42 @@ procedure LIBPHASE is
     ANC_NAME := D(AS_NAME,SUBUNIT);
     LOAD_WITH_ANCESTOR(ANC_NAME,ANC_PRISYM);
     D(AS_NAME, SUBUNIT, ANC_NAME); -- put back name as list of used_name_id's
-    if ANC_PRISYM /= CONST_VOID
-    and then KIND(ANC_NAME) = DN_SELECTED then
-      -- ancestor exists and is subunit, check for conflicting subunit
---@   -- debug stuff
---@   PUT_LINE("Check conflict.");
---@   PUT_TREE(ANC_PRISYM);PUT(' ');
---@   PUT_LINE(PRINTNAME(ANC_PRISYM));
---@   PUT_TREE(SUBUNIT);NEW_LINE;
---@   PUT_TREE(D(AS_SUBUNIT_BODY,SUBUNIT));NEW_LINE;
---@   PUT_TREE(SON1(D(AS_SUBUNIT_BODY,SUBUNIT)));NEW_LINE;
---@   PUT_TREE(D(LX_SYMREP,SON1(D(AS_SUBUNIT_BODY,SUBUNIT))));NEW_LINE;
---@   PUT_LINE(PRINTNAME(D(LX_SYMREP,SON1(D(AS_SUBUNIT_BODY,SUBUNIT)))));
---@   -- end debug stuff
-      UNIT := LOAD_UNIT(PRINTNAME(ANC_PRISYM),
-	    PRINTNAME(D(LX_SYMREP,SON1(D(AS_SUBUNIT_BODY,SUBUNIT)))) );
-      if UNIT /= CONST_VOID then
-	-- (Note. lx_symrep may still be txtrep, so compare printnames)
-	if PRINTNAME(D(LX_SYMREP, D(AS_DESIGNATOR, ANC_NAME) ))
-	      /= PRINTNAME(D(LX_SYMREP, D(AS_DESIGNATOR,
-		   D(AS_NAME, D(AS_ALL_DECL,UNIT)) ))) then
-	  ERROR(SUBUNIT, "Conflicting subunit names");
-	end if;
-      end if;
+    if ANC_PRISYM /= CONST_VOID then
+      -- P3-5.19: LRM 10.2(6) check for conflicting subunit simple names under the same ancestor library unit
+      declare
+        SUB_BDY : constant TREE := D(AS_SUBUNIT_BODY, SUBUNIT);
+        SUB_SN  : TREE := CONST_VOID;
+        function SAME_ANC_PATH(N1, N2: TREE) return BOOLEAN is
+        begin
+          if N1 = CONST_VOID or else N2 = CONST_VOID then
+            return N1 = N2;
+          elsif KIND(N1) = DN_SELECTED and then KIND(N2) = DN_SELECTED then
+            return PRINTNAME(D(LX_SYMREP, D(AS_DESIGNATOR, N1))) =
+                   PRINTNAME(D(LX_SYMREP, D(AS_DESIGNATOR, N2)))
+              and then SAME_ANC_PATH(D(AS_NAME, N1), D(AS_NAME, N2));
+          elsif KIND(N1) /= DN_SELECTED and then KIND(N2) /= DN_SELECTED then
+            return PRINTNAME(D(LX_SYMREP, N1)) = PRINTNAME(D(LX_SYMREP, N2));
+          else
+            return FALSE;
+          end if;
+        end SAME_ANC_PATH;
+      begin
+        if SUB_BDY /= CONST_VOID then
+          SUB_SN := SON1(SUB_BDY);
+        end if;
+        if SUB_SN /= CONST_VOID and then D(LX_SYMREP, SUB_SN) /= CONST_VOID then
+          UNIT := LOAD_UNIT(PRINTNAME(ANC_PRISYM),
+                            PRINTNAME(D(LX_SYMREP, SUB_SN)));
+          if UNIT /= CONST_VOID
+            and then D(AS_ALL_DECL, UNIT) /= CONST_VOID
+            and then KIND(D(AS_ALL_DECL, UNIT)) = DN_SUBUNIT
+          then
+            if not SAME_ANC_PATH(ANC_NAME, D(AS_NAME, D(AS_ALL_DECL, UNIT))) then
+              ERROR(SUBUNIT, "Conflicting subunit names");
+            end if;
+          end if;
+        end if;
+      end;
     end if;
   end WITH_FOR_ANCESTOR;
 
@@ -1042,44 +1055,75 @@ procedure LIBPHASE is
 	      and then (KIND(D(AS_ALL_DECL, BDY_U)) = DN_SUBPROGRAM_BODY
 			or else KIND(D(AS_ALL_DECL, BDY_U)) = DN_PACKAGE_BODY) then
 		D(SM_BODY, GID, D(AS_ALL_DECL, BDY_U));
-		-- Also load any separately-compiled .SUB subunits belonging to this library generic (ca3011a)
+		-- P3-5.3: Recursively load & attach any separately-compiled .SUB subunits belonging to this library generic (ca3011a)
 		declare
 		  BDY_D: constant TREE := D(AS_ALL_DECL, BDY_U);
 		  BLK_B: constant TREE := D(AS_BODY, BDY_D);
-		  LIS: SEQ_TYPE := LIB_INFO_SEQ;
-		  LI: TREE;
-		  SUB_U, SUB_AD, SB: TREE;
-		  ITL: SEQ_TYPE;
-		  IT: TREE;
-		begin
-		  if BLK_B /= CONST_VOID and then KIND(BLK_B) = DN_BLOCK_BODY
-		  and then D(AS_ITEM_S, BLK_B) /= CONST_VOID then
-		    while not IS_EMPTY(LIS) loop
-		      POP(LIS, LI);
-		      if PRINTNAME(D(XD_PRIMARY, LI)) = PRINTNAME(GNAME)
-		      and then PRINTNAME(D(XD_SECONDARY, LI)) /= "$" then
-			SUB_U := LOAD_UNIT(STORESYM(PRINTNAME(D(XD_SHORT, LI)) & ".SUB"));
-			if SUB_U /= CONST_VOID and then D(AS_ALL_DECL, SUB_U) /= CONST_VOID
-			and then KIND(D(AS_ALL_DECL, SUB_U)) = DN_SUBUNIT then
-			  SUB_AD := D(AS_ALL_DECL, SUB_U);
-			  SB := D(AS_SUBUNIT_BODY, SUB_AD);
-			  if SB /= CONST_VOID and then D(AS_SOURCE_NAME, SB) /= CONST_VOID then
-			    ITL := LIST(D(AS_ITEM_S, BLK_B));
-			    while not IS_EMPTY(ITL) loop
-			      POP(ITL, IT);
-			      if KIND(IT) = KIND(SB)
-			      and then D(AS_BODY, IT) /= CONST_VOID
-			      and then KIND(D(AS_BODY, IT)) = DN_STUB
-			      and then D(AS_SOURCE_NAME, IT) /= CONST_VOID
-			      and then PRINTNAME(D(LX_SYMREP, D(AS_SOURCE_NAME, IT))) =
-				       PRINTNAME(D(LX_SYMREP, D(AS_SOURCE_NAME, SB))) then
-				D(AS_BODY, IT, D(AS_BODY, SB));
-				exit;
-			      end if;
-			    end loop;
+		  CHANGED: BOOLEAN := TRUE;
+		  function ATTACH_SUB_IN_BLOCK(BLK: TREE; SB: TREE) return BOOLEAN is
+		    ITL: SEQ_TYPE;
+		    IT: TREE;
+		    SUB_BLK: TREE;
+		  begin
+		    if BLK = CONST_VOID or else KIND(BLK) /= DN_BLOCK_BODY
+		      or else D(AS_ITEM_S, BLK) = CONST_VOID
+		    then
+		      return FALSE;
+		    end if;
+		    ITL := LIST(D(AS_ITEM_S, BLK));
+		    while not IS_EMPTY(ITL) loop
+		      POP(ITL, IT);
+		      if KIND(IT) = DN_SUBPROGRAM_BODY or else KIND(IT) = DN_PACKAGE_BODY or else KIND(IT) = DN_TASK_BODY then
+			if KIND(IT) = KIND(SB)
+			  and then D(AS_BODY, IT) /= CONST_VOID
+			  and then KIND(D(AS_BODY, IT)) = DN_STUB
+			  and then D(AS_SOURCE_NAME, IT) /= CONST_VOID
+			  and then PRINTNAME(D(LX_SYMREP, D(AS_SOURCE_NAME, IT))) =
+				   PRINTNAME(D(LX_SYMREP, D(AS_SOURCE_NAME, SB)))
+			then
+			  D(AS_BODY, IT, D(AS_BODY, SB));
+			  return TRUE;
+			end if;
+			SUB_BLK := D(AS_BODY, IT);
+			if SUB_BLK /= CONST_VOID and then KIND(SUB_BLK) = DN_BLOCK_BODY then
+			  if ATTACH_SUB_IN_BLOCK(SUB_BLK, SB) then
+			    return TRUE;
 			  end if;
 			end if;
 		      end if;
+		    end loop;
+		    return FALSE;
+		  end ATTACH_SUB_IN_BLOCK;
+		begin
+		  if BLK_B /= CONST_VOID and then KIND(BLK_B) = DN_BLOCK_BODY then
+		    for PASS in 1 .. 6 loop
+		      exit when not CHANGED;
+		      CHANGED := FALSE;
+		      declare
+			LIS: SEQ_TYPE := LIB_INFO_SEQ;
+			LI: TREE;
+			SUB_U, SUB_AD, SB: TREE;
+		      begin
+			while not IS_EMPTY(LIS) loop
+			  POP(LIS, LI);
+			  if PRINTNAME(D(XD_PRIMARY, LI)) = PRINTNAME(GNAME)
+			    and then PRINTNAME(D(XD_SECONDARY, LI)) /= "$"
+			  then
+			    SUB_U := LOAD_UNIT(STORESYM(PRINTNAME(D(XD_SHORT, LI)) & ".SUB"));
+			    if SUB_U /= CONST_VOID and then D(AS_ALL_DECL, SUB_U) /= CONST_VOID
+			      and then KIND(D(AS_ALL_DECL, SUB_U)) = DN_SUBUNIT
+			    then
+			      SUB_AD := D(AS_ALL_DECL, SUB_U);
+			      SB := D(AS_SUBUNIT_BODY, SUB_AD);
+			      if SB /= CONST_VOID and then D(AS_SOURCE_NAME, SB) /= CONST_VOID then
+				if ATTACH_SUB_IN_BLOCK(BLK_B, SB) then
+				  CHANGED := TRUE;
+				end if;
+			      end if;
+			    end if;
+			  end if;
+			end loop;
+		      end;
 		    end loop;
 		  end if;
 		end;

@@ -196,8 +196,17 @@ for idx in "${!SRCS[@]}"; do
         exit 0
     fi
 
-    "$PIRC" --target="$TARGET" "$OPT" -c "$pir_out" -o "$obj_out"
-    SINGLE_OBJ="$obj_out"
+    if [ -f "$pir_out" ]; then
+        "$PIRC" --target="$TARGET" "$OPT" -c "$pir_out" -o "$obj_out"
+        SINGLE_OBJ="$obj_out"
+    else
+        for cu_pir in "$WORK/objs/unit_${OBJ_SEQ}__cu"*.pir; do
+            [ -f "$cu_pir" ] || continue
+            cu_obj="${cu_pir%.pir}.o"
+            "$PIRC" --target="$TARGET" "$OPT" -c "$cu_pir" -o "$cu_obj"
+            SINGLE_OBJ="$cu_obj"
+        done
+    fi
 done
 
 if [ "$COMPILE_ONLY" -eq 1 ]; then

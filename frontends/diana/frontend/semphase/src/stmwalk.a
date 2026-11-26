@@ -19,7 +19,7 @@ package body STMWALK is
     GEN_BLOCK_LOOP_COUNT: NATURAL := 0;
 
     -- Label owning-stm_s table and active stm_s / loop stacks for goto/exit checks
-    MAX_LABELS: constant NATURAL := 1024;
+    MAX_LABELS: constant NATURAL := 8192;
     LBL_IDS: array (1 .. MAX_LABELS) of TREE;
     LBL_STM_S: array (1 .. MAX_LABELS) of TREE;
     LBL_CNT: NATURAL := 0;
@@ -506,8 +506,31 @@ package body STMWALK is
 			-- resolve the expression
 			EVAL_EXP_TYPES(EXP, TYPESET);
 			REQUIRE_TYPE(H.RETURN_TYPE, EXP, TYPESET);
-			EXP := RESOLVE_EXP(EXP, TYPESET);
+			if EXP /= CONST_VOID and then KIND(EXP) = DN_AGGREGATE
+			and then not IS_EMPTY(TYPESET)
+			and then H.REGION_DEF /= CONST_VOID
+			and then D(XD_SOURCE_NAME, H.REGION_DEF) /= CONST_VOID
+			and then D(SM_SPEC, D(XD_SOURCE_NAME, H.REGION_DEF)) /= CONST_VOID
+			and then KIND(D(SM_SPEC, D(XD_SOURCE_NAME, H.REGION_DEF))) = DN_FUNCTION_SPEC then
+			    declare
+				RET_M: constant TREE := D(AS_NAME, D(SM_SPEC, D(XD_SOURCE_NAME, H.REGION_DEF)));
+				RET_S: TREE := CONST_VOID;
+			    begin
+				if RET_M /= CONST_VOID and then GET_NAME_DEFN(RET_M) /= CONST_VOID
+				and then KIND(GET_NAME_DEFN(RET_M)) in CLASS_TYPE_NAME then
+				    RET_S := D(SM_TYPE_SPEC, GET_NAME_DEFN(RET_M));
+				end if;
+				if RET_S /= CONST_VOID and then KIND(RET_S) = DN_CONSTRAINED_ARRAY then
+				    EXP := RESOLVE_EXP(EXP, RET_S);
+				else
+				    EXP := RESOLVE_EXP(EXP, TYPESET);
+				end if;
+			    end;
+			else
+			    EXP := RESOLVE_EXP(EXP, TYPESET);
+			end if;
 			D(AS_EXP, STM, EXP);
+			CHECK_NO_OUT_READ(EXP);
 		    end if;
 
 		else -- since there is no expression given
@@ -533,6 +556,7 @@ package body STMWALK is
 		REQUIRE_TYPE(GET_BASE_TYPE(PREDEFINED_DURATION), EXP, TYPESET);
 		EXP := RESOLVE_EXP(EXP, TYPESET);
 		D(AS_EXP, STM, EXP);
+		CHECK_NO_OUT_READ(EXP);
 	    end;
 
 
@@ -555,13 +579,21 @@ package body STMWALK is
 			, EXP, EXP_TYPESET
 			, TYPESET );
 
-		-- resolve exp
-		EXP := RESOLVE_EXP(EXP, TYPESET);
-		D(AS_EXP, STM, EXP);
-
-		-- resolve name
+		-- resolve name first so constrained array target subtype is available for named+others aggregate RHS
 		NAME := RESOLVE_EXP(NAME, TYPESET);
 		D(AS_NAME, STM, NAME);
+
+		-- resolve exp
+		if EXP /= CONST_VOID and then KIND(EXP) = DN_AGGREGATE
+		and then not IS_EMPTY(TYPESET)
+		and then NAME /= CONST_VOID
+		and then D(SM_EXP_TYPE, NAME) /= CONST_VOID
+		and then KIND(D(SM_EXP_TYPE, NAME)) = DN_CONSTRAINED_ARRAY then
+		    EXP := RESOLVE_EXP(EXP, D(SM_EXP_TYPE, NAME));
+		else
+		    EXP := RESOLVE_EXP(EXP, TYPESET);
+		end if;
+		D(AS_EXP, STM, EXP);
 
 		-- LRM 6.2(5): RHS of assignment cannot read an OUT parameter (b62006b/e, b85007b, b95074a)
 		CHECK_NO_OUT_READ(EXP);
@@ -733,6 +765,7 @@ package body STMWALK is
 		    REQUIRE_BOOLEAN_TYPE(EXP, TYPESET);
 		    EXP := RESOLVE_EXP(EXP, TYPESET);
 		    D(AS_EXP, STM, EXP);
+		    CHECK_NO_OUT_READ(EXP);
 		end if;
 
 		-- if a loop name is given
@@ -823,6 +856,7 @@ package body STMWALK is
 		end if;
 		EXP := RESOLVE_EXP(EXP, REQUIRED_TYPE);
 		D(AS_EXP, STM, EXP);
+		CHECK_NO_OUT_READ(EXP);
 
 		-- for each element of the alternative list
 		while not IS_EMPTY(ALTERNATIVE_LIST) loop
@@ -850,7 +884,7 @@ package body STMWALK is
 		-- LRM 5.4: check case choices are static, non-overlapping, others is last/only, and complete
 		if REQUIRED_TYPE /= CONST_VOID then
 		    declare
-			MAX_INTV: constant INTEGER := 512;
+			MAX_INTV: constant INTEGER := 4096;
 			LO_ARR: array (1 .. MAX_INTV) of TREE;
 			HI_ARR: array (1 .. MAX_INTV) of TREE;
 			N_INTV: INTEGER := 0;
@@ -921,7 +955,14 @@ package body STMWALK is
 					begin
 					    if KIND(DR) = DN_RANGE then
 						R_NODE := DR;
+					    elsif KIND(DR) = DN_RANGE_ATTRIBUTE then
+						NON_STATIC := TRUE;
+						ERROR(D(LX_SRCPOS, CH), "Range attribute not allowed as case choice");
 					    elsif KIND(DR) = DN_DISCRETE_SUBTYPE then
+						if not CHKSTAT.IS_STATIC_DISCRETE_RANGE(DR) then
+						    NON_STATIC := TRUE;
+						    ERROR(D(LX_SRCPOS, CH), "Case subtype choice must be static");
+						end if;
 						declare
 						    SI_N: constant TREE := D(AS_SUBTYPE_INDICATION, DR);
 						    C_N: TREE := CONST_VOID;
@@ -971,8 +1012,9 @@ package body STMWALK is
 							HI_ARR(N_INTV) := C_HI;
 						    end if;
 						end if;
-					    else
+					    elsif not NON_STATIC then
 						NON_STATIC := TRUE;
+						ERROR(D(LX_SRCPOS, CH), "Case range must be static");
 					    end if;
 					end;
 				    end if;
@@ -1006,6 +1048,7 @@ package body STMWALK is
 				if KIND(EXP) = DN_USED_OBJECT_ID
 				or else KIND(EXP) = DN_SELECTED
 				or else KIND(EXP) = DN_INDEXED
+				or else KIND(EXP) = DN_ALL
 				or else KIND(EXP) = DN_QUALIFIED
 				or else KIND(EXP) = DN_CONVERSION then
 				    APP_T := EXP_T;
@@ -1029,8 +1072,8 @@ package body STMWALK is
 				end if;
 			    end if;
 
-			    -- LRM 5.4(4): if expression has a static subtype, every non-null choice must lie in [S_LO, S_HI]
-			    if IS_STAT_SUB and then S_LO /= CONST_VOID and then S_HI /= CONST_VOID then
+			    -- LRM 5.4(4): every non-null choice must lie in applicable subtype (or base type) range [S_LO, S_HI]
+			    if not IS_UNIV and then S_LO /= CONST_VOID and then S_HI /= CONST_VOID then
 				for K in 1 .. N_INTV loop
 				    if UARITH."<="(LO_ARR(K), HI_ARR(K)) then
 					if not UARITH."<="(S_LO, LO_ARR(K))
@@ -1464,7 +1507,7 @@ package body STMWALK is
 		    PREV_LOOP_B:  constant NATURAL := LOOP_BARRIER;
 		begin
 		    CAN_RETURN := TRUE;
-		    IN_HANDLER := FALSE;
+		    -- LRM 11.3(3): bare raise; is allowed inside accept enclosed by an exception handler
 		    STM_BARRIER := STM_SP;
 		    LOOP_BARRIER := LOOP_SP;
 		    WALK_STM_S(STM_S, H);
@@ -1510,6 +1553,10 @@ package body STMWALK is
 					( DISCRETE_RANGE
 					, GET_THE_TYPE(RANGE_TYPESET) );
 			D(AS_DISCRETE_RANGE, ITERATION, DISCRETE_RANGE);
+			if DISCRETE_RANGE /= CONST_VOID and then KIND(DISCRETE_RANGE) = DN_RANGE then
+			    CHECK_NO_OUT_READ(D(AS_EXP1, DISCRETE_RANGE));
+			    CHECK_NO_OUT_READ(D(AS_EXP2, DISCRETE_RANGE));
+			end if;
 
 			if not IS_EMPTY(RANGE_TYPESET) then
 			    MAKE_DEF_VISIBLE(ITERATION_ID_DEF);
@@ -1531,6 +1578,7 @@ package body STMWALK is
 			REQUIRE_UNIQUE_TYPE(EXP, EXP_TYPESET);
 			EXP := RESOLVE_EXP(EXP, GET_THE_TYPE(EXP_TYPESET));
 			D(AS_EXP, ITERATION, EXP);
+			CHECK_NO_OUT_READ(EXP);
 		    end;
 		end if;
 
@@ -1562,6 +1610,17 @@ package body STMWALK is
 				end if;
 				case KIND(ST) is
 				when DN_LOOP =>
+				    if D(AS_SOURCE_NAME, ST) /= CONST_VOID
+				    and then D(LX_SYMREP, D(AS_SOURCE_NAME, ST)) = IT_SYM then
+					ERROR(D(LX_SRCPOS, D(AS_SOURCE_NAME, ST)), "Loop name clashes with enclosing loop parameter");
+				    end if;
+				    CHECK_LBL_CLASH(D(AS_STM_S, ST));
+				when DN_BLOCK =>
+				    if D(AS_SOURCE_NAME, ST) /= CONST_VOID
+				    and then D(LX_SYMREP, D(AS_SOURCE_NAME, ST)) = IT_SYM then
+					ERROR(D(LX_SRCPOS, D(AS_SOURCE_NAME, ST)), "Block name clashes with enclosing loop parameter");
+				    end if;
+				when DN_ACCEPT =>
 				    CHECK_LBL_CLASH(D(AS_STM_S, ST));
 				when DN_IF | DN_SELECTIVE_WAIT =>
 				    declare
@@ -1693,6 +1752,7 @@ package body STMWALK is
 		    REQUIRE_UNIQUE_TYPE(EXP, TYPESET);
 		    EXP := RESOLVE_EXP(EXP, GET_THE_TYPE(TYPESET));
 		    D(AS_EXP, COND_CLAUSE, EXP);
+		    CHECK_NO_OUT_READ(EXP);
 
 		    -- walk the sequence of statements
 		    WALK_STM_S(D(AS_STM_S,COND_CLAUSE), H);

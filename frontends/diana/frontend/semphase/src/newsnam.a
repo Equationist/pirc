@@ -99,7 +99,8 @@ package body NEWSNAM is
 			D(SM_INIT_EXP, SOURCE_NAME, CONST_VOID);
 
 		    -- else if declaration includes a constrained array def
-		    elsif KIND(D(AS_TYPE_DEF,DECL)) = DN_CONSTRAINED_ARRAY_DEF
+		    elsif (KIND(DECL) = DN_CONSTANT_DECL or else KIND(DECL) = DN_VARIABLE_DECL)
+		    and then KIND(D(AS_TYPE_DEF,DECL)) = DN_CONSTRAINED_ARRAY_DEF
 		    then
 
 			-- make a new base type

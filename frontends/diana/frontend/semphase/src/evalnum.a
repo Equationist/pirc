@@ -63,10 +63,7 @@ function EVALNUM(TXT: STRING) return TREE is
       while CHR /= ' ' loop
         if CHR /= '_' then
 	  if EXPONENT > 3275 then
-	    if not (VNUMER.L = 1 and then VNUMER.D(1) = 0) then
-	      PUT_LINE ("Exponent in numeric lit too large");
-	      raise ASSERTION_ERROR;
-	    end if;
+	    EXPONENT := 1_000_000;
 	  else
             EXPONENT := EXPONENT * 10 + CHARACTER'POS(CHR) - CHARACTER'POS('0');
 	  end if;
@@ -86,22 +83,35 @@ function EVALNUM(TXT: STRING) return TREE is
     if not (VNUMER.L = 1 and then VNUMER.D(1) = 0) then
       if EXPONENT > 0 then
         for I in 1 .. EXPONENT loop
+	  if VNUMER.L >= VNUMER.D'LAST - 4 then
+	    return CONST_VOID;
+	  end if;
 	  V_SCALE(RADIX, VNUMER);
         end loop;
       elsif EXPONENT < 0 then
         for I in 1 .. - EXPONENT loop
+	  if VDENOM.L >= VDENOM.D'LAST - 4 then
+	    -- Extremely small non-zero real literal (e.g. 1.0E-1008): underflows universal vector cap
+	    return CONST_VOID;
+	  end if;
 	  V_SCALE(RADIX, VDENOM);
         end loop;
       end if;
     end if;
 
     if SCALEFACTOR >= 0 then
-      VNUMER.D(VNUMER.L+1) := 0;
+      if VNUMER.L < VNUMER.D'LAST then
+        VNUMER.D(VNUMER.L+1) := 0;
+      end if;
       return U_INT(VNUMER);
     else
       V_LOWEST_TERMS(VNUMER,VDENOM);
-      VNUMER.D(VNUMER.L+1) := 0;
-      VDENOM.D(VDENOM.L+1) := 0;
+      if VNUMER.L < VNUMER.D'LAST then
+        VNUMER.D(VNUMER.L+1) := 0;
+      end if;
+      if VDENOM.L < VDENOM.D'LAST then
+        VDENOM.D(VDENOM.L+1) := 0;
+      end if;
       return U_REAL(VNUMER, VDENOM);
     end if;
   end;

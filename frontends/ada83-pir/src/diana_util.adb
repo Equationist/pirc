@@ -1093,6 +1093,173 @@ package body Diana_Util is
       return Fixed_Small (B);
    end Fixed_Attr_Small;
 
+   function Gcd_U64 (A, B : Unsigned_64) return Unsigned_64 is
+      X : Unsigned_64 := A;
+      Y : Unsigned_64 := B;
+      T : Unsigned_64;
+   begin
+      while Y /= 0 loop
+         T := X mod Y;
+         X := Y;
+         Y := T;
+      end loop;
+      return (if X = 0 then 1 else X);
+   end Gcd_U64;
+
+   procedure Fixed_Small_Rational
+     (T   : TREE;
+      Ok  : out Boolean;
+      Num : out Integer_64;
+      Den : out Integer_64)
+   is
+      R  : constant TREE := Resolve_Type_Spec (T);
+      B  : constant TREE := Base_Type_Spec (T);
+      Sm : TREE := CONST_VOID;
+      O1, O2 : Boolean;
+      N, D_V : Integer_64;
+   begin
+      Ok  := False;
+      Num := 1;
+      Den := 1;
+      if not Is_Void_Tree (B) and then KIND (B) = DN_FIXED then
+         Sm := D (CD_IMPL_SMALL, B);
+      end if;
+      if (Is_Void_Tree (Sm) or else KIND (Sm) /= DN_REAL_VAL)
+        and then not Is_Void_Tree (R) and then KIND (R) = DN_FIXED
+      then
+         Sm := D (CD_IMPL_SMALL, R);
+      end if;
+      if not Is_Void_Tree (Sm) and then KIND (Sm) = DN_REAL_VAL then
+         Eval_Int64_Checked (D (XD_NUMER, Sm), N, O1);
+         Eval_Int64_Checked (D (XD_DENOM, Sm), D_V, O2);
+         if not O1 and then not O2 and then N > 0 and then D_V > 0 then
+            declare
+               G : constant Unsigned_64 := Gcd_U64 (Unsigned_64 (N), Unsigned_64 (D_V));
+            begin
+               Num := Integer_64 (Unsigned_64 (N) / G);
+               Den := Integer_64 (Unsigned_64 (D_V) / G);
+               Ok  := True;
+            end;
+         end if;
+      end if;
+   end Fixed_Small_Rational;
+
+   procedure Eval_Fixed_Ticks_Exact_Checked
+     (SV      : TREE;
+      Fixed_T : TREE;
+      Val     : out Integer_64;
+      Ovf     : out Boolean)
+   is
+      BT   : constant TREE := Base_Type_Spec (Fixed_T);
+      Bits : constant Natural := Scalar_Bits (if not Is_Void_Tree (BT) then BT else Fixed_T);
+      Min_I : constant Integer_64 :=
+        (if Bits >= 64 then Integer_64'First
+         else -(Integer_64 (Shift_Left (Unsigned_64 (1), Bits - 1))));
+      Max_I : constant Integer_64 :=
+        (if Bits >= 64 then Integer_64'Last
+         else Integer_64 (Shift_Left (Unsigned_64 (1), Bits - 1) - 1));
+      Sm_Ok : Boolean;
+      Sm_N, Sm_D : Integer_64;
+      Used_Exact : Boolean := False;
+   begin
+      Val := 0;
+      Ovf := False;
+      Fixed_Small_Rational (Fixed_T, Sm_Ok, Sm_N, Sm_D);
+      if Sm_Ok and then not Is_Void_Tree (SV) and then KIND (SV) = DN_REAL_VAL then
+         declare
+            VN, VD : Integer_64;
+            ON, OD : Boolean;
+         begin
+            Eval_Int64_Checked (D (XD_NUMER, SV), VN, ON);
+            Eval_Int64_Checked (D (XD_DENOM, SV), VD, OD);
+            if not ON and then not OD and then VD > 0 then
+               declare
+                  Neg : constant Boolean := VN < 0;
+                  UN  : Unsigned_64 := (if VN = Integer_64'First then Unsigned_64 (Integer_64'Last) + 1
+                                        elsif VN < 0 then Unsigned_64 (-VN)
+                                        else Unsigned_64 (VN));
+                  UD  : Unsigned_64 := Unsigned_64 (VD);
+                  USN : Unsigned_64 := Unsigned_64 (Sm_N);
+                  USD : Unsigned_64 := Unsigned_64 (Sm_D);
+                  G1, G2 : Unsigned_64;
+               begin
+                  -- Reduce (UN / UD) / (USN / USD) = (UN * USD) / (UD * USN)
+                  G1 := Gcd_U64 (UN, USN); UN := UN / G1; USN := USN / G1;
+                  G2 := Gcd_U64 (USD, UD); USD := USD / G2; UD := UD / G2;
+                  if (USD = 0 or else UN <= Unsigned_64'Last / USD)
+                    and then (USN = 0 or else UD <= Unsigned_64'Last / USN)
+                  then
+                     declare
+                        Num_P : constant Unsigned_64 := UN * USD;
+                        Den_P : constant Unsigned_64 := UD * USN;
+                        Q     : Unsigned_64;
+                        Rem_V : Unsigned_64;
+                     begin
+                        if Den_P > 0 then
+                           Q := Num_P / Den_P;
+                           Rem_V := Num_P mod Den_P;
+                           if Rem_V >= Den_P - Rem_V then
+                              if Q < Unsigned_64'Last then Q := Q + 1; else Ovf := True; end if;
+                           end if;
+                           Used_Exact := True;
+                           if not Ovf then
+                              if not Neg then
+                                 if Bits >= 64 and then Q = Unsigned_64 (Integer_64'Last) + 1 then
+                                    Val := Max_I;
+                                 elsif Q > Unsigned_64 (Max_I) then
+                                    Ovf := True; Val := Max_I;
+                                 else
+                                    Val := Integer_64 (Q);
+                                 end if;
+                              else
+                                 declare
+                                    Max_Neg : constant Unsigned_64 :=
+                                      (if Min_I = Integer_64'First then Unsigned_64 (Integer_64'Last) + 1
+                                       else Unsigned_64 (-Min_I));
+                                 begin
+                                    if Q > Max_Neg then
+                                       Ovf := True; Val := Min_I;
+                                    elsif Q = Unsigned_64 (Integer_64'Last) + 1 then
+                                       Val := Integer_64'First;
+                                    else
+                                       Val := -Integer_64 (Q);
+                                    end if;
+                                 end;
+                              end if;
+                           end if;
+                        end if;
+                     end;
+                  end if;
+               end;
+            end if;
+         end;
+      end if;
+      if not Used_Exact then
+         declare
+            Sm   : constant IEEE_Float_64 := Fixed_Small (Fixed_T);
+            FVal : constant IEEE_Float_64 := Eval_Float64 (SV);
+            Rat  : constant IEEE_Float_64 := (if Sm > 0.0 then FVal / Sm else 0.0);
+            Min_F : constant IEEE_Float_64 := IEEE_Float_64 (Min_I);
+            Max_F : constant IEEE_Float_64 := IEEE_Float_64 (Max_I);
+         begin
+            if Rat < Min_F then
+               Ovf := True; Val := Min_I;
+            elsif Bits >= 64 and then Rat > 9223372036854775808.0 then
+               Ovf := True; Val := Max_I;
+            elsif Bits < 64 and then Rat > Max_F then
+               Ovf := True; Val := Max_I;
+            elsif Rat >= IEEE_Float_64 (Integer_64'Last) then
+               Val := Max_I;
+            elsif Rat <= IEEE_Float_64 (Integer_64'First) then
+               Val := Min_I;
+            else
+               Val := Integer_64 (IEEE_Float_64'Rounding (Rat));
+               if Val < Min_I or else Val > Max_I then Ovf := True; end if;
+            end if;
+         end;
+      end if;
+   end Eval_Fixed_Ticks_Exact_Checked;
+
    -- Subtype 'DELTA attribute
    function Fixed_Delta (T : TREE) return IEEE_Float_64 is
       R  : constant TREE := Resolve_Type_Spec (T);
@@ -1246,6 +1413,38 @@ package body Diana_Util is
       end loop;
       return True;
    end Is_Library_Level;
+
+   function Is_Unsigned_Scalar (T : TREE; Pir_Type : String) return Boolean is
+      R : constant TREE := Resolve_Type_Spec (T);
+   begin
+      if Is_Void_Tree (R) then
+         return False;
+      end if;
+      if KIND (R) = DN_ENUMERATION then
+         return True;
+      end if;
+      if KIND (R) = DN_INTEGER then
+         declare
+            St : Boolean;
+            Lo, Hi : Integer_64;
+         begin
+            Get_Discrete_Bounds (R, St, Lo, Hi);
+            if not St then
+               Get_Discrete_Bounds (Base_Type_Spec (R), St, Lo, Hi);
+            end if;
+            if St and then Lo >= 0 then
+               if Pir_Type = "i8" and then Hi > 127 then
+                  return True;
+               elsif Pir_Type = "i16" and then Hi > 32767 then
+                  return True;
+               elsif Pir_Type = "i32" and then Hi > 2147483647 then
+                  return True;
+               end if;
+            end if;
+         end;
+      end if;
+      return False;
+   end Is_Unsigned_Scalar;
 
    function Decode_Ada_String_Lit (Raw : String) return String is
       Res : Unbounded_String;

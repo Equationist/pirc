@@ -372,8 +372,14 @@ package body REDSUBP is
                             loop
                                 ORIG_DEF_ID := D( AS_NAME
                                                 , D(SM_UNIT_DESC,ORIG_DEF_ID) );
+                                if ORIG_DEF_ID = CONST_VOID or else KIND(ORIG_DEF_ID) = DN_ATTRIBUTE then
+                                    exit;
+                                end if;
                                 if KIND(ORIG_DEF_ID) = DN_SELECTED then
                                     ORIG_DEF_ID := D(AS_DESIGNATOR,ORIG_DEF_ID);
+                                end if;
+                                if ORIG_DEF_ID = CONST_VOID or else KIND(ORIG_DEF_ID) = DN_ATTRIBUTE then
+                                    exit;
                                 end if;
                                 ORIG_DEF_ID := D(SM_DEFN,ORIG_DEF_ID);
                             end loop;
@@ -1588,7 +1594,9 @@ package body REDSUBP is
 			    end;
 			    exit;
 			when DN_PARENTHESIZED | DN_FUNCTION_CALL | DN_NULLARY_CALL | DN_QUALIFIED
-			   | DN_ATTRIBUTE | DN_AGGREGATE | DN_NUMERIC_LITERAL | DN_STRING_LITERAL | DN_NULL_ACCESS =>
+			   | DN_ATTRIBUTE | DN_AGGREGATE | DN_NUMERIC_LITERAL | DN_STRING_LITERAL | DN_NULL_ACCESS
+			   | DN_USED_CHAR | DN_AND_THEN | DN_OR_ELSE | DN_RANGE_MEMBERSHIP | DN_TYPE_MEMBERSHIP
+			   | DN_QUALIFIED_ALLOCATOR | DN_SUBTYPE_ALLOCATOR =>
 			    BAD_VAR := TRUE;
 			    exit;
 			when others =>
@@ -1938,9 +1946,10 @@ package body REDSUBP is
 		    and then KIND(PFX) /= DN_USED_NAME_ID
 		    and then KIND(PFX) /= DN_USED_OP
 		    and then KIND(PFX) /= DN_USED_CHAR
-		    and then D(SM_EXP_TYPE, PFX) /= CONST_VOID
-		    and then D(SM_EXP_TYPE, PFX) /= CONST_VIRGIN
-		    and then KIND(GET_BASE_STRUCT(D(SM_EXP_TYPE, PFX))) = DN_ACCESS then
+		    and then (KIND(PFX) = DN_ALL
+			      or else (D(SM_EXP_TYPE, PFX) /= CONST_VOID
+				       and then D(SM_EXP_TYPE, PFX) /= CONST_VIRGIN
+				       and then KIND(GET_BASE_STRUCT(D(SM_EXP_TYPE, PFX))) = DN_ACCESS)) then
 			WALK_E(PFX, DEPTH + 1);
 		    end if;
 		    if D(AS_EXP, E) /= CONST_VOID and then D(AS_EXP, E) /= CONST_VIRGIN then

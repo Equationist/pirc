@@ -285,6 +285,9 @@ package body UARITH is
 		    V_SUB(R_SPREAD, L_SPREAD);
 		    return U_INT(L_SPREAD);
 		end if;
+	    exception
+		when ASSERTION_ERROR =>
+		    return CONST_VOID;
 	    end;
 	else -- must be real_val
 	    return U_REAL( D(XD_NUMER, LEFT) * D(XD_DENOM, RIGHT)
@@ -316,6 +319,9 @@ package body UARITH is
 		    V_SUB(R_SPREAD, L_SPREAD);
 		    return U_INT(L_SPREAD);
 		end if;
+	    exception
+		when ASSERTION_ERROR =>
+		    return CONST_VOID;
 	    end;
 	else -- must be real_val
 	    return U_REAL( D(XD_NUMER, LEFT) * D(XD_DENOM, RIGHT)
@@ -335,6 +341,9 @@ package body UARITH is
 	    begin
 		SPREAD(LEFT, L_SPREAD);
 		SPREAD(RIGHT, R_SPREAD);
+		if L_SPREAD.L + R_SPREAD.L > 250 then
+		    return CONST_VOID;
+		end if;
 		V_MUL(L_SPREAD, R_SPREAD, TEMP);
 		TEMP.S := L_SPREAD.S * R_SPREAD.S;
 		return U_INT(TEMP);
@@ -404,6 +413,7 @@ package body UARITH is
 		and then not IS_ZERO(L_SPREAD) then
 		    V_SUB(L_SPREAD, R_SPREAD);
 		    L_SPREAD.D(1..R_SPREAD.L) := R_SPREAD.D(1..R_SPREAD.L);
+		    L_SPREAD.L := R_SPREAD.L;
 		end if;
 		L_SPREAD.S := R_SPREAD.S;
 		return U_INT(L_SPREAD);
@@ -435,40 +445,87 @@ package body UARITH is
     end "REM";
 
     function "**"(LEFT, RIGHT: TREE) return TREE is -- i**i, r**i
+	R_SPREAD: VECTOR;
+	EXP_VAL:  INTEGER := 0;
+	EXP_NEG:  BOOLEAN := FALSE;
     begin
 	if LEFT = CONST_VOID or RIGHT = CONST_VOID then
 	    return CONST_VOID;
-	elsif RIGHT.TLN /= 0 then
-	    --constraint error on second argument
-	    --!!!! node hard-wired 16 bits !!!!
+	end if;
+	-- Extract signed 32-bit exponent safely (supports exponents outside 16-bit range)
+	SPREAD(RIGHT, R_SPREAD);
+	EXP_NEG := (R_SPREAD.S < 0);
+	if R_SPREAD.L > 3 then
 	    return CONST_VOID;
-	elsif KIND(LEFT) = DN_NUM_VAL then
+	end if;
+	for I in reverse 1 .. R_SPREAD.L loop
+	    if EXP_VAL > (INTEGER'LAST - INTEGER(R_SPREAD.D(I))) / 10000 then
+		return CONST_VOID;
+	    end if;
+	    EXP_VAL := EXP_VAL * 10000 + INTEGER(R_SPREAD.D(I));
+	end loop;
+
+	if KIND(LEFT) = DN_NUM_VAL then
 	    declare
 		L_SPREAD: VECTOR;
-		TEMP: VECTOR;
-		RESULT: VECTOR;
-		COUNT: INTEGER := U_POS(RIGHT); -- better be in range
+		BASE:     VECTOR;
+		TEMP:     VECTOR;
+		RESULT:   VECTOR;
+		COUNT:    INTEGER := EXP_VAL;
+		RES_SIGN: INTEGER := +1;
 	    begin
-		if COUNT < 0 then
-		    return CONST_VOID; -- constraint error for - exp
+		if EXP_NEG then
+		    return CONST_VOID; -- constraint error for negative integer exponent
 		end if;
 		SPREAD(LEFT, L_SPREAD);
+		if COUNT = 0 then
+		    return U_VAL(1);
+		elsif IS_ZERO(L_SPREAD) then
+		    return U_VAL(0);
+		elsif L_SPREAD.L = 1 and then L_SPREAD.D(1) = 1 then
+		    if L_SPREAD.S < 0 and then (COUNT mod 2 = 1) then
+			return U_VAL(-1);
+		    else
+			return U_VAL(1);
+		    end if;
+		end if;
+		if L_SPREAD.S < 0 and then (COUNT mod 2 = 1) then
+		    RES_SIGN := -1;
+		end if;
+		V_COPY(L_SPREAD, BASE);
+		BASE.S := +1;
 		SPREAD(1, RESULT);
 		while COUNT > 0 loop
-		    V_MUL(L_SPREAD, RESULT, TEMP);
-		    V_COPY(TEMP, RESULT);
-		    RESULT.S := RESULT.S * L_SPREAD.S;
-		    COUNT := COUNT - 1;
+		    if COUNT mod 2 = 1 then
+			if RESULT.L + BASE.L > RESULT.D'LAST - 2 then
+			    return CONST_VOID;
+			end if;
+			V_MUL(BASE, RESULT, TEMP);
+			V_COPY(TEMP, RESULT);
+		    end if;
+		    COUNT := COUNT / 2;
+		    if COUNT > 0 then
+			if BASE.L + BASE.L > BASE.D'LAST - 2 then
+			    return CONST_VOID;
+			end if;
+			V_MUL(BASE, BASE, TEMP);
+			V_COPY(TEMP, BASE);
+		    end if;
 		end loop;
+		RESULT.S := RES_SIGN;
 		return U_INT(RESULT);
 	    end;
 	else
-	    if U_POS(RIGHT) >= 0 then
+	    if not EXP_NEG then
 		return U_REAL( D(XD_NUMER,LEFT) ** RIGHT
 			     , D(XD_DENOM,LEFT) ** RIGHT );
 	    else
-		return U_REAL( D(XD_DENOM,LEFT) ** (- RIGHT)
-			     , D(XD_NUMER,LEFT) ** (- RIGHT) );
+		declare
+		    POS_R : constant TREE := - RIGHT;
+		begin
+		    return U_REAL( D(XD_DENOM,LEFT) ** POS_R
+				 , D(XD_NUMER,LEFT) ** POS_R );
+		end;
 	    end if;
 	end if;
     end "**";

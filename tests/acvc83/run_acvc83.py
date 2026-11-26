@@ -345,18 +345,32 @@ def compile_unit_in_dir(
     shutil.copyfile(work / "$$$.TMP", work / "WRITELIB.TMP")
     run_cmd([str(DIANA_BIN / "writelib")], work, timeout)
 
-    obj_path = None
+    obj_paths: list[Path] = []
     if compile_obj:
-        obj_path = work / f"{unit_tag}.o"
-        rc, out, err = run_cmd(
-            [str(pirc), f"--target={target}", opt, "-c", str(pir_path), "-o", str(obj_path)],
-            work,
-            timeout,
-        )
-        if rc != 0:
-            return False, "pirc", (err.strip() or out.strip())[:300], None
+        cu_pirs = sorted(work.glob(f"{unit_tag}__cu*.pir"))
+        if cu_pirs:
+            for cp in cu_pirs:
+                co = cp.with_suffix(".o")
+                rc, out, err = run_cmd(
+                    [str(pirc), f"--target={target}", opt, "-c", str(cp), "-o", str(co)],
+                    work,
+                    timeout,
+                )
+                if rc != 0:
+                    return False, "pirc", (err.strip() or out.strip())[:300], None
+                obj_paths.append(co)
+        else:
+            obj_path = work / f"{unit_tag}.o"
+            rc, out, err = run_cmd(
+                [str(pirc), f"--target={target}", opt, "-c", str(pir_path), "-o", str(obj_path)],
+                work,
+                timeout,
+            )
+            if rc != 0:
+                return False, "pirc", (err.strip() or out.strip())[:300], None
+            obj_paths.append(obj_path)
 
-    return True, "ok", "", obj_path
+    return True, "ok", "", (obj_paths if compile_obj else None)
 
 
 def copy_lib_image(src_lib: Path, dst: Path):
@@ -406,9 +420,10 @@ def build_support_library(
             target=target, opt=opt, pirc=pirc, checks=True, compile_obj=True
         )
         if ok and obj is not None:
-            saved_obj = sup_obj_dir / obj.name
-            shutil.copyfile(obj, saved_obj)
-            objs.append(saved_obj)
+            for o in obj:
+                saved_obj = sup_obj_dir / o.name
+                shutil.copyfile(o, saved_obj)
+                objs.append(saved_obj)
             status[tag] = "ok"
         else:
             status[tag] = f"{phase}: {detail}"
@@ -533,7 +548,7 @@ def run_single_test(
                 fail_detail = f"{f.name}: {detail}"
                 break
             if obj is not None:
-                objs.append(obj)
+                objs.extend(obj)
 
         # --- Class A: must compile cleanly (or N/A compile rejection on .dep/.tst) ---
         if cls == "a":

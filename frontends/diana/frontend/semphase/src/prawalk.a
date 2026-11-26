@@ -27,7 +27,8 @@ package body PRAWALK is
     procedure GET_ARGUMENT_EXP
 		( USED_NAME_ID: 	TREE
 		; ASSOC_LIST:		in out SEQ_TYPE
-		; ASSOC_OUT:		out TREE );
+		; ASSOC_OUT:		out TREE
+		; ALLOW_OP:		BOOLEAN := FALSE );
 
     procedure MUST_BE_SIMPLE_NAME (EXP: TREE);
 
@@ -124,6 +125,10 @@ package body PRAWALK is
 	when CONTROLLED =>
 	    -- $$$$ immediately within declarative part or package specification
 	    GET_ARGUMENT_EXP(USED_NAME_ID,ASSOC_LIST,ASSOC_EXP);
+	    if not IS_EMPTY(ASSOC_LIST) then
+		WARNING(D(LX_SRCPOS, USED_NAME_ID), "Too many pragma arguments");
+		raise PRAGMA_ERROR;
+	    end if;
 	    MUST_BE_SIMPLE_NAME(ASSOC_EXP);
 	    ASSOC_EXP := WALK_TYPE_MARK(ASSOC_EXP);
 	    NEW_ASSOC_LIST := APPEND(NEW_ASSOC_LIST, ASSOC_EXP);
@@ -131,7 +136,8 @@ package body PRAWALK is
 	    if KIND(ASSOC_TYPE) /= DN_ACCESS
 	    or else D(SM_DERIVED,ASSOC_TYPE) /= CONST_VOID then
                 ERROR(D(LX_SRCPOS,ASSOC_EXP), "CONTROLLED not allowed for type");
-	    elsif D(XD_REGION, D(XD_SOURCE_NAME,ASSOC_TYPE))
+	    elsif H.REGION_DEF = CONST_VOID
+	    or else D(XD_REGION, D(XD_SOURCE_NAME,ASSOC_TYPE))
 			/= D(XD_SOURCE_NAME, H.REGION_DEF)
 	    then
                 ERROR(D(LX_SRCPOS,ASSOC_EXP), "CONTROLLED not allowed here");
@@ -148,8 +154,10 @@ package body PRAWALK is
 		REQUIRE_UNIQUE_DEF(ASSOC_EXP, DEFSET);
 		ASSOC_EXP := RESOLVE_NAME(ASSOC_EXP, GET_THE_ID(DEFSET));
 		NEW_ASSOC_LIST := APPEND(NEW_ASSOC_LIST, ASSOC_EXP);
-		if KIND(D(SM_DEFN,ASSOC_EXP)) not in CLASS_NON_TASK_NAME
-		and d(SM_DEFN,ASSOC_EXP) /= CONST_VOID
+		if D(SM_DEFN,ASSOC_EXP) /= CONST_VOID
+		and then (KIND(D(SM_DEFN,ASSOC_EXP)) not in CLASS_NON_TASK_NAME
+			  or else (D(XD_REGION, D(SM_DEFN,ASSOC_EXP)) /= CONST_VOID
+				   and then D(XD_REGION, D(SM_DEFN,ASSOC_EXP)) /= PREDEFINED_STANDARD_ID))
 		then
 		    ERROR(D(LX_SRCPOS,ASSOC_EXP)
                                 , "Library unit name required");
@@ -161,8 +169,12 @@ package body PRAWALK is
 	when INLINE =>
 	    -- $$$$ at place of declarative item or following library unit
 	    loop
-		GET_ARGUMENT_EXP(USED_NAME_ID,ASSOC_LIST,ASSOC_EXP);
-		MUST_BE_SIMPLE_NAME(ASSOC_EXP);
+		IDLIST := MAKE;
+		GET_ARGUMENT_EXP(USED_NAME_ID,ASSOC_LIST,ASSOC_EXP, ALLOW_OP => TRUE);
+		if KIND(ASSOC_EXP) /= DN_USED_OBJECT_ID
+		and then KIND(ASSOC_EXP) /= DN_USED_OP then
+		    MUST_BE_SIMPLE_NAME(ASSOC_EXP);
+		end if;
 		FIND_DIRECT_VISIBILITY(ASSOC_EXP, DEFSET);
 		while not IS_EMPTY(DEFSET) loop
 		    POP(DEFSET, DEFINTERP);
@@ -183,7 +195,9 @@ package body PRAWALK is
                     ERROR(D(LX_SRCPOS,ASSOC_EXP), "No such subprogram");
 		end if;
 		D(SM_DEFN,ASSOC_EXP,CAST_TREE(IDLIST));
-		ASSOC_EXP := MAKE_USED_NAME_ID_FROM_OBJECT(ASSOC_EXP);
+		if KIND(ASSOC_EXP) = DN_USED_OBJECT_ID then
+		    ASSOC_EXP := MAKE_USED_NAME_ID_FROM_OBJECT(ASSOC_EXP);
+		end if;
 		NEW_ASSOC_LIST := APPEND(NEW_ASSOC_LIST, ASSOC_EXP);
 		exit
 		    when IS_EMPTY(ASSOC_LIST);
@@ -213,7 +227,11 @@ package body PRAWALK is
 		    , ASSOC_EXP
 		    , NEW_ASSOC_LIST
 		    , ARGUMENT_ID_LIST );
-	    GET_ARGUMENT_EXP(USED_NAME_ID,ASSOC_LIST,ASSOC_EXP);
+	    GET_ARGUMENT_EXP(USED_NAME_ID,ASSOC_LIST,ASSOC_EXP, ALLOW_OP => TRUE);
+	    if not IS_EMPTY(ASSOC_LIST) then
+		WARNING(D(LX_SRCPOS, USED_NAME_ID), "Too many pragma arguments");
+		raise PRAGMA_ERROR;
+	    end if;
 	    MUST_BE_NAME(ASSOC_EXP);
 	    FIND_VISIBILITY(ASSOC_EXP, DEFSET);
 	    while not IS_EMPTY(DEFSET) loop
@@ -234,8 +252,12 @@ package body PRAWALK is
 	    if IS_EMPTY(IDLIST) then
                 ERROR(D(LX_SRCPOS,ASSOC_EXP), "No such subprogram");
 	    end if;
-	    D(SM_DEFN,ASSOC_EXP,CAST_TREE(IDLIST));
-	    ASSOC_EXP := MAKE_USED_NAME_ID_FROM_OBJECT(ASSOC_EXP);
+	    if KIND(ASSOC_EXP) = DN_SELECTED then
+		D(SM_DEFN, D(AS_DESIGNATOR, ASSOC_EXP), CAST_TREE(IDLIST));
+	    else
+		D(SM_DEFN,ASSOC_EXP,CAST_TREE(IDLIST));
+		ASSOC_EXP := MAKE_USED_NAME_ID_FROM_OBJECT(ASSOC_EXP);
+	    end if;
 	    NEW_ASSOC_LIST := APPEND(NEW_ASSOC_LIST, ASSOC_EXP);
 	    while not IS_EMPTY(IDLIST) loop
 		POP(IDLIST,ID);
@@ -266,13 +288,18 @@ package body PRAWALK is
 	when PACK =>
 	    -- $$$$ positions as for representation clause; before rep attr
 	    GET_ARGUMENT_EXP(USED_NAME_ID,ASSOC_LIST,ASSOC_EXP);
+	    if not IS_EMPTY(ASSOC_LIST) then
+		WARNING(D(LX_SRCPOS, USED_NAME_ID), "Too many pragma arguments");
+		raise PRAGMA_ERROR;
+	    end if;
 	    MUST_BE_SIMPLE_NAME(ASSOC_EXP);
 	    ASSOC_EXP := WALK_TYPE_MARK(ASSOC_EXP);
 	    NEW_ASSOC_LIST := APPEND(NEW_ASSOC_LIST, ASSOC_EXP);
 	    ASSOC_TYPE := GET_BASE_STRUCT(ASSOC_EXP);
 	    if KIND(ASSOC_TYPE) not in DN_ARRAY .. DN_RECORD then
                 ERROR(D(LX_SRCPOS,ASSOC_EXP), "PACK not allowed for type");
-	    elsif D(XD_REGION, D(XD_SOURCE_NAME,ASSOC_TYPE))
+	    elsif H.REGION_DEF = CONST_VOID
+	    or else D(XD_REGION, D(XD_SOURCE_NAME,ASSOC_TYPE))
 			/= D(XD_SOURCE_NAME, H.REGION_DEF)
 	    then
                 ERROR(D(LX_SRCPOS,ASSOC_EXP), "PACK not allowed here");
@@ -292,7 +319,7 @@ package body PRAWALK is
 	    declare
 		PRIO_VAL : constant TREE := GET_STATIC_VALUE(ASSOC_EXP);
 	    begin
-		if PRIO_VAL = CONST_VOID then
+		if PRIO_VAL = CONST_VOID or else KIND(PRIO_VAL) /= DN_NUM_VAL then
                     ERROR(D(LX_SRCPOS,ASSOC_EXP),"Priority must be static");
 		elsif not (PRIO_VAL >= U_VAL(0) and PRIO_VAL <= U_VAL(10)) then
                     ERROR(D(LX_SRCPOS,ASSOC_EXP),"Priority out of range");
@@ -301,14 +328,21 @@ package body PRAWALK is
 	    NEW_ASSOC_LIST := APPEND(NEW_ASSOC_LIST, ASSOC_EXP);
 
 	when SHARED =>
-	    -- $$$$ same declarative part or package specification
+	    -- LRM 9.11(9): immediately within same declarative part or package specification
 	    GET_ARGUMENT_EXP(USED_NAME_ID,ASSOC_LIST,ASSOC_EXP);
+	    if not IS_EMPTY(ASSOC_LIST) then
+		WARNING(D(LX_SRCPOS, USED_NAME_ID), "Too many pragma arguments");
+		raise PRAGMA_ERROR;
+	    end if;
 	    MUST_BE_SIMPLE_NAME(ASSOC_EXP);
 	    ASSOC_EXP := WALK_NAME(DN_VARIABLE_ID, ASSOC_EXP);
 	    NEW_ASSOC_LIST := APPEND(NEW_ASSOC_LIST, ASSOC_EXP);
 	    ASSOC_TYPE := GET_BASE_STRUCT(ASSOC_EXP);
             if D(SM_DEFN,ASSOC_EXP) = CONST_VOID then
                 null;
+            elsif H.REGION_DEF = CONST_VOID
+	    or else D(XD_REGION_DEF, GET_DEF_FOR_ID(D(SM_DEFN, ASSOC_EXP))) /= H.REGION_DEF then
+		ERROR(D(LX_SRCPOS, ASSOC_EXP), "SHARED not allowed here");
             elsif KIND(ASSOC_TYPE) in CLASS_SCALAR
 	    or KIND(ASSOC_TYPE) = DN_ACCESS then
 		if not DB(SM_RENAMES_OBJ,D(SM_DEFN,ASSOC_EXP)) then
@@ -353,8 +387,30 @@ package body PRAWALK is
 		end if;
 		MUST_BE_NAME(ASSOC_EXP);
 		FIND_VISIBILITY(ASSOC_EXP, DEFSET);
-		REQUIRE_UNIQUE_DEF(ASSOC_EXP, DEFSET);
-		ID := GET_THE_ID(DEFSET);
+		-- LRM 11.7(5): ON => may name an overloaded subprogram (applies to all visible overloads)
+		declare
+		    ALL_SUBP: BOOLEAN := not IS_EMPTY(DEFSET);
+		    TMP_DS: DEFSET_TYPE := DEFSET;
+		    TMP_DI: DEFINTERP_TYPE;
+		    FIRST_ID: TREE := CONST_VOID;
+		begin
+		    while not IS_EMPTY(TMP_DS) loop
+			POP(TMP_DS, TMP_DI);
+			if FIRST_ID = CONST_VOID then
+			    FIRST_ID := D(XD_SOURCE_NAME, GET_DEF(TMP_DI));
+			end if;
+			if KIND(D(XD_SOURCE_NAME, GET_DEF(TMP_DI))) not in CLASS_SUBPROG_NAME then
+			    ALL_SUBP := FALSE;
+			    exit;
+			end if;
+		    end loop;
+		    if ALL_SUBP then
+			ID := FIRST_ID;
+		    else
+			REQUIRE_UNIQUE_DEF(ASSOC_EXP, DEFSET);
+			ID := GET_THE_ID(DEFSET);
+		    end if;
+		end;
 		ASSOC_EXP := RESOLVE_NAME(ASSOC_EXP, ID);
                 if KIND(ID) in CLASS_OBJECT_NAME'FIRST .. DN_GENERIC_ID
 		and then KIND(ID) /= DN_PACKAGE_ID then
@@ -443,7 +499,8 @@ package body PRAWALK is
     procedure GET_ARGUMENT_EXP
 		( USED_NAME_ID: 	TREE
                 ; ASSOC_LIST:           in out SEQ_TYPE
-		; ASSOC_OUT:		out TREE )
+		; ASSOC_OUT:		out TREE
+		; ALLOW_OP:		BOOLEAN := FALSE )
     is
 	ASSOC_EXP: TREE;
     begin
@@ -453,7 +510,7 @@ package body PRAWALK is
 	end if;
 
 	POP(ASSOC_LIST, ASSOC_EXP);
-	if KIND(ASSOC_EXP) = DN_STRING_LITERAL then
+	if ALLOW_OP and then KIND(ASSOC_EXP) = DN_STRING_LITERAL then
 	    ASSOC_EXP := MAKE_USED_OP_FROM_STRING(ASSOC_EXP);
 	end if;
 

@@ -410,16 +410,23 @@ package body DIANAMAN is
 
   procedure DI(A: INTEGER; T: in TREE; V: in INTEGER) is
   begin
-    D(A,T,MAKE_TREE(V,DN_INT_VAL,0));
+    if V > 32767 then
+      D(A, T, MAKE_TREE(V mod 32768, DN_INT_VAL, V / 32768));
+    else
+      D(A,T,MAKE_TREE(V,DN_INT_VAL,0));
+    end if;
   end DI;
 
   function  DI(A: INTEGER; T: in TREE) return INTEGER is
     TEMP: TREE;
   begin
     TEMP := D(A,T);
-    if TEMP.TTY = BYTE(DN_INT_VAL)
-    and then TEMP.TLN = 0 then
-      return INTEGER(TEMP.TPG);
+    if TEMP.TTY = BYTE(DN_INT_VAL) then
+      if TEMP.TLN = 0 then
+        return INTEGER(TEMP.TPG);
+      else
+        return INTEGER(TEMP.TLN) * 32768 + INTEGER(TEMP.TPG);
+      end if;
     else
       QUIT("Value of " & ATTR_IMAGE(A) & " in " & NODE_REP(T)
                       & " is not an integer");

@@ -116,7 +116,7 @@ package _standrd is
   private
     -- Anonymous fixed type of which DURATION is a subtype
     type _duration is DELTA 1.0E-9
-	  range -1_000_000_000.0 .. 1_000_000_000.0;
+	  range -1_152_921_504.606_846_975 .. 1_152_921_504.606_846_975;
 
     -- Specification of implementation sizes (bits)
     for BOOLEAN'SIZE use 8;

@@ -60,6 +60,68 @@ package body Cg_Stmt is
       After_Lbl  : String);
    function Type_Contains_Task (Ctx : in out Context; Raw_T : TREE; Depth : Natural := 0) return Boolean;
    function Item_List_Has_Tasks (Ctx : in out Context; Item_S : TREE) return Boolean;
+   procedure Scan_Label_Master_Depths
+     (Ctx      : in out Context;
+      Node     : TREE;
+      Depth    : Natural;
+      SS_Depth : Natural := 0;
+      SP_Depth : Natural := 0);
+
+   -- P3-5.3: True when Item is a DN_STUB whose body is inlined from Ctx.Gen_Subunits
+   function Find_Gen_Subunit_Body (Ctx : Context; Item : TREE) return TREE is
+   begin
+      if Is_Void_Tree (Item) or else Is_Void_Tree (D (AS_BODY, Item)) or else KIND (D (AS_BODY, Item)) /= DN_STUB then
+         return CONST_VOID;
+      end if;
+      if KIND (Item) = DN_TASK_BODY then
+         declare
+            TB_Id   : constant TREE := D (AS_SOURCE_NAME, Item);
+            Orig_TS : constant TREE := (if not Is_Void_Tree (TB_Id) then Resolve_Type_Spec (D (SM_TYPE_SPEC, TB_Id)) else CONST_VOID);
+            Sub_TS  : constant TREE := (if not Is_Void_Tree (TB_Id) then Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_TYPE_SPEC, TB_Id))) else CONST_VOID);
+         begin
+            if not Is_Void_Tree (Orig_TS) and then Ctx.Gen_Subunits.Contains (Tree_Key (Orig_TS)) then
+               return Ctx.Gen_Subunits.Element (Tree_Key (Orig_TS));
+            elsif not Is_Void_Tree (Sub_TS) and then Ctx.Gen_Subunits.Contains (Tree_Key (Sub_TS)) then
+               return Ctx.Gen_Subunits.Element (Tree_Key (Sub_TS));
+            end if;
+         end;
+      elsif KIND (Item) in DN_SUBPROGRAM_BODY | DN_PACKAGE_BODY then
+         declare
+            Orig_Id : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, Item));
+            Sub_Id  : constant TREE := Canonical_Def (Subst_Tree (Ctx, Orig_Id));
+         begin
+            if not Is_Void_Tree (Orig_Id) and then Ctx.Gen_Subunits.Contains (Tree_Key (Orig_Id)) then
+               return Ctx.Gen_Subunits.Element (Tree_Key (Orig_Id));
+            elsif not Is_Void_Tree (Sub_Id) and then Ctx.Gen_Subunits.Contains (Tree_Key (Sub_Id)) then
+               return Ctx.Gen_Subunits.Element (Tree_Key (Sub_Id));
+            end if;
+         end;
+      end if;
+      return CONST_VOID;
+   end Find_Gen_Subunit_Body;
+
+   function Is_Gen_Subunit_Stub (Ctx : Context; Item : TREE) return Boolean is
+   begin
+      return not Is_Void_Tree (Find_Gen_Subunit_Body (Ctx, Item));
+   end Is_Gen_Subunit_Stub;
+
+   -- P3-5.7: Verify a generic is truly a predefined RTL generic (not a user generic shadowing the same name!)
+   function Is_RTL_Generic (Gen_Id : TREE) return Boolean is
+      GN  : constant String := (if not Is_Void_Tree (Gen_Id) then Sym_Name (Gen_Id) else "");
+      Pkg : constant String := (if not Is_Void_Tree (Gen_Id) then Enclosing_Package_Name (Gen_Id) else "");
+   begin
+      if Is_Void_Tree (Gen_Id) or else not Is_Library_Level (Gen_Id) then
+         return False;
+      end if;
+      if GN = "INTEGER_IO" or else GN = "FLOAT_IO" or else GN = "FIXED_IO" or else GN = "ENUMERATION_IO" then
+         return Pkg = "TEXT_IO";
+      elsif GN = "SEQUENTIAL_IO" or else GN = "DIRECT_IO"
+        or else GN = "UNCHECKED_DEALLOCATION" or else GN = "UNCHECKED_CONVERSION"
+      then
+         return Pkg = "" or else Pkg = "STANDARD";
+      end if;
+      return False;
+   end Is_RTL_Generic;
 
    -- =========================================================================
    -- Static-Link Capture Pre-Scan
@@ -67,18 +129,129 @@ package body Cg_Stmt is
    -- Walks nested subprograms inside Owner_Key to find any references to
    -- variables owned by Owner_Key (or ancestors), populating Captured_Vars.
 
+   type Cap_Pair is record
+      Var_Key  : Unsigned_32 := 0;
+      Inst_Key : Unsigned_32 := 0;
+   end record;
+
+   package Cap_Vecs is new Ada.Containers.Vectors
+     (Index_Type   => Natural,
+      Element_Type => Cap_Pair);
+
+   procedure Map_Decl_List_Ids
+     (Ctx     : in out Context;
+      Gen_DS  : TREE;
+      Inst_DS : TREE);
+
+   type Cap_Inst_Entry is record
+      IK  : Unsigned_32 := 0;
+      GId : TREE := CONST_VOID;
+   end record;
+   type Cap_Inst_Stack_Arr is array (1 .. 16) of Cap_Inst_Entry;
+   Cap_Inst_Stack : Cap_Inst_Stack_Arr;
+   Cap_Inst_Depth : Natural := 0;
+
    procedure Scan_Tree_For_Captures
-     (Ctx           : Context;
+     (Ctx           : in out Context;
       Node          : TREE;
       Current_Subp  : Unsigned_32;
       Owner_Map     : Var_Maps.Map;
       Parent_Map    : in out Subp_Maps.Map;
-      Captured_Vars : in out U32_Vecs.Vector;
+      Captured_Vars : in out Cap_Vecs.Vector;
       Nested_Subps  : in out U32_Vecs.Vector;
       Target_Owner  : Unsigned_32;
-      Type_Depth    : Natural := 0)
+      Type_Depth    : Natural := 0;
+      Inst_Key      : Unsigned_32 := 0;
+      Inst_Gen_Id   : TREE := CONST_VOID)
    is
       K : NODE_NAME;
+
+      function Resolve_Cap_Inst_Key (Var_Def : TREE; Cur_Inst : Unsigned_32; Cur_Gen_Id : TREE) return Unsigned_32 is
+         Var_Gen : TREE := CONST_VOID;
+         Cur     : TREE := Var_Def;
+         Walk_G  : TREE := Cur_Gen_Id;
+         Walk_I  : Unsigned_32 := Cur_Inst;
+      begin
+         if Cur_Inst = 0 or else Is_Void_Tree (Var_Def) or else Is_Void_Tree (Cur_Gen_Id) then
+            return Cur_Inst;
+         end if;
+         for Hop in 1 .. 16 loop
+            exit when Is_Void_Tree (Cur) or else KIND (Cur) not in CLASS_SOURCE_NAME;
+            declare
+               Reg : constant TREE := D (XD_REGION, Cur);
+            begin
+               exit when Is_Void_Tree (Reg) or else KIND (Reg) not in CLASS_SOURCE_NAME;
+               if KIND (Reg) = DN_GENERIC_ID then
+                  Var_Gen := Canonical_Def (Reg);
+                  exit;
+               end if;
+               Cur := Reg;
+            end;
+         end loop;
+         if Is_Void_Tree (Var_Gen) then
+            return Cur_Inst;
+         end if;
+         -- P3-5.1: Check active enclosing generic instantiation stack first (handles body-nested generics)
+         for Idx in reverse 1 .. Cap_Inst_Depth loop
+            declare
+               SG : constant TREE := Cap_Inst_Stack (Idx).GId;
+               Can_S : constant TREE := (if not Is_Void_Tree (SG) then Canonical_Def (SG) else CONST_VOID);
+               Orig_S : TREE := Can_S;
+            begin
+               if not Is_Void_Tree (Can_S) and then Ctx.Generic_Decls.Contains (Tree_Key (Can_S)) then
+                  declare
+                     GD : constant TREE := Ctx.Generic_Decls.Element (Tree_Key (Can_S));
+                  begin
+                     if not Is_Void_Tree (GD) and then KIND (GD) = DN_GENERIC_DECL then
+                        Orig_S := Canonical_Def (D (AS_SOURCE_NAME, GD));
+                     end if;
+                  end;
+               end if;
+               if Can_S = Var_Gen or else Orig_S = Var_Gen then
+                  return Cap_Inst_Stack (Idx).IK;
+               end if;
+            end;
+         end loop;
+         for Hop in 1 .. 16 loop
+            exit when Is_Void_Tree (Walk_G) or else KIND (Walk_G) not in CLASS_SOURCE_NAME;
+            declare
+               Can_G : constant TREE := Canonical_Def (Walk_G);
+               Orig_G : TREE := Can_G;
+            begin
+               if Ctx.Generic_Decls.Contains (Tree_Key (Can_G)) then
+                  declare
+                     GD : constant TREE := Ctx.Generic_Decls.Element (Tree_Key (Can_G));
+                  begin
+                     if not Is_Void_Tree (GD) and then KIND (GD) = DN_GENERIC_DECL then
+                        Orig_G := Canonical_Def (D (AS_SOURCE_NAME, GD));
+                     end if;
+                  end;
+               end if;
+               if Can_G = Var_Gen or else Orig_G = Var_Gen then
+                  return Walk_I;
+               end if;
+               declare
+                  Reg : constant TREE := D (XD_REGION, Can_G);
+               begin
+                  if not Is_Void_Tree (Reg) and then KIND (Reg) = DN_PACKAGE_ID then
+                     declare
+                        UD : constant TREE := D (SM_UNIT_DESC, Reg);
+                     begin
+                        if not Is_Void_Tree (UD) and then KIND (UD) = DN_INSTANTIATION then
+                           Walk_I := Tree_Key (Canonical_Def (Reg));
+                           Walk_G := Canonical_Def (Get_Name_Defn (D (AS_NAME, UD)));
+                        else
+                           exit;
+                        end if;
+                     end;
+                  else
+                     exit;
+                  end if;
+               end;
+            end;
+         end loop;
+         return Cur_Inst;
+      end Resolve_Cap_Inst_Key;
 
       procedure Scan_Type_Bounds (Ty : TREE) is
          RT : TREE;
@@ -96,8 +269,8 @@ package body Cg_Stmt is
                   Rng : constant TREE := D (SM_RANGE, RT);
                begin
                   if not Is_Void_Tree (Rng) and then KIND (Rng) = DN_RANGE then
-                     Scan_Tree_For_Captures (Ctx, D (AS_EXP1, Rng), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth + 1);
-                     Scan_Tree_For_Captures (Ctx, D (AS_EXP2, Rng), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth + 1);
+                     Scan_Tree_For_Captures (Ctx, D (AS_EXP1, Rng), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth + 1, Inst_Key, Inst_Gen_Id);
+                     Scan_Tree_For_Captures (Ctx, D (AS_EXP2, Rng), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth + 1, Inst_Key, Inst_Gen_Id);
                   end if;
                end;
             when DN_CONSTRAINED_ARRAY =>
@@ -119,11 +292,93 @@ package body Cg_Stmt is
             when DN_ACCESS | DN_CONSTRAINED_ACCESS =>
                Scan_Type_Bounds (D (SM_DESIG_TYPE, RT));
             when DN_CONSTRAINED_RECORD =>
-               Scan_Tree_For_Captures (Ctx, D (SM_NORMALIZED_DSCRMT_S, RT), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth + 1);
+               Scan_Tree_For_Captures (Ctx, D (SM_NORMALIZED_DSCRMT_S, RT), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth + 1, Inst_Key, Inst_Gen_Id);
             when others =>
                null;
          end case;
       end Scan_Type_Bounds;
+
+      procedure Bind_Gen_Formals_For_Scan (Gen_Id : TREE; UK : TREE) is
+         GDecl : TREE := CONST_VOID;
+         GK    : constant Unsigned_32 := Tree_Key (Gen_Id);
+      begin
+         if Ctx.Generic_Decls.Contains (GK) then
+            GDecl := Ctx.Generic_Decls.Element (GK);
+         end if;
+         declare
+            Param_S  : constant TREE :=
+              (if not Is_Void_Tree (GDecl) and then KIND (GDecl) = DN_GENERIC_DECL then D (AS_ITEM_S, GDecl)
+               elsif not Is_Void_Tree (Gen_Id) and then KIND (Gen_Id) = DN_GENERIC_ID then D (SM_GENERIC_PARAM_S, Gen_Id)
+               else CONST_VOID);
+            ADecls_N : constant TREE := D (SM_DECL_S, UK);
+         begin
+            if not Is_Void_Tree (Param_S) and then not Is_Void_Tree (ADecls_N) then
+               declare
+                  FL : SEQ_TYPE := LIST (Param_S);
+                  AL : SEQ_TYPE := LIST (ADecls_N);
+                  FI, AD : TREE;
+               begin
+                  while not IS_EMPTY (FL) and then not IS_EMPTY (AL) loop
+                     POP (FL, FI);
+                     if KIND (FI) = DN_IN then
+                        declare
+                           FNS : SEQ_TYPE := LIST (D (AS_SOURCE_NAME_S, FI));
+                           F_Id : TREE;
+                        begin
+                           while not IS_EMPTY (FNS) and then not IS_EMPTY (AL) loop
+                              POP (FNS, F_Id);
+                              POP (AL, AD);
+                              if KIND (AD) = DN_CONSTANT_DECL then
+                                 Ctx.Generic_Subst.Include (Tree_Key (Canonical_Def (F_Id)),
+                                   Canonical_Def (HEAD (LIST (D (AS_SOURCE_NAME_S, AD)))));
+                              end if;
+                           end loop;
+                        end;
+                     elsif KIND (FI) = DN_IN_OUT then
+                        declare
+                           FNS : SEQ_TYPE := LIST (D (AS_SOURCE_NAME_S, FI));
+                           F_Id : TREE;
+                        begin
+                           while not IS_EMPTY (FNS) and then not IS_EMPTY (AL) loop
+                              POP (FNS, F_Id);
+                              POP (AL, AD);
+                              if KIND (AD) = DN_RENAMES_OBJ_DECL then
+                                 Ctx.Generic_Subst.Include (Tree_Key (Canonical_Def (F_Id)),
+                                   Canonical_Def (D (AS_SOURCE_NAME, AD)));
+                              end if;
+                           end loop;
+                        end;
+                     else
+                        POP (AL, AD);
+                        if KIND (FI) = DN_TYPE_DECL and then KIND (AD) = DN_SUBTYPE_DECL then
+                           declare
+                              F_Tid : constant TREE := D (AS_SOURCE_NAME, FI);
+                              F_Ts  : constant TREE := D (SM_TYPE_SPEC, F_Tid);
+                              A_Sid : constant TREE := D (AS_SOURCE_NAME, AD);
+                              A_Ts  : constant TREE := D (SM_TYPE_SPEC, A_Sid);
+                           begin
+                              Ctx.Generic_Subst.Include (Tree_Key (F_Tid), A_Sid);
+                              if not Is_Void_Tree (F_Ts) and then not Is_Void_Tree (A_Ts) then
+                                 Ctx.Generic_Subst.Include (Tree_Key (F_Ts), A_Ts);
+                              end if;
+                           end;
+                        elsif KIND (FI) = DN_SUBPROG_ENTRY_DECL and then KIND (AD) = DN_SUBPROG_ENTRY_DECL then
+                           declare
+                              AUK : constant TREE := D (AS_UNIT_KIND, AD);
+                           begin
+                              if not Is_Void_Tree (AUK) and then KIND (AUK) = DN_RENAMES_UNIT then
+                                 Ctx.Generic_Subst.Include
+                                   (Tree_Key (Canonical_Def (D (AS_SOURCE_NAME, FI))),
+                                    Canonical_Def (D (AS_SOURCE_NAME, AD)));
+                              end if;
+                           end;
+                        end if;
+                     end if;
+                  end loop;
+               end;
+            end if;
+         end;
+      end Bind_Gen_Formals_For_Scan;
 
       procedure Register_Nested_Child (CK : Unsigned_32) is
          Found_N : Boolean := False;
@@ -174,6 +429,8 @@ package body Cg_Stmt is
             if Current_Subp /= Target_Owner and then Owner_Map.Contains (DK) then
                declare
                   V : constant Var_Info := Owner_Map.Element (DK);
+                  Eff_Inst : constant Unsigned_32 :=
+                    (if V.Captured_Slot = 1 then Resolve_Cap_Inst_Key (Def, Inst_Key, Inst_Gen_Id) else 0);
                begin
                   if V.Owner_Subp = Target_Owner then
                      -- Record captured variable if not already listed
@@ -181,10 +438,10 @@ package body Cg_Stmt is
                         Found : Boolean := False;
                      begin
                         for E of Captured_Vars loop
-                           if E = DK then Found := True; exit; end if;
+                           if E.Var_Key = DK and then E.Inst_Key = Eff_Inst then Found := True; exit; end if;
                         end loop;
                         if not Found then
-                           Captured_Vars.Append (DK);
+                           Captured_Vars.Append ((Var_Key => DK, Inst_Key => Eff_Inst));
                         end if;
                      end;
                      -- Mark Current_Subp and its ancestors up to Target_Owner as needing SL
@@ -220,10 +477,12 @@ package body Cg_Stmt is
                   IK      : constant Unsigned_32 := Tree_Key (Inst_Id);
                   Gen_Id  : constant TREE := Canonical_Def (Get_Name_Defn (D (AS_NAME, UK)));
                   GK      : constant Unsigned_32 := Tree_Key (Gen_Id);
+                  Saved_Sub : constant Tree_Maps.Map := Ctx.Generic_Subst;
                begin
                   if IK /= 0 and then IK /= Current_Subp then
                      Register_Nested_Child (IK);
-                     Scan_Tree_For_Captures (Ctx, D (SM_DECL_S, UK), IK, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth);
+                     Scan_Tree_For_Captures (Ctx, D (SM_DECL_S, UK), IK, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth, Inst_Key, Inst_Gen_Id);
+                     Bind_Gen_Formals_For_Scan (Gen_Id, UK);
                      declare
                         GB : TREE := CONST_VOID;
                      begin
@@ -236,9 +495,19 @@ package body Cg_Stmt is
                            end if;
                         end if;
                         if not Is_Void_Tree (GB) and then KIND (GB) = DN_SUBPROGRAM_BODY then
-                           Scan_Tree_For_Captures (Ctx, D (AS_BODY, GB), IK, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth);
+                           declare
+                              Saved_D : constant Natural := Cap_Inst_Depth;
+                           begin
+                              if Cap_Inst_Depth < Cap_Inst_Stack'Last then
+                                 Cap_Inst_Depth := Cap_Inst_Depth + 1;
+                                 Cap_Inst_Stack (Cap_Inst_Depth) := (IK => IK, GId => Gen_Id);
+                              end if;
+                              Scan_Tree_For_Captures (Ctx, D (AS_BODY, GB), IK, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth, IK, Gen_Id);
+                              Cap_Inst_Depth := Saved_D;
+                           end;
                         end if;
                      end;
+                     Ctx.Generic_Subst := Saved_Sub;
                      return;
                   end if;
                end;
@@ -253,28 +522,52 @@ package body Cg_Stmt is
             if not Is_Void_Tree (UK) and then KIND (UK) = DN_INSTANTIATION then
                declare
                   PID    : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, Node));
+                  PIK    : constant Unsigned_32 := Tree_Key (PID);
                   Gen_Id : constant TREE := Canonical_Def (Get_Name_Defn (D (AS_NAME, UK)));
                   GK     : constant Unsigned_32 := Tree_Key (Gen_Id);
                   GB     : TREE := CONST_VOID;
+                  Saved_Sub : constant Tree_Maps.Map := Ctx.Generic_Subst;
                begin
                   -- Packages do not have their own static-link frame; scan their decls & generic body under Current_Subp!
-                  Scan_Tree_For_Captures (Ctx, D (SM_DECL_S, UK), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth);
-                  Scan_Tree_For_Captures (Ctx, D (SM_SPEC, PID), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth);
-                  if Ctx.Generic_Body.Contains (GK) then
-                     GB := Ctx.Generic_Body.Element (GK);
-                  elsif not Is_Void_Tree (Gen_Id) and then KIND (Gen_Id) = DN_GENERIC_ID then
-                     GB := D (SM_BODY, Gen_Id);
-                     if Is_Void_Tree (GB) then
-                        GB := D (XD_BODY, Gen_Id);
+                  Scan_Tree_For_Captures (Ctx, D (SM_DECL_S, UK), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth, Inst_Key, Inst_Gen_Id);
+                  declare
+                     Saved_D : constant Natural := Cap_Inst_Depth;
+                  begin
+                     if Cap_Inst_Depth < Cap_Inst_Stack'Last then
+                        Cap_Inst_Depth := Cap_Inst_Depth + 1;
+                        Cap_Inst_Stack (Cap_Inst_Depth) := (IK => PIK, GId => Gen_Id);
                      end if;
-                  end if;
-                  if not Is_Void_Tree (GB) then
-                     if KIND (GB) = DN_PACKAGE_BODY then
-                        Scan_Tree_For_Captures (Ctx, D (AS_BODY, GB), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth);
-                     else
-                        Scan_Tree_For_Captures (Ctx, GB, Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth);
+                     Scan_Tree_For_Captures (Ctx, D (SM_SPEC, PID), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth, PIK, Gen_Id);
+                     Bind_Gen_Formals_For_Scan (Gen_Id, UK);
+                     declare
+                        GSp : constant TREE := (if not Is_Void_Tree (Gen_Id) and then KIND (Gen_Id) = DN_GENERIC_ID then D (SM_SPEC, Gen_Id) else CONST_VOID);
+                        ISp : constant TREE := D (SM_SPEC, PID);
+                     begin
+                        if not Is_Void_Tree (GSp) and then KIND (GSp) = DN_PACKAGE_SPEC
+                          and then not Is_Void_Tree (ISp) and then KIND (ISp) = DN_PACKAGE_SPEC
+                        then
+                           Map_Decl_List_Ids (Ctx, D (AS_DECL_S1, GSp), D (AS_DECL_S1, ISp));
+                           Map_Decl_List_Ids (Ctx, D (AS_DECL_S2, GSp), D (AS_DECL_S2, ISp));
+                        end if;
+                     end;
+                     if Ctx.Generic_Body.Contains (GK) then
+                        GB := Ctx.Generic_Body.Element (GK);
+                     elsif not Is_Void_Tree (Gen_Id) and then KIND (Gen_Id) = DN_GENERIC_ID then
+                        GB := D (SM_BODY, Gen_Id);
+                        if Is_Void_Tree (GB) then
+                           GB := D (XD_BODY, Gen_Id);
+                        end if;
                      end if;
-                  end if;
+                     if not Is_Void_Tree (GB) then
+                        if KIND (GB) = DN_PACKAGE_BODY then
+                           Scan_Tree_For_Captures (Ctx, D (AS_BODY, GB), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth, PIK, Gen_Id);
+                        else
+                           Scan_Tree_For_Captures (Ctx, GB, Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth, PIK, Gen_Id);
+                        end if;
+                     end if;
+                     Cap_Inst_Depth := Saved_D;
+                  end;
+                  Ctx.Generic_Subst := Saved_Sub;
                   return;
                end;
             end if;
@@ -282,7 +575,7 @@ package body Cg_Stmt is
       end if;
 
       if K = DN_INSTANTIATION then
-         Scan_Tree_For_Captures (Ctx, D (SM_DECL_S, Node), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth);
+         Scan_Tree_For_Captures (Ctx, D (SM_DECL_S, Node), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth, Inst_Key, Inst_Gen_Id);
       end if;
 
       if K = DN_TASK_BODY then
@@ -290,42 +583,71 @@ package body Cg_Stmt is
             TB_Id : constant TREE := D (AS_SOURCE_NAME, Node);
             TS    : constant TREE := (if not Is_Void_Tree (TB_Id) then Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_TYPE_SPEC, TB_Id))) else CONST_VOID);
             TK    : constant Unsigned_32 := (if not Is_Void_Tree (TS) then Tree_Key (TS) else 0);
+            Sub_B : constant TREE := Find_Gen_Subunit_Body (Ctx, Node);
+            Scan_B : constant TREE := (if not Is_Void_Tree (Sub_B) then D (AS_BODY, Sub_B) else D (AS_BODY, Node));
          begin
             if TK /= 0 and then TK /= Current_Subp then
                Register_Nested_Child (TK);
-               Scan_Tree_For_Captures (Ctx, D (SM_DECL_S, TS), TK, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth);
-               Scan_Tree_For_Captures (Ctx, D (AS_BODY, Node), TK, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth);
+               Scan_Tree_For_Captures (Ctx, D (SM_DECL_S, TS), TK, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth, Inst_Key, Inst_Gen_Id);
+               Scan_Tree_For_Captures (Ctx, Scan_B, TK, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth, Inst_Key, Inst_Gen_Id);
+               return;
+            end if;
+         end;
+      end if;
+
+      if K = DN_PACKAGE_BODY then
+         declare
+            Orig_P : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, Node));
+            Sub_B  : constant TREE := Find_Gen_Subunit_Body (Ctx, Node);
+         begin
+            -- P3-5.1: Skip uninstantiated nested generic package bodies during outer capture scan
+            if not Is_Void_Tree (Orig_P) and then KIND (Orig_P) = DN_GENERIC_ID then
+               return;
+            end if;
+            if not Is_Void_Tree (Sub_B) then
+               Scan_Tree_For_Captures (Ctx, D (AS_BODY, Sub_B), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth, Inst_Key, Inst_Gen_Id);
                return;
             end if;
          end;
       end if;
 
       if K = DN_SUBPROGRAM_BODY then
-         -- LRM 10.2 (c83022g): separate subunit stubs never receive a parent static link
-         if not Is_Void_Tree (D (AS_BODY, Node)) and then KIND (D (AS_BODY, Node)) = DN_STUB then
-            return;
-         end if;
+         -- P3-5.1: Skip uninstantiated nested generic subprogram bodies during outer capture scan
          declare
-            Subp_Id : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, Node));
-            SK      : constant Unsigned_32 := Tree_Key (Subp_Id);
+            Orig_S : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, Node));
+            Sub_B  : constant TREE := Find_Gen_Subunit_Body (Ctx, Node);
          begin
-            if SK /= Current_Subp then
-               Register_Nested_Child (SK);
-               Scan_Tree_For_Captures (Ctx, D (AS_BODY, Node), SK, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth);
+            if not Is_Void_Tree (Orig_S) and then KIND (Orig_S) = DN_GENERIC_ID then
                return;
             end if;
+            -- LRM 10.2 (c83022g): external separate subunit stubs never receive a parent static link;
+            -- P3-5.3: inlined generic subunit stubs DO participate in capture analysis!
+            if not Is_Void_Tree (D (AS_BODY, Node)) and then KIND (D (AS_BODY, Node)) = DN_STUB and then Is_Void_Tree (Sub_B) then
+               return;
+            end if;
+            declare
+               Subp_Id : constant TREE := Canonical_Def (Subst_Tree (Ctx, Orig_S));
+               SK      : constant Unsigned_32 := Tree_Key (Subp_Id);
+               Scan_B  : constant TREE := (if not Is_Void_Tree (Sub_B) then D (AS_BODY, Sub_B) else D (AS_BODY, Node));
+            begin
+               if SK /= Current_Subp then
+                  Register_Nested_Child (SK);
+                  Scan_Tree_For_Captures (Ctx, Scan_B, SK, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth, Inst_Key, Inst_Gen_Id);
+                  return;
+               end if;
+            end;
          end;
       end if;
 
       if KIND (Node) in DN_PROCEDURE_CALL | DN_FUNCTION_CALL then
-         Scan_Tree_For_Captures (Ctx, D (AS_NAME, Node), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth);
+         Scan_Tree_For_Captures (Ctx, D (AS_NAME, Node), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth, Inst_Key, Inst_Gen_Id);
          declare
             NPS : constant TREE := D (SM_NORMALIZED_PARAM_S, Node);
          begin
             if not Is_Void_Tree (NPS) then
-               Scan_Tree_For_Captures (Ctx, NPS, Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth);
+               Scan_Tree_For_Captures (Ctx, NPS, Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth, Inst_Key, Inst_Gen_Id);
             else
-               Scan_Tree_For_Captures (Ctx, D (AS_GENERAL_ASSOC_S, Node), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth);
+               Scan_Tree_For_Captures (Ctx, D (AS_GENERAL_ASSOC_S, Node), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth, Inst_Key, Inst_Gen_Id);
             end if;
          end;
          return;
@@ -338,12 +660,12 @@ package body Cg_Stmt is
          begin
             while not IS_EMPTY (L) loop
                POP (L, Item);
-               Scan_Tree_For_Captures (Ctx, Item, Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth);
+               Scan_Tree_For_Captures (Ctx, Item, Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth, Inst_Key, Inst_Gen_Id);
             end loop;
          end;
       else
          for I in 1 .. ARITIES'Pos (ARITY (Node)) loop
-            Scan_Tree_For_Captures (Ctx, DABS (I, Node), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth);
+            Scan_Tree_For_Captures (Ctx, DABS (I, Node), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth, Inst_Key, Inst_Gen_Id);
          end loop;
       end if;
    end Scan_Tree_For_Captures;
@@ -497,6 +819,13 @@ package body Cg_Stmt is
       end if;
    end Emit_SS_Release_To;
 
+   procedure Emit_SP_Restore_To (Ctx : in out Context; Target_Depth : Natural) is
+   begin
+      if Natural (Ctx.SP_Marks.Length) > Target_Depth then
+         Emit_Inst (Ctx.E, "stackrestore " & To_String (Ctx.SP_Marks.Element (Target_Depth)));
+      end if;
+   end Emit_SP_Restore_To;
+
    -- =========================================================================
    -- Generic Instantiation Emission
    -- =========================================================================
@@ -518,7 +847,7 @@ package body Cg_Stmt is
          POP (GL, GD);
          POP (IL, ID);
          case KIND (GD) is
-            when DN_RENAMES_EXC_DECL =>
+            when DN_RENAMES_EXC_DECL | DN_RENAMES_OBJ_DECL =>
                if KIND (ID) = KIND (GD) then
                   declare
                      GN   : constant TREE := D (AS_SOURCE_NAME, GD);
@@ -590,10 +919,43 @@ package body Cg_Stmt is
                                  end;
                               end if;
                            end Map_Disc_Pair;
+                           procedure Map_Comp_List_Pair (Src_CL, Dst_CL : TREE) is
+                           begin
+                              if Is_Void_Tree (Src_CL) or else Is_Void_Tree (Dst_CL) then return; end if;
+                              Map_Decl_List_Ids (Ctx, D (AS_DECL_S, Src_CL), D (AS_DECL_S, Dst_CL));
+                              declare
+                                 SVP : constant TREE := D (AS_VARIANT_PART, Src_CL);
+                                 DVP : constant TREE := D (AS_VARIANT_PART, Dst_CL);
+                              begin
+                                 if not Is_Void_Tree (SVP) and then KIND (SVP) = DN_VARIANT_PART
+                                   and then not Is_Void_Tree (DVP) and then KIND (DVP) = DN_VARIANT_PART
+                                   and then not Is_Void_Tree (D (AS_VARIANT_S, SVP))
+                                   and then not Is_Void_Tree (D (AS_VARIANT_S, DVP))
+                                 then
+                                    declare
+                                       SVL : SEQ_TYPE := LIST (D (AS_VARIANT_S, SVP));
+                                       DVL : SEQ_TYPE := LIST (D (AS_VARIANT_S, DVP));
+                                       SV, DV : TREE;
+                                    begin
+                                       while not IS_EMPTY (SVL) and then not IS_EMPTY (DVL) loop
+                                          POP (SVL, SV); POP (DVL, DV);
+                                          if KIND (SV) = DN_VARIANT and then KIND (DV) = DN_VARIANT then
+                                             Map_Comp_List_Pair (D (AS_COMP_LIST, SV), D (AS_COMP_LIST, DV));
+                                          end if;
+                                       end loop;
+                                    end;
+                                 end if;
+                              end;
+                           end Map_Comp_List_Pair;
                         begin
                            Map_Disc_Pair (GT, IT);
                            Map_Disc_Pair (GT, RIT);
                            Map_Disc_Pair (RGT, RIT);
+                           if not Is_Void_Tree (RGT) and then KIND (RGT) = DN_RECORD
+                             and then not Is_Void_Tree (RIT) and then KIND (RIT) = DN_RECORD
+                           then
+                              Map_Comp_List_Pair (D (SM_COMP_LIST, RGT), D (SM_COMP_LIST, RIT));
+                           end if;
                         end;
                      end if;
                   end;
@@ -653,11 +1015,29 @@ package body Cg_Stmt is
             when DN_GENERIC_DECL =>
                if KIND (ID) = DN_GENERIC_DECL then
                   declare
-                     GN : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, GD));
+                     GN   : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, GD));
                      IN_N : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, ID));
+                     GHdr : constant TREE := D (AS_HEADER, GD);
+                     IHdr : constant TREE := D (AS_HEADER, ID);
                   begin
                      Ctx.Generic_Subst.Include (Tree_Key (GN), IN_N);
                      Ctx.Generic_Decls.Include (Tree_Key (IN_N), GD);
+                     -- P3-5.1: Propagate nested generic body to instantiated nested generic ID
+                     if Ctx.Generic_Body.Contains (Tree_Key (GN)) then
+                        Ctx.Generic_Body.Include (Tree_Key (IN_N), Ctx.Generic_Body.Element (Tree_Key (GN)));
+                     elsif KIND (GN) = DN_GENERIC_ID then
+                        if not Is_Void_Tree (D (SM_BODY, GN)) then
+                           Ctx.Generic_Body.Include (Tree_Key (IN_N), D (SM_BODY, GN));
+                        elsif not Is_Void_Tree (D (XD_BODY, GN)) then
+                           Ctx.Generic_Body.Include (Tree_Key (IN_N), D (XD_BODY, GN));
+                        end if;
+                     end if;
+                     if not Is_Void_Tree (GHdr) and then KIND (GHdr) = DN_PACKAGE_SPEC
+                       and then not Is_Void_Tree (IHdr) and then KIND (IHdr) = DN_PACKAGE_SPEC
+                     then
+                        Map_Decl_List_Ids (Ctx, D (AS_DECL_S1, GHdr), D (AS_DECL_S1, IHdr));
+                        Map_Decl_List_Ids (Ctx, D (AS_DECL_S2, GHdr), D (AS_DECL_S2, IHdr));
+                     end if;
                   end;
                end if;
             when others =>
@@ -679,21 +1059,19 @@ package body Cg_Stmt is
       Param_S  : TREE := CONST_VOID;
       GBody    : TREE := CONST_VOID;
    begin
-      -- Skip predefined generic instantiations handled directly by RTL
-      if Gen_Name = "INTEGER_IO" or else Gen_Name = "FLOAT_IO"
-        or else Gen_Name = "FIXED_IO" or else Gen_Name = "ENUMERATION_IO"
-        or else Gen_Name = "SEQUENTIAL_IO" or else Gen_Name = "DIRECT_IO"
-        or else Gen_Name = "UNCHECKED_DEALLOCATION" or else Gen_Name = "UNCHECKED_CONVERSION"
-      then
-         -- Still emit instantiated RTL package spec globals (e.g. DEFAULT_WIDTH, DEFAULT_BASE, DEFAULT_FORE, DEFAULT_AFT)!
+      -- Skip predefined RTL generic instantiations handled directly by runtime (P3-5.7: verify enclosing pkg!)
+      if Is_RTL_Generic (Gen_Id) then
+         -- Still emit instantiated RTL package spec vars (e.g. DEFAULT_WIDTH, DEFAULT_BASE, DEFAULT_FORE, DEFAULT_AFT)
+         -- using local vs global storage matching the enclosing scope!
          if KIND (Inst_Decl) = DN_PACKAGE_DECL then
             declare
                ISpec     : constant TREE := D (SM_SPEC, Inst_Id);
+               RTL_Glob  : constant Boolean := (Ctx.Cur_Subp_Key = 0) or else Ctx.Has_Stubs;
                Dummy_Dyn : Boolean;
             begin
                if not Is_Void_Tree (ISpec) and then KIND (ISpec) = DN_PACKAGE_SPEC then
-                  Emit_Decl_Items (Ctx, D (AS_DECL_S1, ISpec), Is_Global => True, Export_All => Export_All, Has_Dyn => Dummy_Dyn);
-                  Emit_Decl_Items (Ctx, D (AS_DECL_S2, ISpec), Is_Global => True, Export_All => False, Has_Dyn => Dummy_Dyn);
+                  Emit_Decl_Items (Ctx, D (AS_DECL_S1, ISpec), Is_Global => RTL_Glob, Export_All => (Export_All and then RTL_Glob), Has_Dyn => Dummy_Dyn);
+                  Emit_Decl_Items (Ctx, D (AS_DECL_S2, ISpec), Is_Global => RTL_Glob, Export_All => False, Has_Dyn => Dummy_Dyn);
                end if;
             end;
          end if;
@@ -745,34 +1123,59 @@ package body Cg_Stmt is
          return;
       end if;
 
-      -- LRM 3.9: check generic body has been elaborated before instantiation (c39007a, c39007b)
-      if Ctx.Enable_Checks and then Ctx.Gen_Elab_Flags.Contains (Gen_Key)
-        and then (KIND (Inst_Decl) /= DN_PACKAGE_DECL or else not Is_Void_Tree (GBody))
+      -- LRM 3.9: check generic body has been elaborated before instantiation (c39007a, c39007b; P3-5.16)
+      if Ctx.Enable_Checks
+        and then (KIND (Inst_Decl) /= DN_PACKAGE_DECL or else not Is_Void_Tree (GBody)
+                  or else (not Is_Void_Tree (Gen_Id) and then KIND (Gen_Id) = DN_GENERIC_ID
+                           and then not Is_Void_Tree (D (SM_SPEC, Gen_Id))
+                           and then KIND (D (SM_SPEC, Gen_Id)) = DN_PACKAGE_SPEC
+                           and then (Lib_Binder.Decl_List_Requires_Body (D (AS_DECL_S1, D (SM_SPEC, Gen_Id)))
+                                     or else Lib_Binder.Decl_List_Requires_Body (D (AS_DECL_S2, D (SM_SPEC, Gen_Id))))))
       then
          declare
-            GSym  : constant String := To_String (Ctx.Gen_Elab_Flags.Element (Gen_Key).Pir_Type);
-            FA    : constant String := Next_Reg (Ctx.E, "gfa");
-            FV    : constant String := Next_Reg (Ctx.E, "gfv");
-            NE    : constant String := Next_Reg (Ctx.E, "gne");
-            L_Bad : constant String := Next_Label (Ctx.E, "gpe_b");
-            L_Ok  : constant String := Next_Label (Ctx.E, "gpe_o");
+            GSym_U : Unbounded_String;
          begin
-            Emit_Inst (Ctx.E, FA & " = addr " & GSym);
-            Emit_Inst (Ctx.E, FV & " = load.i8 " & FA & ", align 1");
-            Emit_Inst (Ctx.E, NE & " = cmp_eq.i8 " & FV & ", 0");
-            Emit_Term (Ctx.E, "br " & NE & ", " & L_Bad & ", " & L_Ok);
-            Emit_Label (Ctx.E, L_Bad);
-            Emit_Raise_Tag (Ctx, Program_Error_Tag (Ctx));
-            Emit_Label (Ctx.E, L_Ok);
+            if Ctx.Gen_Elab_Flags.Contains (Gen_Key) then
+               GSym_U := Ctx.Gen_Elab_Flags.Element (Gen_Key).Pir_Type;
+            elsif not Is_Void_Tree (Gen_Id) and then Is_Library_Level (Gen_Id)
+              and then Gen_Name /= "LENGTH_CHECK" and then Gen_Name /= "ENUM_CHECK"
+              and then Enclosing_Package_Name (Gen_Id) /= "TEXT_IO"
+            then
+               declare
+                  S : constant String := "@ada_gelab__" & Qualified_Ada_Name (Gen_Id);
+               begin
+                  Add_Global_Decl (Ctx.E, S, "extern " & S & " = global i8, align 1");
+                  GSym_U := To_Unbounded_String (S);
+               end;
+            end if;
+            if Length (GSym_U) > 0 then
+               declare
+                  GSym  : constant String := To_String (GSym_U);
+                  FA    : constant String := Next_Reg (Ctx.E, "gfa");
+                  FV    : constant String := Next_Reg (Ctx.E, "gfv");
+                  NE    : constant String := Next_Reg (Ctx.E, "gne");
+                  L_Bad : constant String := Next_Label (Ctx.E, "gpe_b");
+                  L_Ok  : constant String := Next_Label (Ctx.E, "gpe_o");
+               begin
+                  Emit_Inst (Ctx.E, FA & " = addr " & GSym);
+                  Emit_Inst (Ctx.E, FV & " = load.i8 " & FA & ", align 1");
+                  Emit_Inst (Ctx.E, NE & " = cmp_eq.i8 " & FV & ", 0");
+                  Emit_Term (Ctx.E, "br " & NE & ", " & L_Bad & ", " & L_Ok);
+                  Emit_Label (Ctx.E, L_Bad);
+                  Emit_Raise_Tag (Ctx, Program_Error_Tag (Ctx));
+                  Emit_Label (Ctx.E, L_Ok);
+               end;
+            end if;
          end;
       end if;
 
       if Is_Void_Tree (GBody) and then KIND (Inst_Decl) /= DN_PACKAGE_DECL then
-         -- Emit a stub function raising PROGRAM_ERROR so dead-code calls verify in pirc (c39007b)
+         -- Emit a stub function raising PROGRAM_ERROR so dead-code calls verify in pirc (c39007b; P3-5.11 clear Handlers!)
          declare
             Inst_Spec : constant TREE := D (SM_SPEC, Inst_Id);
             SI        : Subp_Info;
             Saved_Buf : Pir_Emit.Func_Buffer;
+            Saved_Hdl : constant Handler_Vecs.Vector := Ctx.Handlers;
          begin
             Pre_Register_Subp (Ctx, Inst_Id, Inst_Spec, Ctx.Cur_Subp_Key);
             SI := Ctx.Subps.Element (Tree_Key (Canonical_Def (Inst_Id)));
@@ -784,19 +1187,31 @@ package body Cg_Stmt is
                  (if not SI.Is_Function or else SI.Ret_Composite then "void"
                   else To_String (Get_Type_Info (Ctx, SI.Ret_Type).Pir_Type));
             begin
+               Ctx.Handlers.Clear;
                Begin_Func (Ctx.E, Saved_Buf,
                  Link & "func " & To_String (SI.Pir_Name) & "(" & Params & ") -> " & Ret_S & " cc ""internal""");
                Emit_Raise_Tag (Ctx, Program_Error_Tag (Ctx));
                End_Func (Ctx.E, Saved_Buf);
+               Ctx.Handlers := Saved_Hdl;
             end;
          end;
          return;
       end if;
 
       declare
-         Saved_Sub : constant Tree_Maps.Map := Ctx.Generic_Subst;
-         Saved_Tag : constant Unbounded_String := Ctx.Gen_Inst_Tag;
-         Saved_Exc : constant Type_Maps.Map := Ctx.Gen_Local_Exc_Tags;
+         Saved_Sub     : constant Tree_Maps.Map := Ctx.Generic_Subst;
+         Saved_Tag     : constant Unbounded_String := Ctx.Gen_Inst_Tag;
+         Saved_Exc     : constant Type_Maps.Map := Ctx.Gen_Local_Exc_Tags;
+         Post_Spec_Exc : Type_Maps.Map := Ctx.Gen_Local_Exc_Tags;
+         Saved_In_GB   : constant Boolean := Ctx.In_Gen_Body;
+         Saved_NGens   : constant U32_Vecs.Vector := Ctx.Gen_Body_Nested_Gens;
+         Restore_Vars  : Var_Maps.Map;
+         Del_Vars      : U32_Vecs.Vector;
+         Restore_Subp  : Subp_Maps.Map;
+         Del_Subp      : U32_Vecs.Vector;
+         Restore_Tasks : Task_Maps.Map;
+         Del_Tasks     : U32_Vecs.Vector;
+         Gen_Is_Global : constant Boolean := (Ctx.Cur_Subp_Key = 0) or else Ctx.Has_Stubs;
          FItems    : SEQ_TYPE := (if Is_Void_Tree (Param_S) then MAKE else LIST (Param_S));
          ADecls_N  : constant TREE := D (SM_DECL_S, Unit_K);
          ADecls    : SEQ_TYPE := (if Is_Void_Tree (ADecls_N) then MAKE else LIST (ADecls_N));
@@ -886,9 +1301,9 @@ package body Cg_Stmt is
                   R2 : constant TREE := D (SM_RANGE, T2);
                begin
                   if not Is_Void_Tree (A1) and then not Is_Void_Tree (A2)
-                    and then Has_Static_Val (Safe_SM_Value (A1))
-                    and then Has_Static_Val (Safe_SM_Value (A2))
-                    and then Eval_Int64 (Safe_SM_Value (A1)) /= Eval_Int64 (Safe_SM_Value (A2))
+                    and then Has_Static_Val (A1)
+                    and then Has_Static_Val (A2)
+                    and then Eval_Int64 (A1) /= Eval_Int64 (A2)
                   then
                      Emit_Raise_Tag (Ctx, Constraint_Error_Tag (Ctx));
                      declare
@@ -910,13 +1325,23 @@ package body Cg_Stmt is
                         H1  : constant String := Emit_Scalar_Coerce (Ctx, To_String (H1V.Reg), To_String (H1V.Pir_Type), "f64");
                         L2  : constant String := Emit_Scalar_Coerce (Ctx, To_String (L2V.Reg), To_String (L2V.Pir_Type), "f64");
                         H2  : constant String := Emit_Scalar_Coerce (Ctx, To_String (H2V.Reg), To_String (H2V.Pir_Type), "f64");
+                        N1  : constant String := Next_Reg (Ctx.E, "gfn1");
+                        N2  : constant String := Next_Reg (Ctx.E, "gfn2");
+                        BN  : constant String := Next_Reg (Ctx.E, "gfbn");
+                        NB  : constant String := Next_Reg (Ctx.E, "gfnb");
                         C1  : constant String := Next_Reg (Ctx.E, "gf1");
                         C2  : constant String := Next_Reg (Ctx.E, "gf2");
+                        Mis : constant String := Next_Reg (Ctx.E, "gfm");
                         Bad : constant String := Next_Reg (Ctx.E, "gfb");
                      begin
+                        Emit_Inst (Ctx.E, N1 & " = fcmp_ogt.f64 " & L1 & ", " & H1);
+                        Emit_Inst (Ctx.E, N2 & " = fcmp_ogt.f64 " & L2 & ", " & H2);
+                        Emit_Inst (Ctx.E, BN & " = and.i8 " & N1 & ", " & N2);
+                        Emit_Inst (Ctx.E, NB & " = xor.i8 " & BN & ", 1");
                         Emit_Inst (Ctx.E, C1 & " = fcmp_one.f64 " & L1 & ", " & L2);
                         Emit_Inst (Ctx.E, C2 & " = fcmp_one.f64 " & H1 & ", " & H2);
-                        Emit_Inst (Ctx.E, Bad & " = or.i8 " & C1 & ", " & C2);
+                        Emit_Inst (Ctx.E, Mis & " = or.i8 " & C1 & ", " & C2);
+                        Emit_Inst (Ctx.E, Bad & " = and.i8 " & Mis & ", " & NB);
                         Emit_Check_Fail_If (Ctx, Bad);
                      end;
                   end if;
@@ -951,13 +1376,23 @@ package body Cg_Stmt is
                         H1  : constant String := Emit_Int_Convert (Ctx, To_String (H1V.Reg), To_String (H1V.Pir_Type), "i64");
                         L2  : constant String := Emit_Int_Convert (Ctx, To_String (L2V.Reg), To_String (L2V.Pir_Type), "i64");
                         H2  : constant String := Emit_Int_Convert (Ctx, To_String (H2V.Reg), To_String (H2V.Pir_Type), "i64");
+                        N1  : constant String := Next_Reg (Ctx.E, "gxn1");
+                        N2  : constant String := Next_Reg (Ctx.E, "gxn2");
+                        BN  : constant String := Next_Reg (Ctx.E, "gxbn");
+                        NB  : constant String := Next_Reg (Ctx.E, "gxnb");
                         C1  : constant String := Next_Reg (Ctx.E, "gx1");
                         C2  : constant String := Next_Reg (Ctx.E, "gx2");
+                        Mis : constant String := Next_Reg (Ctx.E, "gxm");
                         Bad : constant String := Next_Reg (Ctx.E, "gxb");
                      begin
+                        Emit_Inst (Ctx.E, N1 & " = cmp_gt_s.i64 " & L1 & ", " & H1);
+                        Emit_Inst (Ctx.E, N2 & " = cmp_gt_s.i64 " & L2 & ", " & H2);
+                        Emit_Inst (Ctx.E, BN & " = and.i8 " & N1 & ", " & N2);
+                        Emit_Inst (Ctx.E, NB & " = xor.i8 " & BN & ", 1");
                         Emit_Inst (Ctx.E, C1 & " = cmp_ne.i64 " & L1 & ", " & L2);
                         Emit_Inst (Ctx.E, C2 & " = cmp_ne.i64 " & H1 & ", " & H2);
-                        Emit_Inst (Ctx.E, Bad & " = or.i8 " & C1 & ", " & C2);
+                        Emit_Inst (Ctx.E, Mis & " = or.i8 " & C1 & ", " & C2);
+                        Emit_Inst (Ctx.E, Bad & " = and.i8 " & Mis & ", " & NB);
                         Emit_Check_Fail_If (Ctx, Bad);
                      end;
                   end if;
@@ -1009,8 +1444,20 @@ package body Cg_Stmt is
          end Emit_Check_Subtypes_Match;
       begin
          Ctx.Gen_Inst_Tag := Saved_Tag & "_gi" & Tree_Key_Str (Inst_Id);
-         -- If this generic was declared inside an instantiated outer generic, restore outer formal bindings
-         if Ctx.Generic_Env.Contains (Gen_Key) then
+         Ctx.Gen_Body_Nested_Gens.Clear;
+         -- If this generic was declared inside an instantiated outer generic (and we are NOT still
+         -- actively emitting that same outer generic body right now), restore outer formal bindings,
+         -- outer body exception tags, and outer body vars/subps (LRM 12.3(17), 11.1(5)).
+         declare
+            In_Cur_Enclosing_Gen : Boolean := False;
+         begin
+            for NGK of Saved_NGens loop
+               if NGK = Gen_Key then
+                  In_Cur_Enclosing_Gen := True;
+                  exit;
+               end if;
+            end loop;
+         if not In_Cur_Enclosing_Gen and then Ctx.Generic_Env.Contains (Gen_Key) then
             declare
                Env : constant Tree_Maps.Map := Ctx.Generic_Env.Element (Gen_Key);
                Cur : Tree_Maps.Cursor := Env.First;
@@ -1021,6 +1468,78 @@ package body Cg_Stmt is
                end loop;
             end;
          end if;
+         if not In_Cur_Enclosing_Gen and then Ctx.Gen_Env_Exc.Contains (Gen_Key) then
+            declare
+               EEnv : constant Type_Maps.Map := Ctx.Gen_Env_Exc.Element (Gen_Key);
+               Cur  : Type_Maps.Cursor := EEnv.First;
+            begin
+               while Type_Maps.Has_Element (Cur) loop
+                  Ctx.Gen_Local_Exc_Tags.Include (Type_Maps.Key (Cur), Type_Maps.Element (Cur));
+                  Type_Maps.Next (Cur);
+               end loop;
+            end;
+         end if;
+         if not In_Cur_Enclosing_Gen and then Ctx.Gen_Env_Vars.Contains (Gen_Key) then
+            declare
+               VEnv : constant Var_Maps.Map := Ctx.Gen_Env_Vars.Element (Gen_Key);
+               Cur  : Var_Maps.Cursor := VEnv.First;
+            begin
+               while Var_Maps.Has_Element (Cur) loop
+                  declare
+                     VK : constant Unsigned_32 := Var_Maps.Key (Cur);
+                  begin
+                     if Ctx.Vars.Contains (VK) then
+                        Restore_Vars.Include (VK, Ctx.Vars.Element (VK));
+                     else
+                        Del_Vars.Append (VK);
+                     end if;
+                     Ctx.Vars.Include (VK, Var_Maps.Element (Cur));
+                  end;
+                  Var_Maps.Next (Cur);
+               end loop;
+            end;
+         end if;
+         if not In_Cur_Enclosing_Gen and then Ctx.Gen_Env_Subps.Contains (Gen_Key) then
+            declare
+               SEnv : constant Subp_Maps.Map := Ctx.Gen_Env_Subps.Element (Gen_Key);
+               Cur  : Subp_Maps.Cursor := SEnv.First;
+            begin
+               while Subp_Maps.Has_Element (Cur) loop
+                  declare
+                     SK : constant Unsigned_32 := Subp_Maps.Key (Cur);
+                  begin
+                     if Ctx.Subps.Contains (SK) then
+                        Restore_Subp.Include (SK, Ctx.Subps.Element (SK));
+                     else
+                        Del_Subp.Append (SK);
+                     end if;
+                     Ctx.Subps.Include (SK, Subp_Maps.Element (Cur));
+                  end;
+                  Subp_Maps.Next (Cur);
+               end loop;
+            end;
+         end if;
+         if not In_Cur_Enclosing_Gen and then Ctx.Gen_Env_Tasks.Contains (Gen_Key) then
+            declare
+               TEnv : constant Task_Maps.Map := Ctx.Gen_Env_Tasks.Element (Gen_Key);
+               Cur  : Task_Maps.Cursor := TEnv.First;
+            begin
+               while Task_Maps.Has_Element (Cur) loop
+                  declare
+                     TK_E : constant Unsigned_32 := Task_Maps.Key (Cur);
+                  begin
+                     if Ctx.Tasks.Contains (TK_E) then
+                        Restore_Tasks.Include (TK_E, Ctx.Tasks.Element (TK_E));
+                     else
+                        Del_Tasks.Append (TK_E);
+                     end if;
+                     Ctx.Tasks.Include (TK_E, Task_Maps.Element (Cur));
+                  end;
+                  Task_Maps.Next (Cur);
+               end loop;
+            end;
+         end if;
+         end;
          -- Map formal generic parameters -> actual bindings & verify LRM 12.3 subtype constraint matching.
          -- Per LRM 12.3(16) (cc3123b): evaluate explicit generic IN actuals BEFORE defaulted IN formals!
          declare
@@ -1050,6 +1569,13 @@ package body Cg_Stmt is
             end record;
             Def_Ins  : array (1 .. 64) of Def_In_Item;
             Def_Cnt  : Natural := 0;
+            type Deferred_Match_Pair is record
+               T1    : TREE;
+               T2    : TREE;
+               Sub   : Tree_Maps.Map;
+            end record;
+            package Def_Match_Vecs is new Ada.Containers.Vectors (Natural, Deferred_Match_Pair);
+            Def_Matches : Def_Match_Vecs.Vector;
             P_Idx    : Natural := 0;
          begin
             if not Is_Void_Tree (Assoc_S) then
@@ -1093,7 +1619,7 @@ package body Cg_Stmt is
                               A_Id : constant TREE := HEAD (LIST (D (AS_SOURCE_NAME_S, ADecl)));
                            begin
                               if Is_Formal_Explicit (F_Id, P_Idx) or else Def_Cnt >= Def_Ins'Last then
-                                 Emit_Decl_Items (Ctx, CONST_VOID, Is_Global => True, Export_All => Exp_Glob, Has_Dyn => Dummy_Dyn, Only_Item => ADecl);
+                                 Emit_Decl_Items (Ctx, CONST_VOID, Is_Global => Gen_Is_Global, Export_All => Exp_Glob, Has_Dyn => Dummy_Dyn, Only_Item => ADecl);
                                  Ctx.Generic_Subst.Include (Tree_Key (Canonical_Def (F_Id)), Canonical_Def (A_Id));
                               else
                                  Def_Cnt := Def_Cnt + 1;
@@ -1113,7 +1639,7 @@ package body Cg_Stmt is
                         POP (ADecls, ADecl);
                         P_Idx := P_Idx + 1;
                         if KIND (ADecl) = DN_RENAMES_OBJ_DECL then
-                           Emit_Decl_Items (Ctx, CONST_VOID, Is_Global => True, Export_All => Exp_Glob, Has_Dyn => Dummy_Dyn, Only_Item => ADecl);
+                           Emit_Decl_Items (Ctx, CONST_VOID, Is_Global => Gen_Is_Global, Export_All => Exp_Glob, Has_Dyn => Dummy_Dyn, Only_Item => ADecl);
                            declare
                               A_Id : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, ADecl));
                            begin
@@ -1126,7 +1652,7 @@ package body Cg_Stmt is
                else
                   POP (ADecls, ADecl);
                   P_Idx := P_Idx + 1;
-                  Emit_Decl_Items (Ctx, CONST_VOID, Is_Global => True, Export_All => Exp_Glob, Has_Dyn => Dummy_Dyn, Only_Item => ADecl);
+                  Emit_Decl_Items (Ctx, CONST_VOID, Is_Global => Gen_Is_Global, Export_All => Exp_Glob, Has_Dyn => Dummy_Dyn, Only_Item => ADecl);
                   if KIND (FItem) = DN_TYPE_DECL and then KIND (ADecl) = DN_SUBTYPE_DECL then
                      declare
                         F_Tid : constant TREE := D (AS_SOURCE_NAME, FItem);
@@ -1134,10 +1660,14 @@ package body Cg_Stmt is
                         A_Sid : constant TREE := D (AS_SOURCE_NAME, ADecl);
                         A_Ts  : constant TREE := D (SM_TYPE_SPEC, A_Sid);
                      begin
-                        -- Check formal vs actual constraints BEFORE inserting F_Ts -> A_Ts into Generic_Subst!
+                        -- Defer subtype match checks until Pass B binds any defaulted IN formals used in formal type constraints!
                         if not Is_Void_Tree (F_Ts) and then not Is_Void_Tree (A_Ts) then
                            if KIND (F_Ts) in DN_ARRAY | DN_CONSTRAINED_ARRAY | DN_ACCESS | DN_CONSTRAINED_ACCESS then
-                              Emit_Check_Subtypes_Match (F_Ts, A_Ts);
+                              if Def_Cnt > 0 then
+                                 Def_Matches.Append ((T1 => F_Ts, T2 => A_Ts, Sub => Ctx.Generic_Subst));
+                              else
+                                 Emit_Check_Subtypes_Match (F_Ts, A_Ts);
+                              end if;
                            elsif KIND (F_Ts) in DN_PRIVATE | DN_L_PRIVATE then
                               declare
                                  F_DS : constant TREE := D (SM_DISCRIMINANT_S, F_Ts);
@@ -1169,7 +1699,11 @@ package body Cg_Stmt is
                                           end if;
                                           POP (FNS, FID);
                                           POP (ANS, AID);
-                                          Emit_Check_Subtypes_Match (D (SM_OBJ_TYPE, FID), D (SM_OBJ_TYPE, AID));
+                                          if Def_Cnt > 0 then
+                                             Def_Matches.Append ((T1 => D (SM_OBJ_TYPE, FID), T2 => D (SM_OBJ_TYPE, AID), Sub => Ctx.Generic_Subst));
+                                          else
+                                             Emit_Check_Subtypes_Match (D (SM_OBJ_TYPE, FID), D (SM_OBJ_TYPE, AID));
+                                          end if;
                                           Ctx.Generic_Subst.Include (Tree_Key (Canonical_Def (FID)), Canonical_Def (AID));
                                           Ctx.Generic_Subst.Include (Tree_Key (FID), Canonical_Def (AID));
                                        end loop;
@@ -1218,24 +1752,70 @@ package body Cg_Stmt is
             -- Emit remaining trailing ADecls (if any)
             while not IS_EMPTY (ADecls) loop
                POP (ADecls, ADecl);
-               Emit_Decl_Items (Ctx, CONST_VOID, Is_Global => True, Export_All => Exp_Glob, Has_Dyn => Dummy_Dyn, Only_Item => ADecl);
+               Emit_Decl_Items (Ctx, CONST_VOID, Is_Global => Gen_Is_Global, Export_All => Exp_Glob, Has_Dyn => Dummy_Dyn, Only_Item => ADecl);
             end loop;
 
             -- Pass B: emit defaulted generic IN formal parameters in declaration order!
             for DI in 1 .. Def_Cnt loop
-               Emit_Decl_Items (Ctx, CONST_VOID, Is_Global => True, Export_All => Exp_Glob, Has_Dyn => Dummy_Dyn, Only_Item => Def_Ins (DI).ADecl);
+               Emit_Decl_Items (Ctx, CONST_VOID, Is_Global => Gen_Is_Global, Export_All => Exp_Glob, Has_Dyn => Dummy_Dyn, Only_Item => Def_Ins (DI).ADecl);
                declare
                   A_Id : constant TREE := HEAD (LIST (D (AS_SOURCE_NAME_S, Def_Ins (DI).ADecl)));
                begin
                   Ctx.Generic_Subst.Include (Tree_Key (Canonical_Def (Def_Ins (DI).F_Id)), Canonical_Def (A_Id));
                end;
             end loop;
+
+            -- Run deferred subtype match checks now that defaulted IN formals are bound (LRM 12.3(16)/12.3.4(4))
+            if not Def_Matches.Is_Empty then
+               declare
+                  Full_Sub : constant Tree_Maps.Map := Ctx.Generic_Subst;
+               begin
+                  for DM of Def_Matches loop
+                     Ctx.Generic_Subst := DM.Sub;
+                     for DI in 1 .. Def_Cnt loop
+                        declare
+                           A_Id : constant TREE := HEAD (LIST (D (AS_SOURCE_NAME_S, Def_Ins (DI).ADecl)));
+                        begin
+                           Ctx.Generic_Subst.Include (Tree_Key (Canonical_Def (Def_Ins (DI).F_Id)), Canonical_Def (A_Id));
+                        end;
+                     end loop;
+                     Emit_Check_Subtypes_Match (DM.T1, DM.T2);
+                  end loop;
+                  Ctx.Generic_Subst := Full_Sub;
+               end;
+            end if;
          end;
 
          -- For generic package instantiations, emit instantiated spec declarations AFTER ADecls_N
          declare
             Saved_Pkg_G : constant Integer_64 := Ctx.Cur_Task_Group_Id;
             Pkg_Gid     : Integer_64 := 0;
+            procedure Restore_Overlays is
+            begin
+               for VK of Del_Vars loop
+                  if Ctx.Vars.Contains (VK) then Ctx.Vars.Delete (VK); end if;
+               end loop;
+               for C in Restore_Vars.Iterate loop
+                  Ctx.Vars.Include (Var_Maps.Key (C), Var_Maps.Element (C));
+               end loop;
+               for SK of Del_Subp loop
+                  if Ctx.Subps.Contains (SK) then Ctx.Subps.Delete (SK); end if;
+               end loop;
+               for C in Restore_Subp.Iterate loop
+                  Ctx.Subps.Include (Subp_Maps.Key (C), Subp_Maps.Element (C));
+               end loop;
+               for TK_R of Del_Tasks loop
+                  if Ctx.Tasks.Contains (TK_R) then Ctx.Tasks.Delete (TK_R); end if;
+               end loop;
+               for C in Restore_Tasks.Iterate loop
+                  Ctx.Tasks.Include (Task_Maps.Key (C), Task_Maps.Element (C));
+               end loop;
+               Ctx.In_Gen_Body          := Saved_In_GB;
+               Ctx.Gen_Body_Nested_Gens := Saved_NGens;
+               Ctx.Generic_Subst        := Saved_Sub;
+               Ctx.Gen_Inst_Tag         := Saved_Tag;
+               Ctx.Gen_Local_Exc_Tags   := Post_Spec_Exc;
+            end Restore_Overlays;
          begin
          if KIND (Inst_Decl) = DN_PACKAGE_DECL then
             declare
@@ -1247,18 +1827,33 @@ package body Cg_Stmt is
                   Ctx.Cur_Task_Group_Id := Pkg_Gid;
                end if;
                if not Is_Void_Tree (ISpec) and then KIND (ISpec) = DN_PACKAGE_SPEC then
-                  Emit_Decl_Items (Ctx, D (AS_DECL_S1, ISpec), Is_Global => True, Export_All => Export_All, Has_Dyn => Dummy_Dyn);
-                  Emit_Decl_Items (Ctx, D (AS_DECL_S2, ISpec), Is_Global => True, Export_All => Export_All, Has_Dyn => Dummy_Dyn);
+                  Emit_Decl_Items (Ctx, D (AS_DECL_S1, ISpec), Is_Global => Gen_Is_Global, Export_All => Export_All, Has_Dyn => Dummy_Dyn);
+                  Emit_Decl_Items (Ctx, D (AS_DECL_S2, ISpec), Is_Global => Gen_Is_Global, Export_All => Export_All, Has_Dyn => Dummy_Dyn);
+                  -- P3-5.9: Preserve any spec-level exception tags declared inside ISpec for the enclosing generic body!
+                  if Saved_In_GB then
+                     for C in Ctx.Gen_Local_Exc_Tags.Iterate loop
+                        if not Saved_Exc.Contains (Type_Maps.Key (C)) then
+                           Post_Spec_Exc.Include (Type_Maps.Key (C), Type_Maps.Element (C));
+                        end if;
+                     end loop;
+                  end if;
                end if;
             end;
             if Is_Void_Tree (GBody) then
                Ctx.Cur_Task_Group_Id := Saved_Pkg_G;
-               Ctx.Generic_Subst := Saved_Sub;
-               Ctx.Gen_Inst_Tag  := Saved_Tag;
-               Ctx.Gen_Local_Exc_Tags := Saved_Exc;
+               Restore_Overlays;
                return;
             end if;
          end if;
+
+         -- Isolate per-instantiation Saved_Type_Ranges / Saved_Type_Discs / Saved_Expr_Vals across generic bodies (LRM 12.3(17))
+         declare
+            Saved_Ranges     : constant Saved_Range_Maps.Map := Ctx.Saved_Type_Ranges;
+            Saved_Var_Rngs   : constant Saved_Range_Maps.Map := Ctx.Saved_Var_Ranges;
+            Saved_Discs      : constant Saved_Disc_Maps.Map  := Ctx.Saved_Type_Discs;
+            Saved_Exprs      : constant Saved_Expr_Maps.Map  := Ctx.Saved_Expr_Vals;
+         begin
+         Ctx.In_Gen_Body := True;
 
          -- Case 1: Generic subprogram instantiation
          if KIND (GBody) = DN_SUBPROGRAM_BODY then
@@ -1331,8 +1926,16 @@ package body Cg_Stmt is
                   end;
                end if;
                if not Is_Void_Tree (D (AS_BODY, GBody)) and then KIND (D (AS_BODY, GBody)) = DN_STUB then
-                  Ada.Text_IO.Put_Line (Ada.Text_IO.Standard_Error, "generic subunit body must be in same file as spec");
-                  raise Program_Error;
+                  declare
+                     Sub_G : constant TREE := Find_Gen_Subunit_Body (Ctx, GBody);
+                  begin
+                     if not Is_Void_Tree (Sub_G) then
+                        GBody := Sub_G;
+                     else
+                        Ada.Text_IO.Put_Line (Ada.Text_IO.Standard_Error, "generic subunit body must be in same file as spec");
+                        raise Program_Error;
+                     end if;
+                  end;
                end if;
                Emit_Subprogram_Body (Ctx, GBody,
                  Override_Id   => Inst_Id,
@@ -1345,12 +1948,20 @@ package body Cg_Stmt is
             declare
                Gen_Spec  : constant TREE := D (SM_SPEC, Gen_Id);
                Inst_Spec : constant TREE := D (SM_SPEC, Inst_Id);
-               Bdy_Block : constant TREE :=
+               Bdy_Block : TREE :=
                  (if KIND (GBody) = DN_PACKAGE_BODY then D (AS_BODY, GBody) else GBody);
             begin
                if not Is_Void_Tree (Bdy_Block) and then KIND (Bdy_Block) = DN_STUB then
-                  Ada.Text_IO.Put_Line (Ada.Text_IO.Standard_Error, "generic subunit body must be in same file as spec");
-                  raise Program_Error;
+                  declare
+                     Sub_G : constant TREE := Find_Gen_Subunit_Body (Ctx, GBody);
+                  begin
+                     if not Is_Void_Tree (Sub_G) then
+                        Bdy_Block := D (AS_BODY, Sub_G);
+                     else
+                        Ada.Text_IO.Put_Line (Ada.Text_IO.Standard_Error, "generic subunit body must be in same file as spec");
+                        raise Program_Error;
+                     end if;
+                  end;
                end if;
                Ctx.Generic_Subst.Include (Tree_Key (Gen_Id), Inst_Id);
                if not Is_Void_Tree (Gen_Spec) and then KIND (Gen_Spec) = DN_PACKAGE_SPEC
@@ -1358,6 +1969,35 @@ package body Cg_Stmt is
                then
                   Map_Decl_List_Ids (Ctx, D (AS_DECL_S1, Gen_Spec), D (AS_DECL_S1, Inst_Spec));
                   Map_Decl_List_Ids (Ctx, D (AS_DECL_S2, Gen_Spec), D (AS_DECL_S2, Inst_Spec));
+               end if;
+               -- Bind per-instantiation parent frame capture slots for local generic package body variables
+               if not Gen_Is_Global and then Ctx.Cur_Subp_Key /= 0 then
+                  declare
+                     IK : constant Unsigned_32 := Tree_Key (Inst_Id);
+                  begin
+                     for C in Ctx.Gen_Cap_Slots.Iterate loop
+                        declare
+                           PK : constant Unsigned_64 := U64_Nat_Maps.Key (C);
+                           CI : constant Unsigned_32 := Unsigned_32 (Shift_Right (PK, 32) and 16#FFFF_FFFF#);
+                           VK : constant Unsigned_32 := Unsigned_32 (PK and 16#FFFF_FFFF#);
+                        begin
+                           if CI = IK
+                             and then not (Ctx.Gen_Env_Vars.Contains (Gen_Key) and then Ctx.Gen_Env_Vars.Element (Gen_Key).Contains (VK))
+                           then
+                              declare
+                                 V : Var_Info;
+                              begin
+                                 if Ctx.Vars.Contains (VK) then
+                                    V := Ctx.Vars.Element (VK);
+                                 end if;
+                                 V.Owner_Subp    := Ctx.Cur_Subp_Key;
+                                 V.Captured_Slot := U64_Nat_Maps.Element (C);
+                                 Ctx.Vars.Include (VK, V);
+                              end;
+                           end if;
+                        end;
+                     end loop;
+                  end;
                end if;
                if not Is_Void_Tree (Bdy_Block) and then KIND (Bdy_Block) = DN_BLOCK_BODY then
                   declare
@@ -1367,9 +2007,72 @@ package body Cg_Stmt is
                      Hdl_Lbl, After_Lbl : Unbounded_String;
                   begin
                      Emit_Decl_Items (Ctx, D (AS_ITEM_S, Bdy_Block),
-                       Is_Global  => True,
+                       Is_Global  => Gen_Is_Global,
                        Export_All => Export_All,
                        Has_Dyn    => Sub_Dyn);
+                     -- Snapshot outer generic body Exc_Tags, Vars, and Subps for any nested generics declared/bodied inside this generic
+                     if not Ctx.Gen_Body_Nested_Gens.Is_Empty then
+                        declare
+                           Cur_Tag    : constant String := To_String (Ctx.Gen_Inst_Tag);
+                           Body_Vars  : Var_Maps.Map;
+                           Body_Subp  : Subp_Maps.Map;
+                           Body_Tasks : Task_Maps.Map;
+                        begin
+                           for C in Ctx.Vars.Iterate loop
+                              declare
+                                 VK : constant Unsigned_32 := Var_Maps.Key (C);
+                                 VI : constant Var_Info := Var_Maps.Element (C);
+                                 Cap_K : constant Unsigned_64 :=
+                                   Shift_Left (Unsigned_64 (Tree_Key (Inst_Id)), 32) or Unsigned_64 (VK);
+                              begin
+                                 if (Cur_Tag'Length > 0 and then Ada.Strings.Fixed.Index (To_String (VI.Pir_Name), Cur_Tag) > 0)
+                                   or else (Cur_Tag'Length > 0 and then Ada.Strings.Fixed.Index (To_String (VI.Desc_Global), Cur_Tag) > 0)
+                                   or else (not Gen_Is_Global and then Ctx.Gen_Cap_Slots.Contains (Cap_K))
+                                 then
+                                    Body_Vars.Include (VK, VI);
+                                 end if;
+                              end;
+                           end loop;
+                           for C in Ctx.Subps.Iterate loop
+                              declare
+                                 SI_E : constant Subp_Info := Subp_Maps.Element (C);
+                              begin
+                                 if Cur_Tag'Length > 0
+                                   and then Ada.Strings.Fixed.Index (To_String (SI_E.Pir_Name), Cur_Tag) > 0
+                                   and then Ada.Strings.Fixed.Index (To_String (SI_E.Pir_Name), Cur_Tag & "_gi") = 0
+                                 then
+                                    Body_Subp.Include (Subp_Maps.Key (C), SI_E);
+                                 end if;
+                              end;
+                           end loop;
+                           for C in Ctx.Tasks.Iterate loop
+                              declare
+                                 TI_E : constant Task_Info := Task_Maps.Element (C);
+                              begin
+                                 if Cur_Tag'Length > 0 and then
+                                   (To_String (TI_E.Inst_Tag) = Cur_Tag
+                                    or else Ada.Strings.Fixed.Index (To_String (TI_E.Body_Fn), Cur_Tag) > 0)
+                                 then
+                                    Body_Tasks.Include (Task_Maps.Key (C), TI_E);
+                                 end if;
+                              end;
+                           end loop;
+                           for NGK of Ctx.Gen_Body_Nested_Gens loop
+                              if not Ctx.Gen_Local_Exc_Tags.Is_Empty then
+                                 Ctx.Gen_Env_Exc.Include (NGK, Ctx.Gen_Local_Exc_Tags);
+                              end if;
+                              if not Body_Vars.Is_Empty then
+                                 Ctx.Gen_Env_Vars.Include (NGK, Body_Vars);
+                              end if;
+                              if not Body_Subp.Is_Empty then
+                                 Ctx.Gen_Env_Subps.Include (NGK, Body_Subp);
+                              end if;
+                              if not Body_Tasks.Is_Empty then
+                                 Ctx.Gen_Env_Tasks.Include (NGK, Body_Tasks);
+                              end if;
+                           end loop;
+                        end;
+                     end if;
                      if Pkg_Gid /= 0 then
                         Ctx.Cur_Task_Group_Id := Saved_Pkg_G;
                      end if;
@@ -1379,7 +2082,8 @@ package body Cg_Stmt is
                         Ctx.Handlers.Append ((Handler_Label => Hdl_Lbl,
                                               Current_Exn   => Null_Unbounded_String,
                                               In_Handler    => False,
-                                              SS_Mark       => Null_Unbounded_String));
+                                              SS_Mark       => Null_Unbounded_String,
+                                              SP_Mark       => Null_Unbounded_String));
                      end if;
                      if Pkg_Gid /= 0 then
                         declare
@@ -1393,6 +2097,10 @@ package body Cg_Stmt is
                              To_String (Mst_G) & ", " & Img (Long_Long_Integer (Pkg_Gid)), "", Dummy_G);
                         end;
                      end if;
+                     Scan_Label_Master_Depths (Ctx, D (AS_STM_S, Bdy_Block),
+                       Natural (Ctx.Master_Stack.Length), Natural (Ctx.SS_Marks.Length), Natural (Ctx.SP_Marks.Length));
+                     Scan_Label_Master_Depths (Ctx, Alt_S,
+                       Natural (Ctx.Master_Stack.Length), Natural (Ctx.SS_Marks.Length), Natural (Ctx.SP_Marks.Length));
                      Emit_Stm_List (Ctx, D (AS_STM_S, Bdy_Block));
                      if Has_Hdl then
                         if not Is_Terminated (Ctx.E) then
@@ -1407,11 +2115,15 @@ package body Cg_Stmt is
             end;
          end if;
 
-         Ctx.Cur_Task_Group_Id := Saved_Pkg_G;
+         Ctx.Saved_Type_Ranges := Saved_Ranges;
+         Ctx.Saved_Var_Ranges  := Saved_Var_Rngs;
+         Ctx.Saved_Type_Discs  := Saved_Discs;
+         Ctx.Saved_Expr_Vals   := Saved_Exprs;
          end;
-         Ctx.Generic_Subst := Saved_Sub;
-         Ctx.Gen_Inst_Tag  := Saved_Tag;
-         Ctx.Gen_Local_Exc_Tags := Saved_Exc;
+
+         Ctx.Cur_Task_Group_Id := Saved_Pkg_G;
+         Restore_Overlays;
+         end;
       end;
    end Emit_Generic_Instantiation;
 
@@ -1544,8 +2256,13 @@ package body Cg_Stmt is
                           and then KIND (D (AS_CONSTRAINT, TD_N)) in DN_FLOAT_CONSTRAINT | DN_FIXED_CONSTRAINT;
                      begin
                         Emit_Type_Elab_Checks (Ctx, RT_O, Mark_Type => Mark_T, Has_Real_Constraint => Has_Real_C);
+                        -- P3-3.13: Preserve per-object frozen range so A, B : Integer range 1..F don't overwrite A's bounds!
+                        if Ctx.Saved_Type_Ranges.Contains (Tree_Key (RT_O)) then
+                           Ctx.Saved_Var_Ranges.Include (Key, Ctx.Saved_Type_Ranges.Element (Tree_Key (RT_O)));
+                        end if;
                      end;
-                     -- LRM 3.6.1 & 4.1.4 (c35003a/b, c36104a/b, c36105b, c41401a): check discrete ranges in index constraints
+                     -- LRM 3.6.1 & 4.1.4 (c35003a/b, c36104a/b, c36105b, c41401a, P3-3.13):
+                     -- Check discrete subtype mark compatibility without re-evaluating dynamic index bounds!
                      if KIND (TD_N) in DN_CONSTRAINED_ARRAY_DEF | DN_SUBTYPE_INDICATION
                        and then not Is_Void_Tree (D (AS_CONSTRAINT, TD_N))
                        and then KIND (D (AS_CONSTRAINT, TD_N)) = DN_INDEX_CONSTRAINT
@@ -1554,13 +2271,57 @@ package body Cg_Stmt is
                         declare
                            DRL : SEQ_TYPE := LIST (D (AS_DISCRETE_RANGE_S, D (AS_CONSTRAINT, TD_N)));
                            DRI : TREE;
+                           RTI_IC : constant Type_Info := (if KIND (RT_O) = DN_CONSTRAINED_ARRAY then Get_Type_Info (Ctx, RT_O) else (others => <>));
+                           Dim_IC : Natural := 0;
                            PT_U, Lo_U, Hi_U : Unbounded_String;
                            pragma Unreferenced (PT_U, Lo_U, Hi_U);
                         begin
                            while not IS_EMPTY (DRL) loop
                               POP (DRL, DRI);
-                              if KIND (DRI) in DN_DISCRETE_SUBTYPE | DN_RANGE_ATTRIBUTE then
-                                 Emit_Discrete_Range (Ctx, DRI, PT_U, Lo_U, Hi_U);
+                              Dim_IC := Dim_IC + 1;
+                              if KIND (DRI) = DN_DISCRETE_SUBTYPE then
+                                 declare
+                                    Sub_I : constant TREE := D (AS_SUBTYPE_INDICATION, DRI);
+                                    Con_I : constant TREE := (if not Is_Void_Tree (Sub_I) then D (AS_CONSTRAINT, Sub_I) else CONST_VOID);
+                                    TM_I  : constant TREE := (if not Is_Void_Tree (Sub_I) then Get_Name_Defn (D (AS_NAME, Sub_I)) else CONST_VOID);
+                                    Idx_T : constant TREE :=
+                                      (if Dim_IC <= RTI_IC.NDims then Resolve_Type_Spec (Subst_Tree (Ctx, RTI_IC.Dims (Dim_IC).Idx_Type)) else CONST_VOID);
+                                 begin
+                                    if not Is_Void_Tree (Con_I) and then not Is_Void_Tree (TM_I) and then KIND (TM_I) in CLASS_TYPE_NAME
+                                      and then not Is_Void_Tree (Idx_T) and then Ctx.Saved_Type_Ranges.Contains (Tree_Key (Idx_T))
+                                    then
+                                       -- Reuse already-saved bounds from Emit_Type_Elab_Checks to avoid double evaluation!
+                                       declare
+                                          SR  : constant Saved_Range_Info := Ctx.Saved_Type_Ranges.Element (Tree_Key (Idx_T));
+                                          MT  : constant TREE := Subst_Tree (Ctx, D (SM_TYPE_SPEC, TM_I));
+                                          MTI : constant Type_Info := Get_Type_Info (Ctx, MT);
+                                          L0  : constant String := Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
+                                          H0  : constant String := Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
+                                          NE  : constant String := Next_Reg (Ctx.E, "dsne");
+                                          L_C : constant String := Next_Label (Ctx.E, "dsc");
+                                          L_O : constant String := Next_Label (Ctx.E, "dso");
+                                       begin
+                                          Emit_Inst (Ctx.E, NE & " = cmp_le_s." & To_String (SR.Pir_Type) & " " & L0 & ", " & H0);
+                                          Emit_Term (Ctx.E, "br " & NE & ", " & L_C & ", " & L_O);
+                                          Emit_Label (Ctx.E, L_C);
+                                          Emit_Range_Check (Ctx, Emit_Int_Convert (Ctx, L0, To_String (SR.Pir_Type), To_String (MTI.Pir_Type)), To_String (MTI.Pir_Type), MT);
+                                          Emit_Range_Check (Ctx, Emit_Int_Convert (Ctx, H0, To_String (SR.Pir_Type), To_String (MTI.Pir_Type)), To_String (MTI.Pir_Type), MT);
+                                          Emit_Term (Ctx.E, "jmp " & L_O);
+                                          Emit_Label (Ctx.E, L_O);
+                                       end;
+                                    else
+                                       Emit_Discrete_Range (Ctx, DRI, PT_U, Lo_U, Hi_U);
+                                    end if;
+                                 end;
+                              elsif KIND (DRI) = DN_RANGE_ATTRIBUTE then
+                                 declare
+                                    Idx_T : constant TREE :=
+                                      (if Dim_IC <= RTI_IC.NDims then Resolve_Type_Spec (Subst_Tree (Ctx, RTI_IC.Dims (Dim_IC).Idx_Type)) else CONST_VOID);
+                                 begin
+                                    if Is_Void_Tree (Idx_T) or else not Ctx.Saved_Type_Ranges.Contains (Tree_Key (Idx_T)) then
+                                       Emit_Discrete_Range (Ctx, DRI, PT_U, Lo_U, Hi_U);
+                                    end if;
+                                 end;
                               end if;
                            end loop;
                         end;
@@ -1581,7 +2342,7 @@ package body Cg_Stmt is
                               D_N : constant TREE := Canonical_Def (Subst_Tree (Ctx, D (SM_DEFN, N)));
                            begin
                               if not Is_Void_Tree (D_N) and then KIND (D_N) in DN_VARIABLE_ID | DN_CONSTANT_ID
-                                and then not Is_Library_Level (D_N)
+                                and then D (XD_REGION, D_N) = D (XD_REGION, Can_Id)
                                 and then not Ctx.Vars.Contains (Tree_Key (D_N))
                               then
                                  return True;
@@ -1593,8 +2354,24 @@ package body Cg_Stmt is
                              or else Has_Unbound_Var (D (AS_DESIGNATOR, N), Depth + 1);
                         when DN_ATTRIBUTE =>
                            return Has_Unbound_Var (D (AS_NAME, N), Depth + 1);
-                        when DN_PARENTHESIZED =>
+                        when DN_PARENTHESIZED | DN_CONVERSION | DN_QUALIFIED | DN_ALL =>
                            return Has_Unbound_Var (D (AS_EXP, N), Depth + 1);
+                        when DN_INDEXED =>
+                           if Has_Unbound_Var (D (AS_NAME, N), Depth + 1) then return True; end if;
+                           if not Is_Void_Tree (D (AS_EXP_S, N)) then
+                              declare
+                                 IL : SEQ_TYPE := LIST (D (AS_EXP_S, N));
+                                 IE : TREE;
+                              begin
+                                 while not IS_EMPTY (IL) loop
+                                    POP (IL, IE);
+                                    if Has_Unbound_Var (IE, Depth + 1) then return True; end if;
+                                 end loop;
+                              end;
+                           end if;
+                           return False;
+                        when DN_SLICE =>
+                           return Has_Unbound_Var (D (AS_NAME, N), Depth + 1);
                         when DN_FUNCTION_CALL =>
                            declare
                               PS : constant TREE := D (SM_NORMALIZED_PARAM_S, N);
@@ -1654,6 +2431,7 @@ package body Cg_Stmt is
                         VInfo.Ada_Type   := Ada_T;
                         VInfo.Align      := TI.Align;
                         VInfo.Owner_Subp := 0;
+                        VInfo.Has_Desc   := Defer_Addr;
                         Ctx.Vars.Include (Key, VInfo);
                      end;
                   elsif Defer_Addr then
@@ -1667,6 +2445,7 @@ package body Cg_Stmt is
                         VInfo.Ada_Type   := Ada_T;
                         VInfo.Align      := TI.Align;
                         VInfo.Owner_Subp := Ctx.Cur_Subp_Key;
+                        VInfo.Has_Desc   := True;
                         if Ctx.Vars.Contains (Key) and then Ctx.Vars.Element (Key).Owner_Subp = Ctx.Cur_Subp_Key then
                            VInfo.Captured_Slot := Ctx.Vars.Element (Key).Captured_Slot;
                         end if;
@@ -1746,15 +2525,23 @@ package body Cg_Stmt is
                      Get_Discrete_Bounds (Ada_T, St, Lo, Hi);
                      if not St then
                         Can_Fast := False;
-                     elsif Eval_Int64 (Safe_SM_Value (Init_Exp)) < Lo or else Eval_Int64 (Safe_SM_Value (Init_Exp)) > Hi then
-                        if Ctx.Enable_Checks then
-                           Emit_Raise_Tag (Ctx, Constraint_Error_Tag (Ctx));
-                           declare
-                              Unr : constant String := Next_Label (Ctx.E, "sc_u");
-                           begin
-                              Emit_Label (Ctx.E, Unr);
-                           end;
-                        end if;
+                     else
+                        declare
+                           Val_C : Integer_64;
+                           Ovf_C : Boolean;
+                        begin
+                           Eval_Int64_Checked (Safe_SM_Value (Init_Exp), Val_C, Ovf_C);
+                           if Ovf_C or else Val_C < Lo or else Val_C > Hi then
+                              if Ctx.Enable_Checks then
+                                 Emit_Raise_Tag (Ctx, Constraint_Error_Tag (Ctx));
+                                 declare
+                                    Unr : constant String := Next_Label (Ctx.E, "sc_u");
+                                 begin
+                                    Emit_Label (Ctx.E, Unr);
+                                 end;
+                              end if;
+                           end if;
+                        end;
                      end if;
                   else
                      Can_Fast := False;
@@ -1776,26 +2563,30 @@ package body Cg_Stmt is
                   VInfo.Kind      := VK_Const_Float;
                   VInfo.Const_F64 := Eval_Float64 (Safe_SM_Value (Init_Exp));
                elsif Is_Fixed_Type (Ada_T) then
-                  VInfo.Kind      := VK_Const_Int;
+                  VInfo.Kind := VK_Const_Int;
                   declare
-                     FVal : constant IEEE_Float_64 := Eval_Float64 (Safe_SM_Value (Init_Exp)) / Fixed_Small (Ada_T);
+                     Tick_V : Integer_64;
+                     Tick_O : Boolean;
                   begin
-                     if FVal >= IEEE_Float_64 (Integer_64'Last) then
-                        VInfo.Const_I64 := Integer_64'Last;
-                     elsif FVal <= IEEE_Float_64 (Integer_64'First) then
-                        VInfo.Const_I64 := Integer_64'First;
-                     else
-                        VInfo.Const_I64 := Integer_64 (IEEE_Float_64'Rounding (FVal));
+                     Eval_Fixed_Ticks_Exact_Checked (Safe_SM_Value (Init_Exp), Ada_T, Tick_V, Tick_O);
+                     if Tick_O and then Ctx.Enable_Checks then
+                        Emit_Raise_Tag (Ctx, Constraint_Error_Tag (Ctx));
+                        declare
+                           Unr : constant String := Next_Label (Ctx.E, "scx_u");
+                        begin
+                           Emit_Label (Ctx.E, Unr);
+                        end;
                      end if;
+                     VInfo.Const_I64 := Tick_V;
                   end;
                else
                   VInfo.Kind      := VK_Const_Int;
                   VInfo.Const_I64 := Eval_Int64 (Safe_SM_Value (Init_Exp));
                end if;
                Ctx.Vars.Include (Key, VInfo);
-               -- LRM 7.4.3: for exported library-level scalar constants (including full deferred constants),
+               -- LRM 7.4.3: for exported library-level scalar constants (including full deferred constants & lib generic inst specs),
                -- also define and initialize the exported global so separately-compiled clients don't load zeroinit!
-               if Is_Global and then Export_All and then Length (Ctx.Gen_Inst_Tag) = 0 then
+               if Is_Global and then Export_All and then Is_Library_Level (Can_Id) then
                   declare
                      GSym : constant String := "@ada_g__" & Qualified_Ada_Name (Can_Id);
                      GA   : constant String := Next_Reg (Ctx.E, "scga");
@@ -1822,10 +2613,9 @@ package body Cg_Stmt is
                   Link     : constant String := (if Do_Exp then "export " else "");
                   GA   : constant String := Next_Reg (Ctx.E, "ga");
                   ETI  : constant Type_Info := Get_Type_Info (Ctx, TI.Elem_Type);
-                  Is_DE : constant Boolean := ETI.Kind = TK_Constrained_Array and then ETI.Is_Dynamic;
-                  EAl  : constant Natural := (if Is_DE then 8 else Natural'Max (1, ETI.Align));
-                  ESz  : constant Natural := (if Is_DE then 40 else ((ETI.Byte_Size + EAl - 1) / EAl) * EAl);
-                  ND   : Natural := Natural'Max (1, TI.NDims);
+                  EAl  : constant Natural := Elem_Storage_Align (ETI);
+                  ESz  : constant Natural := Elem_Storage_Size (ETI);
+                  ND   : Natural := Natural'Max (1, Natural'Min (TI.NDims, Max_Array_Dims));
                   Data_Ptr : Unbounded_String;
                begin
                   Add_Global_Decl (Ctx.E, GSym,
@@ -1834,7 +2624,7 @@ package body Cg_Stmt is
                   VInfo.Pir_Name    := To_Unbounded_String (GSym);
                   VInfo.Pir_Type    := To_Unbounded_String ("ptr");
                   VInfo.Ada_Type    := Ada_T;
-                  VInfo.Align       := ETI.Align;
+                  VInfo.Align       := EAl;
                   VInfo.Owner_Subp  := 0;
                   VInfo.Has_Desc    := True;
                   VInfo.Desc_Global := To_Unbounded_String (GSym);
@@ -1851,15 +2641,19 @@ package body Cg_Stmt is
                              and then not Is_Void_Tree (D (AS_CONSTRAINT, TD_N))
                              and then KIND (D (AS_CONSTRAINT, TD_N)) = DN_INDEX_CONSTRAINT
                            then LIST (D (AS_DISCRETE_RANGE_S, D (AS_CONSTRAINT, TD_N)))
+                           elsif not Is_Void_Tree (TD_N) and then KIND (TD_N) = DN_CONSTRAINED_ARRAY_DEF
+                             and then not Is_Void_Tree (D (AS_CONSTRAINT, TD_N))
+                             and then KIND (D (AS_CONSTRAINT, TD_N)) = DN_INDEX_CONSTRAINT
+                           then LIST (D (AS_DISCRETE_RANGE_S, D (AS_CONSTRAINT, TD_N)))
                            else MAKE);
                         Idx_T, DR_N : TREE;
                         Dim   : Natural := 0;
                         Tot64 : Unbounded_String;
-                        Byt   : constant String := Next_Reg (Ctx.E, "gby");
+                        Byt   : Unbounded_String;
                         Nz    : constant String := Next_Reg (Ctx.E, "gnz");
                         AlB   : constant String := Next_Reg (Ctx.E, "gal");
                      begin
-                        while not IS_EMPTY (IL) and then Dim < 4 loop
+                        while not IS_EMPTY (IL) and then Dim < Max_Array_Dims loop
                            POP (IL, Idx_T);
                            if not IS_EMPTY (DR_L) then
                               POP (DR_L, DR_N);
@@ -1870,43 +2664,25 @@ package body Cg_Stmt is
                            declare
                               RT, RL, RH : Unbounded_String;
                               F32, L32   : Unbounded_String;
-                              Df : constant String := Next_Reg (Ctx.E, "gd");
-                              Ln : constant String := Next_Reg (Ctx.E, "gl");
-                              Ps : constant String := Next_Reg (Ctx.E, "gp");
-                              Cl : constant String := Next_Reg (Ctx.E, "gcl");
-                              C6 : constant String := Next_Reg (Ctx.E, "gc6");
+                              Uns_I      : Boolean;
                            begin
                               if not Is_Void_Tree (DR_N) and then KIND (DR_N) = DN_RANGE_ATTRIBUTE then
                                  Emit_Discrete_Range (Ctx, DR_N, RT, RL, RH);
-                                 F32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RL), To_String (RT), "i32"));
-                                 L32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RH), To_String (RT), "i32"));
+                                 Uns_I := Is_Unsigned_Scalar (Idx_T, To_String (RT));
+                                 F32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RL), To_String (RT), "i32", Is_Unsigned => Uns_I));
+                                 L32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RH), To_String (RT), "i32", Is_Unsigned => Uns_I));
                               else
                                  Emit_Index_Bounds (Ctx, Idx_T, F32, L32);
                               end if;
                               VInfo.First_Regs (Dim) := F32;
                               VInfo.Last_Regs (Dim)  := L32;
-                              Emit_Inst (Ctx.E, Df & " = sub.i32 " & To_String (L32) & ", " & To_String (F32));
-                              Emit_Inst (Ctx.E, Ln & " = add.i32 " & Df & ", 1");
-                              Emit_Inst (Ctx.E, Ps & " = cmp_gt_s.i32 " & Ln & ", 0");
-                              Emit_Inst (Ctx.E, Cl & " = select.i32 " & Ps & ", " & Ln & ", 0");
-                              Emit_Inst (Ctx.E, C6 & " = sext.i64 " & Cl);
-                              if Dim = 1 then
-                                 Tot64 := To_Unbounded_String (C6);
-                              else
-                                 declare
-                                    M : constant String := Next_Reg (Ctx.E, "gm");
-                                 begin
-                                    Emit_Inst (Ctx.E, M & " = mul.i64 " & To_String (Tot64) & ", " & C6);
-                                    Tot64 := To_Unbounded_String (M);
-                                 end;
-                              end if;
                            end;
                         end loop;
                         ND := Dim;
                         VInfo.NDims := ND;
-                        Emit_Inst (Ctx.E, Byt & " = mul.i64 " & To_String (Tot64) & ", " & Img (ESz));
-                        Emit_Inst (Ctx.E, Nz & " = cmp_gt_s.i64 " & Byt & ", 0");
-                        Emit_Inst (Ctx.E, AlB & " = select.i64 " & Nz & ", " & Byt & ", " & Img (Natural'Max (1, ETI.Align)));
+                        Emit_Array_Byte_Size_I64 (Ctx, VInfo.First_Regs, VInfo.Last_Regs, ND, ESz, Tot64, Byt);
+                        Emit_Inst (Ctx.E, Nz & " = cmp_gt_s.i64 " & To_String (Byt) & ", 0");
+                        Emit_Inst (Ctx.E, AlB & " = select.i64 " & Nz & ", " & To_String (Byt) & ", " & Img (EAl));
                         Emit_Call_Or_Invoke (Ctx, "@__ada_alloc", AlB, "ptr", Data_Ptr);
                         Emit_Inst (Ctx.E, GA & " = addr " & GSym);
                         Emit_Store_Arr_Desc (Ctx, GA, To_String (Data_Ptr), VInfo.First_Regs, VInfo.Last_Regs, ND);
@@ -1947,43 +2723,20 @@ package body Cg_Stmt is
                      declare
                         Src   : constant Expr_Val := Emit_Expr (Ctx, Init_Exp, Ada_T);
                         Tot64 : Unbounded_String;
-                        Byt   : constant String := Next_Reg (Ctx.E, "gby");
+                        Byt   : Unbounded_String;
                         Nz    : constant String := Next_Reg (Ctx.E, "gnz");
                         AlB   : constant String := Next_Reg (Ctx.E, "gal");
                      begin
-                        ND := (if Src.NDims > 0 then Src.NDims else ND);
+                        ND := Natural'Max (1, Natural'Min ((if Src.NDims > 0 then Src.NDims else ND), Max_Array_Dims));
                         VInfo.NDims := ND;
                         for D_Idx in 1 .. ND loop
                            Get_Array_Dim_Bounds (Ctx, Src, D_Idx, VInfo.First_Regs (D_Idx), VInfo.Last_Regs (D_Idx));
-                           declare
-                              Df : constant String := Next_Reg (Ctx.E, "gd");
-                              Ln : constant String := Next_Reg (Ctx.E, "gl");
-                              Ps : constant String := Next_Reg (Ctx.E, "gp");
-                              Cl : constant String := Next_Reg (Ctx.E, "gcl");
-                              C6 : constant String := Next_Reg (Ctx.E, "gc6");
-                           begin
-                              Emit_Inst (Ctx.E, Df & " = sub.i32 " & To_String (VInfo.Last_Regs (D_Idx)) & ", " & To_String (VInfo.First_Regs (D_Idx)));
-                              Emit_Inst (Ctx.E, Ln & " = add.i32 " & Df & ", 1");
-                              Emit_Inst (Ctx.E, Ps & " = cmp_gt_s.i32 " & Ln & ", 0");
-                              Emit_Inst (Ctx.E, Cl & " = select.i32 " & Ps & ", " & Ln & ", 0");
-                              Emit_Inst (Ctx.E, C6 & " = sext.i64 " & Cl);
-                              if D_Idx = 1 then
-                                 Tot64 := To_Unbounded_String (C6);
-                              else
-                                 declare
-                                    M : constant String := Next_Reg (Ctx.E, "gm");
-                                 begin
-                                    Emit_Inst (Ctx.E, M & " = mul.i64 " & To_String (Tot64) & ", " & C6);
-                                    Tot64 := To_Unbounded_String (M);
-                                 end;
-                              end if;
-                           end;
                         end loop;
-                        Emit_Inst (Ctx.E, Byt & " = mul.i64 " & To_String (Tot64) & ", " & Img (ESz));
-                        Emit_Inst (Ctx.E, Nz & " = cmp_gt_s.i64 " & Byt & ", 0");
-                        Emit_Inst (Ctx.E, AlB & " = select.i64 " & Nz & ", " & Byt & ", " & Img (Natural'Max (1, ETI.Align)));
+                        Emit_Array_Byte_Size_I64 (Ctx, VInfo.First_Regs, VInfo.Last_Regs, ND, ESz, Tot64, Byt);
+                        Emit_Inst (Ctx.E, Nz & " = cmp_gt_s.i64 " & To_String (Byt) & ", 0");
+                        Emit_Inst (Ctx.E, AlB & " = select.i64 " & Nz & ", " & To_String (Byt) & ", " & Img (EAl));
                         Emit_Call_Or_Invoke (Ctx, "@__ada_alloc", AlB, "ptr", Data_Ptr);
-                        Emit_Inst (Ctx.E, "memcpy " & To_String (Data_Ptr) & ", " & To_String (Src.Reg) & ", " & Byt & ", align " & Img (ETI.Align));
+                        Emit_Copy_Composite (Ctx, To_String (Data_Ptr), Src, Ada_T);
                         Emit_Inst (Ctx.E, GA & " = addr " & GSym);
                         Emit_Store_Arr_Desc (Ctx, GA, To_String (Data_Ptr), VInfo.First_Regs, VInfo.Last_Regs, ND);
                         Ctx.Vars.Include (Key, VInfo);
@@ -2034,7 +2787,7 @@ package body Cg_Stmt is
                            declare
                               SV  : constant Expr_Val := Emit_Expr (Ctx, Init_Exp, Ada_T);
                               Tgt : Expr_Val;
-                              ND_A : constant Natural := Natural'Max (1, Natural'Min (TI.NDims, 4));
+                              ND_A : constant Natural := Natural'Max (1, Natural'Min (TI.NDims, Max_Array_Dims));
                            begin
                               Tgt.Kind := EK_Slice; Tgt.Reg := To_Unbounded_String (GA); Tgt.Ada_Type := Ada_T; Tgt.NDims := ND_A;
                               for D_I in 1 .. ND_A loop
@@ -2067,19 +2820,19 @@ package body Cg_Stmt is
                Has_Dyn := True;
                declare
                   ETI    : constant Type_Info := Get_Type_Info (Ctx, TI.Elem_Type);
-                  Is_DE  : constant Boolean := ETI.Kind = TK_Constrained_Array and then ETI.Is_Dynamic;
-                  EAl    : constant Natural := (if Is_DE then 8 else Natural'Max (1, ETI.Align));
-                  ESz    : constant Natural := (if Is_DE then 40 else ((ETI.Byte_Size + EAl - 1) / EAl) * EAl);
+                  EAl    : constant Natural := Elem_Storage_Align (ETI);
+                  ESz    : constant Natural := Elem_Storage_Size (ETI);
                   Sub_S  : constant TREE := D (SM_INDEX_SUBTYPE_S, Resolve_Type_Spec (Ada_T));
                   IL     : SEQ_TYPE := LIST (Sub_S);
                   Idx_T  : TREE;
                   Dim    : Natural := 0;
                   Tot64  : Unbounded_String;
+                  Byt    : Unbounded_String;
                begin
                   VInfo.Kind       := VK_Dyn_Array;
                   VInfo.Ada_Type   := Ada_T;
                   VInfo.Pir_Type   := To_Unbounded_String ("ptr");
-                  VInfo.Align      := ETI.Align;
+                  VInfo.Align      := EAl;
                   VInfo.Owner_Subp := Ctx.Cur_Subp_Key;
                   declare
                      TD_N : constant TREE := D (AS_TYPE_DEF, Decl);
@@ -2088,10 +2841,14 @@ package body Cg_Stmt is
                           and then not Is_Void_Tree (D (AS_CONSTRAINT, TD_N))
                           and then KIND (D (AS_CONSTRAINT, TD_N)) = DN_INDEX_CONSTRAINT
                         then LIST (D (AS_DISCRETE_RANGE_S, D (AS_CONSTRAINT, TD_N)))
+                        elsif not Is_Void_Tree (TD_N) and then KIND (TD_N) = DN_CONSTRAINED_ARRAY_DEF
+                          and then not Is_Void_Tree (D (AS_CONSTRAINT, TD_N))
+                          and then KIND (D (AS_CONSTRAINT, TD_N)) = DN_INDEX_CONSTRAINT
+                        then LIST (D (AS_DISCRETE_RANGE_S, D (AS_CONSTRAINT, TD_N)))
                         else MAKE);
                      DR_N : TREE;
                   begin
-                  while not IS_EMPTY (IL) and then Dim < 4 loop
+                  while not IS_EMPTY (IL) and then Dim < Max_Array_Dims loop
                      POP (IL, Idx_T);
                      if not IS_EMPTY (DR_L) then
                         POP (DR_L, DR_N);
@@ -2102,72 +2859,44 @@ package body Cg_Stmt is
                      declare
                         RT, RL, RH : Unbounded_String;
                         F32, L32   : Unbounded_String;
+                        Uns_I      : Boolean;
                      begin
                         if not Is_Void_Tree (DR_N) and then KIND (DR_N) = DN_RANGE_ATTRIBUTE then
                            Emit_Discrete_Range (Ctx, DR_N, RT, RL, RH);
-                           F32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RL), To_String (RT), "i32"));
-                           L32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RH), To_String (RT), "i32"));
+                           Uns_I := Is_Unsigned_Scalar (Idx_T, To_String (RT));
+                           F32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RL), To_String (RT), "i32", Is_Unsigned => Uns_I));
+                           L32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RH), To_String (RT), "i32", Is_Unsigned => Uns_I));
                         else
                            Emit_Index_Bounds (Ctx, Idx_T, F32, L32);
                         end if;
                         VInfo.First_Regs (Dim) := F32;
                         VInfo.Last_Regs (Dim)  := L32;
-                        declare
-                           C6_R : constant String := Emit_Dim_Len_I64 (Ctx, To_String (F32), To_String (L32));
-                        begin
-                           if Dim = 1 then
-                              Tot64 := To_Unbounded_String (C6_R);
-                           else
-                              declare
-                                 M   : constant String := Next_Reg (Ctx.E, "dm");
-                                 Ovf : constant String := Next_Reg (Ctx.E, "dmo");
-                              begin
-                                 Emit_Inst (Ctx.E, M & ", " & Ovf & " = mul_ovf_s.i64 " & To_String (Tot64) & ", " & C6_R);
-                                 if Ctx.Enable_Checks then
-                                    declare
-                                       L_F : constant String := Next_Label (Ctx.E, "dmf");
-                                       L_K : constant String := Next_Label (Ctx.E, "dmk");
-                                    begin
-                                       Emit_Term (Ctx.E, "br " & Ovf & ", " & L_F & ", " & L_K);
-                                       Emit_Label (Ctx.E, L_F);
-                                       Emit_Raise_Tag (Ctx, Storage_Error_Tag (Ctx));
-                                       Emit_Label (Ctx.E, L_K);
-                                    end;
-                                 end if;
-                                 Tot64 := To_Unbounded_String (M);
-                              end;
-                           end if;
-                        end;
                      end;
                   end loop;
                   end;
                   VInfo.NDims := Dim;
+                  Emit_Array_Byte_Size_I64 (Ctx, VInfo.First_Regs, VInfo.Last_Regs, Dim, ESz, Tot64, Byt);
                   declare
-                     Byt : constant String := Next_Reg (Ctx.E, "dby");
-                     Ovf : constant String := Next_Reg (Ctx.E, "dbyo");
                      Too : constant String := Next_Reg (Ctx.E, "dbyt");
-                     Bad : constant String := Next_Reg (Ctx.E, "dbyb");
                      Nz  : constant String := Next_Reg (Ctx.E, "dnz");
                      AlB : constant String := Next_Reg (Ctx.E, "dal");
                      Ptr : constant String := Next_Reg (Ctx.E, "darr");
                   begin
-                     Emit_Inst (Ctx.E, Byt & ", " & Ovf & " = mul_ovf_s.i64 " & To_String (Tot64) & ", " & Img (ESz));
                      if Ctx.Enable_Checks then
                         -- Raise STORAGE_ERROR on huge dynamic stack array (c52103x)
                         declare
                            L_F : constant String := Next_Label (Ctx.E, "dbf");
                            L_K : constant String := Next_Label (Ctx.E, "dbk");
                         begin
-                           Emit_Inst (Ctx.E, Too & " = cmp_gt_s.i64 " & Byt & ", 4194304");
-                           Emit_Inst (Ctx.E, Bad & " = or.i8 " & Ovf & ", " & Too);
-                           Emit_Term (Ctx.E, "br " & Bad & ", " & L_F & ", " & L_K);
+                           Emit_Inst (Ctx.E, Too & " = cmp_gt_s.i64 " & To_String (Byt) & ", 4194304");
+                           Emit_Term (Ctx.E, "br " & Too & ", " & L_F & ", " & L_K);
                            Emit_Label (Ctx.E, L_F);
                            Emit_Raise_Tag (Ctx, Storage_Error_Tag (Ctx));
                            Emit_Label (Ctx.E, L_K);
                         end;
                      end if;
-                     Emit_Inst (Ctx.E, Nz & " = cmp_gt_s.i64 " & Byt & ", 0");
-                     Emit_Inst (Ctx.E, AlB & " = select.i64 " & Nz & ", " & Byt & ", " & Img (EAl));
+                     Emit_Inst (Ctx.E, Nz & " = cmp_gt_s.i64 " & To_String (Byt) & ", 0");
+                     Emit_Inst (Ctx.E, AlB & " = select.i64 " & Nz & ", " & To_String (Byt) & ", " & Img (EAl));
                      Emit_Inst (Ctx.E, Ptr & " = alloca_dyn " & AlB & ", align " & Img (EAl));
                      VInfo.Pir_Name := To_Unbounded_String (Ptr);
                      if Ctx.Vars.Contains (Key) and then Ctx.Vars.Element (Key).Owner_Subp = Ctx.Cur_Subp_Key then
@@ -2190,7 +2919,52 @@ package body Cg_Stmt is
                      end if;
                      Ctx.Vars.Include (Key, VInfo);
                      if not Is_Void_Tree (Init_Exp) then
-                        Emit_Init_Composite (Ctx, Ptr, Ada_T, Init_Exp, VInfo.First_Regs, VInfo.Last_Regs);
+                        -- P3-3.7: Named array aggregate without `others` slides in object declaration!
+                        declare
+                           function Obj_Agg_Named_No_Others (AN : TREE; Rem_D : Natural) return Boolean is
+                           begin
+                              if Rem_D = 0 then return True; end if;
+                              if Is_Void_Tree (AN) or else KIND (AN) /= DN_AGGREGATE then return False; end if;
+                              declare
+                                 AL : SEQ_TYPE := LIST (D (AS_GENERAL_ASSOC_S, AN));
+                                 IT : TREE;
+                                 Has_Any : Boolean := False;
+                              begin
+                                 while not IS_EMPTY (AL) loop
+                                    POP (AL, IT);
+                                    Has_Any := True;
+                                    if KIND (IT) not in DN_ASSOC | DN_NAMED then return False; end if;
+                                    declare
+                                       CS : SEQ_TYPE := LIST (D (AS_CHOICE_S, IT));
+                                       Ch : TREE;
+                                    begin
+                                       while not IS_EMPTY (CS) loop
+                                          POP (CS, Ch);
+                                          if KIND (Ch) = DN_CHOICE_OTHERS then return False; end if;
+                                       end loop;
+                                    end;
+                                    if Rem_D > 1 and then not Obj_Agg_Named_No_Others (D (AS_EXP, IT), Rem_D - 1) then
+                                       return False;
+                                    end if;
+                                 end loop;
+                                 return Has_Any;
+                              end;
+                           end Obj_Agg_Named_No_Others;
+                        begin
+                           if KIND (Init_Exp) = DN_AGGREGATE and then Obj_Agg_Named_No_Others (Init_Exp, Dim) then
+                              declare
+                                 SV  : constant Expr_Val := Emit_Expr (Ctx, Init_Exp, Subst_Base_Type (Ctx, Ada_T));
+                                 Tgt : Expr_Val;
+                              begin
+                                 Tgt.Kind := EK_Slice; Tgt.Reg := To_Unbounded_String (Ptr); Tgt.Ada_Type := Ada_T;
+                                 Tgt.NDims := Dim; Tgt.First_Regs := VInfo.First_Regs; Tgt.Last_Regs := VInfo.Last_Regs;
+                                 Emit_Array_Length_Check (Ctx, Tgt, SV, Dim);
+                                 Emit_Copy_Composite (Ctx, Ptr, SV, Ada_T);
+                              end;
+                           else
+                              Emit_Init_Composite (Ctx, Ptr, Ada_T, Init_Exp, VInfo.First_Regs, VInfo.Last_Regs);
+                           end if;
+                        end;
                      elsif Is_Access_Type (Subst_Resolve_Type (Ctx, TI.Elem_Type)) or else ETI.Kind = TK_Record
                        or else Is_Task_Type (Subst_Resolve_Type (Ctx, TI.Elem_Type))
                        or else ETI.Kind = TK_Constrained_Array
@@ -2240,46 +3014,22 @@ package body Cg_Stmt is
                      Get_Array_Dim_Bounds (Ctx, Src, D_Idx, VInfo.First_Regs (D_Idx), VInfo.Last_Regs (D_Idx));
                   end loop;
 
-                  if not Is_Const then
-                     -- Mutable unconstrained variable: copy into a fresh Secondary Stack buffer
-                     -- so mutating elements never writes to .rodata or aliases another array variable!
+                  -- Always copy non-literal unconstrained initializers (even for `constant String := S;`)
+                  -- so mutating S later never mutates the constant C! (LRM 3.2.1)
+                  if not Is_Const or else KIND (Init_Exp) /= DN_STRING_LITERAL then
                      declare
                         ETI   : constant Type_Info := Get_Type_Info (Ctx, TI.Elem_Type);
-                        ESz   : constant Natural := ((ETI.Byte_Size + ETI.Align - 1) / ETI.Align) * ETI.Align;
+                        EAl   : constant Natural := Elem_Storage_Align (ETI);
+                        ESz   : constant Natural := Elem_Storage_Size (ETI);
                         Tot64 : Unbounded_String;
-                        Byt   : constant String := Next_Reg (Ctx.E, "uby");
+                        Byt   : Unbounded_String;
                         Buf_U : Unbounded_String;
                      begin
-                        for D_Idx in 1 .. ND loop
-                           declare
-                              Df : constant String := Next_Reg (Ctx.E, "ud");
-                              Ln : constant String := Next_Reg (Ctx.E, "ul");
-                              Ps : constant String := Next_Reg (Ctx.E, "up");
-                              Cl : constant String := Next_Reg (Ctx.E, "ucl");
-                              C6 : constant String := Next_Reg (Ctx.E, "uc6");
-                           begin
-                              Emit_Inst (Ctx.E, Df & " = sub.i32 " & To_String (VInfo.Last_Regs (D_Idx)) & ", " & To_String (VInfo.First_Regs (D_Idx)));
-                              Emit_Inst (Ctx.E, Ln & " = add.i32 " & Df & ", 1");
-                              Emit_Inst (Ctx.E, Ps & " = cmp_gt_s.i32 " & Ln & ", 0");
-                              Emit_Inst (Ctx.E, Cl & " = select.i32 " & Ps & ", " & Ln & ", 0");
-                              Emit_Inst (Ctx.E, C6 & " = sext.i64 " & Cl);
-                              if D_Idx = 1 then
-                                 Tot64 := To_Unbounded_String (C6);
-                              else
-                                 declare
-                                    M : constant String := Next_Reg (Ctx.E, "um");
-                                 begin
-                                    Emit_Inst (Ctx.E, M & " = mul.i64 " & To_String (Tot64) & ", " & C6);
-                                    Tot64 := To_Unbounded_String (M);
-                                 end;
-                              end if;
-                           end;
-                        end loop;
-                        Emit_Inst (Ctx.E, Byt & " = mul.i64 " & To_String (Tot64) & ", " & Img (ESz));
-                        Emit_Call_Or_Invoke (Ctx, "@__ada_ss_alloc", Byt & ", " & Img (ETI.Align), "ptr", Buf_U);
-                        Emit_Inst (Ctx.E, "memcpy " & To_String (Buf_U) & ", " & To_String (Src.Reg) & ", " & Byt & ", align " & Img (ETI.Align));
+                        Emit_Array_Byte_Size_I64 (Ctx, VInfo.First_Regs, VInfo.Last_Regs, ND, ESz, Tot64, Byt);
+                        Emit_Call_Or_Invoke (Ctx, "@__ada_ss_alloc", To_String (Byt) & ", " & Img (EAl), "ptr", Buf_U);
+                        Emit_Copy_Composite (Ctx, To_String (Buf_U), Src, Ada_T);
                         Data_Ptr := Buf_U;
-                        VInfo.Align := ETI.Align;
+                        VInfo.Align := EAl;
                      end;
                   end if;
 
@@ -2348,18 +3098,56 @@ package body Cg_Stmt is
                              "store." & To_String (TI.Pir_Type) & " " & VR &
                              ", " & Reg & ", align " & Img (TI.Align));
                         end;
-                     elsif TI.Kind = TK_Constrained_Array and then KIND (Init_Exp) /= DN_AGGREGATE then
+                     elsif TI.Kind = TK_Constrained_Array then
                         declare
-                           SV  : constant Expr_Val := Emit_Expr (Ctx, Init_Exp, Ada_T);
-                           Tgt : Expr_Val;
-                           ND_A : constant Natural := Natural'Max (1, Natural'Min (TI.NDims, 4));
+                           function Obj_Agg_Named_No_Others2 (AN : TREE; Rem_D : Natural) return Boolean is
+                           begin
+                              if Rem_D = 0 then return True; end if;
+                              if Is_Void_Tree (AN) or else KIND (AN) /= DN_AGGREGATE then return False; end if;
+                              declare
+                                 AL : SEQ_TYPE := LIST (D (AS_GENERAL_ASSOC_S, AN));
+                                 IT : TREE;
+                                 Has_Any : Boolean := False;
+                              begin
+                                 while not IS_EMPTY (AL) loop
+                                    POP (AL, IT);
+                                    Has_Any := True;
+                                    if KIND (IT) not in DN_ASSOC | DN_NAMED then return False; end if;
+                                    declare
+                                       CS : SEQ_TYPE := LIST (D (AS_CHOICE_S, IT));
+                                       Ch : TREE;
+                                    begin
+                                       while not IS_EMPTY (CS) loop
+                                          POP (CS, Ch);
+                                          if KIND (Ch) = DN_CHOICE_OTHERS then return False; end if;
+                                       end loop;
+                                    end;
+                                    if Rem_D > 1 and then not Obj_Agg_Named_No_Others2 (D (AS_EXP, IT), Rem_D - 1) then
+                                       return False;
+                                    end if;
+                                 end loop;
+                                 return Has_Any;
+                              end;
+                           end Obj_Agg_Named_No_Others2;
+                           ND_A : constant Natural := Natural'Max (1, Natural'Min (TI.NDims, Max_Array_Dims));
                         begin
-                           Tgt.Kind := EK_Slice; Tgt.Reg := To_Unbounded_String (Reg); Tgt.Ada_Type := Ada_T; Tgt.NDims := ND_A;
-                           for D_I in 1 .. ND_A loop
-                              Emit_Index_Bounds (Ctx, TI.Dims (D_I).Idx_Type, Tgt.First_Regs (D_I), Tgt.Last_Regs (D_I));
-                           end loop;
-                           Emit_Array_Length_Check (Ctx, Tgt, SV, ND_A);
-                           Emit_Copy_Composite (Ctx, Reg, SV, Ada_T);
+                           if KIND (Init_Exp) /= DN_AGGREGATE or else Obj_Agg_Named_No_Others2 (Init_Exp, ND_A) then
+                              declare
+                                 Eval_T : constant TREE :=
+                                   (if KIND (Init_Exp) = DN_AGGREGATE then Subst_Base_Type (Ctx, Ada_T) else Ada_T);
+                                 SV  : constant Expr_Val := Emit_Expr (Ctx, Init_Exp, Eval_T);
+                                 Tgt : Expr_Val;
+                              begin
+                                 Tgt.Kind := EK_Slice; Tgt.Reg := To_Unbounded_String (Reg); Tgt.Ada_Type := Ada_T; Tgt.NDims := ND_A;
+                                 for D_I in 1 .. ND_A loop
+                                    Emit_Index_Bounds (Ctx, TI.Dims (D_I).Idx_Type, Tgt.First_Regs (D_I), Tgt.Last_Regs (D_I));
+                                 end loop;
+                                 Emit_Array_Length_Check (Ctx, Tgt, SV, ND_A);
+                                 Emit_Copy_Composite (Ctx, Reg, SV, Ada_T);
+                              end;
+                           else
+                              Emit_Init_Composite (Ctx, Reg, Ada_T, Init_Exp);
+                           end if;
                         end;
                      else
                         Emit_Init_Composite (Ctx, Reg, Ada_T, Init_Exp);
@@ -2405,6 +3193,8 @@ package body Cg_Stmt is
                  and then To_String (Ctx.Gen_Inst_Tag) /= "_gi" & Tree_Key_Str (Can)
                  and then not Is_Subunit and then not Is_Library_Level (Can))
       then
+         -- Reset stale metadata (Needs_SL, Has_Frame, Frame_Type, Elab_Flag) when re-registering under a new generic instantiation!
+         SI := (others => <>);
          SI.Pir_Name := To_Unbounded_String (Mangle_Subp_Name (Ctx, Can, Spec_Node, Is_Subunit => Is_Subunit));
       end if;
       SI.Spec_Node      := Spec_Node;
@@ -2501,12 +3291,10 @@ package body Cg_Stmt is
                         Can      : constant TREE := Canonical_Def (EID);
                         Key      : constant Unsigned_32 := Tree_Key (Can);
                         QName    : constant String := Qualified_Ada_Name (Can);
-                        Reg_N    : constant TREE := (if KIND (Can) in CLASS_SOURCE_NAME then D (XD_REGION, Can) else CONST_VOID);
                         In_Gen_B : constant Boolean :=
-                          Length (Ctx.Gen_Inst_Tag) > 0 and then not Is_Library_Level (Can)
-                          and then (not Is_Void_Tree (Reg_N) and then KIND (Reg_N) /= DN_PACKAGE_ID);
+                          Length (Ctx.Gen_Inst_Tag) > 0 and then Ctx.In_Gen_Body and then not Is_Library_Level (Can);
                      begin
-                        if Is_Global and then Export_All and then Is_Library_Level (Can) then
+                        if (Is_Global and then Export_All and then Is_Library_Level (Can)) or else Ctx.Has_Stubs then
                            declare
                               Sym : constant String := "@__ada_exc__" & QName;
                               TI  : Type_Info;
@@ -2527,10 +3315,15 @@ package body Cg_Stmt is
                               Ctx.Gen_Local_Exc_Tags.Include (Key, TI);
                            end;
                         else
+                           -- P3-5.10: Define local exception data directly so subunit-local exceptions don't hit Get_Exc_Tag extern fallback!
                            declare
-                              Dummy : constant String := Get_Exc_Tag (Ctx, EID);
+                              Sym : constant String := "@__ada_exc_" & QName & "_" & Tree_Key_Str (Can);
+                              TI  : Type_Info;
                            begin
-                              pragma Unreferenced (Dummy);
+                              Add_Data_Decl (Ctx.E, Sym,
+                                Sym & " = data align 1 { """ & Escape_Pir_String (Sym_Name (Can)) & "\0"" }");
+                              TI.Pir_Type := To_Unbounded_String (Sym);
+                              Ctx.Exc_Tags.Include (Key, TI);
                            end;
                         end if;
                      end;
@@ -2565,13 +3358,13 @@ package body Cg_Stmt is
                   TS  : TREE := CONST_VOID;
                begin
                   if not Is_Void_Tree (Src) then
-                     if KIND (Src) = DN_TYPE_ID then
+                     if KIND (Src) in CLASS_TYPE_NAME then
                         TS := D (SM_TYPE_SPEC, Src);
                      elsif KIND (Src) = DN_VARIABLE_ID then
                         TS := D (SM_OBJ_TYPE, Src);
                      end if;
                      if not Is_Void_Tree (TS) then
-                        Register_Task_Spec (Ctx, TS, Ctx.Cur_Subp_Key);
+                        Register_Task_Spec (Ctx, TS, Ctx.Cur_Subp_Key, Force_Rebind => True);
                      end if;
                   end if;
                end;
@@ -2580,6 +3373,8 @@ package body Cg_Stmt is
                declare
                   SID : constant TREE := Canonical_Def (Subst_Tree (Ctx, Canonical_Def (D (AS_SOURCE_NAME, Item))));
                   Bdy : constant TREE := D (AS_BODY, Item);
+                  Is_Ext_Stub : constant Boolean :=
+                    not Is_Void_Tree (Bdy) and then KIND (Bdy) = DN_STUB and then not Is_Gen_Subunit_Stub (Ctx, Item);
                begin
                   if KIND (SID) = DN_GENERIC_ID then
                      if not Ctx.Generic_Body.Contains (Tree_Key (SID))
@@ -2591,9 +3386,12 @@ package body Cg_Stmt is
                      if not Ctx.Generic_Subst.Is_Empty then
                         Ctx.Generic_Env.Include (Tree_Key (SID), Ctx.Generic_Subst);
                      end if;
+                     if Ctx.In_Gen_Body then
+                        Ctx.Gen_Body_Nested_Gens.Append (Tree_Key (SID));
+                     end if;
                   else
                      Pre_Register_Subp (Ctx, SID, D (AS_HEADER, Item), Ctx.Cur_Subp_Key,
-                       Is_Subunit => (Ctx.In_Subunit or else Ctx.Has_Stubs or else (not Is_Void_Tree (Bdy) and then KIND (Bdy) = DN_STUB)));
+                       Is_Subunit => (Ctx.In_Subunit or else Ctx.Has_Stubs or else Is_Ext_Stub));
                   end if;
                end;
 
@@ -2611,6 +3409,9 @@ package body Cg_Stmt is
                      end if;
                      if not Ctx.Generic_Subst.Is_Empty then
                         Ctx.Generic_Env.Include (Tree_Key (PID), Ctx.Generic_Subst);
+                     end if;
+                     if Ctx.In_Gen_Body then
+                        Ctx.Gen_Body_Nested_Gens.Append (Tree_Key (PID));
                      end if;
                   end if;
                end;
@@ -2745,16 +3546,16 @@ package body Cg_Stmt is
                         end Pre_Reg_Inst_Items;
                      begin
                         if not Is_Void_Tree (ISpec) and then KIND (ISpec) = DN_PACKAGE_SPEC then
-                           if Gen_Name = "INTEGER_IO" or else Gen_Name = "FLOAT_IO"
-                             or else Gen_Name = "FIXED_IO" or else Gen_Name = "ENUMERATION_IO"
-                             or else Gen_Name = "SEQUENTIAL_IO" or else Gen_Name = "DIRECT_IO"
-                           then
-                              declare
-                                 Sub_Dyn : Boolean;
-                              begin
-                                 Emit_Decl_Items (Ctx, D (AS_DECL_S1, ISpec), Is_Global => True, Export_All => Export_All, Has_Dyn => Sub_Dyn);
-                                 Emit_Decl_Items (Ctx, D (AS_DECL_S2, ISpec), Is_Global => True, Export_All => False, Has_Dyn => Sub_Dyn);
-                              end;
+                           if Is_RTL_Generic (Gen_Id) then
+                              -- P3-5.7: Emit global RTL I/O spec vars in Pass 1; local TEXT_IO.*_IO emitted in Pass 2 as stack locals!
+                              if Is_Global then
+                                 declare
+                                    Sub_Dyn : Boolean;
+                                 begin
+                                    Emit_Decl_Items (Ctx, D (AS_DECL_S1, ISpec), Is_Global => True, Export_All => Export_All, Has_Dyn => Sub_Dyn);
+                                    Emit_Decl_Items (Ctx, D (AS_DECL_S2, ISpec), Is_Global => True, Export_All => False, Has_Dyn => Sub_Dyn);
+                                 end;
+                              end if;
                            else
                               Pre_Reg_Inst_Items (D (SM_DECL_S, UK));
                               Pre_Reg_Inst_Items (D (AS_DECL_S1, ISpec));
@@ -2784,6 +3585,10 @@ package body Cg_Stmt is
          end if;
          case KIND (Item) is
             when DN_TYPE_DECL | DN_SUBTYPE_DECL =>
+               -- P3-3.14: Skip incomplete type stub declarations (`type T;`) to avoid premature & duplicate elaboration!
+               if KIND (Item) = DN_TYPE_DECL and then Is_Void_Tree (D (AS_TYPE_DEF, Item)) then
+                  null;
+               else
                declare
                   TID : constant TREE := D (AS_SOURCE_NAME, Item);
                begin
@@ -2809,6 +3614,28 @@ package body Cg_Stmt is
                           and then KIND (D (AS_CONSTRAINT, SI_D)) in DN_FLOAT_CONSTRAINT | DN_FIXED_CONSTRAINT;
                      begin
                         Emit_Type_Elab_Checks (Ctx, TS, Mark_Type => Mark_T, Has_Real_Constraint => Has_Real_C);
+                        -- P3-3.19: Propagate parent Saved_Type_Ranges/Saved_Type_Discs for derived/unconstrained child subtypes!
+                        if not Is_Void_Tree (TS) and then not Is_Void_Tree (Mark_T) then
+                           declare
+                              MT_R : constant TREE := Resolve_Type_Spec (Subst_Tree (Ctx, Mark_T));
+                              Has_New_C : constant Boolean :=
+                                not Is_Void_Tree (SI_D) and then KIND (SI_D) = DN_SUBTYPE_INDICATION
+                                and then not Is_Void_Tree (D (AS_CONSTRAINT, SI_D));
+                           begin
+                              if not Has_New_C and then not Is_Void_Tree (MT_R) then
+                                 if not Ctx.Saved_Type_Ranges.Contains (Tree_Key (TS))
+                                   and then Ctx.Saved_Type_Ranges.Contains (Tree_Key (MT_R))
+                                 then
+                                    Ctx.Saved_Type_Ranges.Include (Tree_Key (TS), Ctx.Saved_Type_Ranges.Element (Tree_Key (MT_R)));
+                                 end if;
+                                 if not Ctx.Saved_Type_Discs.Contains (Tree_Key (TS))
+                                   and then Ctx.Saved_Type_Discs.Contains (Tree_Key (MT_R))
+                                 then
+                                    Ctx.Saved_Type_Discs.Include (Tree_Key (TS), Ctx.Saved_Type_Discs.Element (Tree_Key (MT_R)));
+                                 end if;
+                              end if;
+                           end;
+                        end if;
                         -- LRM 3.6.1 (c35003a/b, c36104a/b, c36105b): check explicit discrete subtype ranges on constrained array / derived / subtype defs
                         if Ctx.Enable_Checks then
                            declare
@@ -2846,7 +3673,7 @@ package body Cg_Stmt is
                         end if;
                         -- Record declaring master for access-to-task-containing types (LRM 9.4)
                         if KIND (Item) = DN_TYPE_DECL and then not Is_Void_Tree (TS)
-                          and then KIND (TS) = DN_ACCESS
+                          and then KIND (TS) in DN_ACCESS | DN_CONSTRAINED_ACCESS
                           and then Length (Ctx.Cur_Master_Reg) > 0
                           and then Type_Contains_Task (Ctx, D (SM_DESIG_TYPE, TS))
                         then
@@ -2854,41 +3681,61 @@ package body Cg_Stmt is
                               BS  : constant TREE := Base_Type_Spec (TS);
                               MTI : Type_Info;
                            begin
-                              if not Is_Global and then Ctx.Cur_Subp_Key /= 0 then
-                                 -- Task/subprogram-local access type: stack-local alloca so concurrent task instances
-                                 -- don't clobber each other (c9a005a/7a), plus global mirror for nested subprograms
-                                 -- and generic instantiations (c94011a).
-                                 declare
-                                    MA   : constant String := Next_Reg (Ctx.E, "amstl");
-                                    MSym : constant String := "@ada_accmst_" & Tree_Key_Str (BS) & To_String (Ctx.Gen_Inst_Tag);
-                                    MG   : constant String := Next_Reg (Ctx.E, "amstg");
-                                 begin
-                                    Emit_Entry_Alloca (Ctx.E, MA & " = alloca ptr, align 8");
-                                    Emit_Inst (Ctx.E, "store.ptr " & To_String (Ctx.Cur_Master_Reg) & ", " & MA & ", align 8");
-                                    Add_Global_Decl (Ctx.E, MSym, MSym & " = global ptr = zeroinit, align 8");
-                                    Emit_Inst (Ctx.E, MG & " = addr " & MSym);
-                                    Emit_Inst (Ctx.E, "store.ptr " & To_String (Ctx.Cur_Master_Reg) & ", " & MG & ", align 8");
-                                    MTI.Pir_Type := To_Unbounded_String (MA & "|" & MSym);
-                                    MTI.Dims (1).First := Integer_64 (Ctx.Cur_Subp_Key);
-                                    Ctx.Access_Masters.Include (Tree_Key (BS), MTI);
-                                 end;
-                              else
-                                 declare
-                                    MSym : constant String := "@ada_accmst_" & Tree_Key_Str (BS) & To_String (Ctx.Gen_Inst_Tag);
-                                    MA   : constant String := Next_Reg (Ctx.E, "amst");
-                                 begin
-                                    Add_Global_Decl (Ctx.E, MSym, MSym & " = global ptr = zeroinit, align 8");
-                                    Emit_Inst (Ctx.E, MA & " = addr " & MSym);
-                                    Emit_Inst (Ctx.E, "store.ptr " & To_String (Ctx.Cur_Master_Reg) & ", " & MA & ", align 8");
-                                    MTI.Pir_Type := To_Unbounded_String (MSym);
-                                    Ctx.Access_Masters.Include (Tree_Key (BS), MTI);
-                                 end;
+                              -- Do not overwrite root access type's master when declaring a derived access type
+                              if KIND (BS) = DN_ACCESS and then Is_Void_Tree (D (SM_DERIVED, BS)) then
+                                 if not Is_Global and then Ctx.Cur_Subp_Key /= 0 then
+                                    -- Task/subprogram-local access type: stack-local alloca so concurrent task instances
+                                    -- don't clobber each other (c9a005a/7a), plus global mirror for nested subprograms
+                                    -- and generic instantiations (c94011a).
+                                    declare
+                                       MA     : constant String := Next_Reg (Ctx.E, "amstl");
+                                       MSym   : constant String := "@ada_accmst_" & Tree_Key_Str (BS) & To_String (Ctx.Gen_Inst_Tag);
+                                       MG     : constant String := Next_Reg (Ctx.E, "amstg");
+                                       Cap_Sl : Natural := 0;
+                                    begin
+                                       Emit_Entry_Alloca (Ctx.E, MA & " = alloca ptr, align 8");
+                                       Emit_Inst (Ctx.E, "store.ptr " & To_String (Ctx.Cur_Master_Reg) & ", " & MA & ", align 8");
+                                       if Ctx.Vars.Contains (Tree_Key (BS))
+                                         and then Ctx.Vars.Element (Tree_Key (BS)).Owner_Subp = Ctx.Cur_Subp_Key
+                                       then
+                                          Cap_Sl := Ctx.Vars.Element (Tree_Key (BS)).Captured_Slot;
+                                       end if;
+                                       if Cap_Sl > 0 and then Length (Ctx.Cur_Frame_Reg) > 0 then
+                                          declare
+                                             FSI : constant Subp_Info := Ctx.Subps.Element (Ctx.Cur_Subp_Key);
+                                             FP  : constant String := Next_Reg (Ctx.E, "amfp");
+                                          begin
+                                             Emit_Inst (Ctx.E, FP & " = field_ptr " & To_String (FSI.Frame_Type) & ", " & To_String (Ctx.Cur_Frame_Reg) & ", " & Img (Cap_Sl));
+                                             Emit_Inst (Ctx.E, "store.ptr " & MA & ", " & FP & ", align 8");
+                                          end;
+                                       end if;
+                                       Add_Global_Decl (Ctx.E, MSym, MSym & " = global ptr = zeroinit, align 8");
+                                       Emit_Inst (Ctx.E, MG & " = addr " & MSym);
+                                       Emit_Inst (Ctx.E, "store.ptr " & To_String (Ctx.Cur_Master_Reg) & ", " & MG & ", align 8");
+                                       MTI.Pir_Type := To_Unbounded_String (MA & "|" & MSym);
+                                       MTI.Dims (1).First := Integer_64 (Ctx.Cur_Subp_Key);
+                                       MTI.Dims (1).Last  := Integer_64 (Cap_Sl);
+                                       Ctx.Access_Masters.Include (Tree_Key (BS), MTI);
+                                    end;
+                                 else
+                                    declare
+                                       MSym : constant String := "@ada_accmst_" & Tree_Key_Str (BS) & To_String (Ctx.Gen_Inst_Tag);
+                                       MA   : constant String := Next_Reg (Ctx.E, "amst");
+                                    begin
+                                       Add_Global_Decl (Ctx.E, MSym, MSym & " = global ptr = zeroinit, align 8");
+                                       Emit_Inst (Ctx.E, MA & " = addr " & MSym);
+                                       Emit_Inst (Ctx.E, "store.ptr " & To_String (Ctx.Cur_Master_Reg) & ", " & MA & ", align 8");
+                                       MTI.Pir_Type := To_Unbounded_String (MSym);
+                                       Ctx.Access_Masters.Include (Tree_Key (BS), MTI);
+                                    end;
+                                 end if;
                               end if;
                            end;
                         end if;
                      end;
                   end if;
                end;
+               end if;
 
             when DN_VARIABLE_DECL | DN_CONSTANT_DECL =>
                Emit_Object_Decl (Ctx, Item, Is_Global, Export_All, Has_Dyn);
@@ -2900,11 +3747,102 @@ package body Cg_Stmt is
                   RK     : constant Unsigned_32 := Tree_Key (RID);
                   Init_N : constant TREE := (if not Is_Void_Tree (Src_N) then D (SM_INIT_EXP, Src_N) else CONST_VOID);
                   Expr_N : constant TREE := (if not Is_Void_Tree (Init_N) then Init_N else D (AS_NAME, Item));
-                  LV     : constant Expr_Val := Emit_LValue (Ctx, Expr_N);
+                  Is_BF_Ren : Boolean := False;
+                  BF_FE_R   : Field_Entry;
+                  BF_Rec_P  : Unbounded_String;
+                  BF_Comp_T : TREE := CONST_VOID;
+                  LV     : Expr_Val;
                   V      : Var_Info;
                begin
                   if Ctx.Vars.Contains (RK) and then Ctx.Vars.Element (RK).Owner_Subp = Ctx.Cur_Subp_Key then
-                     V.Captured_Slot := Ctx.Vars.Element (RK).Captured_Slot;
+                     V.Captured_Slot     := Ctx.Vars.Element (RK).Captured_Slot;
+                     V.Con_Captured_Slot := Ctx.Vars.Element (RK).Con_Captured_Slot;
+                  end if;
+                  -- P3-3.16: Detect renaming of a bitfield record component (or chaining a bitfield renaming)!
+                  if not Is_Void_Tree (Expr_N) and then KIND (Expr_N) = DN_USED_OBJECT_ID then
+                     declare
+                        ED : constant TREE := Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (Expr_N)));
+                     begin
+                        if not Is_Void_Tree (ED) and then Ctx.Vars.Contains (Tree_Key (ED)) then
+                           declare
+                              EV : constant Var_Info := Ctx.Vars.Element (Tree_Key (ED));
+                           begin
+                              if EV.Is_Shared or else (KIND (ED) = DN_VARIABLE_ID and then DB (SM_IS_SHARED, ED)) then
+                                 V.Is_Shared := True;
+                              end if;
+                              if EV.Is_Bitfield then
+                                 Is_BF_Ren := True;
+                                 BF_FE_R   := EV.BF_FE;
+                                 BF_Rec_P  := To_Unbounded_String (Emit_Var_Addr (Ctx, EV));
+                                 BF_Comp_T := EV.Ada_Type;
+                              end if;
+                           end;
+                        elsif not Is_Void_Tree (ED) and then KIND (ED) = DN_VARIABLE_ID and then DB (SM_IS_SHARED, ED) then
+                           V.Is_Shared := True;
+                        end if;
+                     end;
+                  elsif not Is_Void_Tree (Expr_N) and then KIND (Expr_N) = DN_SELECTED then
+                     declare
+                        Des_R : TREE := D (AS_DESIGNATOR, Expr_N);
+                        Def_R : TREE;
+                     begin
+                        while not Is_Void_Tree (Des_R) and then KIND (Des_R) = DN_SELECTED loop
+                           Des_R := D (AS_DESIGNATOR, Des_R);
+                        end loop;
+                        Def_R := Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (Des_R)));
+                        if not Is_Void_Tree (Def_R) and then KIND (Def_R) in DN_COMPONENT_ID | DN_DISCRIMINANT_ID then
+                           declare
+                              Pfx_E  : constant TREE := D (AS_NAME, Expr_N);
+                              Pfx_Ts : constant TREE := Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_EXP_TYPE, Pfx_E)));
+                              Rec_Ts : constant TREE :=
+                                (if Is_Access_Type (Pfx_Ts) then Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_DESIG_TYPE, Pfx_Ts)))
+                                 else Pfx_Ts);
+                              Dummy_RTI : constant Type_Info := Get_Type_Info (Ctx, Rec_Ts);
+                              pragma Unreferenced (Dummy_RTI);
+                              CK : constant Unsigned_32 := Tree_Key (Def_R);
+                           begin
+                              if Ctx.Fields.Contains (CK) and then Is_Bitfield (Ctx.Fields.Element (CK)) then
+                                 declare
+                                    PLV : constant Expr_Val := Emit_LValue (Ctx, Pfx_E);
+                                    PT_P : constant TREE := Resolve_Type_Spec (Subst_Tree (Ctx, PLV.Ada_Type));
+                                 begin
+                                    Is_BF_Ren := True;
+                                    BF_FE_R   := Ctx.Fields.Element (CK);
+                                    BF_Comp_T := Subst_Tree (Ctx, D (SM_OBJ_TYPE, Def_R));
+                                    BF_Rec_P  := PLV.Reg;
+                                    if Is_Access_Type (PT_P) then
+                                       if PLV.Kind = EK_Addr then
+                                          declare
+                                             LP : constant String := Next_Reg (Ctx.E, "bfrp");
+                                          begin
+                                             Emit_Inst (Ctx.E, LP & " = load.ptr " & To_String (BF_Rec_P) & ", align 8");
+                                             BF_Rec_P := To_Unbounded_String (LP);
+                                          end;
+                                       end if;
+                                       Emit_Null_Check (Ctx, To_String (BF_Rec_P));
+                                    end if;
+                                 end;
+                              end if;
+                           end;
+                        elsif not Is_Void_Tree (Def_R) and then KIND (Def_R) = DN_VARIABLE_ID and then DB (SM_IS_SHARED, Def_R) then
+                           V.Is_Shared := True;
+                        end if;
+                     end;
+                  end if;
+                  if Is_BF_Ren then
+                     declare
+                        BTI : constant Type_Info := Get_Type_Info (Ctx, BF_Comp_T);
+                     begin
+                        LV.Kind     := EK_Addr;
+                        LV.Reg      := BF_Rec_P;
+                        LV.Ada_Type := BF_Comp_T;
+                        LV.Pir_Type := BTI.Pir_Type;
+                        LV.Align    := BTI.Align;
+                        V.Is_Bitfield := True;
+                        V.BF_FE       := BF_FE_R;
+                     end;
+                  else
+                     LV := Emit_LValue (Ctx, Expr_N);
                   end if;
                   V.Ada_Type   := LV.Ada_Type;
                   V.Pir_Type   := LV.Pir_Type;
@@ -2912,7 +3850,7 @@ package body Cg_Stmt is
                   V.Owner_Subp := (if Is_Global then 0 else Ctx.Cur_Subp_Key);
                   if Is_Global then
                      declare
-                        Is_Exp : constant Boolean := Export_All and then Length (Ctx.Gen_Inst_Tag) = 0;
+                        Is_Exp : constant Boolean := Export_All and then Is_Library_Level (RID);
                         Link   : constant String := (if Is_Exp then "export " else "");
                         QName  : constant String := Qualified_Ada_Name (RID);
                         Sfx    : constant String := Tree_Key_Str (RID) & To_String (Ctx.Gen_Inst_Tag);
@@ -2927,7 +3865,7 @@ package body Cg_Stmt is
                               Emit_Inst (Ctx.E, GA & " = addr " & GSym);
                               Emit_Inst (Ctx.E, P0 & " = field_ptr @__ada_arr_desc, " & GA & ", 0");
                               Emit_Inst (Ctx.E, "store.ptr " & To_String (LV.Reg) & ", " & P0 & ", align 8");
-                              for D_I in 1 .. Natural'Min (LV.NDims, 4) loop
+                              for D_I in 1 .. Natural'Min (LV.NDims, Max_Array_Dims) loop
                                  declare
                                     FF : constant String := Next_Reg (Ctx.E, "rndf");
                                     LF : constant String := Next_Reg (Ctx.E, "rndl");
@@ -2980,6 +3918,19 @@ package body Cg_Stmt is
                               V.Pir_Name := To_Unbounded_String (GSym);
                            end;
                         end if;
+                        -- P3-3.3: Track constrainedness for global record renamings!
+                        if Get_Type_Info (Ctx, V.Ada_Type).Kind = TK_Record then
+                           declare
+                              Con_R : constant String := Emit_Actual_Constrained (Ctx, Expr_N);
+                              CSym  : constant String := (if Is_Exp then "@ada_rnc__" & QName else "@ada_rnc_" & Sfx);
+                              CA    : constant String := Next_Reg (Ctx.E, "rncg");
+                           begin
+                              Add_Global_Decl (Ctx.E, CSym, Link & CSym & " = global i8 = 1, align 1");
+                              Emit_Inst (Ctx.E, CA & " = addr " & CSym);
+                              Emit_Inst (Ctx.E, "store.i8 " & Con_R & ", " & CA & ", align 1");
+                              V.Con_Global := To_Unbounded_String (CSym);
+                           end;
+                        end if;
                      end;
                   elsif LV.Kind = EK_Slice then
                      V.Kind       := VK_Dyn_Array;
@@ -2997,7 +3948,7 @@ package body Cg_Stmt is
                            Emit_Entry_Alloca (Ctx.E, Desc_R & " = alloca @__ada_arr_desc, align 8");
                            Emit_Inst (Ctx.E, P0_R & " = field_ptr @__ada_arr_desc, " & Desc_R & ", 0");
                            Emit_Inst (Ctx.E, "store.ptr " & To_String (LV.Reg) & ", " & P0_R & ", align 8");
-                           for D_I in 1 .. Natural'Min (LV.NDims, 4) loop
+                           for D_I in 1 .. Natural'Min (LV.NDims, Max_Array_Dims) loop
                               declare
                                  FF : constant String := Next_Reg (Ctx.E, "rnf");
                                  LF : constant String := Next_Reg (Ctx.E, "rnl");
@@ -3044,6 +3995,26 @@ package body Cg_Stmt is
                            Emit_Inst (Ctx.E, "store.ptr " & To_String (LV.Reg) & ", " & FP & ", align 8");
                         end;
                      end if;
+                     -- P3-3.3: Populate V.Constrained_Reg (and spill into frame if captured!) for local record renamings
+                     if Get_Type_Info (Ctx, V.Ada_Type).Kind = TK_Record then
+                        declare
+                           Con_R : constant String := Emit_Actual_Constrained (Ctx, Expr_N);
+                        begin
+                           V.Constrained_Reg := To_Unbounded_String (Con_R);
+                           if V.Con_Captured_Slot > 0 and then Length (Ctx.Cur_Frame_Reg) > 0 then
+                              declare
+                                 CSp : constant String := Next_Reg (Ctx.E, "rncs");
+                                 CFP : constant String := Next_Reg (Ctx.E, "rncf");
+                                 FSI : constant Subp_Info := Ctx.Subps.Element (Ctx.Cur_Subp_Key);
+                              begin
+                                 Emit_Entry_Alloca (Ctx.E, CSp & " = alloca i8, align 1");
+                                 Emit_Inst (Ctx.E, "store.i8 " & Con_R & ", " & CSp & ", align 1");
+                                 Emit_Inst (Ctx.E, CFP & " = field_ptr " & To_String (FSI.Frame_Type) & ", " & To_String (Ctx.Cur_Frame_Reg) & ", " & Img (V.Con_Captured_Slot));
+                                 Emit_Inst (Ctx.E, "store.ptr " & CSp & ", " & CFP & ", align 8");
+                              end;
+                           end if;
+                        end;
+                     end if;
                   end if;
                   Ctx.Vars.Include (RK, V);
                end;
@@ -3060,13 +4031,15 @@ package body Cg_Stmt is
                     and then Ctx.Vars.Contains (Tree_Key (Def_N))
                   then
                      declare
-                        V : constant Var_Info := Ctx.Vars.Element (Tree_Key (Def_N));
+                        V : Var_Info := Ctx.Vars.Element (Tree_Key (Def_N));
                      begin
-                        if V.Kind = VK_Local_Ptr or else V.Kind = VK_Global_Ptr then
+                        if (V.Kind = VK_Local_Ptr or else V.Kind = VK_Global_Ptr) and then V.Has_Desc then
                            declare
                               AV   : constant Expr_Val := Emit_Expr (Ctx, Exp_N);
                               A64  : constant String := Emit_Int_Convert (Ctx, To_String (AV.Reg), To_String (AV.Pir_Type), "i64");
                               PtrR : constant String := Next_Reg (Ctx.E, "daptr");
+                              Init_E : constant TREE := D (SM_INIT_EXP, Def_N);
+                              TI_D   : constant Type_Info := Get_Type_Info (Ctx, V.Ada_Type);
                            begin
                               Emit_Inst (Ctx.E, PtrR & " = inttoptr.ptr " & A64);
                               if V.Kind = VK_Global_Ptr then
@@ -3078,6 +4051,25 @@ package body Cg_Stmt is
                                  end;
                               else
                                  Emit_Inst (Ctx.E, "store.ptr " & PtrR & ", " & To_String (V.Pir_Name) & ", align 8");
+                              end if;
+                              V.Has_Desc := False;
+                              Ctx.Vars.Replace (Tree_Key (Def_N), V);
+                              -- Also run deferred Init_Exp or Default_Init now that the address clause pointer is bound (LRM 13.5, P3-6.10)
+                              if not Is_Void_Tree (Init_E) then
+                                 if TI_D.Kind = TK_Scalar then
+                                    declare
+                                       IV : constant Expr_Val := Emit_Expr (Ctx, Init_E, V.Ada_Type);
+                                       VR : constant String := Emit_Scalar_Coerce (Ctx, To_String (IV.Reg), To_String (IV.Pir_Type), To_String (TI_D.Pir_Type));
+                                    begin
+                                       Emit_Range_Check (Ctx, VR, To_String (TI_D.Pir_Type), V.Ada_Type);
+                                       Emit_Discriminant_Check (Ctx, VR, V.Ada_Type, Is_Access => True);
+                                       Emit_Inst (Ctx.E, "store." & To_String (TI_D.Pir_Type) & " " & VR & ", " & PtrR & ", align " & Img (TI_D.Align));
+                                    end;
+                                 else
+                                    Emit_Init_Composite (Ctx, PtrR, V.Ada_Type, Init_E);
+                                 end if;
+                              else
+                                 Emit_Default_Init (Ctx, PtrR, V.Ada_Type);
                               end if;
                            end;
                         end if;
@@ -3098,19 +4090,82 @@ package body Cg_Stmt is
                         AD : constant TREE := D (AS_USED_NAME_ID, Attr_N);
                         AN : constant String := (if not Is_Void_Tree (AD) then Sym_Name (AD) else "");
                      begin
-                        if AN = "STORAGE_SIZE" and then not Ctx.Saved_Expr_Vals.Contains (Tree_Key (Exp_N)) then
+                        if AN = "STORAGE_SIZE" then
+                           -- P3-6.6: Evaluate 'STORAGE_SIZE once; export for library types and capture in frame for local types!
                            declare
-                              SV : constant Expr_Val := Emit_Expr (Ctx, Exp_N);
-                              SE : Saved_Expr_Info;
+                              Pfx_P : constant TREE := D (AS_NAME, Attr_N);
+                              PDef  : constant TREE := (if not Is_Void_Tree (Pfx_P) then Get_Name_Defn (Pfx_P) else CONST_VOID);
+                              PTS   : constant TREE :=
+                                (if not Is_Void_Tree (PDef) and then KIND (PDef) in CLASS_TYPE_NAME
+                                 then Resolve_Type_Spec (Base_Type_Spec (Subst_Tree (Ctx, D (SM_TYPE_SPEC, PDef))))
+                                 else CONST_VOID);
+                              Cur_N : constant TREE := (if not Is_Void_Tree (PTS) then D (XD_SOURCE_NAME, PTS) else CONST_VOID);
+                              Is_Lib_T : constant Boolean := not Is_Void_Tree (Cur_N) and then Is_Library_Level (Cur_N);
                            begin
-                              if SV.Kind = EK_Scalar then
-                                 Save_Scalar_Slot (Ctx, To_String (SV.Reg), To_String (SV.Pir_Type), SV.Align, SE.Ptr_Reg, SE.Is_Global);
-                                 SE.Pir_Type   := SV.Pir_Type;
-                                 SE.Ada_Type   := SV.Ada_Type;
-                                 SE.Align      := SV.Align;
-                                 SE.Owner_Subp := Ctx.Cur_Subp_Key;
-                                 Ctx.Saved_Expr_Vals.Include (Tree_Key (Exp_N), SE);
-                              end if;
+                           if not Ctx.Saved_Expr_Vals.Contains (Tree_Key (Exp_N)) then
+                              declare
+                                 SV : constant Expr_Val := Emit_Expr (Ctx, Exp_N);
+                                 SE : Saved_Expr_Info;
+                              begin
+                                 if SV.Kind = EK_Scalar then
+                                    if Is_Lib_T then
+                                       declare
+                                          SSym : constant String := "@ada_ssz__" & Qualified_Ada_Name (Cur_N);
+                                          Link_S : constant String := (if Export_All then "export " else "");
+                                          V64  : constant String := Emit_Int_Convert (Ctx, To_String (SV.Reg), To_String (SV.Pir_Type), "i64");
+                                          SA   : constant String := Next_Reg (Ctx.E, "ssza");
+                                       begin
+                                          Add_Global_Decl (Ctx.E, SSym, Link_S & SSym & " = global i64 = 0, align 8");
+                                          Emit_Inst (Ctx.E, SA & " = addr " & SSym);
+                                          Emit_Inst (Ctx.E, "store.i64 " & V64 & ", " & SA & ", align 8");
+                                          SE.Ptr_Reg    := To_Unbounded_String (SSym);
+                                          SE.Is_Global  := True;
+                                          SE.Pir_Type   := To_Unbounded_String ("i64");
+                                          SE.Ada_Type   := SV.Ada_Type;
+                                          SE.Align      := 8;
+                                          SE.Owner_Subp := 0;
+                                       end;
+                                    else
+                                       Save_Scalar_Slot (Ctx, To_String (SV.Reg), To_String (SV.Pir_Type), SV.Align, SE.Ptr_Reg, SE.Is_Global);
+                                       SE.Pir_Type   := SV.Pir_Type;
+                                       SE.Ada_Type   := SV.Ada_Type;
+                                       SE.Align      := SV.Align;
+                                       SE.Owner_Subp := Ctx.Cur_Subp_Key;
+                                       -- Capture local 'STORAGE_SIZE slot into parent static-link frame for nested subprograms/tasks
+                                       if not SE.Is_Global and then Ctx.Cur_Subp_Key /= 0 and then Length (Ctx.Cur_Frame_Reg) > 0
+                                         and then Ctx.Vars.Contains (Tree_Key (Exp_N))
+                                         and then Ctx.Vars.Element (Tree_Key (Exp_N)).Owner_Subp = Ctx.Cur_Subp_Key
+                                         and then Ctx.Vars.Element (Tree_Key (Exp_N)).Captured_Slot > 0
+                                       then
+                                          declare
+                                             SI_F : constant Subp_Info := Ctx.Subps.Element (Ctx.Cur_Subp_Key);
+                                             CS   : constant Natural := Ctx.Vars.Element (Tree_Key (Exp_N)).Captured_Slot;
+                                             FP_S : constant String := Next_Reg (Ctx.E, "sscf");
+                                          begin
+                                             Emit_Inst (Ctx.E, FP_S & " = field_ptr " & To_String (SI_F.Frame_Type) & ", " & To_String (Ctx.Cur_Frame_Reg) & ", " & Img (CS));
+                                             Emit_Inst (Ctx.E, "store.ptr " & To_String (SE.Ptr_Reg) & ", " & FP_S & ", align 8");
+                                             SE.Cap_Slot := CS;
+                                          end;
+                                       end if;
+                                    end if;
+                                    Ctx.Saved_Expr_Vals.Include (Tree_Key (Exp_N), SE);
+                                 end if;
+                              end;
+                           end if;
+                           -- P3-3.15: Export library-level pool counter and reset local pool counter to 0 on elaboration!
+                           if not Is_Void_Tree (PTS) and then KIND (PTS) = DN_ACCESS then
+                              declare
+                                 PSym   : constant String :=
+                                   (if Is_Lib_T then "@ada_pool_used__" & Qualified_Ada_Name (Cur_N)
+                                    else "@ada_pool_used_" & Tree_Key_Str (PTS) & To_String (Ctx.Gen_Inst_Tag));
+                                 Link_P : constant String := (if Is_Lib_T and then Export_All then "export " else "");
+                                 PA     : constant String := Next_Reg (Ctx.E, "pui");
+                              begin
+                                 Add_Global_Decl (Ctx.E, PSym, Link_P & PSym & " = global i64 = 0, align 8");
+                                 Emit_Inst (Ctx.E, PA & " = addr " & PSym);
+                                 Emit_Inst (Ctx.E, "store.i64 0, " & PA & ", align 8");
+                              end;
+                           end if;
                            end;
                         end if;
                      end;
@@ -3120,13 +4175,18 @@ package body Cg_Stmt is
             when DN_GENERIC_DECL =>
                if Ctx.Enable_Checks and then not Ctx.In_Subunit then
                   declare
-                     GID  : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, Item));
-                     GK   : constant Unsigned_32 := Tree_Key (GID);
-                     GSym : constant String := "@ada_gelab_" & Tree_Key_Str (GID) & To_String (Ctx.Gen_Inst_Tag);
-                     GA   : constant String := Next_Reg (Ctx.E, "gea");
-                     GTI  : Type_Info;
+                     GID      : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, Item));
+                     GK       : constant Unsigned_32 := Tree_Key (GID);
+                     Is_Exp_G : constant Boolean :=
+                       Is_Global and then Export_All and then Is_Library_Level (GID);
+                     Link_G   : constant String := (if Is_Exp_G then "export " else "");
+                     GSym     : constant String :=
+                       (if Is_Exp_G then "@ada_gelab__" & Qualified_Ada_Name (GID)
+                        else "@ada_gelab_" & Tree_Key_Str (GID) & To_String (Ctx.Gen_Inst_Tag));
+                     GA       : constant String := Next_Reg (Ctx.E, "gea");
+                     GTI      : Type_Info;
                   begin
-                     Add_Global_Decl (Ctx.E, GSym, GSym & " = global i8 = 0, align 1");
+                     Add_Global_Decl (Ctx.E, GSym, Link_G & GSym & " = global i8 = 0, align 1");
                      Emit_Inst (Ctx.E, GA & " = addr " & GSym);
                      Emit_Inst (Ctx.E, "store.i8 0, " & GA & ", align 1");
                      GTI.Pir_Type := To_Unbounded_String (GSym);
@@ -3164,12 +4224,61 @@ package body Cg_Stmt is
                            E_Id   := Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (RN)));
                         end if;
                         if not Is_Void_Tree (E_Id) and then Ctx.Renamed_Entries.Contains (Tree_Key (E_Id)) then
-                           Ctx.Renamed_Entries.Include (Tree_Key (SID), Ctx.Renamed_Entries.Element (Tree_Key (E_Id)));
+                           declare
+                              Src_RE : constant Renamed_Entry_Info := Ctx.Renamed_Entries.Element (Tree_Key (E_Id));
+                              SK     : constant Unsigned_32 := Tree_Key (SID);
+                              Cap_Sl : Natural := 0;
+                           begin
+                              if not Is_Global and then Ctx.Vars.Contains (SK)
+                                and then Ctx.Vars.Element (SK).Owner_Subp = Ctx.Cur_Subp_Key
+                              then
+                                 Cap_Sl := Ctx.Vars.Element (SK).Captured_Slot;
+                              end if;
+                              if Cap_Sl > 0 and then Length (Ctx.Cur_Frame_Reg) > 0 then
+                                 declare
+                                    FSI : constant Subp_Info := Ctx.Subps.Element (Ctx.Cur_Subp_Key);
+                                    FP  : constant String := Next_Reg (Ctx.E, "refp");
+                                 begin
+                                    Emit_Inst (Ctx.E, FP & " = field_ptr " & To_String (FSI.Frame_Type) & ", " & To_String (Ctx.Cur_Frame_Reg) & ", " & Img (Cap_Sl));
+                                    if Src_RE.Is_Local and then Src_RE.Owner_Subp = Ctx.Cur_Subp_Key then
+                                       Emit_Inst (Ctx.E, "store.ptr " & To_String (Src_RE.Task_Sym) & ", " & FP & ", align 8");
+                                    else
+                                       declare
+                                          Pair_A : constant String := Next_Reg (Ctx.E, "renp");
+                                          Off8   : constant String := Next_Reg (Ctx.E, "ren8");
+                                          Off_I  : constant String := Next_Reg (Ctx.E, "reni");
+                                          TS_G   : constant String :=
+                                            (if Length (Src_RE.Fallback_TSym) > 0 then To_String (Src_RE.Fallback_TSym)
+                                             else To_String (Src_RE.Task_Sym));
+                                          IS_G   : constant String :=
+                                            (if Length (Src_RE.Fallback_ISym) > 0 then To_String (Src_RE.Fallback_ISym)
+                                             else To_String (Src_RE.Idx_Sym));
+                                          GTA    : constant String := Next_Reg (Ctx.E, "rta");
+                                          GIA    : constant String := Next_Reg (Ctx.E, "ria");
+                                          GTV    : constant String := Next_Reg (Ctx.E, "rtv");
+                                          GIV    : constant String := Next_Reg (Ctx.E, "riv");
+                                       begin
+                                          Emit_Entry_Alloca (Ctx.E, Pair_A & " = alloca [2 x i64], align 8");
+                                          Emit_Inst (Ctx.E, GTA & " = addr " & TS_G);
+                                          Emit_Inst (Ctx.E, GTV & " = load.ptr " & GTA & ", align 8");
+                                          Emit_Inst (Ctx.E, "store.ptr " & GTV & ", " & Pair_A & ", align 8");
+                                          Emit_Inst (Ctx.E, Off8 & " = const.i64 8");
+                                          Emit_Inst (Ctx.E, Off_I & " = ptr_add.i64 " & Pair_A & ", " & Off8);
+                                          Emit_Inst (Ctx.E, GIA & " = addr " & IS_G);
+                                          Emit_Inst (Ctx.E, GIV & " = load.i32 " & GIA & ", align 4");
+                                          Emit_Inst (Ctx.E, "store.i32 " & GIV & ", " & Off_I & ", align 4");
+                                          Emit_Inst (Ctx.E, "store.ptr " & Pair_A & ", " & FP & ", align 8");
+                                       end;
+                                    end if;
+                                 end;
+                              end if;
+                              Ctx.Renamed_Entries.Include (SK, Src_RE);
+                           end;
                         elsif not Is_Void_Tree (E_Id) and then KIND (E_Id) = DN_ENTRY_ID then
                            declare
                               Task_Ptr : Unbounded_String;
                               EIdx_Reg : Unbounded_String := To_Unbounded_String ("0");
-                              Is_Exp_R : constant Boolean := Is_Global and then Export_All and then Length (Ctx.Gen_Inst_Tag) = 0;
+                              Is_Exp_R : constant Boolean := Is_Global and then Export_All and then Is_Library_Level (SID);
                               RLink    : constant String := (if Is_Exp_R then "export " else "");
                               RQName   : constant String := Qualified_Ada_Name (SID);
                               TSym     : constant String :=
@@ -3216,73 +4325,68 @@ package body Cg_Stmt is
                                  declare
                                     EI : constant Entry_Info := Ctx.Entries.Element (Tree_Key (E_Id));
                                  begin
-                                    if EI.Is_Family and then not Is_Void_Tree (Fam_Exp) then
-                                       declare
-                                          IV  : constant Expr_Val := Emit_Expr (Ctx, Fam_Exp);
-                                          I32 : constant String := Emit_Int_Convert (Ctx, To_String (IV.Reg), To_String (IV.Pir_Type), "i32");
-                                          D1  : constant String := Next_Reg (Ctx.E, "refd");
-                                          A1  : constant String := Next_Reg (Ctx.E, "refa");
-                                       begin
-                                          if EI.Fam_Is_Static then
-                                             if Ctx.Enable_Checks then
-                                                declare
-                                                   LoC : constant String := Next_Reg (Ctx.E, "rflo");
-                                                   HiC : constant String := Next_Reg (Ctx.E, "rfhi");
-                                                   Bad : constant String := Next_Reg (Ctx.E, "rfb");
-                                                begin
-                                                   Emit_Inst (Ctx.E, LoC & " = cmp_lt_s.i32 " & I32 & ", " & Img (Long_Long_Integer (EI.Fam_Lo)));
-                                                   Emit_Inst (Ctx.E, HiC & " = cmp_gt_s.i32 " & I32 & ", " & Img (Long_Long_Integer (EI.Fam_Hi)));
-                                                   Emit_Inst (Ctx.E, Bad & " = or.i8 " & LoC & ", " & HiC);
-                                                   Emit_Check_Fail_If (Ctx, Bad);
-                                                end;
-                                             end if;
-                                             Emit_Inst (Ctx.E, D1 & " = sub.i32 " & I32 & ", " & Img (Long_Long_Integer (EI.Fam_Lo)));
-                                          else
-                                             declare
-                                                RT2, LoR, HiR : Unbounded_String;
-                                                Lo32, Hi32    : Unbounded_String;
-                                             begin
-                                                Emit_Discrete_Range (Ctx, EI.Fam_DR, RT2, LoR, HiR);
-                                                Lo32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (LoR), To_String (RT2), "i32"));
-                                                Hi32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (HiR), To_String (RT2), "i32"));
-                                                if Ctx.Enable_Checks then
-                                                   declare
-                                                      LoC : constant String := Next_Reg (Ctx.E, "rflo");
-                                                      HiC : constant String := Next_Reg (Ctx.E, "rfhi");
-                                                      Bad : constant String := Next_Reg (Ctx.E, "rfb");
-                                                   begin
-                                                      Emit_Inst (Ctx.E, LoC & " = cmp_lt_s.i32 " & I32 & ", " & To_String (Lo32));
-                                                      Emit_Inst (Ctx.E, HiC & " = cmp_gt_s.i32 " & I32 & ", " & To_String (Hi32));
-                                                      Emit_Inst (Ctx.E, Bad & " = or.i8 " & LoC & ", " & HiC);
-                                                      Emit_Check_Fail_If (Ctx, Bad);
-                                                   end;
-                                                end if;
-                                                Emit_Inst (Ctx.E, D1 & " = sub.i32 " & I32 & ", " & To_String (Lo32));
-                                             end;
-                                          end if;
-                                          Emit_Inst (Ctx.E, A1 & " = add.i32 " & D1 & ", " & Img (EI.Base_Idx));
-                                          EIdx_Reg := To_Unbounded_String (A1);
-                                       end;
-                                    else
-                                       declare
-                                          C : constant String := Next_Reg (Ctx.E, "rei");
-                                       begin
-                                          Emit_Inst (Ctx.E, C & " = const.i32 " & Img (EI.Base_Idx));
-                                          EIdx_Reg := To_Unbounded_String (C);
-                                       end;
-                                    end if;
+                                    EIdx_Reg := To_Unbounded_String (Emit_Entry_Index_Reg (Ctx, EI, Fam_Exp));
                                  end;
                               end if;
-                              Add_Global_Decl (Ctx.E, TSym, RLink & TSym & " = global ptr = zeroinit, align 8");
-                              Add_Global_Decl (Ctx.E, ISym, RLink & ISym & " = global i32 = 0, align 4");
-                              Emit_Inst (Ctx.E, TA & " = addr " & TSym);
-                              Emit_Inst (Ctx.E, "store.ptr " & To_String (Task_Ptr) & ", " & TA & ", align 8");
-                              Emit_Inst (Ctx.E, IA & " = addr " & ISym);
-                              Emit_Inst (Ctx.E, "store.i32 " & To_String (EIdx_Reg) & ", " & IA & ", align 4");
-                              Ctx.Renamed_Entries.Include (Tree_Key (SID),
-                                (Task_Sym => To_Unbounded_String (TSym),
-                                 Idx_Sym  => To_Unbounded_String (ISym),
-                                 Entry_Id => E_Id));
+                              if Is_Global then
+                                 Add_Global_Decl (Ctx.E, TSym, RLink & TSym & " = global ptr = zeroinit, align 8");
+                                 Add_Global_Decl (Ctx.E, ISym, RLink & ISym & " = global i32 = 0, align 4");
+                                 Emit_Inst (Ctx.E, TA & " = addr " & TSym);
+                                 Emit_Inst (Ctx.E, "store.ptr " & To_String (Task_Ptr) & ", " & TA & ", align 8");
+                                 Emit_Inst (Ctx.E, IA & " = addr " & ISym);
+                                 Emit_Inst (Ctx.E, "store.i32 " & To_String (EIdx_Reg) & ", " & IA & ", align 4");
+                                 Ctx.Renamed_Entries.Include (Tree_Key (SID),
+                                   (Task_Sym      => To_Unbounded_String (TSym),
+                                    Idx_Sym       => To_Unbounded_String (ISym),
+                                    Entry_Id      => E_Id,
+                                    Is_Local      => False,
+                                    Owner_Subp    => 0,
+                                    Fallback_TSym => Null_Unbounded_String,
+                                    Fallback_ISym => Null_Unbounded_String));
+                              else
+                                 -- Local task-entry renaming: allocate on stack (with static-link capture if needed)
+                                 -- so recursive and concurrent calls never clobber each other!
+                                 -- Also mirror into private globals for non-captured cross-subp / generic formal defaults (cc3602a).
+                                 declare
+                                    Pair_A : constant String := Next_Reg (Ctx.E, "renp");
+                                    Off8   : constant String := Next_Reg (Ctx.E, "ren8");
+                                    Off_I  : constant String := Next_Reg (Ctx.E, "reni");
+                                    SK     : constant Unsigned_32 := Tree_Key (SID);
+                                    Cap_Sl : Natural := 0;
+                                 begin
+                                    Emit_Entry_Alloca (Ctx.E, Pair_A & " = alloca [2 x i64], align 8");
+                                    Emit_Inst (Ctx.E, "store.ptr " & To_String (Task_Ptr) & ", " & Pair_A & ", align 8");
+                                    Emit_Inst (Ctx.E, Off8 & " = const.i64 8");
+                                    Emit_Inst (Ctx.E, Off_I & " = ptr_add.i64 " & Pair_A & ", " & Off8);
+                                    Emit_Inst (Ctx.E, "store.i32 " & To_String (EIdx_Reg) & ", " & Off_I & ", align 4");
+                                    Add_Global_Decl (Ctx.E, TSym, TSym & " = global ptr = zeroinit, align 8");
+                                    Add_Global_Decl (Ctx.E, ISym, ISym & " = global i32 = 0, align 4");
+                                    Emit_Inst (Ctx.E, TA & " = addr " & TSym);
+                                    Emit_Inst (Ctx.E, "store.ptr " & To_String (Task_Ptr) & ", " & TA & ", align 8");
+                                    Emit_Inst (Ctx.E, IA & " = addr " & ISym);
+                                    Emit_Inst (Ctx.E, "store.i32 " & To_String (EIdx_Reg) & ", " & IA & ", align 4");
+                                    if Ctx.Vars.Contains (SK) and then Ctx.Vars.Element (SK).Owner_Subp = Ctx.Cur_Subp_Key then
+                                       Cap_Sl := Ctx.Vars.Element (SK).Captured_Slot;
+                                    end if;
+                                    if Cap_Sl > 0 and then Length (Ctx.Cur_Frame_Reg) > 0 then
+                                       declare
+                                          FSI : constant Subp_Info := Ctx.Subps.Element (Ctx.Cur_Subp_Key);
+                                          FP  : constant String := Next_Reg (Ctx.E, "refp");
+                                       begin
+                                          Emit_Inst (Ctx.E, FP & " = field_ptr " & To_String (FSI.Frame_Type) & ", " & To_String (Ctx.Cur_Frame_Reg) & ", " & Img (Cap_Sl));
+                                          Emit_Inst (Ctx.E, "store.ptr " & Pair_A & ", " & FP & ", align 8");
+                                       end;
+                                    end if;
+                                    Ctx.Renamed_Entries.Include (SK,
+                                      (Task_Sym      => To_Unbounded_String (Pair_A),
+                                       Idx_Sym       => To_Unbounded_String (Off_I),
+                                       Entry_Id      => E_Id,
+                                       Is_Local      => True,
+                                       Owner_Subp    => Ctx.Cur_Subp_Key,
+                                       Fallback_TSym => To_Unbounded_String (TSym),
+                                       Fallback_ISym => To_Unbounded_String (ISym)));
+                                 end;
+                              end if;
                            end;
                         end if;
                      end;
@@ -3311,13 +4415,9 @@ package body Cg_Stmt is
                begin
                   if not Is_Void_Tree (UK) and then KIND (UK) = DN_INSTANTIATION then
                      declare
-                        Gen_Id   : constant TREE := Canonical_Def (Get_Name_Defn (D (AS_NAME, UK)));
-                        Gen_Name : constant String := (if not Is_Void_Tree (Gen_Id) then Sym_Name (Gen_Id) else "");
+                        Gen_Id : constant TREE := Canonical_Def (Get_Name_Defn (D (AS_NAME, UK)));
                      begin
-                        if Gen_Name /= "INTEGER_IO" and then Gen_Name /= "FLOAT_IO"
-                          and then Gen_Name /= "FIXED_IO" and then Gen_Name /= "ENUMERATION_IO"
-                          and then Gen_Name /= "SEQUENTIAL_IO" and then Gen_Name /= "DIRECT_IO"
-                        then
+                        if not Is_RTL_Generic (Gen_Id) or else not Is_Global then
                            Emit_Generic_Instantiation (Ctx, Item, Export_All);
                         end if;
                      end;
@@ -3351,6 +4451,47 @@ package body Cg_Stmt is
                      end if;
                      if Is_Void_Tree (UK) and then not Is_Void_Tree (Hdr) and then KIND (Hdr) = DN_PACKAGE_SPEC then
                         declare
+                           -- P3-4.9: A nested package declared inside an enclosing package spec that requires a body
+                           -- (e.g. declares a task/subprogram/generic) must get its own Pkg_Gid so its tasks activate
+                           -- before its own body statements (LRM 9.3(2)), not when the outer package begins!
+                           function Spec_List_Requires_Body (DS : TREE) return Boolean is
+                              SL2 : SEQ_TYPE;
+                              I2  : TREE;
+                           begin
+                              if Is_Void_Tree (DS) then return False; end if;
+                              SL2 := LIST (DS);
+                              while not IS_EMPTY (SL2) loop
+                                 POP (SL2, I2);
+                                 case KIND (I2) is
+                                    when DN_TASK_DECL =>
+                                       return True;
+                                    when DN_SUBPROG_ENTRY_DECL =>
+                                       if Is_Void_Tree (D (AS_UNIT_KIND, I2)) then
+                                          return True;
+                                       end if;
+                                    when DN_GENERIC_DECL =>
+                                       return True;
+                                    when DN_PACKAGE_DECL =>
+                                       if Is_Void_Tree (D (AS_UNIT_KIND, I2))
+                                         and then not Is_Void_Tree (D (AS_HEADER, I2))
+                                         and then KIND (D (AS_HEADER, I2)) = DN_PACKAGE_SPEC
+                                       then
+                                          if Spec_List_Requires_Body (D (AS_DECL_S1, D (AS_HEADER, I2)))
+                                            or else Spec_List_Requires_Body (D (AS_DECL_S2, D (AS_HEADER, I2)))
+                                          then
+                                             return True;
+                                          end if;
+                                       end if;
+                                    when others =>
+                                       null;
+                                 end case;
+                              end loop;
+                              return False;
+                           end Spec_List_Requires_Body;
+                           Nested_Needs_Bdy : constant Boolean :=
+                             not Has_Any_Bdy
+                             and then (Spec_List_Requires_Body (D (AS_DECL_S1, Hdr))
+                                       or else Spec_List_Requires_Body (D (AS_DECL_S2, Hdr)));
                            Sub_Dyn : Boolean;
                            Saved_G : constant Integer_64 := Ctx.Cur_Task_Group_Id;
                            Gid     : Integer_64 := 0;
@@ -3360,10 +4501,16 @@ package body Cg_Stmt is
                         begin
                            -- LRM 9.3(2): only a package WITH a body activates its tasks at the package body's begin;
                            -- a bodyless package defers task activation to the enclosing declarative part's begin!
-                           if Length (Ctx.Cur_Master_Reg) > 0 and then Has_Any_Bdy then
-                              Gid := Ctx.Next_Task_Group_Id;
-                              Ctx.Next_Task_Group_Id := Ctx.Next_Task_Group_Id + 1;
-                              Ctx.Pkg_Task_Groups.Include (Tree_Key (PID), Gid);
+                           if Has_Any_Bdy or else Nested_Needs_Bdy then
+                              if Has_Stub_Bdy or else (Nested_Needs_Bdy and then Is_Global) then
+                                 Gid := Integer_64 (Lib_Binder.Lib_Pkg_Task_Group_Id
+                                   (Ada.Strings.Fixed.Translate (Qualified_Ada_Name (PID), Ada.Strings.Maps.Constants.Upper_Case_Map)));
+                                 Ctx.Pkg_Task_Groups.Include (Tree_Key (PID), Gid);
+                              else
+                                 Gid := Ctx.Next_Task_Group_Id;
+                                 Ctx.Next_Task_Group_Id := Ctx.Next_Task_Group_Id + 1;
+                                 Ctx.Pkg_Task_Groups.Include (Tree_Key (PID), Gid);
+                              end if;
                               Ctx.Cur_Task_Group_Id := Gid;
                            end if;
                            Emit_Decl_Items (Ctx, D (AS_DECL_S1, Hdr), Is_Global => Pkg_G, Export_All => Exp_1, Has_Dyn => Sub_Dyn);
@@ -3380,15 +4527,33 @@ package body Cg_Stmt is
 
             when DN_PACKAGE_BODY =>
                declare
-                  PID : constant TREE := Canonical_Def (Subst_Tree (Ctx, Canonical_Def (D (AS_SOURCE_NAME, Item))));
-                  Bdy : constant TREE := D (AS_BODY, Item);
+                  Orig_PID : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, Item));
+                  PID : constant TREE := Canonical_Def (Subst_Tree (Ctx, Orig_PID));
+                  Bdy : TREE := D (AS_BODY, Item);
                begin
+                  -- Inline separate nested package subunit inside a generic body (LRM 10.2/12.3)
+                  if KIND (PID) /= DN_GENERIC_ID and then not Is_Void_Tree (Bdy) and then KIND (Bdy) = DN_STUB then
+                     if Ctx.Gen_Subunits.Contains (Tree_Key (Orig_PID)) then
+                        Bdy := D (AS_BODY, Ctx.Gen_Subunits.Element (Tree_Key (Orig_PID)));
+                     elsif Ctx.Gen_Subunits.Contains (Tree_Key (PID)) then
+                        Bdy := D (AS_BODY, Ctx.Gen_Subunits.Element (Tree_Key (PID)));
+                     end if;
+                  end if;
                   if KIND (PID) = DN_GENERIC_ID then
                      if Ctx.Gen_Elab_Flags.Contains (Tree_Key (PID)) then
                         declare
                            GSym : constant String := To_String (Ctx.Gen_Elab_Flags.Element (Tree_Key (PID)).Pir_Type);
                            GA   : constant String := Next_Reg (Ctx.E, "ge1");
                         begin
+                           Emit_Inst (Ctx.E, GA & " = addr " & GSym);
+                           Emit_Inst (Ctx.E, "store.i8 1, " & GA & ", align 1");
+                        end;
+                     elsif Ctx.Enable_Checks and then not Ctx.In_Subunit and then Is_Library_Level (PID) then
+                        declare
+                           GSym : constant String := "@ada_gelab__" & Qualified_Ada_Name (PID);
+                           GA   : constant String := Next_Reg (Ctx.E, "ge1");
+                        begin
+                           Add_Global_Decl (Ctx.E, GSym, "extern " & GSym & " = global i8, align 1");
                            Emit_Inst (Ctx.E, GA & " = addr " & GSym);
                            Emit_Inst (Ctx.E, "store.i8 1, " & GA & ", align 1");
                         end;
@@ -3404,17 +4569,25 @@ package body Cg_Stmt is
                         Gid       : Integer_64 := 0;
                         Dummy     : Unbounded_String;
                      begin
-                        if not Is_Global and then Length (Ctx.Cur_Master_Reg) > 0 then
-                           if Ctx.Pkg_Task_Groups.Contains (Tree_Key (PID)) then
-                              Gid := Ctx.Pkg_Task_Groups.Element (Tree_Key (PID));
-                              Ctx.Pkg_Task_Groups.Delete (Tree_Key (PID));
-                           elsif Bdy_Has_T then
-                              Gid := Ctx.Next_Task_Group_Id;
-                              Ctx.Next_Task_Group_Id := Ctx.Next_Task_Group_Id + 1;
-                           end if;
-                           if Gid /= 0 then
-                              Ctx.Cur_Task_Group_Id := Gid;
-                           end if;
+                        if Ctx.Pkg_Task_Groups.Contains (Tree_Key (PID)) then
+                           Gid := Ctx.Pkg_Task_Groups.Element (Tree_Key (PID));
+                           Ctx.Pkg_Task_Groups.Delete (Tree_Key (PID));
+                        elsif Is_Global and then KIND (PID) = DN_PACKAGE_ID
+                          and then not Is_Void_Tree (D (SM_SPEC, PID))
+                          and then KIND (D (SM_SPEC, PID)) = DN_PACKAGE_SPEC
+                          and then (Item_List_Has_Tasks (Ctx, D (AS_DECL_S1, D (SM_SPEC, PID)))
+                                    or else Item_List_Has_Tasks (Ctx, D (AS_DECL_S2, D (SM_SPEC, PID)))
+                                    or else Bdy_Has_T)
+                        then
+                           -- P3-4.9: Nested package inside separately-compiled enclosing library package spec
+                           Gid := Integer_64 (Lib_Binder.Lib_Pkg_Task_Group_Id
+                             (Ada.Strings.Fixed.Translate (Qualified_Ada_Name (PID), Ada.Strings.Maps.Constants.Upper_Case_Map)));
+                        elsif Bdy_Has_T then
+                           Gid := Ctx.Next_Task_Group_Id;
+                           Ctx.Next_Task_Group_Id := Ctx.Next_Task_Group_Id + 1;
+                        end if;
+                        if Gid /= 0 then
+                           Ctx.Cur_Task_Group_Id := Gid;
                         end if;
                         Emit_Decl_Items (Ctx, D (AS_ITEM_S, Bdy), Is_Global => Is_Global, Export_All => Export_All, Has_Dyn => Sub_Dyn);
                         if Gid /= 0 then
@@ -3426,13 +4599,25 @@ package body Cg_Stmt is
                            Ctx.Handlers.Append ((Handler_Label => Hdl_Lbl,
                                                  Current_Exn   => Null_Unbounded_String,
                                                  In_Handler    => False,
-                                                 SS_Mark       => Null_Unbounded_String));
+                                                 SS_Mark       => Null_Unbounded_String,
+                                                 SP_Mark       => Null_Unbounded_String));
                         end if;
-                        if not Is_Global and then Length (Ctx.Cur_Master_Reg) > 0 and then Gid /= 0 then
+                        if Gid /= 0 then
                            -- LRM 9.3(2): activate ONLY tasks belonging to this package's group_id!
-                           Emit_Call_Or_Invoke (Ctx, "@__ada_master_activate_group",
-                             To_String (Ctx.Cur_Master_Reg) & ", " & Img (Long_Long_Integer (Gid)), "", Dummy);
+                           declare
+                              Mst_R : Unbounded_String := Ctx.Cur_Master_Reg;
+                           begin
+                              if Length (Mst_R) = 0 then
+                                 Emit_Call_Or_Invoke (Ctx, "@__ada_global_master", "", "ptr", Mst_R, Nounwind => True);
+                              end if;
+                              Emit_Call_Or_Invoke (Ctx, "@__ada_master_activate_group",
+                                To_String (Mst_R) & ", " & Img (Long_Long_Integer (Gid)), "", Dummy);
+                           end;
                         end if;
+                        Scan_Label_Master_Depths (Ctx, D (AS_STM_S, Bdy),
+                          Natural (Ctx.Master_Stack.Length), Natural (Ctx.SS_Marks.Length), Natural (Ctx.SP_Marks.Length));
+                        Scan_Label_Master_Depths (Ctx, Alt_S,
+                          Natural (Ctx.Master_Stack.Length), Natural (Ctx.SS_Marks.Length), Natural (Ctx.SP_Marks.Length));
                         Emit_Stm_List (Ctx, D (AS_STM_S, Bdy));
                         if Has_Hdl then
                            if not Is_Terminated (Ctx.E) then
@@ -3506,7 +4691,33 @@ package body Cg_Stmt is
                            Mark_Subunit_Subps (D (AS_DECL_S2, PSpec));
                         end if;
                         Add_Extern_Func (Ctx.E, Elab_S, "extern func " & Elab_S & "() -> void cc ""internal""");
-                        Emit_Call_Or_Invoke (Ctx, Elab_S, "", "", Dummy);
+                        -- P3-4.9: Propagate enclosing local master to separate package body subunit via TLS active master
+                        if Length (Ctx.Cur_Master_Reg) > 0 then
+                           declare
+                              Prev_AM : Unbounded_String;
+                              L_Unw   : constant String := Next_Label (Ctx.E, "spbu");
+                              L_Ok    : constant String := Next_Label (Ctx.E, "spbo");
+                              Ex_R    : constant String := Next_Reg (Ctx.E, "spbe");
+                              Dummy2  : Unbounded_String;
+                           begin
+                              Emit_Call_Or_Invoke (Ctx, "@__ada_set_active_master", To_String (Ctx.Cur_Master_Reg), "ptr", Prev_AM, Nounwind => True);
+                              Ctx.Handlers.Append ((Handler_Label => To_Unbounded_String (L_Unw),
+                                                    Current_Exn   => Null_Unbounded_String,
+                                                    In_Handler    => False,
+                                                    SS_Mark       => Null_Unbounded_String,
+                                                    SP_Mark       => Null_Unbounded_String));
+                              Emit_Call_Or_Invoke (Ctx, Elab_S, "", "", Dummy);
+                              Ctx.Handlers.Delete_Last;
+                              Emit_Call_Or_Invoke (Ctx, "@__ada_set_active_master", To_String (Prev_AM), "ptr", Dummy2, Nounwind => True);
+                              Emit_Term (Ctx.E, "jmp " & L_Ok);
+                              Emit_Label (Ctx.E, L_Unw, Ex_R & ": ptr");
+                              Emit_Call_Or_Invoke (Ctx, "@__ada_set_active_master", To_String (Prev_AM), "ptr", Dummy2, Nounwind => True);
+                              Emit_Raise_Reg (Ctx, Ex_R);
+                              Emit_Label (Ctx.E, L_Ok);
+                           end;
+                        else
+                           Emit_Call_Or_Invoke (Ctx, Elab_S, "", "", Dummy);
+                        end if;
                      end;
                   end if;
                end;
@@ -3518,11 +4729,11 @@ package body Cg_Stmt is
                   TS_Check : TREE := CONST_VOID;
                begin
                   if not Is_Void_Tree (Src) then
-                     if KIND (Src) = DN_TYPE_ID then TS_Check := Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_TYPE_SPEC, Src)));
+                     if KIND (Src) in CLASS_TYPE_NAME then TS_Check := Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_TYPE_SPEC, Src)));
                      elsif KIND (Src) = DN_VARIABLE_ID then TS_Check := Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_OBJ_TYPE, Src)));
                      end if;
                   end if;
-                  -- LRM 3.9: track task body elaboration flag (c39008a/b/c, c93007a)
+                  -- LRM 3.9: track task body elaboration flag (c39008a/b/c, c93007a); P3-4.3: stack-local for local tasks!
                   if Ctx.Enable_Checks and then not Ctx.In_Subunit
                     and then not Is_Void_Tree (TS_Check) and then KIND (TS_Check) = DN_TASK_SPEC
                     and then Ctx.Tasks.Contains (Tree_Key (TS_Check))
@@ -3531,56 +4742,142 @@ package body Cg_Stmt is
                         TK       : constant Unsigned_32 := Tree_Key (TS_Check);
                         TI       : Task_Info := Ctx.Tasks.Element (TK);
                         Is_Exp_T : constant Boolean :=
-                          Is_Global and then Export_All and then Length (Ctx.Gen_Inst_Tag) = 0
-                          and then Is_Library_Level (Src);
+                          Is_Global and then Export_All and then Is_Library_Level (Src);
                         Link_T   : constant String := (if Is_Exp_T then "export " else "");
                         GSym     : constant String :=
                           (if Is_Exp_T then "@ada_telab__" & Qualified_Ada_Name (Src)
                            else "@ada_telab_" & Tree_Key_Str (TS_Check) & To_String (Ctx.Gen_Inst_Tag));
                         GA       : constant String := Next_Reg (Ctx.E, "tea");
                      begin
-                        Add_Global_Decl (Ctx.E, GSym, Link_T & GSym & " = global i8 = 0, align 1");
-                        Emit_Inst (Ctx.E, GA & " = addr " & GSym);
-                        Emit_Inst (Ctx.E, "store.i8 0, " & GA & ", align 1");
-                        TI.Elab_Flag := To_Unbounded_String (GSym);
-                        Ctx.Tasks.Replace (TK, TI);
+                        if not Is_Global and then Ctx.Cur_Subp_Key /= 0 then
+                           declare
+                              TLoc   : constant String := Next_Reg (Ctx.E, "tel");
+                              Cap_Sl : Natural := 0;
+                           begin
+                              Emit_Entry_Alloca (Ctx.E, TLoc & " = alloca i8, align 1");
+                              Emit_Inst (Ctx.E, "store.i8 0, " & TLoc & ", align 1");
+                              if Ctx.Vars.Contains (TK) and then Ctx.Vars.Element (TK).Owner_Subp = Ctx.Cur_Subp_Key then
+                                 Cap_Sl := Ctx.Vars.Element (TK).Captured_Slot;
+                              end if;
+                              if Cap_Sl > 0 and then Length (Ctx.Cur_Frame_Reg) > 0 then
+                                 declare
+                                    FSI : constant Subp_Info := Ctx.Subps.Element (Ctx.Cur_Subp_Key);
+                                    FP  : constant String := Next_Reg (Ctx.E, "tefp");
+                                 begin
+                                    Emit_Inst (Ctx.E, FP & " = field_ptr " & To_String (FSI.Frame_Type) & ", " & To_String (Ctx.Cur_Frame_Reg) & ", " & Img (Cap_Sl));
+                                    Emit_Inst (Ctx.E, "store.ptr " & TLoc & ", " & FP & ", align 8");
+                                 end;
+                              end if;
+                              Add_Global_Decl (Ctx.E, GSym, GSym & " = global i8 = 0, align 1");
+                              Emit_Inst (Ctx.E, GA & " = addr " & GSym);
+                              Emit_Inst (Ctx.E, "store.i8 0, " & GA & ", align 1");
+                              TI.Elab_Flag     := To_Unbounded_String (TLoc);
+                              TI.Elab_Is_Local := True;
+                              TI.Elab_Owner    := Ctx.Cur_Subp_Key;
+                              TI.Elab_Cap_Slot := Cap_Sl;
+                              TI.Elab_Fallback := To_Unbounded_String (GSym);
+                              Ctx.Tasks.Replace (TK, TI);
+                           end;
+                        else
+                           Add_Global_Decl (Ctx.E, GSym, Link_T & GSym & " = global i8 = 0, align 1");
+                           Emit_Inst (Ctx.E, GA & " = addr " & GSym);
+                           Emit_Inst (Ctx.E, "store.i8 0, " & GA & ", align 1");
+                           TI.Elab_Flag     := To_Unbounded_String (GSym);
+                           TI.Elab_Is_Local := False;
+                           Ctx.Tasks.Replace (TK, TI);
+                        end if;
                      end;
                   end if;
-                  if Ctx.Enable_Checks and then not Is_Void_Tree (TS_Check) and then KIND (TS_Check) = DN_TASK_SPEC
+                  -- P3-4.10: Elaborate & save dynamic entry family bounds/base/count ONCE at DN_TASK_DECL
+                  if not Is_Void_Tree (TS_Check) and then KIND (TS_Check) = DN_TASK_SPEC
                     and then not Is_Void_Tree (D (SM_DECL_S, TS_Check))
                   then
                      declare
-                        EL : SEQ_TYPE := LIST (D (SM_DECL_S, TS_Check));
-                        EN : TREE;
+                        TK_E       : constant Unsigned_32 := Tree_Key (TS_Check);
+                        Has_Dyn_E  : constant Boolean :=
+                          Ctx.Tasks.Contains (TK_E) and then Ctx.Tasks.Element (TK_E).Has_Dyn_Entries;
+                        Is_Exp_EF  : constant Boolean :=
+                          Is_Global and then Export_All and then Is_Library_Level (Src);
+                        EF_Link    : constant String := (if Is_Exp_EF then "export " else "");
+                        Cur_Base   : Unbounded_String := To_Unbounded_String ("0");
+                        EL         : SEQ_TYPE := LIST (D (SM_DECL_S, TS_Check));
+                        EN         : TREE;
                      begin
+                        if Has_Dyn_E then
+                           declare
+                              Z0 : constant String := Next_Reg (Ctx.E, "efb0");
+                           begin
+                              Emit_Inst (Ctx.E, Z0 & " = const.i32 0");
+                              Cur_Base := To_Unbounded_String (Z0);
+                           end;
+                        end if;
                         while not IS_EMPTY (EL) loop
                            POP (EL, EN);
                            if KIND (EN) = DN_SUBPROG_ENTRY_DECL then
                               declare
-                                 Hdr : constant TREE := D (AS_HEADER, EN);
-                                 DR  : constant TREE := (if not Is_Void_Tree (Hdr) and then KIND (Hdr) = DN_ENTRY then D (AS_DISCRETE_RANGE, Hdr) else CONST_VOID);
+                                 EID  : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, EN));
+                                 EK_E : constant Unsigned_32 := Tree_Key (EID);
+                                 Hdr  : constant TREE := D (AS_HEADER, EN);
+                                 DR   : constant TREE := (if not Is_Void_Tree (Hdr) and then KIND (Hdr) = DN_ENTRY then D (AS_DISCRETE_RANGE, Hdr) else CONST_VOID);
+                                 Has_EI_E : constant Boolean := Ctx.Entries.Contains (EK_E);
+                                 EI_E     : Entry_Info;
+                                 Lo32_E, Hi32_E : Unbounded_String;
+                                 Have_Dyn_Bounds : Boolean := False;
                               begin
+                                 if Has_EI_E then
+                                    EI_E := Ctx.Entries.Element (EK_E);
+                                 end if;
+                                 if Has_Dyn_E and then Has_EI_E and then Length (EI_E.Fam_Base_Sym) > 0 then
+                                    declare
+                                       BSym : constant String := To_String (EI_E.Fam_Base_Sym);
+                                       BA   : constant String := Next_Reg (Ctx.E, "efbd");
+                                    begin
+                                       Add_Global_Decl (Ctx.E, BSym, EF_Link & BSym & " = global i32 = 0, align 4");
+                                       Emit_Inst (Ctx.E, BA & " = addr " & BSym);
+                                       Emit_Inst (Ctx.E, "store.i32 " & To_String (Cur_Base) & ", " & BA & ", align 4");
+                                    end;
+                                 end if;
                                  if not Is_Void_Tree (DR) and then KIND (DR) = DN_DISCRETE_SUBTYPE then
                                     declare
                                        SI_N : constant TREE := D (AS_SUBTYPE_INDICATION, DR);
                                        C_N  : constant TREE := (if KIND (SI_N) = DN_SUBTYPE_INDICATION then D (AS_CONSTRAINT, SI_N) else CONST_VOID);
                                     begin
-                                       if not Is_Void_Tree (C_N) and then KIND (C_N) = DN_RANGE then
+                                       if not Is_Void_Tree (C_N) and then KIND (C_N) in DN_RANGE | DN_RANGE_ATTRIBUTE then
                                           declare
                                              Base_T : constant TREE := Subst_Tree (Ctx, D (SM_TYPE_SPEC, Get_Name_Defn (D (AS_NAME, SI_N))));
                                              PT_U, Lo_R, Hi_R : Unbounded_String;
-                                             Non_Null : constant String := Next_Reg (Ctx.E, "efnn");
-                                             L_Chk    : constant String := Next_Label (Ctx.E, "efc");
-                                             L_Done   : constant String := Next_Label (Ctx.E, "efd");
+                                             Uns_B    : Boolean;
                                           begin
                                              Emit_Discrete_Range (Ctx, C_N, PT_U, Lo_R, Hi_R);
-                                             Emit_Inst (Ctx.E, Non_Null & " = cmp_le_s." & To_String (PT_U) & " " & To_String (Lo_R) & ", " & To_String (Hi_R));
-                                             Emit_Term (Ctx.E, "br " & Non_Null & ", " & L_Chk & ", " & L_Done);
-                                             Emit_Label (Ctx.E, L_Chk);
-                                             Emit_Range_Check (Ctx, To_String (Lo_R), To_String (PT_U), Base_T);
-                                             Emit_Range_Check (Ctx, To_String (Hi_R), To_String (PT_U), Base_T);
-                                             Emit_Term (Ctx.E, "jmp " & L_Done);
-                                             Emit_Label (Ctx.E, L_Done);
+                                             Uns_B := Is_Unsigned_Scalar (Base_T, To_String (PT_U));
+                                             if Ctx.Enable_Checks then
+                                                declare
+                                                   Non_Null : constant String := Next_Reg (Ctx.E, "efnn");
+                                                   L_Chk    : constant String := Next_Label (Ctx.E, "efc");
+                                                   L_Done   : constant String := Next_Label (Ctx.E, "efd");
+                                                   Le_Op    : constant String := (if Uns_B then "cmp_le_u." else "cmp_le_s.");
+                                                begin
+                                                   Emit_Inst (Ctx.E, Non_Null & " = " & Le_Op & To_String (PT_U) & " " & To_String (Lo_R) & ", " & To_String (Hi_R));
+                                                   Emit_Term (Ctx.E, "br " & Non_Null & ", " & L_Chk & ", " & L_Done);
+                                                   Emit_Label (Ctx.E, L_Chk);
+                                                   Emit_Range_Check (Ctx, To_String (Lo_R), To_String (PT_U), Base_T);
+                                                   Emit_Range_Check (Ctx, To_String (Hi_R), To_String (PT_U), Base_T);
+                                                   Emit_Term (Ctx.E, "jmp " & L_Done);
+                                                   Emit_Label (Ctx.E, L_Done);
+                                                end;
+                                             end if;
+                                             Lo32_E := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (Lo_R), To_String (PT_U), "i32", Is_Unsigned => Uns_B));
+                                             Hi32_E := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (Hi_R), To_String (PT_U), "i32", Is_Unsigned => Uns_B));
+                                             Have_Dyn_Bounds := True;
+                                          end;
+                                       elsif Has_Dyn_E and then Has_EI_E and then not EI_E.Fam_Is_Static then
+                                          declare
+                                             PT_U, Lo_R, Hi_R : Unbounded_String;
+                                          begin
+                                             Emit_Discrete_Range (Ctx, DR, PT_U, Lo_R, Hi_R);
+                                             Lo32_E := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (Lo_R), To_String (PT_U), "i32"));
+                                             Hi32_E := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (Hi_R), To_String (PT_U), "i32"));
+                                             Have_Dyn_Bounds := True;
                                           end;
                                        end if;
                                     end;
@@ -3588,13 +4885,80 @@ package body Cg_Stmt is
                                     declare
                                        PT_U, Lo_R, Hi_R : Unbounded_String;
                                     begin
-                                       Emit_Discrete_Range (Ctx, DR, PT_U, Lo_R, Hi_R);
-                                       pragma Unreferenced (PT_U, Lo_R, Hi_R);
+                                       if Ctx.Enable_Checks or else (Has_Dyn_E and then Has_EI_E and then not EI_E.Fam_Is_Static) then
+                                          Emit_Discrete_Range (Ctx, DR, PT_U, Lo_R, Hi_R);
+                                          Lo32_E := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (Lo_R), To_String (PT_U), "i32"));
+                                          Hi32_E := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (Hi_R), To_String (PT_U), "i32"));
+                                          Have_Dyn_Bounds := True;
+                                       end if;
                                     end;
+                                 end if;
+                                 if Has_Dyn_E and then Has_EI_E then
+                                    if EI_E.Is_Family and then not EI_E.Fam_Is_Static and then Have_Dyn_Bounds then
+                                       declare
+                                          LSym : constant String := To_String (EI_E.Fam_Lo_Sym);
+                                          HSym : constant String := To_String (EI_E.Fam_Hi_Sym);
+                                          LA   : constant String := Next_Reg (Ctx.E, "efld");
+                                          HA   : constant String := Next_Reg (Ctx.E, "efhd");
+                                          Ge   : constant String := Next_Reg (Ctx.E, "efge");
+                                          Df   : constant String := Next_Reg (Ctx.E, "efdf");
+                                          P1   : constant String := Next_Reg (Ctx.E, "efp1");
+                                          Cnt  : constant String := Next_Reg (Ctx.E, "efct");
+                                          Nxt  : constant String := Next_Reg (Ctx.E, "efnx");
+                                       begin
+                                          Add_Global_Decl (Ctx.E, LSym, EF_Link & LSym & " = global i32 = 0, align 4");
+                                          Add_Global_Decl (Ctx.E, HSym, EF_Link & HSym & " = global i32 = -1, align 4");
+                                          Emit_Inst (Ctx.E, LA & " = addr " & LSym);
+                                          Emit_Inst (Ctx.E, "store.i32 " & To_String (Lo32_E) & ", " & LA & ", align 4");
+                                          Emit_Inst (Ctx.E, HA & " = addr " & HSym);
+                                          Emit_Inst (Ctx.E, "store.i32 " & To_String (Hi32_E) & ", " & HA & ", align 4");
+                                          Emit_Inst (Ctx.E, Ge & " = cmp_ge_s.i32 " & To_String (Hi32_E) & ", " & To_String (Lo32_E));
+                                          Emit_Inst (Ctx.E, Df & " = sub.i32 " & To_String (Hi32_E) & ", " & To_String (Lo32_E));
+                                          Emit_Inst (Ctx.E, P1 & " = add.i32 " & Df & ", 1");
+                                          Emit_Inst (Ctx.E, Cnt & " = select.i32 " & Ge & ", " & P1 & ", 0");
+                                          Emit_Inst (Ctx.E, Nxt & " = add.i32 " & To_String (Cur_Base) & ", " & Cnt);
+                                          Cur_Base := To_Unbounded_String (Nxt);
+                                       end;
+                                    elsif EI_E.Is_Family and then EI_E.Fam_Is_Static then
+                                       declare
+                                          Sz_S : constant Long_Long_Integer :=
+                                            (if EI_E.Fam_Hi >= EI_E.Fam_Lo then Long_Long_Integer (EI_E.Fam_Hi - EI_E.Fam_Lo + 1) else 0);
+                                          Nxt  : constant String := Next_Reg (Ctx.E, "efnx");
+                                       begin
+                                          if Sz_S > 0 then
+                                             Emit_Inst (Ctx.E, Nxt & " = add.i32 " & To_String (Cur_Base) & ", " & Img (Sz_S));
+                                             Cur_Base := To_Unbounded_String (Nxt);
+                                          end if;
+                                       end;
+                                    else
+                                       declare
+                                          Nxt : constant String := Next_Reg (Ctx.E, "efnx");
+                                       begin
+                                          Emit_Inst (Ctx.E, Nxt & " = add.i32 " & To_String (Cur_Base) & ", 1");
+                                          Cur_Base := To_Unbounded_String (Nxt);
+                                       end;
+                                    end if;
                                  end if;
                               end;
                            end if;
                         end loop;
+                        if Has_Dyn_E and then Ctx.Tasks.Contains (TK_E) then
+                           declare
+                              TI_E : constant Task_Info := Ctx.Tasks.Element (TK_E);
+                              NSym : constant String := To_String (TI_E.Dyn_Entries_Sym);
+                              Gt0  : constant String := Next_Reg (Ctx.E, "efg0");
+                              Tot  : constant String := Next_Reg (Ctx.E, "eftt");
+                              NA   : constant String := Next_Reg (Ctx.E, "efna");
+                           begin
+                              if NSym'Length > 0 then
+                                 Add_Global_Decl (Ctx.E, NSym, EF_Link & NSym & " = global i32 = 1, align 4");
+                                 Emit_Inst (Ctx.E, Gt0 & " = cmp_gt_s.i32 " & To_String (Cur_Base) & ", 0");
+                                 Emit_Inst (Ctx.E, Tot & " = select.i32 " & Gt0 & ", " & To_String (Cur_Base) & ", 1");
+                                 Emit_Inst (Ctx.E, NA & " = addr " & NSym);
+                                 Emit_Inst (Ctx.E, "store.i32 " & Tot & ", " & NA & ", align 4");
+                              end if;
+                           end;
+                        end if;
                      end;
                   end if;
                end;
@@ -3613,9 +4977,9 @@ package body Cg_Stmt is
                         if Is_Global then
                            declare
                               GSym : constant String :=
-                                (if Export_All and then Length (Ctx.Gen_Inst_Tag) = 0 then "@ada_g__" & Qualified_Ada_Name (Can_Id)
+                                (if Export_All and then Is_Library_Level (Can_Id) then "@ada_g__" & Qualified_Ada_Name (Can_Id)
                                  else "@ada_g__" & Qualified_Ada_Name (Can_Id) & "_" & Tree_Key_Str (Can_Id) & To_String (Ctx.Gen_Inst_Tag));
-                              Link : constant String := (if Export_All and then Length (Ctx.Gen_Inst_Tag) = 0 then "export " else "");
+                              Link : constant String := (if Export_All and then Is_Library_Level (Can_Id) then "export " else "");
                               GA   : constant String := Next_Reg (Ctx.E, "tga");
                            begin
                               Add_Global_Decl (Ctx.E, GSym, Link & GSym & " = global ptr = zeroinit, align 8");
@@ -3673,18 +5037,32 @@ package body Cg_Stmt is
                         TI : constant Task_Info := Ctx.Tasks.Element (Tree_Key (TS));
                      begin
                         if Length (TI.Elab_Flag) > 0 then
-                           declare
-                              GA : constant String := Next_Reg (Ctx.E, "te1");
-                           begin
-                              Emit_Inst (Ctx.E, GA & " = addr " & To_String (TI.Elab_Flag));
-                              Emit_Inst (Ctx.E, "store.i8 1, " & GA & ", align 1");
+                           if TI.Elab_Is_Local then
+                              if TI.Elab_Owner = Ctx.Cur_Subp_Key then
+                                 Emit_Inst (Ctx.E, "store.i8 1, " & To_String (TI.Elab_Flag) & ", align 1");
+                              end if;
+                              if Length (TI.Elab_Fallback) > 0 then
+                                 declare
+                                    GA : constant String := Next_Reg (Ctx.E, "te1");
+                                 begin
+                                    Emit_Inst (Ctx.E, GA & " = addr " & To_String (TI.Elab_Fallback));
+                                    Emit_Inst (Ctx.E, "store.i8 1, " & GA & ", align 1");
+                                 end;
+                              end if;
                               Did_Set := True;
-                           end;
+                           else
+                              declare
+                                 GA : constant String := Next_Reg (Ctx.E, "te1");
+                              begin
+                                 Emit_Inst (Ctx.E, GA & " = addr " & To_String (TI.Elab_Flag));
+                                 Emit_Inst (Ctx.E, "store.i8 1, " & GA & ", align 1");
+                                 Did_Set := True;
+                              end;
+                           end if;
                         end if;
                      end;
                   end if;
                   if not Did_Set and then Ctx.Enable_Checks and then not Ctx.In_Subunit
-                    and then Length (Ctx.Gen_Inst_Tag) = 0
                     and then not Is_Void_Tree (TB_Id) and then Is_Library_Level (TB_Id)
                   then
                      declare
@@ -3710,6 +5088,15 @@ package body Cg_Stmt is
                            GSym : constant String := To_String (Ctx.Gen_Elab_Flags.Element (Tree_Key (SID)).Pir_Type);
                            GA   : constant String := Next_Reg (Ctx.E, "ge1");
                         begin
+                           Emit_Inst (Ctx.E, GA & " = addr " & GSym);
+                           Emit_Inst (Ctx.E, "store.i8 1, " & GA & ", align 1");
+                        end;
+                     elsif Ctx.Enable_Checks and then not Ctx.In_Subunit and then Is_Library_Level (SID) then
+                        declare
+                           GSym : constant String := "@ada_gelab__" & Qualified_Ada_Name (SID);
+                           GA   : constant String := Next_Reg (Ctx.E, "ge1");
+                        begin
+                           Add_Global_Decl (Ctx.E, GSym, "extern " & GSym & " = global i8, align 1");
                            Emit_Inst (Ctx.E, GA & " = addr " & GSym);
                            Emit_Inst (Ctx.E, "store.i8 1, " & GA & ", align 1");
                         end;
@@ -3805,13 +5192,23 @@ package body Cg_Stmt is
 
       Emit_Label (Ctx.E, Hdl_Label, Exn_Reg & ": ptr");
 
-      -- Reclaim any Secondary Stack temporaries allocated in the failed try body!
+      -- LRM 9.10(6): beginning of an exception handler is a mandatory abort sync point
+      declare
+         Dummy_Ab : Unbounded_String;
+      begin
+         Emit_Call_Or_Invoke (Ctx, "@__ada_check_abort", "", "", Dummy_Ab, Nounwind => True);
+      end;
+
+      -- Reclaim any Secondary Stack temporaries & inner alloca_dyn allocations from the failed try body!
       declare
          HE : constant Handler_Entry := Ctx.Handlers.Element (Top_Idx);
          Dummy : Unbounded_String;
       begin
          if Length (HE.SS_Mark) > 0 then
             Emit_Call_Or_Invoke (Ctx, "@__ada_ss_release", To_String (HE.SS_Mark), "", Dummy, Nounwind => True);
+         end if;
+         if Length (HE.SP_Mark) > 0 then
+            Emit_Inst (Ctx.E, "stackrestore " & To_String (HE.SP_Mark));
          end if;
       end;
 
@@ -3899,39 +5296,67 @@ package body Cg_Stmt is
          return True;
       elsif Is_Constrained_Array (R) or else KIND (R) = DN_ARRAY then
          declare
-            BT : constant TREE := Base_Type_Spec (R);
+            BT : constant TREE := Subst_Base_Type (Ctx, R);
          begin
             return not Is_Void_Tree (BT) and then KIND (BT) = DN_ARRAY
               and then Type_Contains_Task (Ctx, D (SM_COMP_TYPE, BT), Depth + 1);
          end;
       elsif Is_Record_Type (R) then
          declare
-            BT : constant TREE := Base_Type_Spec (R);
-         begin
-            if not Is_Void_Tree (BT) and then KIND (BT) = DN_RECORD then
+            BT : constant TREE := Subst_Base_Type (Ctx, R);
+
+            function Comp_List_Contains_Task (CL : TREE; Dp : Natural) return Boolean is
+            begin
+               if Is_Void_Tree (CL) or else Dp > 8 then
+                  return False;
+               end if;
+               if not Is_Void_Tree (D (AS_DECL_S, CL)) then
+                  declare
+                     DL   : SEQ_TYPE := LIST (D (AS_DECL_S, CL));
+                     Decl : TREE;
+                  begin
+                     while not IS_EMPTY (DL) loop
+                        POP (DL, Decl);
+                        if KIND (Decl) = DN_VARIABLE_DECL then
+                           declare
+                              CID : constant TREE := HEAD (LIST (D (AS_SOURCE_NAME_S, Decl)));
+                           begin
+                              if Type_Contains_Task (Ctx, D (SM_OBJ_TYPE, CID), Dp + 1) then
+                                 return True;
+                              end if;
+                           end;
+                        end if;
+                     end loop;
+                  end;
+               end if;
                declare
-                  CL : constant TREE := D (SM_COMP_LIST, BT);
+                  VP : constant TREE := D (AS_VARIANT_PART, CL);
                begin
-                  if not Is_Void_Tree (CL) and then not Is_Void_Tree (D (AS_DECL_S, CL)) then
+                  if not Is_Void_Tree (VP) and then KIND (VP) = DN_VARIANT_PART
+                    and then not Is_Void_Tree (D (AS_VARIANT_S, VP))
+                  then
                      declare
-                        DL : SEQ_TYPE := LIST (D (AS_DECL_S, CL));
-                        Decl : TREE;
+                        VL : SEQ_TYPE := LIST (D (AS_VARIANT_S, VP));
+                        VN : TREE;
                      begin
-                        while not IS_EMPTY (DL) loop
-                           POP (DL, Decl);
-                           if KIND (Decl) = DN_VARIABLE_DECL then
-                              declare
-                                 CID : constant TREE := HEAD (LIST (D (AS_SOURCE_NAME_S, Decl)));
-                              begin
-                                 if Type_Contains_Task (Ctx, D (SM_OBJ_TYPE, CID), Depth + 1) then
-                                    return True;
-                                 end if;
-                              end;
+                        while not IS_EMPTY (VL) loop
+                           POP (VL, VN);
+                           if KIND (VN) = DN_VARIANT
+                             and then Comp_List_Contains_Task (D (AS_COMP_LIST, VN), Dp + 1)
+                           then
+                              return True;
                            end if;
                         end loop;
                      end;
                   end if;
                end;
+               return False;
+            end Comp_List_Contains_Task;
+         begin
+            if not Is_Void_Tree (BT) and then KIND (BT) = DN_RECORD then
+               if Comp_List_Contains_Task (D (SM_COMP_LIST, BT), Depth) then
+                  return True;
+               end if;
             end if;
          end;
       end if;
@@ -3958,7 +5383,7 @@ package body Cg_Stmt is
                     (if not Is_Void_Tree (TID) and then KIND (TID) in CLASS_TYPE_NAME
                      then Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_TYPE_SPEC, TID))) else CONST_VOID);
                begin
-                  if not Is_Void_Tree (TS) and then KIND (TS) = DN_ACCESS
+                  if not Is_Void_Tree (TS) and then KIND (TS) in DN_ACCESS | DN_CONSTRAINED_ACCESS
                     and then Type_Contains_Task (Ctx, D (SM_DESIG_TYPE, TS))
                   then
                      return True;
@@ -3990,15 +5415,76 @@ package body Cg_Stmt is
                   if not Is_Void_Tree (UK) and then KIND (UK) = DN_INSTANTIATION then
                      declare
                         Gen_Id : constant TREE := Canonical_Def (Get_Name_Defn (D (AS_NAME, UK)));
+                        GK     : constant Unsigned_32 := Tree_Key (Gen_Id);
+                        GB     : TREE := CONST_VOID;
                      begin
-                        if not Is_Void_Tree (Gen_Id) and then Ctx.Generic_Body.Contains (Tree_Key (Gen_Id)) then
+                        if not Is_Void_Tree (Gen_Id) then
+                           if Ctx.Generic_Body.Contains (GK) then
+                              GB := Ctx.Generic_Body.Element (GK);
+                           elsif KIND (Gen_Id) = DN_GENERIC_ID then
+                              GB := D (SM_BODY, Gen_Id);
+                              if Is_Void_Tree (GB) then
+                                 GB := D (XD_BODY, Gen_Id);
+                              end if;
+                           end if;
+                        end if;
+                        if not Is_Void_Tree (GB) then
                            declare
-                              GB : constant TREE := Ctx.Generic_Body.Element (Tree_Key (Gen_Id));
                               BB : constant TREE := (if KIND (GB) = DN_PACKAGE_BODY then D (AS_BODY, GB) else GB);
+                              Saved_Sub : constant Tree_Maps.Map := Ctx.Generic_Subst;
+                              GDecl : constant TREE :=
+                                (if Ctx.Generic_Decls.Contains (GK) then Ctx.Generic_Decls.Element (GK)
+                                 else CONST_VOID);
+                              Param_S : constant TREE :=
+                                (if not Is_Void_Tree (GDecl) and then KIND (GDecl) = DN_GENERIC_DECL then D (AS_ITEM_S, GDecl)
+                                 elsif not Is_Void_Tree (Gen_Id) and then KIND (Gen_Id) = DN_GENERIC_ID then D (SM_GENERIC_PARAM_S, Gen_Id)
+                                 else CONST_VOID);
+                              ADecls_N : constant TREE := D (SM_DECL_S, UK);
+                              Res_Has : Boolean := False;
                            begin
-                              if not Is_Void_Tree (BB) and then KIND (BB) = DN_BLOCK_BODY
-                                and then Item_List_Has_Tasks (Ctx, D (AS_ITEM_S, BB))
-                              then
+                              -- Temporarily map formal types -> actual types so tasks via formal limited private types are detected!
+                              if not Is_Void_Tree (Param_S) and then not Is_Void_Tree (ADecls_N) then
+                                 declare
+                                    FL : SEQ_TYPE := LIST (Param_S);
+                                    AL : SEQ_TYPE := LIST (ADecls_N);
+                                    FI, AD : TREE;
+                                 begin
+                                    while not IS_EMPTY (FL) and then not IS_EMPTY (AL) loop
+                                       POP (FL, FI);
+                                       if KIND (FI) in DN_IN | DN_IN_OUT then
+                                          declare
+                                             FNS : SEQ_TYPE := LIST (D (AS_SOURCE_NAME_S, FI));
+                                             Dummy_F : TREE;
+                                          begin
+                                             while not IS_EMPTY (FNS) and then not IS_EMPTY (AL) loop
+                                                POP (FNS, Dummy_F);
+                                                POP (AL, AD);
+                                             end loop;
+                                          end;
+                                       else
+                                          POP (AL, AD);
+                                          if KIND (FI) = DN_TYPE_DECL and then KIND (AD) = DN_SUBTYPE_DECL then
+                                             declare
+                                                F_Tid : constant TREE := D (AS_SOURCE_NAME, FI);
+                                                F_Ts  : constant TREE := D (SM_TYPE_SPEC, F_Tid);
+                                                A_Sid : constant TREE := D (AS_SOURCE_NAME, AD);
+                                                A_Ts  : constant TREE := D (SM_TYPE_SPEC, A_Sid);
+                                             begin
+                                                Ctx.Generic_Subst.Include (Tree_Key (F_Tid), A_Sid);
+                                                if not Is_Void_Tree (F_Ts) and then not Is_Void_Tree (A_Ts) then
+                                                   Ctx.Generic_Subst.Include (Tree_Key (F_Ts), A_Ts);
+                                                end if;
+                                             end;
+                                          end if;
+                                       end if;
+                                    end loop;
+                                 end;
+                              end if;
+                              if not Is_Void_Tree (BB) and then KIND (BB) = DN_BLOCK_BODY then
+                                 Res_Has := Item_List_Has_Tasks (Ctx, D (AS_ITEM_S, BB));
+                              end if;
+                              Ctx.Generic_Subst := Saved_Sub;
+                              if Res_Has then
                                  return True;
                               end if;
                            end;
@@ -4014,6 +5500,9 @@ package body Cg_Stmt is
                      if Item_List_Has_Tasks (Ctx, D (AS_ITEM_S, Bdy)) then
                         return True;
                      end if;
+                  elsif not Is_Void_Tree (Bdy) and then KIND (Bdy) = DN_STUB then
+                     -- P3-4.9: Separate local package body subunit may declare tasks attached to enclosing master
+                     return True;
                   end if;
                end;
             when others =>
@@ -4033,7 +5522,13 @@ package body Cg_Stmt is
       end if;
    end Emit_Master_Leave_To;
 
-   procedure Scan_Label_Master_Depths (Ctx : in out Context; Node : TREE; Depth : Natural) is
+   procedure Scan_Label_Master_Depths
+     (Ctx      : in out Context;
+      Node     : TREE;
+      Depth    : Natural;
+      SS_Depth : Natural := 0;
+      SP_Depth : Natural := 0)
+   is
       K : NODE_NAME;
    begin
       if Is_Void_Tree (Node) or else Node.TPG <= 0 or else Node.TLN = 0 then
@@ -4054,23 +5549,42 @@ package body Cg_Stmt is
                while not IS_EMPTY (LL) loop
                   POP (LL, LID);
                   Ctx.Label_Mst_Depths.Include (Tree_Key (LID), Integer_64 (Depth));
+                  Ctx.Label_SS_Depths.Include (Tree_Key (LID), Integer_64 (SS_Depth));
+                  Ctx.Label_SP_Depths.Include (Tree_Key (LID), Integer_64 (SP_Depth));
                end loop;
             end if;
          end;
-         Scan_Label_Master_Depths (Ctx, D (AS_STM, Node), Depth);
+         Scan_Label_Master_Depths (Ctx, D (AS_STM, Node), Depth, SS_Depth, SP_Depth);
          return;
       elsif K = DN_BLOCK then
          declare
-            BB    : constant TREE := D (AS_BLOCK_BODY, Node);
-            NextD : Natural := Depth;
+            BB      : constant TREE := D (AS_BLOCK_BODY, Node);
+            NextD   : Natural := Depth;
+            Next_SS : Natural := SS_Depth;
+            Next_SP : constant Natural := SP_Depth + 1;
          begin
             if not Is_Void_Tree (BB) then
                if Item_List_Has_Tasks (Ctx, D (AS_ITEM_S, BB)) then
                   NextD := Depth + 1;
                end if;
-               Scan_Label_Master_Depths (Ctx, D (AS_STM_S, BB), NextD);
-               Scan_Label_Master_Depths (Ctx, D (AS_ALTERNATIVE_S, BB), NextD);
+               if Tree_Uses_SS (Ctx, BB) and then not (Ctx.Cur_Ret_Uncon and then Tree_Has_Return (BB)) then
+                  Next_SS := SS_Depth + 1;
+               end if;
+               Scan_Label_Master_Depths (Ctx, D (AS_STM_S, BB), NextD, Next_SS, Next_SP);
+               Scan_Label_Master_Depths (Ctx, D (AS_ALTERNATIVE_S, BB), NextD, Next_SS, Next_SP);
             end if;
+         end;
+         return;
+      elsif K = DN_LOOP then
+         declare
+            Iter    : constant TREE := D (AS_ITERATION, Node);
+            BStms   : constant TREE := D (AS_STM_S, Node);
+            Cond_SS : constant Boolean :=
+              not Is_Void_Tree (Iter) and then KIND (Iter) = DN_WHILE and then Tree_Uses_SS (Ctx, D (AS_EXP, Iter));
+            Loop_SS : constant Boolean := Tree_Uses_SS (Ctx, BStms) or else Cond_SS;
+            Next_SS : constant Natural := SS_Depth + (if Loop_SS then 1 else 0);
+         begin
+            Scan_Label_Master_Depths (Ctx, BStms, Depth, Next_SS, SP_Depth);
          end;
          return;
       end if;
@@ -4081,12 +5595,12 @@ package body Cg_Stmt is
          begin
             while not IS_EMPTY (L) loop
                POP (L, Item);
-               Scan_Label_Master_Depths (Ctx, Item, Depth);
+               Scan_Label_Master_Depths (Ctx, Item, Depth, SS_Depth, SP_Depth);
             end loop;
          end;
       else
          for I in 1 .. ARITIES'Pos (ARITY (Node)) loop
-            Scan_Label_Master_Depths (Ctx, DABS (I, Node), Depth);
+            Scan_Label_Master_Depths (Ctx, DABS (I, Node), Depth, SS_Depth, SP_Depth);
          end loop;
       end if;
    end Scan_Label_Master_Depths;
@@ -4116,6 +5630,7 @@ package body Cg_Stmt is
          begin
             Emit_Inst (Ctx.E, SP & " = stacksave");
             Saved_SP := To_Unbounded_String (SP);
+            Ctx.SP_Marks.Append (Saved_SP);
          end;
          if Tree_Uses_SS (Ctx, Block_Node)
            and then not (Ctx.Cur_Ret_Uncon and then Tree_Has_Return (Block_Node))
@@ -4142,7 +5657,8 @@ package body Cg_Stmt is
             Ctx.Handlers.Append ((Handler_Label => MDec_Exc,
                                   Current_Exn   => Null_Unbounded_String,
                                   In_Handler    => False,
-                                  SS_Mark       => Null_Unbounded_String));
+                                  SS_Mark       => Null_Unbounded_String,
+                                  SP_Mark       => Null_Unbounded_String));
          end if;
 
          declare
@@ -4159,6 +5675,7 @@ package body Cg_Stmt is
                      if (KIND (IT) = DN_SUBPROGRAM_BODY or else KIND (IT) = DN_PACKAGE_BODY or else KIND (IT) = DN_TASK_BODY)
                        and then not Is_Void_Tree (D (AS_BODY, IT))
                        and then KIND (D (AS_BODY, IT)) = DN_STUB
+                       and then not Is_Gen_Subunit_Stub (Ctx, IT)
                      then
                         Block_Has_Stubs := True;
                         exit;
@@ -4179,7 +5696,8 @@ package body Cg_Stmt is
             Ctx.Handlers.Append ((Handler_Label => Mst_Exc,
                                   Current_Exn   => Null_Unbounded_String,
                                   In_Handler    => False,
-                                  SS_Mark       => Null_Unbounded_String));
+                                  SS_Mark       => Null_Unbounded_String,
+                                  SP_Mark       => Null_Unbounded_String));
          end if;
 
          if Has_Hdl then
@@ -4187,14 +5705,19 @@ package body Cg_Stmt is
             After_Lbl := To_Unbounded_String (Next_Label (Ctx.E, "exc_end"));
             declare
                H_Mark : Unbounded_String := Null_Unbounded_String;
+               H_SP   : constant String := Next_Reg (Ctx.E, "hsp");
             begin
-               if not Ctx.SS_Marks.Is_Empty then
-                  H_Mark := Ctx.SS_Marks.Last_Element;
+               -- Take a fresh SS mark & SP mark AFTER Emit_Decl_Items so entering an exception handler
+               -- never frees local dynamic/unconstrained arrays declared in this block/subprogram!
+               Emit_Inst (Ctx.E, H_SP & " = stacksave");
+               if not Ctx.Cur_Ret_Uncon and then Tree_Uses_SS (Ctx, Stm_S) then
+                  Emit_Call_Or_Invoke (Ctx, "@__ada_ss_mark", "", "i64", H_Mark, Nounwind => True);
                end if;
                Ctx.Handlers.Append ((Handler_Label => Hdl_Lbl,
                                      Current_Exn   => Null_Unbounded_String,
                                      In_Handler    => False,
-                                     SS_Mark       => H_Mark));
+                                     SS_Mark       => H_Mark,
+                                     SP_Mark       => To_Unbounded_String (H_SP)));
             end;
          end if;
 
@@ -4261,8 +5784,11 @@ package body Cg_Stmt is
          Ctx.SS_Marks.Delete_Last;
       end if;
 
-      if not Is_Subp and then Has_Dyn and then not Is_Terminated (Ctx.E) then
-         Emit_Inst (Ctx.E, "stackrestore " & To_String (Saved_SP));
+      if not Is_Subp then
+         if Has_Dyn and then not Is_Terminated (Ctx.E) then
+            Emit_Inst (Ctx.E, "stackrestore " & To_String (Saved_SP));
+         end if;
+         Ctx.SP_Marks.Delete_Last;
       end if;
    end Emit_Block_Body;
 
@@ -4398,10 +5924,9 @@ package body Cg_Stmt is
 
       Emit_Label (Ctx.E, L_Def);
       declare
-         Sel_BT  : constant TREE := Base_Type_Spec (Subst_Tree (Ctx, Sel.Ada_Type));
-         Is_Enum : constant Boolean := not Is_Void_Tree (Sel_BT) and then KIND (Sel_BT) = DN_ENUMERATION;
-         Ge_Op   : constant String := (if Is_Enum then "cmp_ge_u." else "cmp_ge_s.");
-         Le_Op   : constant String := (if Is_Enum then "cmp_le_u." else "cmp_le_s.");
+         Is_Uns : constant Boolean := Is_Unsigned_Scalar (Subst_Tree (Ctx, Sel.Ada_Type), PT);
+         Ge_Op  : constant String := (if Is_Uns then "cmp_ge_u." else "cmp_ge_s.");
+         Le_Op  : constant String := (if Is_Uns then "cmp_le_u." else "cmp_le_s.");
       begin
          for WR of Wide_Ranges loop
             declare
@@ -4458,7 +5983,8 @@ package body Cg_Stmt is
       Ctx.Loops.Append ((Label_Key    => L_Key,
                          Exit_Label   => To_Unbounded_String (L_End),
                          SS_Depth     => Natural (Ctx.SS_Marks.Length),
-                         Master_Depth => Natural (Ctx.Master_Stack.Length)));
+                         Master_Depth => Natural (Ctx.Master_Stack.Length),
+                         SP_Depth     => Natural (Ctx.SP_Marks.Length)));
 
       if Is_Void_Tree (Iter) then
          -- Infinite loop
@@ -4481,9 +6007,21 @@ package body Cg_Stmt is
             Emit_Term (Ctx.E, "jmp " & L_Cond);
             Emit_Label (Ctx.E, L_Cond);
             declare
-               C : constant Expr_Val := Emit_Expr (Ctx, D (AS_EXP, Iter));
+               CMark : Unbounded_String;
+               Dummy : Unbounded_String;
             begin
-               Emit_Term (Ctx.E, "br " & To_String (C.Reg) & ", " & L_Body & ", " & L_End);
+               if Cond_SS then
+                  Emit_Call_Or_Invoke (Ctx, "@__ada_ss_mark", "", "i64", CMark, Nounwind => True);
+               end if;
+               declare
+                  C  : constant Expr_Val := Emit_Expr (Ctx, D (AS_EXP, Iter));
+                  CR : constant String := Emit_Scalar_Coerce (Ctx, To_String (C.Reg), To_String (C.Pir_Type), "i8");
+               begin
+                  if Cond_SS then
+                     Emit_Call_Or_Invoke (Ctx, "@__ada_ss_release", To_String (CMark), "", Dummy, Nounwind => True);
+                  end if;
+                  Emit_Term (Ctx.E, "br " & CR & ", " & L_Body & ", " & L_End);
+               end;
             end;
             Emit_Label (Ctx.E, L_Body);
             Emit_Body_With_SS;
@@ -4555,8 +6093,7 @@ package body Cg_Stmt is
             declare
                Can_Fast : Boolean := False;
                Limit_V  : Integer_64 := 0;
-               Ada_BT   : constant TREE := Base_Type_Spec (Ada_T);
-               Is_Enum  : constant Boolean := not Is_Void_Tree (Ada_BT) and then KIND (Ada_BT) = DN_ENUMERATION;
+               Is_Uns   : constant Boolean := Is_Unsigned_Scalar (Ada_T, To_String (PT));
             begin
                if KIND (Rng_Node) = DN_RANGE then
                   declare
@@ -4566,7 +6103,7 @@ package body Cg_Stmt is
                   begin
                      if Has_Static_Val (BV) then
                         Limit_V := Eval_Int64 (BV);
-                        if Is_Enum then
+                        if Is_Uns then
                            if not Is_Rev then
                               if (Bits = 8 and then Limit_V < 255)
                                 or else (Bits = 16 and then Limit_V < 65535)
@@ -4605,9 +6142,9 @@ package body Cg_Stmt is
                      L_Hdr  : constant String := Next_Label (Ctx.E, "for_h");
                      Cmp_C  : constant String := Next_Reg (Ctx.E, "fcmp");
                      Cmp_Op : constant String :=
-                       (if Is_Enum then (if Is_Rev then "cmp_ge_u." else "cmp_le_u.")
+                       (if Is_Uns then (if Is_Rev then "cmp_ge_u." else "cmp_le_u.")
                         else (if Is_Rev then "cmp_ge_s." else "cmp_le_s."));
-                     Step_Fl : constant String := (if Is_Enum then "" else " [unsafe_s]");
+                     Step_Fl : constant String := (if Is_Uns then "" else " [unsafe_s]");
                   begin
                      Emit_Term (Ctx.E, "jmp " & L_Hdr & "(" & To_String (Start_R) & ")");
                      Emit_Label (Ctx.E, L_Hdr, Cur_V & ": " & To_String (PT));
@@ -4628,8 +6165,8 @@ package body Cg_Stmt is
                else
                   -- Wrap-safe loop when bound is dynamic or equals Type'Last / Type'First!
                   declare
-                     Gt_Op   : constant String := (if Is_Enum then "cmp_gt_u." else "cmp_gt_s.");
-                     Step_Fl : constant String := (if Is_Enum then "" else " [unsafe_s]");
+                     Gt_Op   : constant String := (if Is_Uns then "cmp_gt_u." else "cmp_gt_s.");
+                     Step_Fl : constant String := (if Is_Uns then "" else " [unsafe_s]");
                   begin
                      Emit_Inst (Ctx.E, Empty_C & " = " & Gt_Op & To_String (PT) & " " & To_String (Lo_R) & ", " & To_String (Hi_R));
                      Emit_Term (Ctx.E, "br " & Empty_C & ", " & L_End & ", " & L_Body & "(" & To_String (Start_R) & ")");
@@ -4692,6 +6229,12 @@ package body Cg_Stmt is
                if Ctx.Label_Mst_Depths.Contains (LK) then
                   Emit_Master_Leave_To (Ctx, Natural (Ctx.Label_Mst_Depths.Element (LK)));
                end if;
+               if Ctx.Label_SS_Depths.Contains (LK) then
+                  Emit_SS_Release_To (Ctx, Natural (Ctx.Label_SS_Depths.Element (LK)));
+               end if;
+               if Ctx.Label_SP_Depths.Contains (LK) then
+                  Emit_SP_Restore_To (Ctx, Natural (Ctx.Label_SP_Depths.Element (LK)));
+               end if;
                Emit_Term (Ctx.E, "jmp .ada_lbl_" & Tree_Key_Str (LDef) & To_String (Ctx.Gen_Inst_Tag));
             end;
 
@@ -4702,7 +6245,24 @@ package body Cg_Stmt is
                BF_FE     : Field_Entry;
                BF_Def    : TREE := CONST_VOID;
             begin
-               if KIND (LHS_Node) = DN_SELECTED then
+               if KIND (LHS_Node) = DN_USED_OBJECT_ID
+                 or else (KIND (LHS_Node) = DN_SELECTED
+                          and then not Is_Void_Tree (Get_Name_Defn (D (AS_DESIGNATOR, LHS_Node)))
+                          and then KIND (Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (D (AS_DESIGNATOR, LHS_Node)))))
+                                   not in DN_COMPONENT_ID | DN_DISCRIMINANT_ID)
+               then
+                  declare
+                     OD_L : constant TREE := Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (LHS_Node)));
+                  begin
+                     if not Is_Void_Tree (OD_L) and then Ctx.Vars.Contains (Tree_Key (OD_L))
+                       and then Ctx.Vars.Element (Tree_Key (OD_L)).Is_Bitfield
+                     then
+                        Is_BF_LHS := True;
+                        BF_FE     := Ctx.Vars.Element (Tree_Key (OD_L)).BF_FE;
+                        BF_Def    := OD_L;
+                     end if;
+                  end;
+               elsif KIND (LHS_Node) = DN_SELECTED then
                   declare
                      Des : TREE := D (AS_DESIGNATOR, LHS_Node);
                      Def : TREE;
@@ -4722,7 +6282,9 @@ package body Cg_Stmt is
                            pragma Unreferenced (Dummy_RTI);
                            CK : constant Unsigned_32 := Tree_Key (Def);
                         begin
-                           if Ctx.Fields.Contains (CK) and then Is_Bitfield (Ctx.Fields.Element (CK)) then
+                           if Ctx.Fields.Contains (CK) and then Is_Bitfield (Ctx.Fields.Element (CK))
+                             and then Get_Type_Info (Ctx, Subst_Tree (Ctx, D (SM_OBJ_TYPE, Def))).Kind = TK_Scalar
+                           then
                               Is_BF_LHS := True;
                               BF_FE     := Ctx.Fields.Element (CK);
                               BF_Def    := Def;
@@ -4733,73 +6295,124 @@ package body Cg_Stmt is
                end if;
                if Is_BF_LHS then
                   declare
-                     Pfx_LV : constant Expr_Val := Emit_LValue (Ctx, D (AS_NAME, LHS_Node));
-                     Pfx_T  : constant TREE := Resolve_Type_Spec (Subst_Tree (Ctx, Pfx_LV.Ada_Type));
-                     Rec_P  : Unbounded_String := Pfx_LV.Reg;
-                     BF_CT  : constant TREE := Subst_Tree (Ctx, D (SM_OBJ_TYPE, BF_Def));
+                     Is_Ren_BF : constant Boolean := KIND (BF_Def) not in DN_COMPONENT_ID | DN_DISCRIMINANT_ID;
+                     Rec_P  : Unbounded_String;
+                     BF_CT  : constant TREE :=
+                       (if Is_Ren_BF then Ctx.Vars.Element (Tree_Key (BF_Def)).Ada_Type
+                        else Subst_Tree (Ctx, D (SM_OBJ_TYPE, BF_Def)));
                      DTI    : constant Type_Info := Get_Type_Info (Ctx, BF_CT);
-                     RHS    : constant Expr_Val := Emit_Expr (Ctx, D (AS_EXP, Stm), BF_CT);
-                     VR     : constant String :=
-                       Emit_Scalar_Coerce (Ctx, To_String (RHS.Reg), To_String (RHS.Pir_Type), To_String (DTI.Pir_Type));
+                     RHS    : Expr_Val;
+                     VR     : Unbounded_String;
                   begin
-                     if Is_Access_Type (Pfx_T) then
-                        if Pfx_LV.Kind = EK_Addr then
-                           declare
-                              LP : constant String := Next_Reg (Ctx.E, "bfap");
-                           begin
-                              Emit_Inst (Ctx.E, LP & " = load.ptr " & To_String (Rec_P) & ", align 8");
-                              Rec_P := To_Unbounded_String (LP);
-                           end;
-                        end if;
-                        Emit_Null_Check (Ctx, To_String (Rec_P));
+                     if Is_Ren_BF then
+                        Rec_P := To_Unbounded_String (Emit_Var_Addr (Ctx, Ctx.Vars.Element (Tree_Key (BF_Def))));
+                     else
+                        declare
+                           Pfx_LV : constant Expr_Val := Emit_LValue (Ctx, D (AS_NAME, LHS_Node));
+                           Pfx_T  : constant TREE := Resolve_Type_Spec (Subst_Tree (Ctx, Pfx_LV.Ada_Type));
+                        begin
+                           Rec_P := Pfx_LV.Reg;
+                           if Is_Access_Type (Pfx_T) then
+                              if Pfx_LV.Kind = EK_Addr then
+                                 declare
+                                    LP : constant String := Next_Reg (Ctx.E, "bfap");
+                                 begin
+                                    Emit_Inst (Ctx.E, LP & " = load.ptr " & To_String (Rec_P) & ", align 8");
+                                    Rec_P := To_Unbounded_String (LP);
+                                 end;
+                              end if;
+                              Emit_Null_Check (Ctx, To_String (Rec_P));
+                           end if;
+                           -- P3-6.3: Run variant discriminant check before bitfield store (LRM 4.1.3(16))
+                           if BF_FE.In_Union then
+                              declare
+                                 Rec_T_BF : constant TREE :=
+                                   (if Is_Access_Type (Pfx_T) then Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_DESIG_TYPE, Pfx_T)))
+                                    else Pfx_T);
+                              begin
+                                 Emit_Variant_Check_For_Field (Ctx, To_String (Rec_P), Rec_T_BF, BF_Def, Tree_Key (BF_Def));
+                              end;
+                           end if;
+                        end;
                      end if;
-                     Emit_Range_Check (Ctx, VR, To_String (DTI.Pir_Type), BF_CT);
-                     Emit_Bitfield_Store (Ctx, To_String (Rec_P), BF_FE, VR, To_String (DTI.Pir_Type), BF_CT);
+                     RHS := Emit_Expr (Ctx, D (AS_EXP, Stm), BF_CT);
+                     VR  := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, To_String (RHS.Reg), To_String (RHS.Pir_Type), To_String (DTI.Pir_Type)));
+                     Emit_Range_Check (Ctx, To_String (VR), To_String (DTI.Pir_Type), BF_CT);
+                     Emit_Bitfield_Store (Ctx, To_String (Rec_P), BF_FE, To_String (VR), To_String (DTI.Pir_Type), BF_CT);
                   end;
                else
                   declare
                      LHS       : constant Expr_Val := Emit_LValue (Ctx, LHS_Node);
                      DTI       : constant Type_Info := Get_Type_Info (Ctx, LHS.Ada_Type);
                      RHS_Node  : constant TREE := D (AS_EXP, Stm);
-                     Is_Shared : Boolean := False;
+                     Is_Shared : constant Boolean := Is_Shared_Object (Ctx, LHS_Node);
                   begin
-               if KIND (LHS_Node) = DN_USED_OBJECT_ID or else KIND (LHS_Node) = DN_SELECTED then
-                  declare
-                     LDef : constant TREE := Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (LHS_Node)));
-                  begin
-                     if not Is_Void_Tree (LDef) and then KIND (LDef) = DN_VARIABLE_ID and then DB (SM_IS_SHARED, LDef) then
-                        Is_Shared := True;
-                     end if;
-                  end;
-               end if;
                if DTI.Kind = TK_Scalar then
                   declare
                      RHS : constant Expr_Val := Emit_Expr (Ctx, RHS_Node, LHS.Ada_Type);
-                     VR  : constant String :=
-                       Emit_Scalar_Coerce (Ctx, To_String (RHS.Reg), To_String (RHS.Pir_Type), To_String (DTI.Pir_Type));
+                     SP  : constant String := To_String (RHS.Pir_Type);
+                     DP  : constant String := To_String (DTI.Pir_Type);
+                     VR  : Unbounded_String;
+                     -- P3-3.13: If LHS is an object with its own per-object frozen range (multi-object decl),
+                     -- bind its frozen range into Saved_Type_Ranges for the duration of Emit_Range_Check!
+                     Swap_TK  : Unsigned_32 := 0;
+                     Had_Orig : Boolean := False;
+                     Orig_SR  : Saved_Range_Info;
                   begin
-                     Emit_Range_Check (Ctx, VR, To_String (DTI.Pir_Type), LHS.Ada_Type);
-                     Emit_Discriminant_Check (Ctx, VR, LHS.Ada_Type, Is_Access => True);
+                     if KIND (LHS_Node) = DN_USED_OBJECT_ID
+                       or else (KIND (LHS_Node) = DN_SELECTED
+                                and then not Is_Void_Tree (Get_Name_Defn (D (AS_DESIGNATOR, LHS_Node)))
+                                and then KIND (Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (D (AS_DESIGNATOR, LHS_Node)))))
+                                         not in DN_COMPONENT_ID | DN_DISCRIMINANT_ID)
+                     then
+                        declare
+                           OD_A : constant TREE := Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (LHS_Node)));
+                           OK_A : constant Unsigned_32 := (if not Is_Void_Tree (OD_A) then Tree_Key (OD_A) else 0);
+                           RT_A : constant TREE := Resolve_Type_Spec (Subst_Tree (Ctx, LHS.Ada_Type));
+                        begin
+                           if OK_A /= 0 and then Ctx.Saved_Var_Ranges.Contains (OK_A) and then not Is_Void_Tree (RT_A) then
+                              Swap_TK := Tree_Key (RT_A);
+                              if Ctx.Saved_Type_Ranges.Contains (Swap_TK) then
+                                 Had_Orig := True;
+                                 Orig_SR  := Ctx.Saved_Type_Ranges.Element (Swap_TK);
+                              end if;
+                              Ctx.Saved_Type_Ranges.Include (Swap_TK, Ctx.Saved_Var_Ranges.Element (OK_A));
+                           end if;
+                        end;
+                     end if;
+                     if Int_Bits_Of_Pir (SP) > Int_Bits_Of_Pir (DP) and then Is_Discrete_Type (LHS.Ada_Type) then
+                        Emit_Range_Check (Ctx, To_String (RHS.Reg), SP, LHS.Ada_Type);
+                     end if;
+                     VR := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, To_String (RHS.Reg), SP, DP));
+                     Emit_Range_Check (Ctx, To_String (VR), DP, LHS.Ada_Type);
+                     if Swap_TK /= 0 then
+                        if Had_Orig then
+                           Ctx.Saved_Type_Ranges.Include (Swap_TK, Orig_SR);
+                        else
+                           Ctx.Saved_Type_Ranges.Exclude (Swap_TK);
+                        end if;
+                     end if;
+                     Emit_Discriminant_Check (Ctx, To_String (VR), LHS.Ada_Type, Is_Access => True);
                      if Is_Shared then
                         Emit_Inst (Ctx.E, "fence [seq_cst]");
                         Emit_Inst (Ctx.E,
-                          "store." & To_String (DTI.Pir_Type) & " " & VR &
+                          "store." & DP & " " & To_String (VR) &
                           ", " & To_String (LHS.Reg) & ", align " & Img (DTI.Align) & " [volatile]");
                         Emit_Inst (Ctx.E, "fence [seq_cst]");
                      else
                         Emit_Inst (Ctx.E,
-                          "store." & To_String (DTI.Pir_Type) & " " & VR &
+                          "store." & DP & " " & To_String (VR) &
                           ", " & To_String (LHS.Reg) & ", align " & Img (DTI.Align));
                      end if;
                   end;
                else
                   declare
-                     -- Check if RHS is an aggregate containing `others` assigned to an
+                     -- Check if RHS is an aggregate containing `others` (within array dims only!) assigned to an
                      -- unconstrained/dynamic array LHS (needs LHS's bounds in a temp buffer
                      -- to preserve LRM 5.2 exception safety & non-aliasing!).
-                     function Agg_Has_Others (AN : TREE) return Boolean is
+                     function Agg_Has_Others (AN : TREE; Rem_D : Natural) return Boolean is
                      begin
-                        if Is_Void_Tree (AN) or else KIND (AN) /= DN_AGGREGATE then
+                        if Rem_D = 0 or else Is_Void_Tree (AN) or else KIND (AN) /= DN_AGGREGATE then
                            return False;
                         end if;
                         declare
@@ -4820,11 +6433,11 @@ package body Cg_Stmt is
                                        end if;
                                     end loop;
                                  end;
-                                 if Agg_Has_Others (D (AS_EXP, IT)) then
+                                 if Rem_D > 1 and then Agg_Has_Others (D (AS_EXP, IT), Rem_D - 1) then
                                     return True;
                                  end if;
                               else
-                                 if Agg_Has_Others (IT) then
+                                 if Rem_D > 1 and then Agg_Has_Others (IT, Rem_D - 1) then
                                     return True;
                                  end if;
                               end if;
@@ -4839,43 +6452,30 @@ package body Cg_Stmt is
                      if KIND (RHS_Node) = DN_AGGREGATE
                        and then (DTI.Kind = TK_Unconstrained_Array
                                  or else (DTI.Kind = TK_Constrained_Array and then DTI.Is_Dynamic))
-                       and then Agg_Has_Others (RHS_Node)
+                       and then Agg_Has_Others (RHS_Node, Natural'Max (1, DTI.NDims))
                      then
                         -- Allocate temp buffer with LHS's bounds, initialize temp, then copy to LHS
                         declare
                            ETI   : constant Type_Info := Get_Type_Info (Ctx, DTI.Elem_Type);
-                           ESz   : constant Natural := ((ETI.Byte_Size + ETI.Align - 1) / ETI.Align) * ETI.Align;
-                           ND    : constant Natural := Natural'Max (1, DTI.NDims);
+                           EAl   : constant Natural := Elem_Storage_Align (ETI);
+                           ESz   : constant Natural := Elem_Storage_Size (ETI);
+                           ND    : constant Natural := Natural'Max (1, Natural'Min (DTI.NDims, Max_Array_Dims));
                            LFs, LLs : Str_Array_4;
                            Tot64 : Unbounded_String;
-                           Byt   : constant String := Next_Reg (Ctx.E, "atby");
+                           Byt   : Unbounded_String;
                            Buf_U : Unbounded_String;
                         begin
                            for D_I in 1 .. ND loop
                               Get_Array_Dim_Bounds (Ctx, LHS, D_I, LFs (D_I), LLs (D_I));
-                              declare
-                                 DL : constant String := Emit_Dim_Len_I64 (Ctx, To_String (LFs (D_I)), To_String (LLs (D_I)));
-                              begin
-                                 if D_I = 1 then
-                                    Tot64 := To_Unbounded_String (DL);
-                                 else
-                                    declare
-                                       M : constant String := Next_Reg (Ctx.E, "atm");
-                                    begin
-                                       Emit_Inst (Ctx.E, M & " = mul.i64 " & To_String (Tot64) & ", " & DL);
-                                       Tot64 := To_Unbounded_String (M);
-                                    end;
-                                 end if;
-                              end;
                            end loop;
-                           Emit_Inst (Ctx.E, Byt & " = mul.i64 " & To_String (Tot64) & ", " & Img (ESz));
-                           Emit_Call_Or_Invoke (Ctx, "@__ada_ss_alloc", Byt & ", " & Img (ETI.Align), "ptr", Buf_U);
+                           Emit_Array_Byte_Size_I64 (Ctx, LFs, LLs, ND, ESz, Tot64, Byt);
+                           Emit_Call_Or_Invoke (Ctx, "@__ada_ss_alloc", To_String (Byt) & ", " & Img (EAl), "ptr", Buf_U);
                            Emit_Init_Composite (Ctx, To_String (Buf_U), LHS.Ada_Type, RHS_Node, LFs, LLs);
                            RHS.Kind       := EK_Slice;
                            RHS.Reg        := Buf_U;
                            RHS.Pir_Type   := To_Unbounded_String ("ptr");
                            RHS.Ada_Type   := LHS.Ada_Type;
-                           RHS.Align      := ETI.Align;
+                           RHS.Align      := EAl;
                            RHS.NDims      := ND;
                            RHS.First_Regs := LFs;
                            RHS.Last_Regs  := LLs;
@@ -4912,16 +6512,26 @@ package body Cg_Stmt is
                      end if;
                      if DTI.Kind = TK_Record then
                         Emit_Discriminant_Check (Ctx, To_String (RHS.Reg), LHS.Ada_Type, Is_Access => False);
-                        -- LRM 3.7.2(4) / 5.2(4): DN_ALL dereference (and records without default discriminants)
-                        -- are ALWAYS constrained: LHS's existing discriminants must match RHS's discriminants!
+                        -- LRM 3.7.2(4) / 5.2(4) (P3-3.1, P3-3.3): DN_ALL dereference, constrained record components
+                        -- (including discriminant-dependent O.Inner := Bad!), records without default discriminants,
+                        -- and constrained IN OUT/OUT/renamed records must preserve LHS's existing discriminants!
                         if Ctx.Enable_Checks then
                            declare
+                              LHS_RT : constant TREE := Resolve_Type_Spec (Subst_Tree (Ctx, LHS.Ada_Type));
                               BT : constant TREE := Resolve_Type_Spec (Base_Type_Spec (Subst_Tree (Ctx, LHS.Ada_Type)));
                               DS : constant TREE := (if not Is_Void_Tree (BT) and then KIND (BT) = DN_RECORD then D (SM_DISCRIMINANT_S, BT) else CONST_VOID);
-                              Must_Match : Boolean := KIND (D (AS_NAME, Stm)) = DN_ALL;
+                              Must_Match : Boolean :=
+                                KIND (D (AS_NAME, Stm)) = DN_ALL
+                                or else (not Is_Void_Tree (LHS_RT) and then KIND (LHS_RT) = DN_CONSTRAINED_RECORD);
                               Dyn_Con_Reg : Unbounded_String;
                            begin
-                              if not Must_Match and then KIND (D (AS_NAME, Stm)) = DN_USED_OBJECT_ID then
+                              if not Must_Match
+                                and then (KIND (D (AS_NAME, Stm)) = DN_USED_OBJECT_ID
+                                          or else (KIND (D (AS_NAME, Stm)) = DN_SELECTED
+                                                   and then not Is_Void_Tree (Get_Name_Defn (D (AS_DESIGNATOR, D (AS_NAME, Stm))))
+                                                   and then KIND (Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (D (AS_DESIGNATOR, D (AS_NAME, Stm))))))
+                                                            not in DN_COMPONENT_ID | DN_DISCRIMINANT_ID))
+                              then
                                  declare
                                     LDef : constant TREE := Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (D (AS_NAME, Stm))));
                                  begin
@@ -4931,6 +6541,25 @@ package body Cg_Stmt is
                                        begin
                                           if LVInfo.Owner_Subp = Ctx.Cur_Subp_Key and then Length (LVInfo.Constrained_Reg) > 0 then
                                              Dyn_Con_Reg := LVInfo.Constrained_Reg;
+                                          elsif Length (LVInfo.Con_Global) > 0 then
+                                             declare
+                                                CGA : constant String := Next_Reg (Ctx.E, "dcga");
+                                                CGV : constant String := Next_Reg (Ctx.E, "dcgv");
+                                             begin
+                                                Emit_Inst (Ctx.E, CGA & " = addr " & To_String (LVInfo.Con_Global));
+                                                Emit_Inst (Ctx.E, CGV & " = load.i8 " & CGA & ", align 1");
+                                                Dyn_Con_Reg := To_Unbounded_String (CGV);
+                                             end;
+                                          elsif LVInfo.Con_Captured_Slot > 0 and then LVInfo.Owner_Subp /= 0 and then LVInfo.Owner_Subp /= Ctx.Cur_Subp_Key then
+                                             declare
+                                                CFP : constant String := Emit_Captured_Slot_Ptr (Ctx, LVInfo.Owner_Subp, LVInfo.Con_Captured_Slot);
+                                                CCP : constant String := Next_Reg (Ctx.E, "dccp");
+                                                CCV : constant String := Next_Reg (Ctx.E, "dccv");
+                                             begin
+                                                Emit_Inst (Ctx.E, CCP & " = load.ptr " & CFP & ", align 8");
+                                                Emit_Inst (Ctx.E, CCV & " = load.i8 " & CCP & ", align 1");
+                                                Dyn_Con_Reg := To_Unbounded_String (CCV);
+                                             end;
                                           end if;
                                        end;
                                     end if;
@@ -4991,17 +6620,65 @@ package body Cg_Stmt is
                                                 declare
                                                    DT  : constant TREE := Subst_Tree (Ctx, D (SM_OBJ_TYPE, DID));
                                                    DTI_D : constant Type_Info := Get_Type_Info (Ctx, DT);
-                                                   LP  : constant String := Next_Reg (Ctx.E, "dlp");
-                                                   LV  : constant String := Next_Reg (Ctx.E, "dlv");
-                                                   RP  : constant String := Next_Reg (Ctx.E, "drp");
-                                                   RV  : constant String := Next_Reg (Ctx.E, "drv");
+                                                   DK_D : constant Unsigned_32 := Tree_Key (Canonical_Def (DID));
+                                                   LV, RV : Unbounded_String;
                                                    Neq : constant String := Next_Reg (Ctx.E, "dne");
                                                 begin
-                                                   Emit_Inst (Ctx.E, LP & " = field_ptr " & To_String (RTI.Pir_Type) & ", " & To_String (LHS.Reg) & ", " & Img (FIdx));
-                                                   Emit_Inst (Ctx.E, LV & " = load." & To_String (DTI_D.Pir_Type) & " " & LP & ", align " & Img (DTI_D.Align));
-                                                   Emit_Inst (Ctx.E, RP & " = field_ptr " & To_String (RTI.Pir_Type) & ", " & To_String (RHS.Reg) & ", " & Img (FIdx));
-                                                   Emit_Inst (Ctx.E, RV & " = load." & To_String (DTI_D.Pir_Type) & " " & RP & ", align " & Img (DTI_D.Align));
-                                                   Emit_Inst (Ctx.E, Neq & " = cmp_ne." & To_String (DTI_D.Pir_Type) & " " & LV & ", " & RV);
+                                                   if Ctx.Fields.Contains (DK_D) then
+                                                      declare
+                                                         DFE : constant Field_Entry := Ctx.Fields.Element (DK_D);
+                                                      begin
+                                                         if Is_Bitfield (DFE) then
+                                                            LV := To_Unbounded_String (Emit_Bitfield_Load (Ctx, To_String (LHS.Reg), DFE, DT));
+                                                            RV := To_Unbounded_String (Emit_Bitfield_Load (Ctx, To_String (RHS.Reg), DFE, DT));
+                                                         elsif DFE.In_Union or else DFE.Has_Explicit_Offset then
+                                                            declare
+                                                               Off_R : constant String := Next_Reg (Ctx.E, "doff");
+                                                               LP    : constant String := Next_Reg (Ctx.E, "dlp");
+                                                               RP    : constant String := Next_Reg (Ctx.E, "drp");
+                                                               LV0   : constant String := Next_Reg (Ctx.E, "dlv");
+                                                               RV0   : constant String := Next_Reg (Ctx.E, "drv");
+                                                            begin
+                                                               Emit_Inst (Ctx.E, Off_R & " = const.i64 " & Img (DFE.Byte_Offset));
+                                                               Emit_Inst (Ctx.E, LP & " = ptr_add.i64 " & To_String (LHS.Reg) & ", " & Off_R & " [inbounds]");
+                                                               Emit_Inst (Ctx.E, LV0 & " = load." & To_String (DTI_D.Pir_Type) & " " & LP & ", align " & Img (Explicit_Field_Align (DFE, DTI_D.Align)));
+                                                               Emit_Inst (Ctx.E, RP & " = ptr_add.i64 " & To_String (RHS.Reg) & ", " & Off_R & " [inbounds]");
+                                                               Emit_Inst (Ctx.E, RV0 & " = load." & To_String (DTI_D.Pir_Type) & " " & RP & ", align " & Img (Explicit_Field_Align (DFE, DTI_D.Align)));
+                                                               LV := To_Unbounded_String (LV0);
+                                                               RV := To_Unbounded_String (RV0);
+                                                            end;
+                                                         else
+                                                            declare
+                                                               LP  : constant String := Next_Reg (Ctx.E, "dlp");
+                                                               RP  : constant String := Next_Reg (Ctx.E, "drp");
+                                                               LV0 : constant String := Next_Reg (Ctx.E, "dlv");
+                                                               RV0 : constant String := Next_Reg (Ctx.E, "drv");
+                                                            begin
+                                                               Emit_Inst (Ctx.E, LP & " = field_ptr " & To_String (RTI.Pir_Type) & ", " & To_String (LHS.Reg) & ", " & Img (DFE.Field_Idx));
+                                                               Emit_Inst (Ctx.E, LV0 & " = load." & To_String (DTI_D.Pir_Type) & " " & LP & ", align " & Img (DTI_D.Align));
+                                                               Emit_Inst (Ctx.E, RP & " = field_ptr " & To_String (RTI.Pir_Type) & ", " & To_String (RHS.Reg) & ", " & Img (DFE.Field_Idx));
+                                                               Emit_Inst (Ctx.E, RV0 & " = load." & To_String (DTI_D.Pir_Type) & " " & RP & ", align " & Img (DTI_D.Align));
+                                                               LV := To_Unbounded_String (LV0);
+                                                               RV := To_Unbounded_String (RV0);
+                                                            end;
+                                                         end if;
+                                                      end;
+                                                   else
+                                                      declare
+                                                         LP  : constant String := Next_Reg (Ctx.E, "dlp");
+                                                         RP  : constant String := Next_Reg (Ctx.E, "drp");
+                                                         LV0 : constant String := Next_Reg (Ctx.E, "dlv");
+                                                         RV0 : constant String := Next_Reg (Ctx.E, "drv");
+                                                      begin
+                                                         Emit_Inst (Ctx.E, LP & " = field_ptr " & To_String (RTI.Pir_Type) & ", " & To_String (LHS.Reg) & ", " & Img (FIdx));
+                                                         Emit_Inst (Ctx.E, LV0 & " = load." & To_String (DTI_D.Pir_Type) & " " & LP & ", align " & Img (DTI_D.Align));
+                                                         Emit_Inst (Ctx.E, RP & " = field_ptr " & To_String (RTI.Pir_Type) & ", " & To_String (RHS.Reg) & ", " & Img (FIdx));
+                                                         Emit_Inst (Ctx.E, RV0 & " = load." & To_String (DTI_D.Pir_Type) & " " & RP & ", align " & Img (DTI_D.Align));
+                                                         LV := To_Unbounded_String (LV0);
+                                                         RV := To_Unbounded_String (RV0);
+                                                      end;
+                                                   end if;
+                                                   Emit_Inst (Ctx.E, Neq & " = cmp_ne." & To_String (DTI_D.Pir_Type) & " " & To_String (LV) & ", " & To_String (RV));
                                                    Emit_Check_Fail_If (Ctx, Neq);
                                                 end;
                                                 FIdx := FIdx + 1;
@@ -5039,10 +6716,11 @@ package body Cg_Stmt is
                   if KIND (Clause) = DN_COND_CLAUSE then
                      declare
                         Cond  : constant Expr_Val := Emit_Expr (Ctx, D (AS_EXP, Clause));
+                        CondR : constant String := Emit_Scalar_Coerce (Ctx, To_String (Cond.Reg), To_String (Cond.Pir_Type), "i8");
                         L_T   : constant String := Next_Label (Ctx.E, "if_t");
                         L_F   : constant String := Next_Label (Ctx.E, "if_f");
                      begin
-                        Emit_Term (Ctx.E, "br " & To_String (Cond.Reg) & ", " & L_T & ", " & L_F);
+                        Emit_Term (Ctx.E, "br " & CondR & ", " & L_T & ", " & L_F);
                         Emit_Label (Ctx.E, L_T);
                         Emit_Stm_List (Ctx, D (AS_STM_S, Clause));
                         if not Is_Terminated (Ctx.E) then
@@ -5072,6 +6750,7 @@ package body Cg_Stmt is
                Exit_Lbl     : Unbounded_String;
                Exit_SS_Dep  : Natural := Natural (Ctx.SS_Marks.Length);
                Exit_Mst_Dep : Natural := Natural (Ctx.Master_Stack.Length);
+               Exit_SP_Dep  : Natural := Natural (Ctx.SP_Marks.Length);
             begin
                if not Is_Void_Tree (Target_Loop) then
                   declare
@@ -5083,6 +6762,7 @@ package body Cg_Stmt is
                            Exit_Lbl     := Ctx.Loops.Element (I).Exit_Label;
                            Exit_SS_Dep  := Ctx.Loops.Element (I).SS_Depth;
                            Exit_Mst_Dep := Ctx.Loops.Element (I).Master_Depth;
+                           Exit_SP_Dep  := Ctx.Loops.Element (I).SP_Depth;
                            exit;
                         end if;
                      end loop;
@@ -5092,29 +6772,34 @@ package body Cg_Stmt is
                   Exit_Lbl     := Ctx.Loops.Last_Element.Exit_Label;
                   Exit_SS_Dep  := Ctx.Loops.Last_Element.SS_Depth;
                   Exit_Mst_Dep := Ctx.Loops.Last_Element.Master_Depth;
+                  Exit_SP_Dep  := Ctx.Loops.Last_Element.SP_Depth;
                end if;
 
                if Is_Void_Tree (Cond_Exp) then
                   Emit_Master_Leave_To (Ctx, Exit_Mst_Dep);
                   Emit_SS_Release_To (Ctx, Exit_SS_Dep);
+                  Emit_SP_Restore_To (Ctx, Exit_SP_Dep);
                   Emit_Term (Ctx.E, "jmp " & To_String (Exit_Lbl));
                else
                   declare
                      C     : constant Expr_Val := Emit_Expr (Ctx, Cond_Exp);
+                     CR    : constant String := Emit_Scalar_Coerce (Ctx, To_String (C.Reg), To_String (C.Pir_Type), "i8");
                      L_Ex  : constant String := Next_Label (Ctx.E, "ex_t");
                      L_Cnt : constant String := Next_Label (Ctx.E, "ex_c");
                   begin
                      if Natural (Ctx.SS_Marks.Length) > Exit_SS_Dep
                        or else Natural (Ctx.Master_Stack.Length) > Exit_Mst_Dep
+                       or else Natural (Ctx.SP_Marks.Length) > Exit_SP_Dep
                      then
-                        Emit_Term (Ctx.E, "br " & To_String (C.Reg) & ", " & L_Ex & ", " & L_Cnt);
+                        Emit_Term (Ctx.E, "br " & CR & ", " & L_Ex & ", " & L_Cnt);
                         Emit_Label (Ctx.E, L_Ex);
                         Emit_Master_Leave_To (Ctx, Exit_Mst_Dep);
                         Emit_SS_Release_To (Ctx, Exit_SS_Dep);
+                        Emit_SP_Restore_To (Ctx, Exit_SP_Dep);
                         Emit_Term (Ctx.E, "jmp " & To_String (Exit_Lbl));
                         Emit_Label (Ctx.E, L_Cnt);
                      else
-                        Emit_Term (Ctx.E, "br " & To_String (C.Reg) & ", " & To_String (Exit_Lbl) & ", " & L_Cnt);
+                        Emit_Term (Ctx.E, "br " & CR & ", " & To_String (Exit_Lbl) & ", " & L_Cnt);
                         Emit_Label (Ctx.E, L_Cnt);
                      end if;
                   end;
@@ -5136,7 +6821,7 @@ package body Cg_Stmt is
                   Ctx.Handlers.Clear;
                   for CO of Ctx.Copy_Outs loop
                      if To_String (CO.Pir_Type) = "@__ada_arr_desc" then
-                        Emit_Inst (Ctx.E, "memcpy " & To_String (CO.Ptr_Reg) & ", " & To_String (CO.Loc_Reg) & ", 40, align 8");
+                        Emit_Inst (Ctx.E, "memcpy " & To_String (CO.Ptr_Reg) & ", " & To_String (CO.Loc_Reg) & ", " & Img (Arr_Desc_Size) & ", align 8");
                      else
                         declare
                            V : constant String := Next_Reg (Ctx.E, "co");
@@ -5171,22 +6856,59 @@ package body Cg_Stmt is
                   declare
                      RTI     : constant Type_Info := Get_Type_Info (Ctx, Ctx.Cur_Ret_Type);
                      ETI     : constant Type_Info := Get_Type_Info (Ctx, RTI.Elem_Type);
-                     ESz     : constant Natural := ((ETI.Byte_Size + ETI.Align - 1) / ETI.Align) * ETI.Align;
-                     ND      : constant Natural := (if RTI.NDims > 0 then RTI.NDims else 1);
+                     EAl     : constant Natural := Elem_Storage_Align (ETI);
+                     ESz     : constant Natural := Elem_Storage_Size (ETI);
+                     ND      : constant Natural := Natural'Max (1, Natural'Min ((if RTI.NDims > 0 then RTI.NDims else 1), Max_Array_Dims));
                      Desc_Ty : constant String := Get_Arr_Desc_Type (Ctx, ND);
                      Firsts  : Str_Array_4;
                      Lasts   : Str_Array_4;
                      Tot64   : Unbounded_String;
                      SS_Ptr  : Unbounded_String;
                      Unw_Exp : TREE := Exp;
+                     Ret_Tmp_Rng_Keys : U32_Vecs.Vector;
+                     Ret_Tmp_Exp_Keys : U32_Vecs.Vector;
+
+                     function Ret_Agg_Named_No_Others (AN : TREE; Rem_D : Natural) return Boolean is
+                     begin
+                        if Rem_D = 0 then return True; end if;
+                        if Is_Void_Tree (AN) or else KIND (AN) /= DN_AGGREGATE then return False; end if;
+                        declare
+                           AL : SEQ_TYPE := LIST (D (AS_GENERAL_ASSOC_S, AN));
+                           IT : TREE;
+                           Has_Any : Boolean := False;
+                        begin
+                           while not IS_EMPTY (AL) loop
+                              POP (AL, IT);
+                              Has_Any := True;
+                              if KIND (IT) not in DN_ASSOC | DN_NAMED then return False; end if;
+                              declare
+                                 CS : SEQ_TYPE := LIST (D (AS_CHOICE_S, IT));
+                                 Ch : TREE;
+                              begin
+                                 while not IS_EMPTY (CS) loop
+                                    POP (CS, Ch);
+                                    if KIND (Ch) = DN_CHOICE_OTHERS then return False; end if;
+                                 end loop;
+                              end;
+                              if Rem_D > 1 and then not Ret_Agg_Named_No_Others (D (AS_EXP, IT), Rem_D - 1) then
+                                 return False;
+                              end if;
+                           end loop;
+                           return Has_Any;
+                        end;
+                     end Ret_Agg_Named_No_Others;
                   begin
+                     -- P3-3.6: Do NOT strip DN_QUALIFIED (so `return S2'(others => 42)` enforces S2's bounds!)
                      while not Is_Void_Tree (Unw_Exp)
-                       and then (KIND (Unw_Exp) = DN_QUALIFIED or else KIND (Unw_Exp) = DN_PARENTHESIZED)
+                       and then KIND (Unw_Exp) = DN_PARENTHESIZED
                      loop
                         Unw_Exp := D (AS_EXP, Unw_Exp);
                      end loop;
 
-                     if KIND (Unw_Exp) = DN_AGGREGATE then
+                     -- P3-3.7: For constrained return of named aggregate without `others`, fall into general branch to slide!
+                     if KIND (Unw_Exp) = DN_AGGREGATE
+                       and then not (RTI.Kind = TK_Constrained_Array and then Ret_Agg_Named_No_Others (Unw_Exp, ND))
+                     then
                         -- Determine bounds of returned array aggregate (1D positional, named range, or dynamic subtype)
                         if RTI.Kind = TK_Constrained_Array then
                            declare
@@ -5208,7 +6930,7 @@ package body Cg_Stmt is
                               end loop;
                            end;
                         else
-                           -- Unconstrained array aggregate (1D..4D): infer bounds recursively per dimension!
+                           -- Unconstrained array aggregate (1D..8D): infer bounds recursively per dimension!
                            declare
                               Cur_Agg : TREE := Unw_Exp;
                            begin
@@ -5221,6 +6943,9 @@ package body Cg_Stmt is
                                     Got_R  : Boolean := False;
                                     Next_A : TREE := CONST_VOID;
                                  begin
+                                    if not Is_Void_Tree (Cur_Agg) and then KIND (Cur_Agg) = DN_STRING_LITERAL then
+                                       Count := Integer_64 (Decode_Ada_String_Lit (Sym_Name (Cur_Agg))'Length);
+                                    end if;
                                     while not IS_EMPTY (Assocs) loop
                                        POP (Assocs, Item);
                                        if KIND (Item) = DN_ASSOC or else KIND (Item) = DN_NAMED then
@@ -5237,10 +6962,19 @@ package body Cg_Stmt is
                                                    declare
                                                       RT, RL, RH : Unbounded_String;
                                                       L32, H32 : Unbounded_String;
+                                                      SR : Saved_Range_Info;
                                                    begin
                                                       Emit_Discrete_Range (Ctx, D (AS_DISCRETE_RANGE, Ch), RT, RL, RH);
                                                       L32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RL), To_String (RT), "i32"));
                                                       H32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RH), To_String (RT), "i32"));
+                                                      -- P3-3.8: Cache Pass-1 choice range so Pass 2 does NOT double-evaluate!
+                                                      Save_Scalar_Slot (Ctx, To_String (L32), "i32", 4, SR.Lo_Ptr, SR.Is_Global);
+                                                      Save_Scalar_Slot (Ctx, To_String (H32), "i32", 4, SR.Hi_Ptr, SR.Is_Global);
+                                                      SR.Pir_Type   := To_Unbounded_String ("i32");
+                                                      SR.Align      := 4;
+                                                      SR.Owner_Subp := Ctx.Cur_Subp_Key;
+                                                      Ctx.Saved_Type_Ranges.Include (Tree_Key (Ch), SR);
+                                                      Ret_Tmp_Rng_Keys.Append (Tree_Key (Ch));
                                                       if not Got_R then
                                                          Firsts (Dim_I) := L32;
                                                          Lasts (Dim_I)  := H32;
@@ -5263,9 +6997,20 @@ package body Cg_Stmt is
                                                    end;
                                                 elsif KIND (Ch) = DN_CHOICE_EXP then
                                                    declare
-                                                      CE  : constant Expr_Val := Emit_Expr (Ctx, D (AS_EXP, Ch));
+                                                      ChE : constant TREE := D (AS_EXP, Ch);
+                                                      CE  : constant Expr_Val := Emit_Expr (Ctx, ChE);
                                                       C32 : constant String := Emit_Int_Convert (Ctx, To_String (CE.Reg), To_String (CE.Pir_Type), "i32");
+                                                      SE  : Saved_Expr_Info;
                                                    begin
+                                                      if CE.Kind = EK_Scalar then
+                                                         Save_Scalar_Slot (Ctx, To_String (CE.Reg), To_String (CE.Pir_Type), CE.Align, SE.Ptr_Reg, SE.Is_Global);
+                                                         SE.Pir_Type   := CE.Pir_Type;
+                                                         SE.Ada_Type   := CE.Ada_Type;
+                                                         SE.Align      := CE.Align;
+                                                         SE.Owner_Subp := Ctx.Cur_Subp_Key;
+                                                         Ctx.Saved_Expr_Vals.Include (Tree_Key (ChE), SE);
+                                                         Ret_Tmp_Exp_Keys.Append (Tree_Key (ChE));
+                                                      end if;
                                                       if not Got_R then
                                                          Firsts (Dim_I) := To_Unbounded_String (C32);
                                                          Lasts (Dim_I)  := To_Unbounded_String (C32);
@@ -5332,33 +7077,27 @@ package body Cg_Stmt is
                            end;
                         end if;
 
-                        for D_Idx in 1 .. ND loop
-                           declare
-                              C6 : constant String := Emit_Dim_Len_I64 (Ctx, To_String (Firsts (D_Idx)), To_String (Lasts (D_Idx)));
-                           begin
-                              if D_Idx = 1 then
-                                 Tot64 := To_Unbounded_String (C6);
-                              else
-                                 declare
-                                    M : constant String := Next_Reg (Ctx.E, "rm");
-                                 begin
-                                    Emit_Inst (Ctx.E, M & " = mul.i64 " & To_String (Tot64) & ", " & C6);
-                                    Tot64 := To_Unbounded_String (M);
-                                 end;
-                              end if;
-                           end;
-                        end loop;
                         declare
-                           Byt : constant String := Next_Reg (Ctx.E, "rby");
+                           Byt : Unbounded_String;
                         begin
-                           Emit_Inst (Ctx.E, Byt & " = mul.i64 " & To_String (Tot64) & ", " & Img (ESz));
-                           Emit_Call_Or_Invoke (Ctx, "@__ada_ss_alloc", Byt & ", " & Img (ETI.Align), "ptr", SS_Ptr);
+                           Emit_Array_Byte_Size_I64 (Ctx, Firsts, Lasts, ND, ESz, Tot64, Byt);
+                           Emit_Call_Or_Invoke (Ctx, "@__ada_ss_alloc", To_String (Byt) & ", " & Img (EAl), "ptr", SS_Ptr);
                         end;
                         Emit_Init_Composite (Ctx, To_String (SS_Ptr), Ctx.Cur_Ret_Type, Unw_Exp, Firsts, Lasts);
+                        for K_Tmp of Ret_Tmp_Rng_Keys loop
+                           Ctx.Saved_Type_Ranges.Exclude (K_Tmp);
+                        end loop;
+                        for K_Tmp of Ret_Tmp_Exp_Keys loop
+                           Ctx.Saved_Expr_Vals.Exclude (K_Tmp);
+                        end loop;
                      else
                         -- General array expression: evaluate, check/slide if constrained return type, allocate on SS, copy!
                         declare
-                           Src : constant Expr_Val := Emit_Expr (Ctx, Exp, Ctx.Cur_Ret_Type);
+                           Eval_RT : constant TREE :=
+                             (if KIND (Unw_Exp) = DN_AGGREGATE and then RTI.Kind = TK_Constrained_Array
+                              then Subst_Base_Type (Ctx, Ctx.Cur_Ret_Type)
+                              else Ctx.Cur_Ret_Type);
+                           Src : constant Expr_Val := Emit_Expr (Ctx, Exp, Eval_RT);
                            Byt : constant String := Next_Reg (Ctx.E, "rby");
                         begin
                            if RTI.Kind = TK_Constrained_Array then
@@ -5441,14 +7180,19 @@ package body Cg_Stmt is
                   declare
                      RTI : constant Type_Info := Get_Type_Info (Ctx, Ctx.Cur_Ret_Type);
                      V   : constant Expr_Val := Emit_Expr (Ctx, Exp, Ctx.Cur_Ret_Type);
-                     VR  : constant String :=
-                       Emit_Scalar_Coerce (Ctx, To_String (V.Reg), To_String (V.Pir_Type), To_String (RTI.Pir_Type));
+                     SP  : constant String := To_String (V.Pir_Type);
+                     DP  : constant String := To_String (RTI.Pir_Type);
+                     VR  : Unbounded_String;
                   begin
-                     Emit_Range_Check (Ctx, VR, To_String (RTI.Pir_Type), Ctx.Cur_Ret_Type);
-                     Emit_Discriminant_Check (Ctx, VR, Ctx.Cur_Ret_Type, Is_Access => True);
+                     if Int_Bits_Of_Pir (SP) > Int_Bits_Of_Pir (DP) and then Is_Discrete_Type (Ctx.Cur_Ret_Type) then
+                        Emit_Range_Check (Ctx, To_String (V.Reg), SP, Ctx.Cur_Ret_Type);
+                     end if;
+                     VR := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, To_String (V.Reg), SP, DP));
+                     Emit_Range_Check (Ctx, To_String (VR), DP, Ctx.Cur_Ret_Type);
+                     Emit_Discriminant_Check (Ctx, To_String (VR), Ctx.Cur_Ret_Type, Is_Access => True);
                      Emit_Copy_Outs;
                      Emit_SS_Release_To (Ctx, 0);
-                     Emit_Term (Ctx.E, "ret " & VR);
+                     Emit_Term (Ctx.E, "ret " & To_String (VR));
                   end;
                end if;
             end;
@@ -5546,103 +7290,115 @@ package body Cg_Stmt is
 
          when DN_PROCEDURE_CALL | DN_ENTRY_CALL | DN_COND_ENTRY | DN_TIMED_ENTRY =>
             declare
-               Is_Renamed_Entry_Call : Boolean := False;
+               -- P3-4.11: Resolve cross-unit & chained renamed task entries (for normal, conditional, and timed entry calls!)
+               function Try_Bind_Cross_Unit_Renamed_Entry (PDef : TREE) return Boolean is
+               begin
+                  if Is_Void_Tree (PDef) then
+                     return False;
+                  end if;
+                  if Ctx.Renamed_Entries.Contains (Tree_Key (PDef)) then
+                     return True;
+                  end if;
+                  if KIND (PDef) = DN_PROCEDURE_ID
+                    and then not Is_Void_Tree (D (SM_UNIT_DESC, PDef))
+                    and then KIND (D (SM_UNIT_DESC, PDef)) = DN_RENAMES_UNIT
+                  then
+                     declare
+                        Cur_P    : TREE := PDef;
+                        Leaf_Ren : TREE := PDef;
+                        Tgt_E    : TREE := CONST_VOID;
+                        Tsk_T    : TREE := CONST_VOID;
+                     begin
+                        for Step in 1 .. 8 loop
+                           exit when Is_Void_Tree (Cur_P);
+                           if KIND (Cur_P) = DN_ENTRY_ID then
+                              Tgt_E := Cur_P;
+                              exit;
+                           elsif KIND (Cur_P) = DN_PROCEDURE_ID
+                             and then not Is_Void_Tree (D (SM_UNIT_DESC, Cur_P))
+                             and then KIND (D (SM_UNIT_DESC, Cur_P)) = DN_RENAMES_UNIT
+                           then
+                              Leaf_Ren := Cur_P;
+                              declare
+                                 RN : TREE := D (AS_NAME, D (SM_UNIT_DESC, Cur_P));
+                              begin
+                                 if not Is_Void_Tree (RN) and then KIND (RN) = DN_INDEXED then
+                                    RN := D (AS_NAME, RN);
+                                 end if;
+                                 if not Is_Void_Tree (RN) and then KIND (RN) = DN_SELECTED then
+                                    Cur_P := Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (D (AS_DESIGNATOR, RN))));
+                                    if not Is_Void_Tree (Cur_P) and then KIND (Cur_P) = DN_ENTRY_ID
+                                      and then not Is_Void_Tree (D (AS_NAME, RN))
+                                      and then KIND (D (AS_NAME, RN)) in CLASS_EXP
+                                      and then KIND (D (AS_NAME, RN)) /= DN_USED_NAME_ID
+                                    then
+                                       Tsk_T := Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_EXP_TYPE, D (AS_NAME, RN))));
+                                    end if;
+                                 elsif not Is_Void_Tree (RN) then
+                                    Cur_P := Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (RN)));
+                                 else
+                                    exit;
+                                 end if;
+                              end;
+                           else
+                              exit;
+                           end if;
+                        end loop;
+                        if not Is_Void_Tree (Tgt_E) then
+                           if not Is_Void_Tree (Tsk_T) then
+                              if KIND (Tsk_T) = DN_ACCESS then
+                                 Register_Task_Spec (Ctx, D (SM_DESIG_TYPE, Tsk_T), Ctx.Cur_Subp_Key);
+                              else
+                                 Register_Task_Spec (Ctx, Tsk_T, Ctx.Cur_Subp_Key);
+                              end if;
+                           elsif KIND (Tgt_E) in CLASS_SOURCE_NAME and then not Is_Void_Tree (D (XD_REGION, Tgt_E)) then
+                              declare
+                                 TR : constant TREE := D (XD_REGION, Tgt_E);
+                              begin
+                                 if KIND (TR) in CLASS_TYPE_NAME then
+                                    Register_Task_Spec (Ctx, D (SM_TYPE_SPEC, TR), Ctx.Cur_Subp_Key);
+                                 elsif KIND (TR) = DN_VARIABLE_ID then
+                                    Register_Task_Spec (Ctx, D (SM_OBJ_TYPE, TR), Ctx.Cur_Subp_Key);
+                                 end if;
+                              end;
+                           end if;
+                           declare
+                              RQName : constant String := Qualified_Ada_Name (Leaf_Ren);
+                              TSym   : constant String := "@ada_rent_t__" & RQName;
+                              ISym   : constant String := "@ada_rent_i__" & RQName;
+                           begin
+                              Add_Global_Decl (Ctx.E, TSym, "extern " & TSym & " = global ptr, align 8");
+                              Add_Global_Decl (Ctx.E, ISym, "extern " & ISym & " = global i32, align 4");
+                              Ctx.Renamed_Entries.Include (Tree_Key (PDef),
+                                (Task_Sym      => To_Unbounded_String (TSym),
+                                 Idx_Sym       => To_Unbounded_String (ISym),
+                                 Entry_Id      => Tgt_E,
+                                 Is_Local      => False,
+                                 Owner_Subp    => 0,
+                                 Fallback_TSym => Null_Unbounded_String,
+                                 Fallback_ISym => Null_Unbounded_String));
+                              return True;
+                           end;
+                        end if;
+                     end;
+                  end if;
+                  return False;
+               end Try_Bind_Cross_Unit_Renamed_Entry;
             begin
                if K = DN_PROCEDURE_CALL then
                   declare
                      PDef : constant TREE := Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (D (AS_NAME, Stm))));
                   begin
-                     if not Is_Void_Tree (PDef) and then Ctx.Renamed_Entries.Contains (Tree_Key (PDef)) then
-                        Is_Renamed_Entry_Call := True;
-                     elsif not Is_Void_Tree (PDef) and then KIND (PDef) = DN_PROCEDURE_ID
-                       and then not Is_Void_Tree (D (SM_UNIT_DESC, PDef))
-                       and then KIND (D (SM_UNIT_DESC, PDef)) = DN_RENAMES_UNIT
-                     then
-                        -- Cross-unit renamed task entry (LRM 8.5(9)): resolve target entry & bind extern globals
+                     if not Try_Bind_Cross_Unit_Renamed_Entry (PDef) then
                         declare
-                           Cur_P  : TREE := PDef;
-                           Tgt_E  : TREE := CONST_VOID;
-                           Tsk_T  : TREE := CONST_VOID;
+                           Dummy : constant Expr_Val := Emit_Subp_Call (Ctx, Stm, Is_Func => False);
                         begin
-                           for Step in 1 .. 8 loop
-                              exit when Is_Void_Tree (Cur_P);
-                              if KIND (Cur_P) = DN_ENTRY_ID then
-                                 Tgt_E := Cur_P;
-                                 exit;
-                              elsif KIND (Cur_P) = DN_PROCEDURE_ID
-                                and then not Is_Void_Tree (D (SM_UNIT_DESC, Cur_P))
-                                and then KIND (D (SM_UNIT_DESC, Cur_P)) = DN_RENAMES_UNIT
-                              then
-                                 declare
-                                    RN : TREE := D (AS_NAME, D (SM_UNIT_DESC, Cur_P));
-                                 begin
-                                    if not Is_Void_Tree (RN) and then KIND (RN) = DN_INDEXED then
-                                       RN := D (AS_NAME, RN);
-                                    end if;
-                                    if not Is_Void_Tree (RN) and then KIND (RN) = DN_SELECTED then
-                                       Cur_P := Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (D (AS_DESIGNATOR, RN))));
-                                       if not Is_Void_Tree (Cur_P) and then KIND (Cur_P) = DN_ENTRY_ID
-                                         and then not Is_Void_Tree (D (AS_NAME, RN))
-                                         and then KIND (D (AS_NAME, RN)) in CLASS_EXP
-                                         and then KIND (D (AS_NAME, RN)) /= DN_USED_NAME_ID
-                                       then
-                                          Tsk_T := Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_EXP_TYPE, D (AS_NAME, RN))));
-                                       end if;
-                                    elsif not Is_Void_Tree (RN) then
-                                       Cur_P := Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (RN)));
-                                    else
-                                       exit;
-                                    end if;
-                                 end;
-                              else
-                                 exit;
-                              end if;
-                           end loop;
-                           if not Is_Void_Tree (Tgt_E) then
-                              if not Is_Void_Tree (Tsk_T) then
-                                 if KIND (Tsk_T) = DN_ACCESS then
-                                    Register_Task_Spec (Ctx, D (SM_DESIG_TYPE, Tsk_T), Ctx.Cur_Subp_Key);
-                                 else
-                                    Register_Task_Spec (Ctx, Tsk_T, Ctx.Cur_Subp_Key);
-                                 end if;
-                              elsif KIND (Tgt_E) in CLASS_SOURCE_NAME and then not Is_Void_Tree (D (XD_REGION, Tgt_E)) then
-                                 declare
-                                    TR : constant TREE := D (XD_REGION, Tgt_E);
-                                 begin
-                                    if KIND (TR) in CLASS_TYPE_NAME then
-                                       Register_Task_Spec (Ctx, D (SM_TYPE_SPEC, TR), Ctx.Cur_Subp_Key);
-                                    elsif KIND (TR) = DN_VARIABLE_ID then
-                                       Register_Task_Spec (Ctx, D (SM_OBJ_TYPE, TR), Ctx.Cur_Subp_Key);
-                                    end if;
-                                 end;
-                              end if;
-                              declare
-                                 RQName : constant String := Qualified_Ada_Name (PDef);
-                                 TSym   : constant String := "@ada_rent_t__" & RQName;
-                                 ISym   : constant String := "@ada_rent_i__" & RQName;
-                              begin
-                                 Add_Global_Decl (Ctx.E, TSym, "extern " & TSym & " = global ptr, align 8");
-                                 Add_Global_Decl (Ctx.E, ISym, "extern " & ISym & " = global i32, align 4");
-                                 Ctx.Renamed_Entries.Include (Tree_Key (PDef),
-                                   (Task_Sym => To_Unbounded_String (TSym),
-                                    Idx_Sym  => To_Unbounded_String (ISym),
-                                    Entry_Id => Tgt_E));
-                                 Is_Renamed_Entry_Call := True;
-                              end;
-                           end if;
+                           pragma Unreferenced (Dummy);
                         end;
+                        return;
                      end if;
                   end;
-                  if not Is_Renamed_Entry_Call then
-                     declare
-                        Dummy : constant Expr_Val := Emit_Subp_Call (Ctx, Stm, Is_Func => False);
-                     begin
-                        pragma Unreferenced (Dummy);
-                     end;
-                     return;
-                  end if;
                end if;
-            end;
             declare
                type Entry_Copy_Back is record
                   Field_Idx : Natural := 0;
@@ -5654,6 +7410,7 @@ package body Cg_Stmt is
                   Pkt_Pir   : Unbounded_String;
                   Pkt_Align : Natural := 4;
                   Pkt_Type  : TREE := CONST_VOID;
+                  Is_Shared : Boolean := False;
                end record;
                package ECB_Vecs is new Ada.Containers.Vectors (Natural, Entry_Copy_Back);
 
@@ -5693,21 +7450,97 @@ package body Cg_Stmt is
                      Call_Def : constant TREE :=
                        (if KIND (Name_N) /= DN_INDEXED
                         then Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (Name_N))) else CONST_VOID);
-                     Is_Ren_Ent : constant Boolean :=
-                       not Is_Void_Tree (Call_Def) and then Ctx.Renamed_Entries.Contains (Tree_Key (Call_Def));
+                     Is_Ren_Ent : constant Boolean := Try_Bind_Cross_Unit_Renamed_Entry (Call_Def);
                   begin
                   if Is_Ren_Ent then
                      declare
                         REI : constant Renamed_Entry_Info := Ctx.Renamed_Entries.Element (Tree_Key (Call_Def));
-                        TA  : constant String := Next_Reg (Ctx.E, "rtpa");
                         TV  : constant String := Next_Reg (Ctx.E, "rtpv");
-                        IA  : constant String := Next_Reg (Ctx.E, "reia");
                         IV  : constant String := Next_Reg (Ctx.E, "reiv");
                      begin
-                        Emit_Inst (Ctx.E, TA & " = addr " & To_String (REI.Task_Sym));
-                        Emit_Inst (Ctx.E, TV & " = load.ptr " & TA & ", align 8");
-                        Emit_Inst (Ctx.E, IA & " = addr " & To_String (REI.Idx_Sym));
-                        Emit_Inst (Ctx.E, IV & " = load.i32 " & IA & ", align 4");
+                        if REI.Is_Local then
+                           declare
+                              Base_P   : Unbounded_String := REI.Task_Sym;
+                              Found_SL : Boolean := (REI.Owner_Subp = Ctx.Cur_Subp_Key);
+                              Off_I    : constant String := Next_Reg (Ctx.E, "reio");
+                           begin
+                              if not Found_SL and then Ctx.Vars.Contains (Tree_Key (Call_Def))
+                                and then Ctx.Vars.Element (Tree_Key (Call_Def)).Captured_Slot > 0
+                              then
+                                 declare
+                                    Cap_Sl : constant Natural := Ctx.Vars.Element (Tree_Key (Call_Def)).Captured_Slot;
+                                    Cur_SK : Unsigned_32 := Ctx.Cur_Subp_Key;
+                                    Cur_SL : Unbounded_String := Ctx.Cur_SL_Reg;
+                                 begin
+                                    for Step in 1 .. 16 loop
+                                       exit when Cur_SK = 0 or else not Ctx.Subps.Contains (Cur_SK);
+                                       declare
+                                          PSI : constant Subp_Info := Ctx.Subps.Element (Cur_SK);
+                                          Par : constant Unsigned_32 := PSI.Parent_Subp;
+                                       begin
+                                          exit when Par = 0 or else not Ctx.Subps.Contains (Par);
+                                          declare
+                                             OSI : constant Subp_Info := Ctx.Subps.Element (Par);
+                                          begin
+                                             if Par = REI.Owner_Subp then
+                                                declare
+                                                   FP : constant String := Next_Reg (Ctx.E, "rslp");
+                                                   LP : constant String := Next_Reg (Ctx.E, "rslv");
+                                                begin
+                                                   Emit_Inst (Ctx.E, FP & " = field_ptr " & To_String (OSI.Frame_Type) & ", " & To_String (Cur_SL) & ", " & Img (Cap_Sl));
+                                                   Emit_Inst (Ctx.E, LP & " = load.ptr " & FP & ", align 8");
+                                                   Base_P := To_Unbounded_String (LP);
+                                                   Found_SL := True;
+                                                end;
+                                                exit;
+                                             else
+                                                declare
+                                                   FP : constant String := Next_Reg (Ctx.E, "rsln");
+                                                   NP : constant String := Next_Reg (Ctx.E, "rslq");
+                                                begin
+                                                   Emit_Inst (Ctx.E, FP & " = field_ptr " & To_String (OSI.Frame_Type) & ", " & To_String (Cur_SL) & ", 0");
+                                                   Emit_Inst (Ctx.E, NP & " = load.ptr " & FP & ", align 8");
+                                                   Cur_SL := To_Unbounded_String (NP);
+                                                   Cur_SK := Par;
+                                                end;
+                                             end if;
+                                          end;
+                                       end;
+                                    end loop;
+                                 end;
+                              end if;
+                              if Found_SL then
+                                 Emit_Inst (Ctx.E, TV & " = load.ptr " & To_String (Base_P) & ", align 8");
+                                 declare
+                                    Off8 : constant String := Next_Reg (Ctx.E, "rei8");
+                                 begin
+                                    Emit_Inst (Ctx.E, Off8 & " = const.i64 8");
+                                    Emit_Inst (Ctx.E, Off_I & " = ptr_add.i64 " & To_String (Base_P) & ", " & Off8);
+                                 end;
+                                 Emit_Inst (Ctx.E, IV & " = load.i32 " & Off_I & ", align 4");
+                              else
+                                 declare
+                                    TA : constant String := Next_Reg (Ctx.E, "rtpa");
+                                    IA : constant String := Next_Reg (Ctx.E, "reia");
+                                 begin
+                                    Emit_Inst (Ctx.E, TA & " = addr " & To_String (REI.Fallback_TSym));
+                                    Emit_Inst (Ctx.E, TV & " = load.ptr " & TA & ", align 8");
+                                    Emit_Inst (Ctx.E, IA & " = addr " & To_String (REI.Fallback_ISym));
+                                    Emit_Inst (Ctx.E, IV & " = load.i32 " & IA & ", align 4");
+                                 end;
+                              end if;
+                           end;
+                        else
+                           declare
+                              TA : constant String := Next_Reg (Ctx.E, "rtpa");
+                              IA : constant String := Next_Reg (Ctx.E, "reia");
+                           begin
+                              Emit_Inst (Ctx.E, TA & " = addr " & To_String (REI.Task_Sym));
+                              Emit_Inst (Ctx.E, TV & " = load.ptr " & TA & ", align 8");
+                              Emit_Inst (Ctx.E, IA & " = addr " & To_String (REI.Idx_Sym));
+                              Emit_Inst (Ctx.E, IV & " = load.i32 " & IA & ", align 4");
+                           end;
+                        end if;
                         Task_Ptr := To_Unbounded_String (TV);
                         EIdx_Reg := To_Unbounded_String (IV);
                         Entry_Id := REI.Entry_Id;
@@ -5766,61 +7599,7 @@ package body Cg_Stmt is
                   end if;
 
                   if Has_EI then
-                     if EI.Is_Family and then not Is_Void_Tree (Fam_Exp) then
-                        declare
-                           IV  : constant Expr_Val := Emit_Expr (Ctx, Fam_Exp);
-                           I32 : constant String := Emit_Int_Convert (Ctx, To_String (IV.Reg), To_String (IV.Pir_Type), "i32");
-                           D1  : constant String := Next_Reg (Ctx.E, "efd");
-                           A1  : constant String := Next_Reg (Ctx.E, "efa");
-                        begin
-                           if EI.Fam_Is_Static then
-                              if Ctx.Enable_Checks then
-                                 declare
-                                    LoC : constant String := Next_Reg (Ctx.E, "eflo");
-                                    HiC : constant String := Next_Reg (Ctx.E, "efhi");
-                                    Bad : constant String := Next_Reg (Ctx.E, "efb");
-                                 begin
-                                    Emit_Inst (Ctx.E, LoC & " = cmp_lt_s.i32 " & I32 & ", " & Img (Long_Long_Integer (EI.Fam_Lo)));
-                                    Emit_Inst (Ctx.E, HiC & " = cmp_gt_s.i32 " & I32 & ", " & Img (Long_Long_Integer (EI.Fam_Hi)));
-                                    Emit_Inst (Ctx.E, Bad & " = or.i8 " & LoC & ", " & HiC);
-                                    Emit_Check_Fail_If (Ctx, Bad);
-                                 end;
-                              end if;
-                              Emit_Inst (Ctx.E, D1 & " = sub.i32 " & I32 & ", " & Img (Long_Long_Integer (EI.Fam_Lo)));
-                           else
-                              declare
-                                 RT2, LoR, HiR : Unbounded_String;
-                                 Lo32, Hi32    : Unbounded_String;
-                              begin
-                                 Emit_Discrete_Range (Ctx, EI.Fam_DR, RT2, LoR, HiR);
-                                 Lo32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (LoR), To_String (RT2), "i32"));
-                                 Hi32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (HiR), To_String (RT2), "i32"));
-                                 if Ctx.Enable_Checks then
-                                    declare
-                                       LoC : constant String := Next_Reg (Ctx.E, "eflo");
-                                       HiC : constant String := Next_Reg (Ctx.E, "efhi");
-                                       Bad : constant String := Next_Reg (Ctx.E, "efb");
-                                    begin
-                                       Emit_Inst (Ctx.E, LoC & " = cmp_lt_s.i32 " & I32 & ", " & To_String (Lo32));
-                                       Emit_Inst (Ctx.E, HiC & " = cmp_gt_s.i32 " & I32 & ", " & To_String (Hi32));
-                                       Emit_Inst (Ctx.E, Bad & " = or.i8 " & LoC & ", " & HiC);
-                                       Emit_Check_Fail_If (Ctx, Bad);
-                                    end;
-                                 end if;
-                                 Emit_Inst (Ctx.E, D1 & " = sub.i32 " & I32 & ", " & To_String (Lo32));
-                              end;
-                           end if;
-                           Emit_Inst (Ctx.E, A1 & " = add.i32 " & D1 & ", " & Img (EI.Base_Idx));
-                           EIdx_Reg := To_Unbounded_String (A1);
-                        end;
-                     else
-                        declare
-                           C : constant String := Next_Reg (Ctx.E, "ei");
-                        begin
-                           Emit_Inst (Ctx.E, C & " = const.i32 " & Img (EI.Base_Idx));
-                           EIdx_Reg := To_Unbounded_String (C);
-                        end;
-                     end if;
+                     EIdx_Reg := To_Unbounded_String (Emit_Entry_Index_Reg (Ctx, EI, Fam_Exp));
                   end if;
                   end if;
                   end;
@@ -5905,7 +7684,7 @@ package body Cg_Stmt is
                                              if PTI.Kind = TK_Constrained_Array then
                                                 declare
                                                    Tgt_V : Expr_Val;
-                                                   ND_A  : constant Natural := Natural'Max (1, Natural'Min (PTI.NDims, 4));
+                                                   ND_A  : constant Natural := Natural'Max (1, Natural'Min (PTI.NDims, Max_Array_Dims));
                                                    Act_U : TREE := Act;
                                                 begin
                                                    while not Is_Void_Tree (Act_U) and then KIND (Act_U) = DN_PARENTHESIZED loop
@@ -5967,6 +7746,7 @@ package body Cg_Stmt is
                                              declare
                                                 LV  : constant Expr_Val := Emit_LValue (Ctx, Inner_Act);
                                                 ATI : constant Type_Info := Get_Type_Info (Ctx, LV.Ada_Type);
+                                                Act_Sh : constant Boolean := Is_Shared_Object (Ctx, Inner_Act);
                                              begin
                                                 Emit_Inst (Ctx.E, Fld & " = field_ptr " & To_String (EI.Pkt_Type) & ", " & PR & ", " & Img (FIdx));
                                                 if PMode = DN_IN_OUT then
@@ -5974,7 +7754,12 @@ package body Cg_Stmt is
                                                       RV : constant String := Next_Reg (Ctx.E, "ecin");
                                                       VR : Unbounded_String;
                                                    begin
-                                                      Emit_Inst (Ctx.E, RV & " = load." & To_String (ATI.Pir_Type) & " " & To_String (LV.Reg) & ", align " & Img (ATI.Align));
+                                                      if Act_Sh then
+                                                         Emit_Inst (Ctx.E, RV & " = load." & To_String (ATI.Pir_Type) & " " & To_String (LV.Reg) & ", align " & Img (ATI.Align) & " [volatile]");
+                                                         Emit_Inst (Ctx.E, "fence [seq_cst]");
+                                                      else
+                                                         Emit_Inst (Ctx.E, RV & " = load." & To_String (ATI.Pir_Type) & " " & To_String (LV.Reg) & ", align " & Img (ATI.Align));
+                                                      end if;
                                                       if not Is_Void_Tree (Conv_T) then
                                                          declare
                                                             CTI : constant Type_Info := Get_Type_Info (Ctx, Conv_T);
@@ -5999,7 +7784,8 @@ package body Cg_Stmt is
                                                                  Conv_Type => Conv_T,
                                                                  Pkt_Pir   => PTI.Pir_Type,
                                                                  Pkt_Align => PTI.Align,
-                                                                 Pkt_Type  => PT));
+                                                                 Pkt_Type  => PT,
+                                                                 Is_Shared => Act_Sh));
                                                 FIdx := FIdx + 1;
                                              end;
                                           end;
@@ -6073,7 +7859,13 @@ package body Cg_Stmt is
                         end if;
                         Emit_Range_Check (Ctx, To_String (CV), To_String (CB.Act_Pir), CB.Act_Type);
                         Emit_Discriminant_Check (Ctx, To_String (CV), CB.Act_Type, Is_Access => True);
-                        Emit_Inst (Ctx.E, "store." & To_String (CB.Act_Pir) & " " & To_String (CV) & ", " & To_String (CB.Act_Ptr) & ", align " & Img (CB.Act_Align));
+                        if CB.Is_Shared then
+                           Emit_Inst (Ctx.E, "fence [seq_cst]");
+                           Emit_Inst (Ctx.E, "store." & To_String (CB.Act_Pir) & " " & To_String (CV) & ", " & To_String (CB.Act_Ptr) & ", align " & Img (CB.Act_Align) & " [volatile]");
+                           Emit_Inst (Ctx.E, "fence [seq_cst]");
+                        else
+                           Emit_Inst (Ctx.E, "store." & To_String (CB.Act_Pir) & " " & To_String (CV) & ", " & To_String (CB.Act_Ptr) & ", align " & Img (CB.Act_Align));
+                        end if;
                      end;
                   end loop;
                end Emit_Entry_Copy_Backs;
@@ -6181,6 +7973,7 @@ package body Cg_Stmt is
                      end if;
                   end;
                end if;
+            end;
             end;
 
          when DN_ACCEPT | DN_SELECTIVE_WAIT =>
@@ -6313,7 +8106,7 @@ package body Cg_Stmt is
                                                    declare
                                                       Sp : constant String := Next_Reg (Ctx.E, "asp");
                                                    begin
-                                                      Emit_Entry_Alloca (Ctx.E, Sp & " = alloca " & Img (Natural'Max (1, PTI.Byte_Size)) & ", align " & Img (Natural'Max (1, PTI.Align)));
+                                                      Emit_Entry_Alloca (Ctx.E, Sp & " = alloca " & To_String (PTI.Pir_Type) & ", align " & Img (Natural'Max (1, PTI.Align)));
                                                       Emit_Inst (Ctx.E, "store." & To_String (PTI.Pir_Type) & " " & To_String (VI.Pir_Name) & ", " & Sp & ", align " & Img (Natural'Max (1, PTI.Align)));
                                                       Emit_Inst (Ctx.E, FPR & " = field_ptr " & To_String (FSI.Frame_Type) & ", " & To_String (Ctx.Cur_Frame_Reg) & ", " & Img (VI.Captured_Slot));
                                                       Emit_Inst (Ctx.E, "store.ptr " & Sp & ", " & FPR & ", align 8");
@@ -6331,7 +8124,7 @@ package body Cg_Stmt is
                                                       Emit_Entry_Alloca (Ctx.E, DR & " = alloca @__ada_arr_desc, align 8");
                                                       Emit_Inst (Ctx.E, P0 & " = field_ptr @__ada_arr_desc, " & DR & ", 0");
                                                       Emit_Inst (Ctx.E, "store.ptr " & To_String (VI.Pir_Name) & ", " & P0 & ", align 8");
-                                                      for D_I in 1 .. Natural'Min (VI.NDims, 4) loop
+                                                      for D_I in 1 .. Natural'Min (VI.NDims, Max_Array_Dims) loop
                                                          declare
                                                             FF : constant String := Next_Reg (Ctx.E, "apdf");
                                                             LF : constant String := Next_Reg (Ctx.E, "apdl");
@@ -6374,7 +8167,8 @@ package body Cg_Stmt is
                         Ctx.Handlers.Append ((Handler_Label => To_Unbounded_String (H_Lbl),
                                               Current_Exn   => Null_Unbounded_String,
                                               In_Handler    => False,
-                                              SS_Mark       => H_Mark));
+                                              SS_Mark       => H_Mark,
+                                              SP_Mark       => Null_Unbounded_String));
                         Ctx.Accept_End_Lbls.Append (To_Unbounded_String (R_Lbl));
                         Ctx.Accept_Mst_Depths.Append (Unsigned_32 (Ctx.Master_Stack.Length));
                         Emit_Stm_List (Ctx, Acc_SS);
@@ -6397,7 +8191,18 @@ package body Cg_Stmt is
                   end if;
 
                   for BK of Bound_Ks loop
-                     if Ctx.Vars.Contains (BK) then Ctx.Vars.Delete (BK); end if;
+                     if Ctx.Vars.Contains (BK) then
+                        declare
+                           Old_V : Var_Info := Ctx.Vars.Element (BK);
+                        begin
+                           if Old_V.Captured_Slot > 0 and then Old_V.Owner_Subp = Ctx.Cur_Subp_Key then
+                              Old_V.Pir_Name := Null_Unbounded_String;
+                              Ctx.Vars.Replace (BK, Old_V);
+                           else
+                              Ctx.Vars.Delete (BK);
+                           end if;
+                        end;
+                     end if;
                   end loop;
                end Emit_Accept_Core;
 
@@ -6419,61 +8224,7 @@ package body Cg_Stmt is
                      declare
                         EI : constant Entry_Info := Ctx.Entries.Element (Tree_Key (E_Def));
                      begin
-                        if EI.Is_Family and then not Is_Void_Tree (Fam_E) then
-                           declare
-                              IV  : constant Expr_Val := Emit_Expr (Ctx, Fam_E);
-                              I32 : constant String := Emit_Int_Convert (Ctx, To_String (IV.Reg), To_String (IV.Pir_Type), "i32");
-                              D1  : constant String := Next_Reg (Ctx.E, "afd");
-                              A1  : constant String := Next_Reg (Ctx.E, "afa");
-                           begin
-                              if EI.Fam_Is_Static then
-                                 if Ctx.Enable_Checks then
-                                    declare
-                                       LoC : constant String := Next_Reg (Ctx.E, "aflo");
-                                       HiC : constant String := Next_Reg (Ctx.E, "afhi");
-                                       Bad : constant String := Next_Reg (Ctx.E, "afb");
-                                    begin
-                                       Emit_Inst (Ctx.E, LoC & " = cmp_lt_s.i32 " & I32 & ", " & Img (Long_Long_Integer (EI.Fam_Lo)));
-                                       Emit_Inst (Ctx.E, HiC & " = cmp_gt_s.i32 " & I32 & ", " & Img (Long_Long_Integer (EI.Fam_Hi)));
-                                       Emit_Inst (Ctx.E, Bad & " = or.i8 " & LoC & ", " & HiC);
-                                       Emit_Check_Fail_If (Ctx, Bad);
-                                    end;
-                                 end if;
-                                 Emit_Inst (Ctx.E, D1 & " = sub.i32 " & I32 & ", " & Img (Long_Long_Integer (EI.Fam_Lo)));
-                              else
-                                 declare
-                                    RT2, LoR, HiR : Unbounded_String;
-                                    Lo32, Hi32    : Unbounded_String;
-                                 begin
-                                    Emit_Discrete_Range (Ctx, EI.Fam_DR, RT2, LoR, HiR);
-                                    Lo32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (LoR), To_String (RT2), "i32"));
-                                    Hi32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (HiR), To_String (RT2), "i32"));
-                                    if Ctx.Enable_Checks then
-                                       declare
-                                          LoC : constant String := Next_Reg (Ctx.E, "aflo");
-                                          HiC : constant String := Next_Reg (Ctx.E, "afhi");
-                                          Bad : constant String := Next_Reg (Ctx.E, "afb");
-                                       begin
-                                          Emit_Inst (Ctx.E, LoC & " = cmp_lt_s.i32 " & I32 & ", " & To_String (Lo32));
-                                          Emit_Inst (Ctx.E, HiC & " = cmp_gt_s.i32 " & I32 & ", " & To_String (Hi32));
-                                          Emit_Inst (Ctx.E, Bad & " = or.i8 " & LoC & ", " & HiC);
-                                          Emit_Check_Fail_If (Ctx, Bad);
-                                       end;
-                                    end if;
-                                    Emit_Inst (Ctx.E, D1 & " = sub.i32 " & I32 & ", " & To_String (Lo32));
-                                 end;
-                              end if;
-                              Emit_Inst (Ctx.E, A1 & " = add.i32 " & D1 & ", " & Img (EI.Base_Idx));
-                              return A1;
-                           end;
-                        else
-                           declare
-                              C : constant String := Next_Reg (Ctx.E, "aei");
-                           begin
-                              Emit_Inst (Ctx.E, C & " = const.i32 " & Img (EI.Base_Idx));
-                              return C;
-                           end;
-                        end if;
+                        return Emit_Entry_Index_Reg (Ctx, EI, Fam_E);
                      end;
                   end if;
                   declare
@@ -6565,6 +8316,7 @@ package body Cg_Stmt is
                         Emit_Entry_Alloca (Ctx.E, Pkt_Slot & " = alloca ptr, align 8");
                         Emit_Entry_Alloca (Ctx.E, Cal_Slot & " = alloca ptr, align 8");
 
+                        -- P3-4.15: LRM 9.7.1(5) Pass 1: evaluate ALL guards before any delay/entry-family index expressions
                         for I in 0 .. NArm - 1 loop
                            declare
                               KP : constant String := Next_Reg (Ctx.E, "swkp");
@@ -6574,35 +8326,61 @@ package body Cg_Stmt is
                               Emit_Inst (Ctx.E, KP & " = elem_ptr i32, " & AK_Arr & ", " & Img (I));
                               Emit_Inst (Ctx.E, EP & " = elem_ptr i32, " & EI_Arr & ", " & Img (I));
                               Emit_Inst (Ctx.E, DP & " = elem_ptr i64, " & DL_Arr & ", " & Img (I));
-                              Emit_Inst (Ctx.E, "store.i32 0, " & KP & ", align 4");
                               Emit_Inst (Ctx.E, "store.i32 0, " & EP & ", align 4");
                               Emit_Inst (Ctx.E, "store.i64 0, " & DP & ", align 8");
                               if not Is_Void_Tree (Arms (I).Guard) then
                                  declare
-                                    GV    : constant Expr_Val := Emit_Expr (Ctx, Arms (I).Guard);
-                                    L_Opn : constant String := Next_Label (Ctx.E, "swg_o");
-                                    L_Cls : constant String := Next_Label (Ctx.E, "swg_c");
+                                    GV  : constant Expr_Val := Emit_Expr (Ctx, Arms (I).Guard);
+                                    Sel : constant String := Next_Reg (Ctx.E, "swks");
                                  begin
-                                    Emit_Term (Ctx.E, "br " & To_String (GV.Reg) & ", " & L_Opn & ", " & L_Cls);
-                                    Emit_Label (Ctx.E, L_Opn);
-                                    Emit_Inst (Ctx.E, "store.i32 " & Img (Arms (I).Alt_Kind) & ", " & KP & ", align 4");
-                                    if Arms (I).Alt_Kind = 1 then
-                                       Emit_Inst (Ctx.E, "store.i32 " & Compute_Accept_EIdx (Arms (I).First_S) & ", " & EP & ", align 4");
-                                    elsif Arms (I).Alt_Kind = 2 then
-                                       Emit_Inst (Ctx.E, "store.i64 " & Emit_Duration_Ns (Ctx, D (AS_EXP, Arms (I).First_S)) & ", " & DP & ", align 8");
-                                    end if;
-                                    Emit_Term (Ctx.E, "jmp " & L_Cls);
-                                    Emit_Label (Ctx.E, L_Cls);
+                                    Emit_Inst (Ctx.E, Sel & " = select.i32 " & To_String (GV.Reg) & ", " & Img (Arms (I).Alt_Kind) & ", 0");
+                                    Emit_Inst (Ctx.E, "store.i32 " & Sel & ", " & KP & ", align 4");
                                  end;
                               else
                                  Emit_Inst (Ctx.E, "store.i32 " & Img (Arms (I).Alt_Kind) & ", " & KP & ", align 4");
-                                 if Arms (I).Alt_Kind = 1 then
-                                    Emit_Inst (Ctx.E, "store.i32 " & Compute_Accept_EIdx (Arms (I).First_S) & ", " & EP & ", align 4");
-                                 elsif Arms (I).Alt_Kind = 2 then
-                                    Emit_Inst (Ctx.E, "store.i64 " & Emit_Duration_Ns (Ctx, D (AS_EXP, Arms (I).First_S)) & ", " & DP & ", align 8");
-                                 end if;
                               end if;
                            end;
+                        end loop;
+
+                        -- Pass 2: evaluate entry-family indices and delay durations ONLY for open alternatives
+                        for I in 0 .. NArm - 1 loop
+                           if Arms (I).Alt_Kind = 1 or else Arms (I).Alt_Kind = 2 then
+                              declare
+                                 KP : constant String := Next_Reg (Ctx.E, "swk2");
+                                 EP : constant String := Next_Reg (Ctx.E, "swe2");
+                                 DP : constant String := Next_Reg (Ctx.E, "swd2");
+                              begin
+                                 Emit_Inst (Ctx.E, KP & " = elem_ptr i32, " & AK_Arr & ", " & Img (I));
+                                 Emit_Inst (Ctx.E, EP & " = elem_ptr i32, " & EI_Arr & ", " & Img (I));
+                                 Emit_Inst (Ctx.E, DP & " = elem_ptr i64, " & DL_Arr & ", " & Img (I));
+                                 if not Is_Void_Tree (Arms (I).Guard) then
+                                    declare
+                                       KV    : constant String := Next_Reg (Ctx.E, "swkv");
+                                       Is_Op : constant String := Next_Reg (Ctx.E, "swop");
+                                       L_Opn : constant String := Next_Label (Ctx.E, "swg_o");
+                                       L_Cls : constant String := Next_Label (Ctx.E, "swg_c");
+                                    begin
+                                       Emit_Inst (Ctx.E, KV & " = load.i32 " & KP & ", align 4");
+                                       Emit_Inst (Ctx.E, Is_Op & " = cmp_ne.i32 " & KV & ", 0");
+                                       Emit_Term (Ctx.E, "br " & Is_Op & ", " & L_Opn & ", " & L_Cls);
+                                       Emit_Label (Ctx.E, L_Opn);
+                                       if Arms (I).Alt_Kind = 1 then
+                                          Emit_Inst (Ctx.E, "store.i32 " & Compute_Accept_EIdx (Arms (I).First_S) & ", " & EP & ", align 4");
+                                       else
+                                          Emit_Inst (Ctx.E, "store.i64 " & Emit_Duration_Ns (Ctx, D (AS_EXP, Arms (I).First_S)) & ", " & DP & ", align 8");
+                                       end if;
+                                       Emit_Term (Ctx.E, "jmp " & L_Cls);
+                                       Emit_Label (Ctx.E, L_Cls);
+                                    end;
+                                 else
+                                    if Arms (I).Alt_Kind = 1 then
+                                       Emit_Inst (Ctx.E, "store.i32 " & Compute_Accept_EIdx (Arms (I).First_S) & ", " & EP & ", align 4");
+                                    else
+                                       Emit_Inst (Ctx.E, "store.i64 " & Emit_Duration_Ns (Ctx, D (AS_EXP, Arms (I).First_S)) & ", " & DP & ", align 8");
+                                    end if;
+                                 end if;
+                              end;
+                           end if;
                         end loop;
 
                         Emit_Call_Or_Invoke (Ctx, "@__ada_select_wait",
@@ -6622,6 +8400,7 @@ package body Cg_Stmt is
 
                         Emit_Label (Ctx.E, L_Term);
                         if Length (Ctx.Cur_Task_Exit_Lbl) > 0 then
+                           Emit_Master_Leave_To (Ctx, Ctx.Cur_Task_Base_Mst_Depth);
                            Emit_Term (Ctx.E, "jmp " & To_String (Ctx.Cur_Task_Exit_Lbl));
                         else
                            Emit_Term (Ctx.E, "ret");
@@ -6719,15 +8498,19 @@ package body Cg_Stmt is
       Saved_Handlers    : constant Handler_Vecs.Vector := Ctx.Handlers;
       Saved_Copy_Outs   : constant Copy_Out_Vecs.Vector := Ctx.Copy_Outs;
       Saved_SS_Marks    : constant Str_Vecs.Vector := Ctx.SS_Marks;
+      Saved_SP_Marks    : constant Str_Vecs.Vector := Ctx.SP_Marks;
       Saved_Mst_Stack   : constant Str_Vecs.Vector := Ctx.Master_Stack;
+      Saved_Acc_Lbls    : constant Str_Vecs.Vector := Ctx.Accept_End_Lbls;
       Saved_Acc_Mst_Dep : constant U32_Vecs.Vector := Ctx.Accept_Mst_Depths;
+      Saved_TBase_Mst   : constant Natural := Ctx.Cur_Task_Base_Mst_Depth;
       Saved_Lbl_Mst_Dep : constant I64_Maps.Map := Ctx.Label_Mst_Depths;
+      Saved_Lbl_SS_Dep  : constant I64_Maps.Map := Ctx.Label_SS_Depths;
+      Saved_Lbl_SP_Dep  : constant I64_Maps.Map := Ctx.Label_SP_Depths;
       Saved_Uplevel     : constant Type_Maps.Map := Ctx.Uplevel_Cache;
 
-      Captured_Vars  : U32_Vecs.Vector;
+      Captured_Vars  : Cap_Vecs.Vector;
       Nested_Subps   : U32_Vecs.Vector;
    begin
-      -- Map Body_Node header params -> Spec_Node params if they differ (e.g. generic package body subprograms!)
       declare
          Bdy_Hdr : constant TREE := D (AS_HEADER, Body_Node);
       begin
@@ -6762,6 +8545,25 @@ package body Cg_Stmt is
          end if;
       end;
 
+      -- P3-5.3: Inline separate subunit belonging to a generic template BEFORE Eff_Subunit / Needs_SL:=False!
+      if not Is_Void_Tree (Block_B) and then KIND (Block_B) = DN_STUB then
+         declare
+            Sub_Body : constant TREE := Find_Gen_Subunit_Body (Ctx, Body_Node);
+         begin
+            if not Is_Void_Tree (Sub_Body) and then KIND (Sub_Body) = DN_SUBPROGRAM_BODY
+              and then not Is_Void_Tree (D (AS_BODY, Sub_Body))
+              and then KIND (D (AS_BODY, Sub_Body)) /= DN_STUB
+            then
+               Emit_Subprogram_Body (Ctx, Sub_Body,
+                 Override_Id   => Subp_Id,
+                 Override_Spec => Spec_Node,
+                 Is_Exported   => Is_Exported,
+                 Is_Subunit    => Is_Subunit);
+               return;
+            end if;
+         end;
+      end if;
+
       declare
          Was_Pre_Reg : constant Boolean := Ctx.Subps.Contains (Subp_Key);
          Eff_Subunit : constant Boolean := Is_Subunit or else Ctx.Has_Stubs or else (not Is_Void_Tree (Block_B) and then KIND (Block_B) = DN_STUB);
@@ -6778,7 +8580,7 @@ package body Cg_Stmt is
          end if;
       end;
 
-      -- Handle separate subunit stub: declare extern and skip body emission
+      -- Handle external separate subunit stub: declare extern and skip
       if Is_Void_Tree (Block_B) or else KIND (Block_B) = DN_STUB then
          Ensure_Extern_Subp (Ctx, Subp_Id, SI);
          return;
@@ -6787,9 +8589,10 @@ package body Cg_Stmt is
       -- Pre-register local variables, block variables, loop variables, & parameters for static-link capture scan
       declare
          Temp_Owners : Var_Maps.Map;
+         Local_Meta  : U32_Vecs.Vector;
          PS : constant TREE := D (AS_PARAM_S, Spec_Node);
 
-         procedure Collect_Local_Owners (Node : TREE) is
+         procedure Collect_Local_Owners (Node : TREE; In_Gen_Bdy : Boolean := False) is
             K : NODE_NAME;
          begin
             if Is_Void_Tree (Node) or else Node.TPG <= 0 or else Node.TLN = 0 then
@@ -6809,14 +8612,44 @@ package body Cg_Stmt is
                      end if;
                   end if;
                end;
-               if K = DN_SUBPROGRAM_BODY then
-                  return;
-               end if;
+                  if K = DN_SUBPROGRAM_BODY then
+                     return;
+                  end if;
+                  if K = DN_PACKAGE_BODY then
+                     declare
+                        Sub_P : constant TREE := Find_Gen_Subunit_Body (Ctx, Node);
+                     begin
+                        if not Is_Void_Tree (Sub_P) then
+                           Collect_Local_Owners (D (AS_BODY, Sub_P), In_Gen_Bdy);
+                           return;
+                        end if;
+                     end;
+                  end if;
             end if;
             if K not in CLASS_ALL_SOURCE or else K = DN_SUBPROGRAM_BODY or else K = DN_TASK_BODY then
                return;
             end if;
-            if K = DN_VARIABLE_DECL or else K = DN_CONSTANT_DECL then
+            if K = DN_TYPE_DECL then
+               declare
+                  TID : constant TREE := D (AS_SOURCE_NAME, Node);
+                  TS  : constant TREE :=
+                    (if not Is_Void_Tree (TID) and then KIND (TID) in CLASS_TYPE_NAME
+                     then Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_TYPE_SPEC, TID))) else CONST_VOID);
+               begin
+                  if not Is_Void_Tree (TS) and then KIND (TS) in DN_ACCESS | DN_CONSTRAINED_ACCESS
+                    and then Type_Contains_Task (Ctx, D (SM_DESIG_TYPE, TS))
+                  then
+                     declare
+                        BS : constant TREE := Base_Type_Spec (TS);
+                     begin
+                        if not Is_Void_Tree (BS) and then KIND (BS) = DN_ACCESS and then Is_Void_Tree (D (SM_DERIVED, BS)) then
+                           Local_Meta.Append (Tree_Key (BS));
+                        end if;
+                     end;
+                  end if;
+               end;
+               return;
+            elsif K = DN_VARIABLE_DECL or else K = DN_CONSTANT_DECL then
                declare
                   NS : SEQ_TYPE := LIST (D (AS_SOURCE_NAME_S, Node));
                   ID : TREE;
@@ -6826,7 +8659,8 @@ package body Cg_Stmt is
                      declare
                         V : Var_Info;
                      begin
-                        V.Owner_Subp := Subp_Key;
+                        V.Owner_Subp    := Subp_Key;
+                        V.Captured_Slot := (if In_Gen_Bdy then 1 else 0);
                         Temp_Owners.Include (Tree_Key (Canonical_Def (ID)), V);
                      end;
                   end loop;
@@ -6835,14 +8669,36 @@ package body Cg_Stmt is
             elsif K = DN_TASK_DECL then
                declare
                   Src : constant TREE := D (AS_SOURCE_NAME, Node);
+                  TS_M : TREE := CONST_VOID;
                begin
                   if not Is_Void_Tree (Src) and then KIND (Src) = DN_VARIABLE_ID then
                      declare
                         V : Var_Info;
                      begin
-                        V.Owner_Subp := Subp_Key;
+                        V.Owner_Subp    := Subp_Key;
+                        V.Captured_Slot := (if In_Gen_Bdy then 1 else 0);
                         Temp_Owners.Include (Tree_Key (Canonical_Def (Src)), V);
                      end;
+                     TS_M := Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_OBJ_TYPE, Src)));
+                  elsif not Is_Void_Tree (Src) and then KIND (Src) in CLASS_TYPE_NAME then
+                     TS_M := Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_TYPE_SPEC, Src)));
+                  end if;
+                  if not Is_Void_Tree (TS_M) and then KIND (TS_M) = DN_TASK_SPEC then
+                     Local_Meta.Append (Tree_Key (TS_M));
+                  end if;
+               end;
+               return;
+            elsif K = DN_LENGTH_ENUM_REP then
+               -- P3-6.6: Capture local dynamic 'STORAGE_SIZE slots in parent static-link frame
+               declare
+                  AN : constant TREE := D (AS_NAME, Node);
+                  EN : constant TREE := D (AS_EXP, Node);
+               begin
+                  if not Is_Void_Tree (AN) and then KIND (AN) = DN_ATTRIBUTE and then not Is_Void_Tree (EN)
+                    and then not Is_Void_Tree (D (AS_USED_NAME_ID, AN))
+                    and then Sym_Name (D (AS_USED_NAME_ID, AN)) = "STORAGE_SIZE"
+                  then
+                     Local_Meta.Append (Tree_Key (EN));
                   end if;
                end;
                return;
@@ -6851,7 +8707,8 @@ package body Cg_Stmt is
                   ID : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, Node));
                   V  : Var_Info;
                begin
-                  V.Owner_Subp := Subp_Key;
+                  V.Owner_Subp    := Subp_Key;
+                  V.Captured_Slot := (if In_Gen_Bdy then 1 else 0);
                   Temp_Owners.Include (Tree_Key (ID), V);
                end;
                return;
@@ -6860,10 +8717,76 @@ package body Cg_Stmt is
                   ID : constant TREE := D (AS_SOURCE_NAME, Node);
                   V  : Var_Info;
                begin
-                  V.Owner_Subp := Subp_Key;
+                  V.Owner_Subp    := Subp_Key;
+                  V.Captured_Slot := (if In_Gen_Bdy then 1 else 0);
                   Temp_Owners.Include (Tree_Key (ID), V);
                end;
                return;
+            elsif K = DN_SUBPROG_ENTRY_DECL then
+               declare
+                  UK : constant TREE := D (AS_UNIT_KIND, Node);
+               begin
+                  if not Is_Void_Tree (UK) and then KIND (UK) = DN_INSTANTIATION then
+                     Collect_Local_Owners (D (SM_DECL_S, UK), In_Gen_Bdy);
+                     return;
+                  elsif not Is_Void_Tree (UK) and then KIND (UK) = DN_RENAMES_UNIT then
+                     declare
+                        SID : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, Node));
+                        V   : Var_Info;
+                     begin
+                        V.Owner_Subp    := Subp_Key;
+                        V.Captured_Slot := (if In_Gen_Bdy then 1 else 0);
+                        Temp_Owners.Include (Tree_Key (SID), V);
+                     end;
+                     return;
+                  end if;
+               end;
+            elsif K = DN_PACKAGE_DECL then
+               declare
+                  UK : constant TREE := D (AS_UNIT_KIND, Node);
+               begin
+                  if not Is_Void_Tree (UK) and then KIND (UK) = DN_INSTANTIATION then
+                     declare
+                        PID    : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, Node));
+                        Gen_Id : constant TREE := Canonical_Def (Get_Name_Defn (D (AS_NAME, UK)));
+                        GK     : constant Unsigned_32 := Tree_Key (Gen_Id);
+                        GB     : TREE := CONST_VOID;
+                     begin
+                        Collect_Local_Owners (D (SM_DECL_S, UK), False);
+                        Collect_Local_Owners (D (SM_SPEC, PID), False);
+                        -- P3-5.1: Propagate nested generic bodies in instantiated package spec
+                        declare
+                           GSp : constant TREE := (if not Is_Void_Tree (Gen_Id) and then KIND (Gen_Id) = DN_GENERIC_ID then D (SM_SPEC, Gen_Id) else CONST_VOID);
+                           ISp : constant TREE := D (SM_SPEC, PID);
+                           Saved_Sub : constant Tree_Maps.Map := Ctx.Generic_Subst;
+                        begin
+                           if not Is_Void_Tree (GSp) and then KIND (GSp) = DN_PACKAGE_SPEC
+                             and then not Is_Void_Tree (ISp) and then KIND (ISp) = DN_PACKAGE_SPEC
+                           then
+                              Map_Decl_List_Ids (Ctx, D (AS_DECL_S1, GSp), D (AS_DECL_S1, ISp));
+                              Map_Decl_List_Ids (Ctx, D (AS_DECL_S2, GSp), D (AS_DECL_S2, ISp));
+                           end if;
+                           Ctx.Generic_Subst := Saved_Sub;
+                        end;
+                        if Ctx.Generic_Body.Contains (GK) then
+                           GB := Ctx.Generic_Body.Element (GK);
+                        elsif not Is_Void_Tree (Gen_Id) and then KIND (Gen_Id) = DN_GENERIC_ID then
+                           GB := D (SM_BODY, Gen_Id);
+                           if Is_Void_Tree (GB) then
+                              GB := D (XD_BODY, Gen_Id);
+                           end if;
+                        end if;
+                        if not Is_Void_Tree (GB) then
+                           if KIND (GB) = DN_PACKAGE_BODY then
+                              Collect_Local_Owners (D (AS_BODY, GB), True);
+                           else
+                              Collect_Local_Owners (GB, True);
+                           end if;
+                        end if;
+                        return;
+                     end;
+                  end if;
+               end;
             end if;
             if ARITY (Node) = ARBITRARY then
                declare
@@ -6872,12 +8795,12 @@ package body Cg_Stmt is
                begin
                   while not IS_EMPTY (L) loop
                      POP (L, Item);
-                     Collect_Local_Owners (Item);
+                     Collect_Local_Owners (Item, In_Gen_Bdy);
                   end loop;
                end;
             else
                for I in 1 .. ARITIES'Pos (ARITY (Node)) loop
-                  Collect_Local_Owners (DABS (I, Node));
+                  Collect_Local_Owners (DABS (I, Node), In_Gen_Bdy);
                end loop;
             end if;
          end Collect_Local_Owners;
@@ -6908,6 +8831,24 @@ package body Cg_Stmt is
          end if;
          Collect_Local_Owners (Block_B);
          Scan_Tree_For_Captures (Ctx, Block_B, Subp_Key, Temp_Owners, Ctx.Subps, Captured_Vars, Nested_Subps, Subp_Key);
+         -- P3-4.3: Capture local access-master & task-elab slots in frame whenever nested subprograms/tasks exist
+         if not Local_Meta.Is_Empty and then (not Nested_Subps.Is_Empty or else Item_List_Has_Tasks (Ctx, D (AS_ITEM_S, Block_B))) then
+            for MK of Local_Meta loop
+               declare
+                  Found_M : Boolean := False;
+               begin
+                  for CP of Captured_Vars loop
+                     if CP.Inst_Key = 0 and then CP.Var_Key = MK then
+                        Found_M := True;
+                        exit;
+                     end if;
+                  end loop;
+                  if not Found_M then
+                     Captured_Vars.Append ((Inst_Key => 0, Var_Key => MK));
+                  end if;
+               end;
+            end loop;
+         end if;
       end;
 
       -- Reload SI (Needs_SL might have been set by outer scan!)
@@ -6928,22 +8869,36 @@ package body Cg_Stmt is
       if not Captured_Vars.Is_Empty or else (SI.Needs_SL and then not Nested_Subps.Is_Empty) then
          SI.Has_Frame := True;
          SI.Frame_Type := To_Unbounded_String ("@__frame_" & Tree_Key_Str (Subp_Id) & To_String (Ctx.Gen_Inst_Tag));
-         -- Emit frame struct: { ptr parent_sl, ptr cap1, ptr cap2, ... }
+         -- Emit frame struct: { ptr parent_sl, ptr cap1..capN, ptr con1..conN }
          declare
-            FT_Decl : Unbounded_String := To_Unbounded_String ("type " & To_String (SI.Frame_Type) & " = { ptr");
+            N_Cap     : constant Natural := Natural (Captured_Vars.Length);
+            FT_Decl   : Unbounded_String := To_Unbounded_String ("type " & To_String (SI.Frame_Type) & " = { ptr");
          begin
-            for Slot in 1 .. Natural (Captured_Vars.Length) loop
+            for Slot in 1 .. N_Cap loop
+               Append (FT_Decl, ", ptr");
+            end loop;
+            for Slot in 1 .. N_Cap loop
                Append (FT_Decl, ", ptr");
                declare
-                  CK : constant Unsigned_32 := Captured_Vars.Element (Slot - 1);
-                  V  : Var_Info;
+                  CP : constant Cap_Pair := Captured_Vars.Element (Slot - 1);
+                  CK : constant Unsigned_32 := CP.Var_Key;
                begin
-                  if Ctx.Vars.Contains (CK) then
-                     V := Ctx.Vars.Element (CK);
+                  if CP.Inst_Key /= 0 then
+                     Ctx.Gen_Cap_Slots.Include
+                       (Shift_Left (Unsigned_64 (CP.Inst_Key), 32) or Unsigned_64 (CK), Slot);
+                  else
+                     declare
+                        V : Var_Info;
+                     begin
+                        if Ctx.Vars.Contains (CK) then
+                           V := Ctx.Vars.Element (CK);
+                        end if;
+                        V.Captured_Slot     := Slot;
+                        V.Con_Captured_Slot := N_Cap + Slot;
+                        V.Owner_Subp        := Subp_Key;
+                        Ctx.Vars.Include (CK, V);
+                     end;
                   end if;
-                  V.Captured_Slot := Slot;
-                  V.Owner_Subp := Subp_Key;
-                  Ctx.Vars.Include (CK, V);
                end;
             end loop;
             Append (FT_Decl, " }");
@@ -6976,23 +8931,70 @@ package body Cg_Stmt is
       Ctx.Cur_SL_Reg        := To_Unbounded_String (if SI.Needs_SL then "%__sl" else "");
       Ctx.Cur_Frame_Reg     := Null_Unbounded_String;
       Ctx.Cur_Master_Reg    := Null_Unbounded_String;
-      Ctx.Cur_Task_Reg      := Null_Unbounded_String;
-      Ctx.Cur_Task_Exit_Lbl := Null_Unbounded_String;
+      Ctx.Cur_Task_Reg            := Null_Unbounded_String;
+      Ctx.Cur_Task_Exit_Lbl       := Null_Unbounded_String;
+      Ctx.Cur_Task_Base_Mst_Depth := 0;
       Ctx.Loops.Clear;
       Ctx.Handlers.Clear;
       Ctx.Copy_Outs.Clear;
       Ctx.SS_Marks.Clear;
+      Ctx.SP_Marks.Clear;
       Ctx.Master_Stack.Clear;
+      Ctx.Accept_End_Lbls.Clear;
       Ctx.Accept_Mst_Depths.Clear;
       Ctx.Label_Mst_Depths.Clear;
+      Ctx.Label_SS_Depths.Clear;
+      Ctx.Label_SP_Depths.Clear;
       Ctx.Uplevel_Cache.Clear;
       if not Is_Void_Tree (D (AS_BODY, Body_Node)) and then KIND (D (AS_BODY, Body_Node)) = DN_BLOCK_BODY then
          declare
-            BB    : constant TREE := D (AS_BODY, Body_Node);
-            InitD : constant Natural := (if Item_List_Has_Tasks (Ctx, D (AS_ITEM_S, BB)) then 1 else 0);
+            BB     : constant TREE := D (AS_BODY, Body_Node);
+            InitD  : constant Natural := (if Item_List_Has_Tasks (Ctx, D (AS_ITEM_S, BB)) then 1 else 0);
+            InitSS : constant Natural := (if not SI.Ret_Uncon_Arr and then Tree_Uses_SS (Ctx, BB) then 1 else 0);
          begin
-            Scan_Label_Master_Depths (Ctx, D (AS_STM_S, BB), InitD);
-            Scan_Label_Master_Depths (Ctx, D (AS_ALTERNATIVE_S, BB), InitD);
+            Scan_Label_Master_Depths (Ctx, D (AS_STM_S, BB), InitD, InitSS, 0);
+            Scan_Label_Master_Depths (Ctx, D (AS_ALTERNATIVE_S, BB), InitD, InitSS, 0);
+            -- P3-4.14: Apply pragma PRIORITY for a main subprogram (LRM 9.8(2))
+            if Is_Exported and then not Is_Subunit and then Is_Library_Level (Subp_Id)
+              and then not Is_Void_Tree (D (AS_ITEM_S, BB))
+            then
+               declare
+                  IL : SEQ_TYPE := LIST (D (AS_ITEM_S, BB));
+                  It : TREE;
+               begin
+                  while not IS_EMPTY (IL) loop
+                     POP (IL, It);
+                     if KIND (It) = DN_PRAGMA then
+                        declare
+                           PID : constant TREE := D (AS_USED_NAME_ID, It);
+                           PAS : constant TREE := D (AS_GENERAL_ASSOC_S, It);
+                        begin
+                           if not Is_Void_Tree (PID) and then Sym_Name (PID) = "PRIORITY"
+                             and then not Is_Void_Tree (PAS) and then not IS_EMPTY (LIST (PAS))
+                           then
+                              declare
+                                 A1 : TREE := HEAD (LIST (PAS));
+                                 SV : TREE;
+                                 Dummy_P : Unbounded_String;
+                              begin
+                                 if KIND (A1) = DN_ASSOC then A1 := D (AS_EXP, A1); end if;
+                                 SV := Safe_SM_Value (A1);
+                                 if Has_Static_Val (SV) and then KIND (SV) = DN_NUM_VAL then
+                                    declare
+                                       PV : constant Integer_64 := Eval_Int64 (SV);
+                                    begin
+                                       if PV >= 0 and then PV <= 10 then
+                                          Emit_Call_Or_Invoke (Ctx, "@__ada_set_main_priority", Img (Long_Long_Integer (PV)), "", Dummy_P, Nounwind => True);
+                                       end if;
+                                    end;
+                                 end if;
+                              end;
+                           end if;
+                        end;
+                     end if;
+                  end loop;
+               end;
+            end if;
          end;
       end if;
 
@@ -7052,6 +9054,7 @@ package body Cg_Stmt is
                         if (KIND (IT) = DN_SUBPROGRAM_BODY or else KIND (IT) = DN_PACKAGE_BODY or else KIND (IT) = DN_TASK_BODY)
                           and then not Is_Void_Tree (D (AS_BODY, IT))
                           and then KIND (D (AS_BODY, IT)) = DN_STUB
+                          and then not Is_Gen_Subunit_Stub (Ctx, IT)
                         then
                            Subp_Has_Stubs := True;
                            exit;
@@ -7087,7 +9090,8 @@ package body Cg_Stmt is
                         VInfo : Var_Info;
                      begin
                         if Ctx.Vars.Contains (PK) and then Ctx.Vars.Element (PK).Owner_Subp = Subp_Key then
-                           VInfo.Captured_Slot := Ctx.Vars.Element (PK).Captured_Slot;
+                           VInfo.Captured_Slot     := Ctx.Vars.Element (PK).Captured_Slot;
+                           VInfo.Con_Captured_Slot := Ctx.Vars.Element (PK).Con_Captured_Slot;
                         end if;
                         VInfo.Ada_Type   := PT;
                         VInfo.Pir_Type   := TI.Pir_Type;
@@ -7115,7 +9119,7 @@ package body Cg_Stmt is
                                    "export " & GSym & " = global @__ada_arr_desc = zeroinit, align 8");
                                  Emit_Entry_Alloca (Ctx.E, Sav & " = alloca @__ada_arr_desc, align 8");
                                  Emit_Inst (Ctx.E, GA & " = addr " & GSym);
-                                 Emit_Inst (Ctx.E, "memcpy " & Sav & ", " & GA & ", 40, align 8");
+                                 Emit_Inst (Ctx.E, "memcpy " & Sav & ", " & GA & ", " & Img (Arr_Desc_Size) & ", align 8");
                                  Emit_Store_Arr_Desc (Ctx, GA, PN & "_ptr", VInfo.First_Regs, VInfo.Last_Regs, TI.NDims);
                                  VInfo.Has_Desc    := True;
                                  VInfo.Desc_Global := To_Unbounded_String (GSym);
@@ -7175,6 +9179,19 @@ package body Cg_Stmt is
                                    To_String (Ctx.Cur_Frame_Reg) & ", " & Img (VInfo.Captured_Slot));
                                  Emit_Inst (Ctx.E, "store.ptr " & PN & ", " & FP & ", align 8");
                               end;
+                              if VInfo.Con_Captured_Slot > 0 and then Length (VInfo.Constrained_Reg) > 0 then
+                                 declare
+                                    CSp : constant String := Next_Reg (Ctx.E, "pcs");
+                                    CFP : constant String := Next_Reg (Ctx.E, "pcf");
+                                 begin
+                                    Emit_Entry_Alloca (Ctx.E, CSp & " = alloca i8, align 1");
+                                    Emit_Inst (Ctx.E, "store.i8 " & To_String (VInfo.Constrained_Reg) & ", " & CSp & ", align 1");
+                                    Emit_Inst (Ctx.E,
+                                      CFP & " = field_ptr " & To_String (SI.Frame_Type) & ", " &
+                                      To_String (Ctx.Cur_Frame_Reg) & ", " & Img (VInfo.Con_Captured_Slot));
+                                    Emit_Inst (Ctx.E, "store.ptr " & CSp & ", " & CFP & ", align 8");
+                                 end;
+                              end if;
                            end if;
                         elsif Mode = DN_OUT or else Mode = DN_IN_OUT then
                            -- Scalar OUT / IN OUT: Ada 83 LRM 6.2(7) copy-in / copy-out semantics!
@@ -7320,7 +9337,7 @@ package body Cg_Stmt is
          else
             for CO of Ctx.Copy_Outs loop
                if To_String (CO.Pir_Type) = "@__ada_arr_desc" then
-                  Emit_Inst (Ctx.E, "memcpy " & To_String (CO.Ptr_Reg) & ", " & To_String (CO.Loc_Reg) & ", 40, align 8");
+                  Emit_Inst (Ctx.E, "memcpy " & To_String (CO.Ptr_Reg) & ", " & To_String (CO.Loc_Reg) & ", " & Img (Arr_Desc_Size) & ", align 8");
                else
                   declare
                      V : constant String := Next_Reg (Ctx.E, "co");
@@ -7358,10 +9375,15 @@ package body Cg_Stmt is
       Ctx.Loops             := Saved_Loops;
       Ctx.Handlers          := Saved_Handlers;
       Ctx.Copy_Outs         := Saved_Copy_Outs;
-      Ctx.SS_Marks          := Saved_SS_Marks;
-      Ctx.Master_Stack      := Saved_Mst_Stack;
-      Ctx.Accept_Mst_Depths := Saved_Acc_Mst_Dep;
-      Ctx.Label_Mst_Depths  := Saved_Lbl_Mst_Dep;
+      Ctx.SS_Marks                := Saved_SS_Marks;
+      Ctx.SP_Marks                := Saved_SP_Marks;
+      Ctx.Master_Stack            := Saved_Mst_Stack;
+      Ctx.Accept_End_Lbls         := Saved_Acc_Lbls;
+      Ctx.Accept_Mst_Depths       := Saved_Acc_Mst_Dep;
+      Ctx.Cur_Task_Base_Mst_Depth := Saved_TBase_Mst;
+      Ctx.Label_Mst_Depths        := Saved_Lbl_Mst_Dep;
+      Ctx.Label_SS_Depths         := Saved_Lbl_SS_Dep;
+      Ctx.Label_SP_Depths         := Saved_Lbl_SP_Dep;
       Ctx.Uplevel_Cache     := Saved_Uplevel;
    end Emit_Subprogram_Body;
 
@@ -7510,7 +9532,7 @@ package body Cg_Stmt is
                WCU : constant TREE := D (TW_COMP_UNIT, TW);
                WAD : constant TREE := (if not Is_Void_Tree (WCU) then D (AS_ALL_DECL, WCU) else CONST_VOID);
             begin
-               if not Is_Void_Tree (WAD) and then KIND (WAD) = DN_PACKAGE_DECL then
+               if not Is_Void_Tree (WAD) and then KIND (WAD) in DN_PACKAGE_DECL | DN_GENERIC_DECL then
                   declare
                      WPN : constant String :=
                        Ada.Strings.Fixed.Translate (Sym_Name (D (AS_SOURCE_NAME, WAD)), Ada.Strings.Maps.Constants.Upper_Case_Map);
@@ -7605,6 +9627,7 @@ package body Cg_Stmt is
             AD : constant TREE := D (AS_ALL_DECL, CU);
          begin
             if not Is_Void_Tree (AD) and then (KIND (AD) = DN_PACKAGE_DECL
+              or else KIND (AD) = DN_GENERIC_DECL
               or else (KIND (AD) = DN_SUBPROG_ENTRY_DECL and then not Is_Void_Tree (D (AS_UNIT_KIND, AD))
                        and then KIND (D (AS_UNIT_KIND, AD)) = DN_INSTANTIATION))
             then
@@ -7621,9 +9644,12 @@ package body Cg_Stmt is
             AD : constant TREE := D (AS_ALL_DECL, CU);
          begin
             if not Is_Void_Tree (AD) then
-               if KIND (AD) = DN_PACKAGE_DECL then
+               if KIND (AD) = DN_PACKAGE_DECL or else KIND (AD) = DN_GENERIC_DECL
+                 or else (KIND (AD) = DN_SUBPROG_ENTRY_DECL and then not Is_Void_Tree (D (AS_UNIT_KIND, AD))
+                          and then KIND (D (AS_UNIT_KIND, AD)) = DN_INSTANTIATION)
+               then
                   Add_Context_Edges (CU, Find_Node (Ada.Strings.Fixed.Translate (Sym_Name (D (AS_SOURCE_NAME, AD)), Ada.Strings.Maps.Constants.Upper_Case_Map), False));
-               elsif KIND (AD) = DN_PACKAGE_BODY then
+               elsif KIND (AD) = DN_PACKAGE_BODY or else (KIND (AD) = DN_SUBPROGRAM_BODY and then KIND (Canonical_Def (D (AS_SOURCE_NAME, AD))) = DN_GENERIC_ID) then
                   Add_Context_Edges (CU, Find_Node (Ada.Strings.Fixed.Translate (Sym_Name (Canonical_Def (D (AS_SOURCE_NAME, AD))), Ada.Strings.Maps.Constants.Upper_Case_Map), True));
                elsif KIND (AD) = DN_SUBUNIT then
                   declare
@@ -7687,13 +9713,9 @@ package body Cg_Stmt is
                   end if;
                end loop;
                if Pick = 0 then
-                  -- Break any cycle deterministically
-                  for I in 1 .. N_Count loop
-                     if not Done (I) then
-                        Pick := I;
-                        exit;
-                     end if;
-                  end loop;
+                  -- P3-5.15: Reject circular elaboration dependencies (LRM 10.5(2, 11))!
+                  Ada.Text_IO.Put_Line (Ada.Text_IO.Standard_Error, "elaboration error: circular elaboration dependency detected");
+                  raise Elab_Cycle_Error;
                end if;
                exit when Pick = 0;
                Done (Pick) := True;
@@ -7755,12 +9777,17 @@ package body Cg_Stmt is
       Saved_Handlers    : constant Handler_Vecs.Vector := Ctx.Handlers;
       Saved_Copy_Outs   : constant Copy_Out_Vecs.Vector := Ctx.Copy_Outs;
       Saved_SS_Marks    : constant Str_Vecs.Vector := Ctx.SS_Marks;
+      Saved_SP_Marks    : constant Str_Vecs.Vector := Ctx.SP_Marks;
       Saved_Mst_Stack   : constant Str_Vecs.Vector := Ctx.Master_Stack;
+      Saved_Acc_Lbls    : constant Str_Vecs.Vector := Ctx.Accept_End_Lbls;
       Saved_Acc_Mst_Dep : constant U32_Vecs.Vector := Ctx.Accept_Mst_Depths;
+      Saved_TBase_Mst   : constant Natural := Ctx.Cur_Task_Base_Mst_Depth;
       Saved_Lbl_Mst_Dep : constant I64_Maps.Map := Ctx.Label_Mst_Depths;
+      Saved_Lbl_SS_Dep  : constant I64_Maps.Map := Ctx.Label_SS_Depths;
+      Saved_Lbl_SP_Dep  : constant I64_Maps.Map := Ctx.Label_SP_Depths;
       Saved_Uplevel     : constant Type_Maps.Map := Ctx.Uplevel_Cache;
 
-      Captured_Vars  : U32_Vecs.Vector;
+      Captured_Vars  : Cap_Vecs.Vector;
       Nested_Subps   : U32_Vecs.Vector;
    begin
       if Is_Void_Tree (TS) or else KIND (TS) /= DN_TASK_SPEC then
@@ -7807,7 +9834,8 @@ package body Cg_Stmt is
 
       declare
          Temp_Owners : Var_Maps.Map;
-         procedure Collect_Task_Owners (Node : TREE) is
+         Local_Meta  : U32_Vecs.Vector;
+         procedure Collect_Task_Owners (Node : TREE; In_Gen_Bdy : Boolean := False) is
             K : NODE_NAME;
          begin
             if Is_Void_Tree (Node) or else Node.TPG <= 0 or else Node.TLN = 0 then return; end if;
@@ -7826,9 +9854,39 @@ package body Cg_Stmt is
                   end if;
                end;
                if K = DN_SUBPROGRAM_BODY then return; end if;
+               if K = DN_PACKAGE_BODY then
+                  declare
+                     Sub_P : constant TREE := Find_Gen_Subunit_Body (Ctx, Node);
+                  begin
+                     if not Is_Void_Tree (Sub_P) then
+                        Collect_Task_Owners (D (AS_BODY, Sub_P), In_Gen_Bdy);
+                        return;
+                     end if;
+                  end;
+               end if;
             end if;
             if K not in CLASS_ALL_SOURCE or else K = DN_SUBPROGRAM_BODY or else K = DN_TASK_BODY then return; end if;
-            if K = DN_VARIABLE_DECL or else K = DN_CONSTANT_DECL then
+            if K = DN_TYPE_DECL then
+               declare
+                  TID : constant TREE := D (AS_SOURCE_NAME, Node);
+                  TS_A : constant TREE :=
+                    (if not Is_Void_Tree (TID) and then KIND (TID) in CLASS_TYPE_NAME
+                     then Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_TYPE_SPEC, TID))) else CONST_VOID);
+               begin
+                  if not Is_Void_Tree (TS_A) and then KIND (TS_A) in DN_ACCESS | DN_CONSTRAINED_ACCESS
+                    and then Type_Contains_Task (Ctx, D (SM_DESIG_TYPE, TS_A))
+                  then
+                     declare
+                        BS : constant TREE := Base_Type_Spec (TS_A);
+                     begin
+                        if not Is_Void_Tree (BS) and then KIND (BS) = DN_ACCESS and then Is_Void_Tree (D (SM_DERIVED, BS)) then
+                           Local_Meta.Append (Tree_Key (BS));
+                        end if;
+                     end;
+                  end if;
+               end;
+               return;
+            elsif K = DN_VARIABLE_DECL or else K = DN_CONSTANT_DECL then
                declare
                   NS : SEQ_TYPE := LIST (D (AS_SOURCE_NAME_S, Node));
                   ID : TREE;
@@ -7838,7 +9896,8 @@ package body Cg_Stmt is
                      declare
                         V : Var_Info;
                      begin
-                        V.Owner_Subp := TK;
+                        V.Owner_Subp    := TK;
+                        V.Captured_Slot := (if In_Gen_Bdy then 1 else 0);
                         Temp_Owners.Include (Tree_Key (Canonical_Def (ID)), V);
                      end;
                   end loop;
@@ -7847,14 +9906,36 @@ package body Cg_Stmt is
             elsif K = DN_TASK_DECL then
                declare
                   Src : constant TREE := D (AS_SOURCE_NAME, Node);
+                  TS_M : TREE := CONST_VOID;
                begin
                   if not Is_Void_Tree (Src) and then KIND (Src) = DN_VARIABLE_ID then
                      declare
                         V : Var_Info;
                      begin
-                        V.Owner_Subp := TK;
+                        V.Owner_Subp    := TK;
+                        V.Captured_Slot := (if In_Gen_Bdy then 1 else 0);
                         Temp_Owners.Include (Tree_Key (Canonical_Def (Src)), V);
                      end;
+                     TS_M := Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_OBJ_TYPE, Src)));
+                  elsif not Is_Void_Tree (Src) and then KIND (Src) in CLASS_TYPE_NAME then
+                     TS_M := Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_TYPE_SPEC, Src)));
+                  end if;
+                  if not Is_Void_Tree (TS_M) and then KIND (TS_M) = DN_TASK_SPEC then
+                     Local_Meta.Append (Tree_Key (TS_M));
+                  end if;
+               end;
+               return;
+            elsif K = DN_LENGTH_ENUM_REP then
+               -- P3-6.6: Capture local dynamic 'STORAGE_SIZE slots in parent static-link frame
+               declare
+                  AN : constant TREE := D (AS_NAME, Node);
+                  EN : constant TREE := D (AS_EXP, Node);
+               begin
+                  if not Is_Void_Tree (AN) and then KIND (AN) = DN_ATTRIBUTE and then not Is_Void_Tree (EN)
+                    and then not Is_Void_Tree (D (AS_USED_NAME_ID, AN))
+                    and then Sym_Name (D (AS_USED_NAME_ID, AN)) = "STORAGE_SIZE"
+                  then
+                     Local_Meta.Append (Tree_Key (EN));
                   end if;
                end;
                return;
@@ -7863,7 +9944,8 @@ package body Cg_Stmt is
                   ID : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, Node));
                   V  : Var_Info;
                begin
-                  V.Owner_Subp := TK;
+                  V.Owner_Subp    := TK;
+                  V.Captured_Slot := (if In_Gen_Bdy then 1 else 0);
                   Temp_Owners.Include (Tree_Key (ID), V);
                end;
                return;
@@ -7872,8 +9954,74 @@ package body Cg_Stmt is
                   ID : constant TREE := D (AS_SOURCE_NAME, Node);
                   V  : Var_Info;
                begin
-                  V.Owner_Subp := TK;
+                  V.Owner_Subp    := TK;
+                  V.Captured_Slot := (if In_Gen_Bdy then 1 else 0);
                   Temp_Owners.Include (Tree_Key (ID), V);
+               end;
+            elsif K = DN_SUBPROG_ENTRY_DECL then
+               declare
+                  UK : constant TREE := D (AS_UNIT_KIND, Node);
+               begin
+                  if not Is_Void_Tree (UK) and then KIND (UK) = DN_INSTANTIATION then
+                     Collect_Task_Owners (D (SM_DECL_S, UK), In_Gen_Bdy);
+                     return;
+                  elsif not Is_Void_Tree (UK) and then KIND (UK) = DN_RENAMES_UNIT then
+                     declare
+                        SID : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, Node));
+                        V   : Var_Info;
+                     begin
+                        V.Owner_Subp    := TK;
+                        V.Captured_Slot := (if In_Gen_Bdy then 1 else 0);
+                        Temp_Owners.Include (Tree_Key (SID), V);
+                     end;
+                     return;
+                  end if;
+               end;
+            elsif K = DN_PACKAGE_DECL then
+               declare
+                  UK : constant TREE := D (AS_UNIT_KIND, Node);
+               begin
+                  if not Is_Void_Tree (UK) and then KIND (UK) = DN_INSTANTIATION then
+                     declare
+                        PID    : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, Node));
+                        Gen_Id : constant TREE := Canonical_Def (Get_Name_Defn (D (AS_NAME, UK)));
+                        GK     : constant Unsigned_32 := Tree_Key (Gen_Id);
+                        GB     : TREE := CONST_VOID;
+                     begin
+                        Collect_Task_Owners (D (SM_DECL_S, UK), False);
+                        Collect_Task_Owners (D (SM_SPEC, PID), False);
+                        -- P3-5.1: Propagate nested generic bodies in instantiated package spec
+                        declare
+                           GSp : constant TREE := (if not Is_Void_Tree (Gen_Id) and then KIND (Gen_Id) = DN_GENERIC_ID then D (SM_SPEC, Gen_Id) else CONST_VOID);
+                           ISp : constant TREE := D (SM_SPEC, PID);
+                           Saved_Sub : constant Tree_Maps.Map := Ctx.Generic_Subst;
+                        begin
+                           if not Is_Void_Tree (GSp) and then KIND (GSp) = DN_PACKAGE_SPEC
+                             and then not Is_Void_Tree (ISp) and then KIND (ISp) = DN_PACKAGE_SPEC
+                           then
+                              Map_Decl_List_Ids (Ctx, D (AS_DECL_S1, GSp), D (AS_DECL_S1, ISp));
+                              Map_Decl_List_Ids (Ctx, D (AS_DECL_S2, GSp), D (AS_DECL_S2, ISp));
+                           end if;
+                           Ctx.Generic_Subst := Saved_Sub;
+                        end;
+                        if Ctx.Generic_Body.Contains (GK) then
+                           GB := Ctx.Generic_Body.Element (GK);
+                        elsif not Is_Void_Tree (Gen_Id) and then KIND (Gen_Id) = DN_GENERIC_ID then
+                           GB := D (SM_BODY, Gen_Id);
+                           if Is_Void_Tree (GB) then
+                              GB := D (XD_BODY, Gen_Id);
+                           end if;
+                        end if;
+                        if not Is_Void_Tree (GB) then
+                           if KIND (GB) = DN_PACKAGE_BODY then
+                              Collect_Task_Owners (D (AS_BODY, GB), True);
+                           else
+                              Collect_Task_Owners (GB, True);
+                           end if;
+                        end if;
+                        return;
+                     end;
+                  end if;
                end;
             elsif K = DN_ACCEPT then
                declare
@@ -7895,7 +10043,8 @@ package body Cg_Stmt is
                                  declare
                                     V : Var_Info;
                                  begin
-                                    V.Owner_Subp := TK;
+                                    V.Owner_Subp    := TK;
+                                    V.Captured_Slot := (if In_Gen_Bdy then 1 else 0);
                                     Temp_Owners.Include (Tree_Key (Canonical_Def (ID)), V);
                                     Temp_Owners.Include (Tree_Key (ID), V);
                                  end;
@@ -7911,15 +10060,32 @@ package body Cg_Stmt is
                   L : SEQ_TYPE := LIST (Node);
                   It : TREE;
                begin
-                  while not IS_EMPTY (L) loop POP (L, It); Collect_Task_Owners (It); end loop;
+                  while not IS_EMPTY (L) loop POP (L, It); Collect_Task_Owners (It, In_Gen_Bdy); end loop;
                end;
             else
-               for I in 1 .. ARITIES'Pos (ARITY (Node)) loop Collect_Task_Owners (DABS (I, Node)); end loop;
+               for I in 1 .. ARITIES'Pos (ARITY (Node)) loop Collect_Task_Owners (DABS (I, Node), In_Gen_Bdy); end loop;
             end if;
          end Collect_Task_Owners;
       begin
          Collect_Task_Owners (Block_B);
          Scan_Tree_For_Captures (Ctx, Block_B, TK, Temp_Owners, Ctx.Subps, Captured_Vars, Nested_Subps, TK);
+         if not Local_Meta.Is_Empty and then (not Nested_Subps.Is_Empty or else Item_List_Has_Tasks (Ctx, D (AS_ITEM_S, Block_B))) then
+            for MK of Local_Meta loop
+               declare
+                  Found_M : Boolean := False;
+               begin
+                  for CP of Captured_Vars loop
+                     if CP.Inst_Key = 0 and then CP.Var_Key = MK then
+                        Found_M := True;
+                        exit;
+                     end if;
+                  end loop;
+                  if not Found_M then
+                     Captured_Vars.Append ((Inst_Key => 0, Var_Key => MK));
+                  end if;
+               end;
+            end loop;
+         end if;
       end;
 
       declare
@@ -7947,13 +10113,22 @@ package body Cg_Stmt is
                for Slot in 1 .. Natural (Captured_Vars.Length) loop
                   Append (FT_Decl, ", ptr");
                   declare
-                     CK : constant Unsigned_32 := Captured_Vars.Element (Slot - 1);
-                     V  : Var_Info;
+                     CP : constant Cap_Pair := Captured_Vars.Element (Slot - 1);
+                     CK : constant Unsigned_32 := CP.Var_Key;
                   begin
-                     if Ctx.Vars.Contains (CK) then V := Ctx.Vars.Element (CK); end if;
-                     V.Captured_Slot := Slot + 1;
-                     V.Owner_Subp := TK;
-                     Ctx.Vars.Include (CK, V);
+                     if CP.Inst_Key /= 0 then
+                        Ctx.Gen_Cap_Slots.Include
+                          (Shift_Left (Unsigned_64 (CP.Inst_Key), 32) or Unsigned_64 (CK), Slot + 1);
+                     else
+                        declare
+                           V : Var_Info;
+                        begin
+                           if Ctx.Vars.Contains (CK) then V := Ctx.Vars.Element (CK); end if;
+                           V.Captured_Slot := Slot + 1;
+                           V.Owner_Subp := TK;
+                           Ctx.Vars.Include (CK, V);
+                        end;
+                     end if;
                   end;
                end loop;
                Append (FT_Decl, " }");
@@ -7963,7 +10138,12 @@ package body Cg_Stmt is
          end if;
 
          declare
-            Link : constant String := (if Is_Library_Level (TB_Id) or else Ctx.In_Subunit then "export " else "");
+            TS_Src : constant TREE := D (XD_SOURCE_NAME, TS);
+            Link   : constant String :=
+              (if Is_Library_Level (TB_Id)
+                 or else (not Is_Void_Tree (TS_Src) and then Is_Library_Level (TS_Src))
+                 or else Ctx.In_Subunit
+               then "export " else "");
             Hdr  : constant String := Link & "func " & To_String (TI.Body_Fn) & "(%__sl: ptr, %__self: ptr) -> void cc ""c""";
          begin
             Begin_Func (Ctx.E, Saved_Buf, Hdr);
@@ -7980,14 +10160,19 @@ package body Cg_Stmt is
          Ctx.Cur_Frame_Reg     := Null_Unbounded_String;
          Ctx.Cur_Master_Reg    := Null_Unbounded_String;
          Ctx.Cur_Task_Reg      := To_Unbounded_String ("%__self");
-         Ctx.Cur_Task_Exit_Lbl := To_Unbounded_String (Next_Label (Ctx.E, "task_exit"));
+         Ctx.Cur_Task_Exit_Lbl       := To_Unbounded_String (Next_Label (Ctx.E, "task_exit"));
+         Ctx.Cur_Task_Base_Mst_Depth := 0;
          Ctx.Loops.Clear;
          Ctx.Handlers.Clear;
          Ctx.Copy_Outs.Clear;
          Ctx.SS_Marks.Clear;
+         Ctx.SP_Marks.Clear;
          Ctx.Master_Stack.Clear;
+         Ctx.Accept_End_Lbls.Clear;
          Ctx.Accept_Mst_Depths.Clear;
          Ctx.Label_Mst_Depths.Clear;
+         Ctx.Label_SS_Depths.Clear;
+         Ctx.Label_SP_Depths.Clear;
          Ctx.Uplevel_Cache.Clear;
 
          if TSI.Has_Frame then
@@ -8032,19 +10217,50 @@ package body Cg_Stmt is
             Ctx.Handlers.Append ((Handler_Label => To_Unbounded_String (Act_Fail),
                                   Current_Exn   => Null_Unbounded_String,
                                   In_Handler    => False,
-                                  SS_Mark       => Null_Unbounded_String));
+                                  SS_Mark       => Null_Unbounded_String,
+                                  SP_Mark       => Null_Unbounded_String));
             if Has_Tasks then
                Emit_Call_Or_Invoke (Ctx, "@__ada_master_enter", "", "ptr", Local_Mst);
                Emit_Inst (Ctx.E, "store.ptr " & To_String (Local_Mst) & ", " & To_String (Mst_Slot) & ", align 8");
                Ctx.Cur_Master_Reg := Local_Mst;
                Ctx.Master_Stack.Append (Local_Mst);
+               Ctx.Cur_Task_Base_Mst_Depth := 1;
                Scan_Label_Master_Depths (Ctx, Stm_S, 1);
                Scan_Label_Master_Depths (Ctx, Alt_S, 1);
             else
+               Ctx.Cur_Task_Base_Mst_Depth := 0;
                Scan_Label_Master_Depths (Ctx, Stm_S, 0);
                Scan_Label_Master_Depths (Ctx, Alt_S, 0);
             end if;
-            Emit_Decl_Items (Ctx, Item_S, Is_Global => False, Export_All => False, Has_Dyn => Has_Dyn);
+            -- P3-5.10 & P3-5.17: Export task-body declarations & exceptions when task body contains separate subunits!
+            declare
+               Task_Has_Stubs  : Boolean := False;
+               Saved_Has_Stubs : constant Boolean := Ctx.Has_Stubs;
+            begin
+               if not Is_Void_Tree (Item_S) then
+                  declare
+                     SL_T : SEQ_TYPE := LIST (Item_S);
+                     IT_T : TREE;
+                  begin
+                     while not IS_EMPTY (SL_T) loop
+                        POP (SL_T, IT_T);
+                        if (KIND (IT_T) = DN_SUBPROGRAM_BODY or else KIND (IT_T) = DN_PACKAGE_BODY or else KIND (IT_T) = DN_TASK_BODY)
+                          and then not Is_Void_Tree (D (AS_BODY, IT_T))
+                          and then KIND (D (AS_BODY, IT_T)) = DN_STUB
+                          and then not Is_Gen_Subunit_Stub (Ctx, IT_T)
+                        then
+                           Task_Has_Stubs := True;
+                           exit;
+                        end if;
+                     end loop;
+                  end;
+               end if;
+               if Task_Has_Stubs then
+                  Ctx.Has_Stubs := True;
+               end if;
+               Emit_Decl_Items (Ctx, Item_S, Is_Global => Task_Has_Stubs, Export_All => Task_Has_Stubs, Has_Dyn => Has_Dyn);
+               Ctx.Has_Stubs := Saved_Has_Stubs;
+            end;
             Ctx.Handlers.Delete_Last;
 
             Emit_Call_Or_Invoke (Ctx, "@__ada_task_activated", "%__self", "", Dummy, Nounwind => True);
@@ -8052,17 +10268,21 @@ package body Cg_Stmt is
             Ctx.Handlers.Append ((Handler_Label => To_Unbounded_String (Top_Exc),
                                   Current_Exn   => Null_Unbounded_String,
                                   In_Handler    => False,
-                                  SS_Mark       => Null_Unbounded_String));
+                                  SS_Mark       => Null_Unbounded_String,
+                                  SP_Mark       => Null_Unbounded_String));
 
             if Has_Hdl then
                declare
                   Hdl_Lbl   : constant String := Next_Label (Ctx.E, "exc_h");
                   After_Lbl : constant String := Next_Label (Ctx.E, "exc_end");
+                  H_SP      : constant String := Next_Reg (Ctx.E, "thsp");
                begin
+                  Emit_Inst (Ctx.E, H_SP & " = stacksave");
                   Ctx.Handlers.Append ((Handler_Label => To_Unbounded_String (Hdl_Lbl),
                                         Current_Exn   => Null_Unbounded_String,
                                         In_Handler    => False,
-                                        SS_Mark       => Null_Unbounded_String));
+                                        SS_Mark       => Null_Unbounded_String,
+                                        SP_Mark       => To_Unbounded_String (H_SP)));
                   if Has_Tasks then
                      Emit_Call_Or_Invoke (Ctx, "@__ada_master_activate", To_String (Local_Mst), "", Dummy);
                   end if;
@@ -8085,6 +10305,9 @@ package body Cg_Stmt is
             end if;
 
             Emit_Label (Ctx.E, Act_Fail, Exn_Act & ": ptr");
+            -- Notify activator and set T'CALLABLE=FALSE first so we cannot deadlock with
+            -- already-activated child tasks waiting on T or T's activator (LRM 9.3(5))
+            Emit_Call_Or_Invoke (Ctx, "@__ada_task_activation_failed", "%__self", "", Dummy, Nounwind => True);
             if Has_Tasks then
                declare
                   ML : constant String := Next_Reg (Ctx.E, "tml");
@@ -8093,7 +10316,6 @@ package body Cg_Stmt is
                   Emit_Call_Or_Invoke (Ctx, "@__ada_master_abort_unactivated", ML, "", Dummy, Nounwind => True);
                end;
             end if;
-            Emit_Call_Or_Invoke (Ctx, "@__ada_task_activation_failed", "%__self", "", Dummy, Nounwind => True);
             Emit_Term (Ctx.E, "ret");
 
             Emit_Label (Ctx.E, Top_Exc, Exn_Top & ": ptr");
@@ -8124,15 +10346,20 @@ package body Cg_Stmt is
          Ctx.Loops             := Saved_Loops;
          Ctx.Handlers          := Saved_Handlers;
          Ctx.Copy_Outs         := Saved_Copy_Outs;
-         Ctx.SS_Marks          := Saved_SS_Marks;
-         Ctx.Master_Stack      := Saved_Mst_Stack;
-         Ctx.Accept_Mst_Depths := Saved_Acc_Mst_Dep;
-         Ctx.Label_Mst_Depths  := Saved_Lbl_Mst_Dep;
-         Ctx.Uplevel_Cache     := Saved_Uplevel;
+         Ctx.SS_Marks                := Saved_SS_Marks;
+         Ctx.SP_Marks                := Saved_SP_Marks;
+         Ctx.Master_Stack            := Saved_Mst_Stack;
+         Ctx.Accept_End_Lbls         := Saved_Acc_Lbls;
+         Ctx.Accept_Mst_Depths       := Saved_Acc_Mst_Dep;
+         Ctx.Cur_Task_Base_Mst_Depth := Saved_TBase_Mst;
+         Ctx.Label_Mst_Depths        := Saved_Lbl_Mst_Dep;
+         Ctx.Label_SS_Depths         := Saved_Lbl_SS_Dep;
+         Ctx.Label_SP_Depths         := Saved_Lbl_SP_Dep;
+         Ctx.Uplevel_Cache           := Saved_Uplevel;
       end;
    end Emit_Task_Body;
 
-   procedure Emit_Compilation (Ctx : in out Context; Comp_Node : TREE) is
+   procedure Emit_Compilation (Ctx : in out Context; Comp_Node : TREE; Only_CU : Natural := 0) is
       CU_List        : SEQ_TYPE := LIST (D (AS_COMPLTN_UNIT_S, Comp_Node));
       CU             : TREE;
       In_Unit_Bodies : Unbounded_String := To_Unbounded_String ("|");
@@ -8198,6 +10425,67 @@ package body Cg_Stmt is
             end loop;
             return False;
          end Subunit_Has_Generic_Ancestor;
+
+         procedure Scan_Nested_Generics (Item_S : TREE) is
+            IL : SEQ_TYPE;
+            It : TREE;
+         begin
+            if Is_Void_Tree (Item_S) then
+               return;
+            end if;
+            IL := LIST (Item_S);
+            while not IS_EMPTY (IL) loop
+               POP (IL, It);
+               if KIND (It) = DN_GENERIC_DECL then
+                  declare
+                     GID : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, It));
+                  begin
+                     if not Is_Void_Tree (GID) then
+                        Ctx.Generic_Decls.Include (Tree_Key (GID), It);
+                     end if;
+                  end;
+               elsif KIND (It) = DN_PACKAGE_DECL then
+                  declare
+                     Hdr : constant TREE := D (AS_HEADER, It);
+                  begin
+                     if not Is_Void_Tree (Hdr) and then KIND (Hdr) = DN_PACKAGE_SPEC then
+                        Scan_Nested_Generics (D (AS_DECL_S1, Hdr));
+                        Scan_Nested_Generics (D (AS_DECL_S2, Hdr));
+                     end if;
+                  end;
+               elsif KIND (It) = DN_PACKAGE_BODY then
+                  declare
+                     NPID : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, It));
+                     NBdy : constant TREE := D (AS_BODY, It);
+                  begin
+                     if not Is_Void_Tree (NPID) and then KIND (NPID) = DN_GENERIC_ID then
+                        if not Ctx.Generic_Body.Contains (Tree_Key (NPID))
+                          or else Is_Void_Tree (NBdy)
+                          or else KIND (NBdy) /= DN_STUB
+                        then
+                           Ctx.Generic_Body.Include (Tree_Key (NPID), It);
+                        end if;
+                     elsif not Is_Void_Tree (NBdy) and then KIND (NBdy) = DN_BLOCK_BODY then
+                        Scan_Nested_Generics (D (AS_ITEM_S, NBdy));
+                     end if;
+                  end;
+               elsif KIND (It) = DN_SUBPROGRAM_BODY then
+                  declare
+                     NSID : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, It));
+                     NBdy : constant TREE := D (AS_BODY, It);
+                  begin
+                     if not Is_Void_Tree (NSID) and then KIND (NSID) = DN_GENERIC_ID then
+                        if not Ctx.Generic_Body.Contains (Tree_Key (NSID))
+                          or else Is_Void_Tree (NBdy)
+                          or else KIND (NBdy) /= DN_STUB
+                        then
+                           Ctx.Generic_Body.Include (Tree_Key (NSID), It);
+                        end if;
+                     end if;
+                  end;
+               end if;
+            end loop;
+         end Scan_Nested_Generics;
       begin
          while not IS_EMPTY (Scan_L) loop
             POP (Scan_L, SCU);
@@ -8216,7 +10504,7 @@ package body Cg_Stmt is
                         if not Is_Void_Tree (T_Id) then
                            if KIND (T_Id) = DN_TASK_BODY_ID then T_Sp := Resolve_Type_Spec (D (SM_TYPE_SPEC, T_Id));
                            elsif KIND (T_Id) = DN_VARIABLE_ID then T_Sp := Resolve_Type_Spec (D (SM_OBJ_TYPE, T_Id));
-                           elsif KIND (T_Id) = DN_TYPE_ID then T_Sp := Resolve_Type_Spec (D (SM_TYPE_SPEC, T_Id));
+                           elsif KIND (T_Id) in CLASS_TYPE_NAME then T_Sp := Resolve_Type_Spec (D (SM_TYPE_SPEC, T_Id));
                            end if;
                            if not Is_Void_Tree (T_Sp) then
                               Ctx.Gen_Subunits.Include (Tree_Key (T_Sp), AD);
@@ -8235,24 +10523,42 @@ package body Cg_Stmt is
                end if;
                if KIND (AD) = DN_PACKAGE_DECL and then not Was_Subu then
                   Set_Latest ("PS:" & Ada.Strings.Fixed.Translate (Sym_Name (D (AS_SOURCE_NAME, AD)), Ada.Strings.Maps.Constants.Upper_Case_Map), CU_Idx);
+                  if not Is_Void_Tree (D (AS_HEADER, AD)) and then KIND (D (AS_HEADER, AD)) = DN_PACKAGE_SPEC then
+                     Scan_Nested_Generics (D (AS_DECL_S1, D (AS_HEADER, AD)));
+                     Scan_Nested_Generics (D (AS_DECL_S2, D (AS_HEADER, AD)));
+                  end if;
                elsif KIND (AD) = DN_PACKAGE_BODY then
                   declare
                      PID : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, AD));
+                     PBdy : constant TREE := D (AS_BODY, AD);
                   begin
                      if KIND (PID) = DN_GENERIC_ID then
                         if not Ctx.Generic_Body.Contains (Tree_Key (PID))
-                          or else Is_Void_Tree (D (AS_BODY, AD))
-                          or else KIND (D (AS_BODY, AD)) /= DN_STUB
+                          or else Is_Void_Tree (PBdy)
+                          or else KIND (PBdy) /= DN_STUB
                         then
                            Ctx.Generic_Body.Include (Tree_Key (PID), AD);
                         end if;
-                     elsif not Was_Subu then
-                        declare
-                           UPN : constant String := Ada.Strings.Fixed.Translate (Sym_Name (PID), Ada.Strings.Maps.Constants.Upper_Case_Map);
-                        begin
-                           Set_Latest ("PB:" & UPN, CU_Idx);
-                           Append (In_Unit_Bodies, UPN & "|");
-                        end;
+                        if not Was_Subu then
+                           declare
+                              UPN : constant String := Ada.Strings.Fixed.Translate (Sym_Name (PID), Ada.Strings.Maps.Constants.Upper_Case_Map);
+                           begin
+                              Set_Latest ("PB:" & UPN, CU_Idx);
+                              Append (In_Unit_Bodies, UPN & "|");
+                           end;
+                        end if;
+                     else
+                        if not Is_Void_Tree (PBdy) and then KIND (PBdy) = DN_BLOCK_BODY then
+                           Scan_Nested_Generics (D (AS_ITEM_S, PBdy));
+                        end if;
+                        if not Was_Subu then
+                           declare
+                              UPN : constant String := Ada.Strings.Fixed.Translate (Sym_Name (PID), Ada.Strings.Maps.Constants.Upper_Case_Map);
+                           begin
+                              Set_Latest ("PB:" & UPN, CU_Idx);
+                              Append (In_Unit_Bodies, UPN & "|");
+                           end;
+                        end if;
                      end if;
                   end;
                elsif KIND (AD) = DN_GENERIC_DECL then
@@ -8260,6 +10566,9 @@ package body Cg_Stmt is
                      GID : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, AD));
                   begin
                      Ctx.Generic_Decls.Include (Tree_Key (GID), AD);
+                     if not Was_Subu then
+                        Set_Latest ("PS:" & Ada.Strings.Fixed.Translate (Sym_Name (GID), Ada.Strings.Maps.Constants.Upper_Case_Map), CU_Idx);
+                     end if;
                   end;
                elsif KIND (AD) = DN_SUBPROGRAM_BODY then
                   declare
@@ -8273,10 +10582,21 @@ package body Cg_Stmt is
                         then
                            Ctx.Generic_Body.Include (Tree_Key (SID), AD);
                         end if;
-                     elsif not Was_Subu and then not Is_Void_Tree (Hdr) and then KIND (Hdr) = DN_PROCEDURE_SPEC
-                       and then (Is_Void_Tree (D (AS_PARAM_S, Hdr)) or else IS_EMPTY (LIST (D (AS_PARAM_S, Hdr))))
-                     then
-                        Main_CU_Idx := CU_Idx;
+                        if not Was_Subu then
+                           declare
+                              UPN : constant String := Ada.Strings.Fixed.Translate (Sym_Name (SID), Ada.Strings.Maps.Constants.Upper_Case_Map);
+                           begin
+                              Set_Latest ("PB:" & UPN, CU_Idx);
+                              Append (In_Unit_Bodies, UPN & "|");
+                           end;
+                        end if;
+                     elsif not Was_Subu then
+                        Set_Latest ("SB:" & Ada.Strings.Fixed.Translate (Sym_Name (SID), Ada.Strings.Maps.Constants.Upper_Case_Map), CU_Idx);
+                        if not Is_Void_Tree (Hdr) and then KIND (Hdr) = DN_PROCEDURE_SPEC
+                          and then (Is_Void_Tree (D (AS_PARAM_S, Hdr)) or else IS_EMPTY (LIST (D (AS_PARAM_S, Hdr))))
+                        then
+                           Main_CU_Idx := CU_Idx;
+                        end if;
                      end if;
                   end;
                elsif KIND (AD) = DN_SUBPROG_ENTRY_DECL and then not Was_Subu
@@ -8287,6 +10607,7 @@ package body Cg_Stmt is
                      SID : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, AD));
                      Sp  : constant TREE := (if not Is_Void_Tree (SID) then D (SM_SPEC, SID) else CONST_VOID);
                   begin
+                     Set_Latest ("SB:" & Ada.Strings.Fixed.Translate (Sym_Name (SID), Ada.Strings.Maps.Constants.Upper_Case_Map), CU_Idx);
                      if not Is_Void_Tree (Sp) and then KIND (Sp) = DN_PROCEDURE_SPEC
                        and then (Is_Void_Tree (D (AS_PARAM_S, Sp)) or else IS_EMPTY (LIST (D (AS_PARAM_S, Sp))))
                      then
@@ -8301,6 +10622,7 @@ package body Cg_Stmt is
       while not IS_EMPTY (CU_List) loop
          POP (CU_List, CU);
          CU_Idx := CU_Idx + 1;
+         if Only_CU = 0 or else CU_Idx = Only_CU then
          declare
             Raw_All  : constant TREE := D (AS_ALL_DECL, CU);
             All_Decl : TREE := Raw_All;
@@ -8328,19 +10650,70 @@ package body Cg_Stmt is
             end if;
             if K = DN_TASK_BODY then
                Emit_Task_Body (Ctx, All_Decl);
+            elsif K = DN_GENERIC_DECL then
+               declare
+                  GID   : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, All_Decl));
+                  UPN   : constant String := Ada.Strings.Fixed.Translate (Sym_Name (GID), Ada.Strings.Maps.Constants.Upper_Case_Map);
+                  PName : constant String := Lower_Name (Sym_Name (GID));
+                  GSym  : constant String := "@ada_gelab__" & Qualified_Ada_Name (GID);
+                  GTI   : Type_Info;
+                  Saved : Pir_Emit.Func_Buffer;
+               begin
+                  if not Is_Subu and then Get_Latest ("PS:" & UPN) = CU_Idx then
+                     Add_Global_Decl (Ctx.E, GSym, "export " & GSym & " = global i8 = 0, align 1");
+                     GTI.Pir_Type := To_Unbounded_String (GSym);
+                     Ctx.Gen_Elab_Flags.Include (Tree_Key (GID), GTI);
+                     Begin_Func (Ctx.E, Saved,
+                       "export func @ada__" & PName & "__elab_spec() -> void cc ""internal""");
+                     declare
+                        GA : constant String := Next_Reg (Ctx.E, "lgea");
+                     begin
+                        Emit_Inst (Ctx.E, GA & " = addr " & GSym);
+                        Emit_Inst (Ctx.E, "store.i8 0, " & GA & ", align 1");
+                     end;
+                     Emit_Term (Ctx.E, "ret");
+                     End_Func (Ctx.E, Saved);
+                  end if;
+               end;
+
             elsif K = DN_SUBPROGRAM_BODY then
                declare
                   SID        : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, All_Decl));
                   Is_Subunit : constant Boolean := Is_Subu;
                begin
-                  if KIND (SID) /= DN_GENERIC_ID then
-                     Emit_Subprogram_Body (Ctx, All_Decl, Is_Exported => True, Is_Subunit => Is_Subunit);
-                     if Ctx.Emit_Main and then not Is_Subunit and then CU_Idx = Main_CU_Idx then
-                        declare
-                           SI : constant Subp_Info := Ctx.Subps.Element (Tree_Key (SID));
-                        begin
-                           Emit_Main_Wrapper (Ctx, To_String (SI.Pir_Name), Comp_Node, To_String (In_Unit_Bodies));
-                        end;
+                  if KIND (SID) = DN_GENERIC_ID then
+                     declare
+                        UPN   : constant String := Ada.Strings.Fixed.Translate (Sym_Name (SID), Ada.Strings.Maps.Constants.Upper_Case_Map);
+                        PName : constant String := Lower_Name (Sym_Name (SID));
+                        GSym  : constant String := "@ada_gelab__" & Qualified_Ada_Name (SID);
+                        Saved : Pir_Emit.Func_Buffer;
+                     begin
+                        if not Is_Subunit and then Get_Latest ("PB:" & UPN) = CU_Idx then
+                           if not Ctx.Gen_Elab_Flags.Contains (Tree_Key (SID)) then
+                              Add_Global_Decl (Ctx.E, GSym, "extern " & GSym & " = global i8, align 1");
+                           end if;
+                           Begin_Func (Ctx.E, Saved,
+                             "export func @ada__" & PName & "__elab_body() -> void cc ""internal""");
+                           declare
+                              GA : constant String := Next_Reg (Ctx.E, "lge1");
+                           begin
+                              Emit_Inst (Ctx.E, GA & " = addr " & GSym);
+                              Emit_Inst (Ctx.E, "store.i8 1, " & GA & ", align 1");
+                           end;
+                           Emit_Term (Ctx.E, "ret");
+                           End_Func (Ctx.E, Saved);
+                        end if;
+                     end;
+                  else
+                     if Is_Subunit or else Get_Latest ("SB:" & Ada.Strings.Fixed.Translate (Sym_Name (SID), Ada.Strings.Maps.Constants.Upper_Case_Map)) = CU_Idx then
+                        Emit_Subprogram_Body (Ctx, All_Decl, Is_Exported => True, Is_Subunit => Is_Subunit);
+                        if Ctx.Emit_Main and then not Is_Subunit and then CU_Idx = Main_CU_Idx then
+                           declare
+                              SI : constant Subp_Info := Ctx.Subps.Element (Tree_Key (SID));
+                           begin
+                              Emit_Main_Wrapper (Ctx, To_String (SI.Pir_Name), Comp_Node, To_String (In_Unit_Bodies));
+                           end;
+                        end if;
                      end if;
                   end if;
                end;
@@ -8352,7 +10725,9 @@ package body Cg_Stmt is
                   UK    : constant TREE := D (AS_UNIT_KIND, All_Decl);
                   Saved : Pir_Emit.Func_Buffer;
                begin
-                  if not Is_Void_Tree (UK) and then KIND (UK) = DN_INSTANTIATION then
+                  if not Is_Void_Tree (UK) and then KIND (UK) = DN_INSTANTIATION
+                    and then (Is_Subu or else Get_Latest ("SB:" & Ada.Strings.Fixed.Translate (Sym_Name (SID), Ada.Strings.Maps.Constants.Upper_Case_Map)) = CU_Idx)
+                  then
                      Begin_Func (Ctx.E, Saved,
                        "export func @ada__" & PName & "__elab_spec() -> void cc ""internal""");
                      Emit_Generic_Instantiation (Ctx, All_Decl, Export_All => True);
@@ -8431,9 +10806,27 @@ package body Cg_Stmt is
                   Is_Sup : constant Boolean :=
                     UPN = "REPORT" or else UPN = "FCNDECL" or else UPN = "SPPRT13" or else UPN = "CHECKFILE";
                begin
-                  if KIND (PID) /= DN_GENERIC_ID
-                    and then (Is_Subu or else Get_Latest ("PB:" & UPN) = CU_Idx)
-                  then
+                  if KIND (PID) = DN_GENERIC_ID then
+                     if not Is_Subu and then Get_Latest ("PB:" & UPN) = CU_Idx then
+                        declare
+                           GSym : constant String := "@ada_gelab__" & Qualified_Ada_Name (PID);
+                        begin
+                           if not Ctx.Gen_Elab_Flags.Contains (Tree_Key (PID)) then
+                              Add_Global_Decl (Ctx.E, GSym, "extern " & GSym & " = global i8, align 1");
+                           end if;
+                           Begin_Func (Ctx.E, Saved,
+                             "export func @ada__" & PName & "__elab_body() -> void cc ""internal""");
+                           declare
+                              GA : constant String := Next_Reg (Ctx.E, "lge1");
+                           begin
+                              Emit_Inst (Ctx.E, GA & " = addr " & GSym);
+                              Emit_Inst (Ctx.E, "store.i8 1, " & GA & ", align 1");
+                           end;
+                           Emit_Term (Ctx.E, "ret");
+                           End_Func (Ctx.E, Saved);
+                        end;
+                     end if;
+                  elsif Is_Subu or else Get_Latest ("PB:" & UPN) = CU_Idx then
                      Begin_Func (Ctx.E, Saved,
                        "export func @ada__" & PName & "__elab_body() -> void cc ""internal""");
                      if not Is_Void_Tree (Bdy) and then KIND (Bdy) = DN_BLOCK_BODY then
@@ -8441,19 +10834,40 @@ package body Cg_Stmt is
                            Spec_Hdr   : constant TREE :=
                              (if KIND (PID) = DN_PACKAGE_ID then D (SM_SPEC, PID) else CONST_VOID);
                            Spec_Has_T : constant Boolean :=
-                             not Is_Subu and then not Is_Void_Tree (Spec_Hdr) and then KIND (Spec_Hdr) = DN_PACKAGE_SPEC
+                             not Is_Void_Tree (Spec_Hdr) and then KIND (Spec_Hdr) = DN_PACKAGE_SPEC
                              and then (Item_List_Has_Tasks (Ctx, D (AS_DECL_S1, Spec_Hdr))
                                        or else Item_List_Has_Tasks (Ctx, D (AS_DECL_S2, Spec_Hdr)));
-                           Bdy_Has_T  : constant Boolean := not Is_Subu and then Item_List_Has_Tasks (Ctx, D (AS_ITEM_S, Bdy));
+                           Bdy_Has_T  : constant Boolean := Item_List_Has_Tasks (Ctx, D (AS_ITEM_S, Bdy));
                            Any_Has_T  : constant Boolean := Spec_Has_T or else Bdy_Has_T;
                            Saved_G    : constant Integer_64 := Ctx.Cur_Task_Group_Id;
-                           Pkg_Gid    : constant Integer_64 := Integer_64 (Lib_Binder.Lib_Pkg_Task_Group_Id (UPN));
+                           Gid_Name   : constant String :=
+                             (if Is_Subu then Ada.Strings.Fixed.Translate (PName, Ada.Strings.Maps.Constants.Upper_Case_Map)
+                              else UPN);
+                           Pkg_Gid    : constant Integer_64 := Integer_64 (Lib_Binder.Lib_Pkg_Task_Group_Id (Gid_Name));
                            GM_R, Dummy : Unbounded_String;
+                           Saved_Mst   : constant Unbounded_String := Ctx.Cur_Master_Reg;
+                           Subu_Mst    : Unbounded_String;
                            Prev_LPB : constant Boolean := Ctx.In_Lib_Pkg_Body;
                            Alt_S    : constant TREE := D (AS_ALTERNATIVE_S, Bdy);
                            Has_Hdl  : constant Boolean := not Is_Void_Tree (Alt_S) and then not IS_EMPTY (LIST (Alt_S));
                            Hdl_Lbl, After_Lbl : Unbounded_String;
                         begin
+                           -- P3-4.9: Separate local package body subunit attaches & activates tasks on enclosing active master!
+                           if Is_Subu then
+                              declare
+                                 AM_R  : Unbounded_String;
+                                 GM_F  : Unbounded_String;
+                                 Is_N  : constant String := Next_Reg (Ctx.E, "samn");
+                                 Sel_M : constant String := Next_Reg (Ctx.E, "samm");
+                              begin
+                                 Emit_Call_Or_Invoke (Ctx, "@__ada_get_active_master", "", "ptr", AM_R, Nounwind => True);
+                                 Emit_Call_Or_Invoke (Ctx, "@__ada_global_master", "", "ptr", GM_F, Nounwind => True);
+                                 Emit_Inst (Ctx.E, Is_N & " = cmp_eq.ptr " & To_String (AM_R) & ", 0");
+                                 Emit_Inst (Ctx.E, Sel_M & " = select.ptr " & Is_N & ", " & To_String (GM_F) & ", " & To_String (AM_R));
+                                 Subu_Mst := To_Unbounded_String (Sel_M);
+                                 Ctx.Cur_Master_Reg := Subu_Mst;
+                              end;
+                           end if;
                            if Any_Has_T then
                               Ctx.Cur_Task_Group_Id := Pkg_Gid;
                            end if;
@@ -8469,13 +10883,22 @@ package body Cg_Stmt is
                               Ctx.Handlers.Append ((Handler_Label => Hdl_Lbl,
                                                     Current_Exn   => Null_Unbounded_String,
                                                     In_Handler    => False,
-                                                    SS_Mark       => Null_Unbounded_String));
+                                                    SS_Mark       => Null_Unbounded_String,
+                                                    SP_Mark       => Null_Unbounded_String));
                            end if;
                            if Any_Has_T then
-                              Emit_Call_Or_Invoke (Ctx, "@__ada_global_master", "", "ptr", GM_R, Nounwind => True);
+                              if Is_Subu and then Length (Subu_Mst) > 0 then
+                                 GM_R := Subu_Mst;
+                              else
+                                 Emit_Call_Or_Invoke (Ctx, "@__ada_global_master", "", "ptr", GM_R, Nounwind => True);
+                              end if;
                               Emit_Call_Or_Invoke (Ctx, "@__ada_master_activate_group",
                                 To_String (GM_R) & ", " & Img (Long_Long_Integer (Pkg_Gid)), "", Dummy);
                            end if;
+                           Scan_Label_Master_Depths (Ctx, D (AS_STM_S, Bdy),
+                             Natural (Ctx.Master_Stack.Length), Natural (Ctx.SS_Marks.Length), Natural (Ctx.SP_Marks.Length));
+                           Scan_Label_Master_Depths (Ctx, Alt_S,
+                             Natural (Ctx.Master_Stack.Length), Natural (Ctx.SS_Marks.Length), Natural (Ctx.SP_Marks.Length));
                            Emit_Stm_List (Ctx, D (AS_STM_S, Bdy));
                            if Has_Hdl then
                               if not Is_Terminated (Ctx.E) then
@@ -8485,6 +10908,7 @@ package body Cg_Stmt is
                               Ctx.Handlers.Delete_Last;
                               Emit_Label (Ctx.E, To_String (After_Lbl));
                            end if;
+                           Ctx.Cur_Master_Reg := Saved_Mst;
                         end;
                      end if;
                      if not Is_Terminated (Ctx.E) then
@@ -8495,6 +10919,7 @@ package body Cg_Stmt is
                end;
             end if;
          end;
+         end if;
       end loop;
       Ctx.In_Subunit := False;
       end;

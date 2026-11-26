@@ -49,7 +49,9 @@ package body DERIVED is
 
 	-- if parent type is in visible part of package
 	-- ... and CURRENT LOCATION is not in SAME VISIBLE PART (ERROR)
-	if KIND(PARENT_REGION) = DN_PACKAGE_ID
+	if (KIND(PARENT_REGION) = DN_PACKAGE_ID
+	    or else (KIND(PARENT_REGION) = DN_GENERIC_ID
+		     and then KIND(D(SM_SPEC, PARENT_REGION)) = DN_PACKAGE_SPEC))
 	and then DB(XD_IS_IN_SPEC, PARENT_DEF)
 	and then not (H.IS_IN_SPEC
 		and then PARENT_REGION = D(XD_SOURCE_NAME, H.REGION_DEF) )
@@ -59,7 +61,7 @@ package body DERIVED is
 	    -- ... until parent declaration is passed
 	    -- ... also, remember list of derived subprograms of parent
 	    DECL_LIST := LIST(D(AS_DECL_S1, D(SM_SPEC, PARENT_REGION)));
-	    loop
+	    while not IS_EMPTY(DECL_LIST) loop
 	    	POP(DECL_LIST, DECL);
 	    	if KIND(DECL) = DN_TYPE_DECL 
                 or else KIND(DECL) = DN_TASK_DECL then
@@ -296,6 +298,10 @@ package body DERIVED is
 		UNEQUAL_ID := COPY_NODE(UNEQUAL_ID);
 		D(SM_FIRST, UNEQUAL_ID, UNEQUAL_ID);
 		D(SM_SPEC, UNEQUAL_ID, NEW_HEADER);
+		if KIND(D(LX_SYMREP, UNEQUAL_ID)) = DN_TXTREP then
+		    D(LX_SYMREP, UNEQUAL_ID,
+		      STORESYM(PRINTNAME(D(LX_SYMREP, UNEQUAL_ID))));
+		end if;
 		if KIND(D(LX_SYMREP,UNEQUAL_ID)) = DN_SYMBOL_REP then
 		    MAKE_DEF_VISIBLE
 			    ( MAKE_DEF_FOR_ID(UNEQUAL_ID, H)

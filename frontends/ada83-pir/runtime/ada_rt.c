@@ -14,6 +14,9 @@
 #ifdef __APPLE__
 #define _DARWIN_C_SOURCE
 #include <sys/ucontext.h>
+#elif defined(__linux__)
+#define _GNU_SOURCE
+#include <ucontext.h>
 #endif
 #define _POSIX_C_SOURCE 200809L
 #include <inttypes.h>
@@ -488,7 +491,7 @@ int64_t __ada_val_i64(const char *ptr, int32_t len) {
                 if (prev_us) __ada_raise(__ada_exc_constraint_error);
                 prev_us = 1;
             } else if (ptr[i] >= '0' && ptr[i] <= '9') {
-                expv = expv * 10 + (ptr[i] - '0');
+                if (expv < 1000000) expv = expv * 10 + (ptr[i] - '0');
                 if (expv > 1000 && acc != 0) __ada_raise(__ada_exc_constraint_error);
                 prev_us = 0;
                 got = 1;
@@ -685,15 +688,20 @@ void __ada_free(void *p) {
 
 void *__ada_pool_alloc(int64_t *used_p, int64_t limit, int64_t bytes) {
     if (bytes <= 0) bytes = 1;
-    if (limit <= 0) {
+    if (limit <= 0 || bytes > limit) {
         __ada_raise(__ada_exc_storage_error);
     }
-    int64_t prev = __sync_fetch_and_add(used_p, bytes);
-    if (prev + bytes > limit || prev + bytes < prev) {
-        __sync_fetch_and_sub(used_p, bytes);
+    int64_t cur = __atomic_load_n(used_p, __ATOMIC_ACQUIRE);
+    if (cur + bytes > limit || cur + bytes < cur) {
         __ada_raise(__ada_exc_storage_error);
     }
     void *p = __ada_alloc(bytes);
+    int64_t prev = __sync_fetch_and_add(used_p, bytes);
+    if (prev + bytes > limit || prev + bytes < prev) {
+        __sync_fetch_and_sub(used_p, bytes);
+        __ada_free(p);
+        __ada_raise(__ada_exc_storage_error);
+    }
     return p;
 }
 
@@ -726,7 +734,8 @@ static void ada_stack_sig_handler(int sig, siginfo_t *si, void *uc) {
         size_t    sz  = pthread_get_stacksize_np(self);
         uintptr_t bot = (top > sz) ? (top - sz) : 0u;
         uintptr_t fa  = (uintptr_t)si->si_addr;
-        uintptr_t lo  = (bot > 262144u) ? (bot - 262144u) : 0u;
+        uintptr_t lo  = (bot > 4194304u) ? (bot - 4194304u) : 65536u;
+        if (lo < 65536u) lo = 65536u;
         uintptr_t hi  = bot + 65536u;
         if (fa >= lo && fa <= hi) {
             ucontext_t *uctx = (ucontext_t *)uc;
@@ -745,6 +754,41 @@ static void ada_stack_sig_handler(int sig, siginfo_t *si, void *uc) {
 #else
             __ada_raise(__ada_exc_storage_error);
 #endif
+        }
+    }
+#elif defined(__linux__)
+    if (si && si->si_addr != NULL && uc != NULL) {
+        pthread_attr_t attr;
+        void *stk_addr = NULL;
+        size_t stk_sz  = 0u;
+        if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+            int rc = pthread_attr_getstack(&attr, &stk_addr, &stk_sz);
+            pthread_attr_destroy(&attr);
+            if (rc == 0 && stk_addr != NULL && stk_sz > 0u) {
+                uintptr_t bot = (uintptr_t)stk_addr;
+                uintptr_t fa  = (uintptr_t)si->si_addr;
+                uintptr_t lo  = (bot > 4194304u) ? (bot - 4194304u) : 65536u;
+                if (lo < 65536u) lo = 65536u;
+                uintptr_t hi  = bot + 65536u;
+                if (fa >= lo && fa <= hi) {
+                    ucontext_t *uctx = (ucontext_t *)uc;
+                    uintptr_t esp = ((uintptr_t)&g_ada_emerg_stk[2048]) & ~(uintptr_t)15u;
+#if defined(__aarch64__)
+                    uctx->uc_mcontext.pc = (uint64_t)(uintptr_t)&ada_raise_storage_error_trampoline;
+                    uctx->uc_mcontext.sp = (uint64_t)esp;
+                    uctx->uc_mcontext.regs[29] = (uint64_t)esp;
+                    uctx->uc_mcontext.regs[30] = 0u;
+                    return;
+#elif defined(__x86_64__)
+                    uctx->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)&ada_raise_storage_error_trampoline;
+                    uctx->uc_mcontext.gregs[REG_RSP] = (greg_t)(esp - 8u);
+                    uctx->uc_mcontext.gregs[REG_RBP] = (greg_t)esp;
+                    return;
+#else
+                    __ada_raise(__ada_exc_storage_error);
+#endif
+                }
+            }
         }
     }
 #else
@@ -994,4 +1038,88 @@ int32_t __ada_fixed_fore(int64_t lo_ticks, int64_t hi_ticks, double base_small) 
         p10 *= 10.0;
     }
     return n;
+}
+
+int32_t __ada_fixed_fore_rat(int64_t lo_ticks, int64_t hi_ticks, int64_t sm_num, int64_t sm_den) {
+    if (hi_ticks < lo_ticks) return 2;
+    if (sm_num <= 0 || sm_den <= 0) {
+        return __ada_fixed_fore(lo_ticks, hi_ticks, 1.0);
+    }
+    unsigned __int128 alo = (unsigned __int128)ada_abs_i64(lo_ticks);
+    unsigned __int128 ahi = (unsigned __int128)ada_abs_i64(hi_ticks);
+    unsigned __int128 mt = (alo > ahi) ? alo : ahi;
+    unsigned __int128 prod = mt * (unsigned __int128)sm_num;
+    unsigned __int128 thresh = (unsigned __int128)sm_den * 10u;
+    int32_t n = 2;
+    while (n < 38 && prod >= thresh) {
+        n++;
+        if (thresh > (((unsigned __int128)0 - (unsigned __int128)1) / 10u)) break;
+        thresh *= 10u;
+    }
+    return n;
+}
+
+static int64_t ada_i128_div_round(__int128 num, __int128 den, int64_t lo, int64_t hi, int32_t chk) {
+    if (den == 0) {
+        if (chk) __ada_raise(__ada_exc_constraint_error);
+        return 0;
+    }
+    int neg = 0;
+    unsigned __int128 un, ud;
+    if (num < 0) { neg = !neg; un = (unsigned __int128)(-(num + 1)) + 1u; }
+    else { un = (unsigned __int128)num; }
+    if (den < 0) { neg = !neg; ud = (unsigned __int128)(-(den + 1)) + 1u; }
+    else { ud = (unsigned __int128)den; }
+    unsigned __int128 q = un / ud;
+    unsigned __int128 r = un % ud;
+    if (r * 2u >= ud) q += 1u; /* round halfway away from zero */
+    if (!neg) {
+        if (q > (unsigned __int128)INT64_MAX) {
+            if (chk) __ada_raise(__ada_exc_constraint_error);
+            return INT64_MAX;
+        }
+        int64_t v = (int64_t)q;
+        if (chk && (v < lo || v > hi)) __ada_raise(__ada_exc_constraint_error);
+        return v;
+    } else {
+        unsigned __int128 max_neg = (unsigned __int128)INT64_MAX + 1u;
+        if (q > max_neg) {
+            if (chk) __ada_raise(__ada_exc_constraint_error);
+            return INT64_MIN;
+        }
+        int64_t v = (q == max_neg) ? INT64_MIN : -(int64_t)q;
+        if (chk && (v < lo || v > hi)) __ada_raise(__ada_exc_constraint_error);
+        return v;
+    }
+}
+
+int64_t __ada_fixed_mul_i64(int64_t a, int64_t b, int64_t snum, int64_t sden,
+                            int64_t lo, int64_t hi, int32_t chk) {
+    if (a == 0 || b == 0) {
+        if (chk && (0 < lo || 0 > hi)) __ada_raise(__ada_exc_constraint_error);
+        return 0;
+    }
+    /* Compute (a * b * snum) / sden; reduce factors to prevent 128-bit overflow */
+    __int128 p = (__int128)a * (__int128)b;
+    unsigned __int128 up = (p < 0) ? ((unsigned __int128)(-(p + 1)) + 1u) : (unsigned __int128)p;
+    unsigned __int128 usn = (snum < 0) ? (unsigned __int128)(-snum) : (unsigned __int128)snum;
+    if (usn > 0 && up > (((unsigned __int128)1 << 126) / usn)) {
+        /* Fallback to double if triple product exceeds 126 bits */
+        double x = ((double)a * (double)b) * ((double)snum / (double)sden);
+        return __ada_f64_to_i64_round(x, lo, hi, chk);
+    }
+    return ada_i128_div_round(p * (__int128)snum, (__int128)sden, lo, hi, chk);
+}
+
+int64_t __ada_fixed_div_i64(int64_t a, int64_t b, int64_t snum, int64_t sden,
+                            int64_t lo, int64_t hi, int32_t chk) {
+    if (b == 0) {
+        if (chk) __ada_raise(__ada_exc_constraint_error);
+        return 0;
+    }
+    if (a == 0) {
+        if (chk && (0 < lo || 0 > hi)) __ada_raise(__ada_exc_constraint_error);
+        return 0;
+    }
+    return ada_i128_div_round((__int128)a * (__int128)snum, (__int128)b * (__int128)sden, lo, hi, chk);
 }

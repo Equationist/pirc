@@ -563,6 +563,7 @@ package body ATTWALK is
                 end if;
                 PREFIX_TYPE_OUT := GET_BASE_TYPE(ID);
                 if KIND(PREFIX_TYPE_OUT) = DN_TASK_SPEC
+                and then ID = D(XD_SOURCE_NAME, PREFIX_TYPE_OUT)
                 and then DI(XD_LEX_LEVEL
                             , GET_DEF_FOR_ID(D(XD_SOURCE_NAME,PREFIX_TYPE_OUT)))
                         > 0
@@ -590,7 +591,7 @@ package body ATTWALK is
                 end if;
 
                 case DEFINED_ATTRIBUTES'VAL(DI(XD_POS,ATTRIBUTE_ID)) is
-                when CALLABLE | FIRST | LAST | LENGTH | RANGE_X
+                when CALLABLE | CONSTRAINED | FIRST | LAST | LENGTH | RANGE_X
                                 | TERMINATED =>
                     -- expression allowed
                     declare
@@ -602,6 +603,7 @@ package body ATTWALK is
                         REDUCE_APPLY_NAMES (PREFIX, DEFSET, GENERAL_ASSOC_S);
                         REQUIRE_UNIQUE_DEF(PREFIX, DEFSET);
                         STASH_DEFSET(PREFIX, DEFSET);
+                        ID := GET_THE_ID(DEFSET);
                         PREFIX := MAKE_FUNCTION_CALL
                                 ( AS_NAME => PREFIX
                                 , AS_GENERAL_ASSOC_S => GENERAL_ASSOC_S
@@ -629,9 +631,12 @@ package body ATTWALK is
             if KIND(PREFIX) = DN_FUNCTION_CALL then
                 declare
                     NAME: TREE := D(AS_NAME, PREFIX);
-                    HOLD_PREFIX: TREE; -- save prefix to restore it
-                    HOLD_DESIGNATOR: TREE; -- save desig to restore it
-                    SAVE_NAME: TREE := NAME;
+                    MAX_SEL: constant NATURAL := 32;
+                    HOLD_NODE: array (1 .. MAX_SEL) of TREE;
+                    HOLD_PREFIX: array (1 .. MAX_SEL) of TREE;
+                    HOLD_DESIGNATOR: array (1 .. MAX_SEL) of TREE;
+                    HOLD_CNT: NATURAL := 0;
+                    CUR_S: TREE;
                     GENERAL_ASSOC_S: TREE
                                 := D(AS_GENERAL_ASSOC_S,PREFIX);
                     GENERAL_ASSOC_LIST: SEQ_TYPE := LIST(GENERAL_ASSOC_S);
@@ -643,10 +648,15 @@ package body ATTWALK is
                     and then IS_EMPTY(TAIL(GENERAL_ASSOC_LIST))
                     and then KIND(HEAD(GENERAL_ASSOC_LIST)) /= DN_ASSOC
                     then
-                        if KIND(NAME) = DN_SELECTED then
-                            HOLD_DESIGNATOR := D(AS_DESIGNATOR, NAME);
-                            HOLD_PREFIX := D(AS_NAME, NAME);
-                        end if;
+                        CUR_S := NAME;
+                        while CUR_S /= CONST_VOID and then KIND(CUR_S) = DN_SELECTED
+                        and then HOLD_CNT < MAX_SEL loop
+                            HOLD_CNT := HOLD_CNT + 1;
+                            HOLD_NODE(HOLD_CNT) := CUR_S;
+                            HOLD_DESIGNATOR(HOLD_CNT) := D(AS_DESIGNATOR, CUR_S);
+                            HOLD_PREFIX(HOLD_CNT) := D(AS_NAME, CUR_S);
+                            CUR_S := D(AS_NAME, CUR_S);
+                        end loop;
                         FIND_VISIBILITY(NAME, DEFSET);
                         ID := GET_THE_ID(DEFSET);
                         if KIND(ID) = DN_VOID then
@@ -682,11 +692,12 @@ package body ATTWALK is
                             D(SM_EXP_TYPE, PREFIX, CONST_VOID);
                             D(SM_NORMALIZED_PARAM_S, PREFIX, CONST_VOID);
                             return;
-                        elsif KIND(NAME) = DN_SELECTED then
-                            -- put it back to used object id
-                            -- since visibility will be checked again
-                            D(AS_DESIGNATOR, NAME, HOLD_DESIGNATOR);
-                            D(AS_NAME, NAME, HOLD_PREFIX);
+                        elsif HOLD_CNT > 0 then
+                            -- restore entire selected chain since visibility will be checked again
+                            for K in reverse 1 .. HOLD_CNT loop
+                                D(AS_DESIGNATOR, HOLD_NODE(K), HOLD_DESIGNATOR(K));
+                                D(AS_NAME, HOLD_NODE(K), HOLD_PREFIX(K));
+                            end loop;
                         end if;
                     end if;
                 end;
@@ -853,13 +864,28 @@ package body ATTWALK is
                 ERROR(D(LX_SRCPOS,ATTRIBUTE_NODE),
                         "Predefined SYSTEM not withed");
             end if;
-            if KIND(PREFIX_ID) not in CLASS_UNIT_NAME'FIRST .. DN_ENTRY_ID
+            if PREFIX_ID = CONST_VOID then
+                -- P3-6.8 (LRM 13.7.2(2)): Reject non-entity/non-object expression prefixes (e.g. 123'Address, (A+B)'Address)
+                declare
+                    PN: TREE := D(AS_NAME, ATTRIBUTE_NODE);
+                begin
+                    if PN = CONST_VOID
+                    or else (KIND(PN) /= DN_USED_OBJECT_ID
+                             and then KIND(PN) /= DN_SELECTED
+                             and then KIND(PN) /= DN_INDEXED
+                             and then KIND(PN) /= DN_SLICE
+                             and then KIND(PN) /= DN_ALL)
+                    then
+                        PREFIX_ERROR := TRUE;
+                    end if;
+                end;
+            elsif KIND(PREFIX_ID) not in CLASS_UNIT_NAME'FIRST .. DN_ENTRY_ID
+            and then KIND(PREFIX_ID) /= DN_LABEL_ID
             and then ( KIND(PREFIX_ID) /= DN_TYPE_ID
                        or else KIND(D(SM_TYPE_SPEC, PREFIX_ID)) /= DN_TASK_SPEC
                        or else DI(XD_LEX_LEVEL
                                , D(XD_REGION_DEF,GET_DEF_FOR_ID(PREFIX_ID)))
-                           = 0)
-            and then PREFIX_ID /= CONST_VOID then
+                           = 0) then
                 PREFIX_ERROR := TRUE;
             end if;
         when AFT | FORE =>
@@ -937,11 +963,41 @@ package body ATTWALK is
                     CUR_R: TREE := CURRENT_REGION_DEF;
                     CUR_SN: TREE;
                     OK_REGION: BOOLEAN := FALSE;
+                    SEL_NODE: TREE := CONST_VOID;
+                    SEL_BAD: BOOLEAN := FALSE;
                 begin
-                    if KIND(PFX_NODE) = DN_SELECTED
-                    or else (KIND(PFX_NODE) = DN_INDEXED
-                             and then KIND(D(AS_NAME, PFX_NODE)) = DN_SELECTED)
-                    then
+                    -- Entry family name without index is invalid for 'COUNT
+                    if D(SM_SPEC, PREFIX_ID) /= CONST_VOID
+                    and then KIND(D(SM_SPEC, PREFIX_ID)) = DN_ENTRY
+                    and then D(AS_DISCRETE_RANGE, D(SM_SPEC, PREFIX_ID)) /= CONST_VOID
+                    and then KIND(PFX_NODE) /= DN_INDEXED
+                    and then KIND(PFX_NODE) /= DN_FUNCTION_CALL then
+                        SEL_BAD := TRUE;
+                    end if;
+                    if KIND(PFX_NODE) = DN_SELECTED then
+                        SEL_NODE := PFX_NODE;
+                    elsif (KIND(PFX_NODE) = DN_INDEXED or else KIND(PFX_NODE) = DN_FUNCTION_CALL)
+                    and then KIND(D(AS_NAME, PFX_NODE)) = DN_SELECTED then
+                        SEL_NODE := D(AS_NAME, PFX_NODE);
+                    end if;
+                    if SEL_NODE /= CONST_VOID then
+                        -- Expanded name T.E'COUNT is legal iff prefix denotes the enclosing task (LRM 9.9(5), 4.1.3(10))
+                        declare
+                            SPFX: constant TREE := D(AS_NAME, SEL_NODE);
+                            SPFX_DEF: TREE := CONST_VOID;
+                        begin
+                            if SPFX /= CONST_VOID then
+                                SPFX_DEF := GET_NAME_DEFN(SPFX);
+                            end if;
+                            if SPFX_DEF = CONST_VOID
+                            or else (SPFX_DEF /= ENT_REGION
+                                     and then not (KIND(SPFX_DEF) = DN_TASK_BODY_ID
+                                                   and then D(SM_FIRST, SPFX_DEF) = ENT_REGION)) then
+                                SEL_BAD := TRUE;
+                            end if;
+                        end;
+                    end if;
+                    if SEL_BAD then
                         PREFIX_ERROR := TRUE;
                     else
                         while CUR_R /= CONST_VOID loop
@@ -989,7 +1045,9 @@ package body ATTWALK is
                         ATTRIBUTE_VALUE := U_VAL(4)
                                 * GET_FLOAT_MANTISSA(PREFIX_SUBSTRUCT);
                     when SAFE_EMAX =>
-                        if DI(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) <= 32 then
+                        if DI(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) <= 32
+                        or else (D(SM_ACCURACY, GET_BASE_STRUCT(PREFIX_TYPE)) /= CONST_VOID
+                                 and then D(SM_ACCURACY, GET_BASE_STRUCT(PREFIX_TYPE)) <= U_VAL(6)) then
                             ATTRIBUTE_VALUE := U_VAL(125);
                         else
                             ATTRIBUTE_VALUE := U_VAL(1021);
@@ -1067,7 +1125,9 @@ package body ATTWALK is
                                 * U_VAL(16) ** GET_FLOAT_MANTISSA
                                           (PREFIX_SUBSTRUCT);
                     when SAFE_LARGE =>
-                        if DI(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) <= 32 then
+                        if DI(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) <= 32
+                        or else (D(SM_ACCURACY, GET_BASE_STRUCT(PREFIX_TYPE)) /= CONST_VOID
+                                 and then D(SM_ACCURACY, GET_BASE_STRUCT(PREFIX_TYPE)) <= U_VAL(6)) then
                             ATTRIBUTE_VALUE :=
                                     ( U_REAL(1)
                                          - U_REAL(1)/U_VAL(2)**GET_FLOAT_MANTISSA(GET_BASE_STRUCT(PREFIX_TYPE)) )
@@ -1079,7 +1139,9 @@ package body ATTWALK is
                                     * U_VAL(2) ** U_VAL(1021);
                         end if;
                     when SAFE_SMALL =>
-                        if DI(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) <= 32 then
+                        if DI(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) <= 32
+                        or else (D(SM_ACCURACY, GET_BASE_STRUCT(PREFIX_TYPE)) /= CONST_VOID
+                                 and then D(SM_ACCURACY, GET_BASE_STRUCT(PREFIX_TYPE)) <= U_VAL(6)) then
                             ATTRIBUTE_VALUE :=
                                     ( U_REAL(1, 2) )
                                     / U_VAL(2) ** U_VAL(125);
@@ -1142,20 +1204,24 @@ package body ATTWALK is
                 PREFIX_ERROR := TRUE;
             end if;
         when IMAGE =>
-            if not IS_DISCRETE_TYPE(GET_BASE_TYPE(PREFIX_TYPE)) then
+            if KIND(PREFIX_ID) not in CLASS_TYPE_NAME
+            or else not IS_DISCRETE_TYPE(GET_BASE_TYPE(PREFIX_TYPE)) then
                 PREFIX_ERROR := TRUE;
             end if;
             ATTRIBUTE_SUBTYPE := PREDEFINED_STRING;
         when MACHINE_OVERFLOWS | MACHINE_ROUNDS =>
             ATTRIBUTE_SUBTYPE := PREDEFINED_BOOLEAN;
-            if WHICH_ATTRIBUTE = MACHINE_OVERFLOWS then
-                ATTRIBUTE_VALUE := U_VAL(0);
-            else
-                ATTRIBUTE_VALUE := U_VAL(1);
-            end if;
             if KIND(PREFIX_ID) in CLASS_TYPE_NAME
             and then KIND(GET_BASE_STRUCT(PREFIX_TYPE)) in CLASS_REAL then
-                null;
+                if IS_STATIC_SUBTYPE(GET_SUBSTRUCT(PREFIX_TYPE)) then
+                    if WHICH_ATTRIBUTE = MACHINE_OVERFLOWS then
+                        ATTRIBUTE_VALUE := U_VAL(0);
+                    elsif KIND(GET_BASE_STRUCT(PREFIX_TYPE)) = DN_FIXED then
+                        ATTRIBUTE_VALUE := U_VAL(0);
+                    else
+                        ATTRIBUTE_VALUE := U_VAL(1);
+                    end if;
+                end if;
             else
                 PREFIX_ERROR := TRUE;
             end if;
@@ -1238,7 +1304,7 @@ package body ATTWALK is
         if PARAMETER /= CONST_VOID then
 
             if KIND(PREFIX_ID) in CLASS_TYPE_NAME then
-                PREFIX_SUBSTRUCT := GET_SUBSTRUCT(D(SM_TYPE_SPEC,PREFIX_ID));
+                PREFIX_SUBSTRUCT := GET_SUBSTRUCT(PREFIX_TYPE);
             else
                 PREFIX_SUBSTRUCT := CONST_VOID;
             end if;
@@ -1256,23 +1322,68 @@ package body ATTWALK is
             when PRED =>
                 REQUIRE_TYPE(PREFIX_BASE, PARAMETER, PARAM_TYPESET);
                 PARAMETER := RESOLVE_EXP(PARAMETER, PARAM_TYPESET);
-                -- $$$$ only for static subtype; check constraint
                 if IS_STATIC_SUBTYPE(PREFIX_SUBSTRUCT) then
-                    ATTRIBUTE_VALUE
-                             := GET_STATIC_VALUE(PARAMETER) - U_VAL(1);
+                    declare
+                        VAL_TMP: TREE := GET_STATIC_VALUE(PARAMETER) - U_VAL(1);
+                        BS: constant TREE := GET_BASE_STRUCT(PREFIX_TYPE);
+                        RNG: TREE := CONST_VOID;
+                    begin
+                        if VAL_TMP /= CONST_VOID and then BS /= CONST_VOID
+                        and then KIND(BS) in DN_ENUMERATION .. DN_INTEGER then
+                            RNG := D(SM_RANGE, BS);
+                            if RNG /= CONST_VOID and then KIND(RNG) = DN_RANGE then
+                                if not (GET_STATIC_VALUE(D(AS_EXP1, RNG)) <= VAL_TMP
+                                        and then VAL_TMP <= GET_STATIC_VALUE(D(AS_EXP2, RNG))) then
+                                    VAL_TMP := CONST_VOID;
+                                end if;
+                            end if;
+                        end if;
+                        ATTRIBUTE_VALUE := VAL_TMP;
+                    end;
                 end if;
             when SUCC =>
                 REQUIRE_TYPE(PREFIX_BASE, PARAMETER, PARAM_TYPESET);
                 PARAMETER := RESOLVE_EXP(PARAMETER, PARAM_TYPESET);
                 if IS_STATIC_SUBTYPE(PREFIX_SUBSTRUCT) then
-                    ATTRIBUTE_VALUE
-                            := GET_STATIC_VALUE(PARAMETER) + U_VAL(1);
+                    declare
+                        VAL_TMP: TREE := GET_STATIC_VALUE(PARAMETER) + U_VAL(1);
+                        BS: constant TREE := GET_BASE_STRUCT(PREFIX_TYPE);
+                        RNG: TREE := CONST_VOID;
+                    begin
+                        if VAL_TMP /= CONST_VOID and then BS /= CONST_VOID
+                        and then KIND(BS) in DN_ENUMERATION .. DN_INTEGER then
+                            RNG := D(SM_RANGE, BS);
+                            if RNG /= CONST_VOID and then KIND(RNG) = DN_RANGE then
+                                if not (GET_STATIC_VALUE(D(AS_EXP1, RNG)) <= VAL_TMP
+                                        and then VAL_TMP <= GET_STATIC_VALUE(D(AS_EXP2, RNG))) then
+                                    VAL_TMP := CONST_VOID;
+                                end if;
+                            end if;
+                        end if;
+                        ATTRIBUTE_VALUE := VAL_TMP;
+                    end;
                 end if;
             when VAL =>
                 REQUIRE_INTEGER_TYPE(PARAMETER, PARAM_TYPESET);
                 PARAMETER := RESOLVE_EXP(PARAMETER, PARAM_TYPESET);
                 if IS_STATIC_SUBTYPE(PREFIX_SUBSTRUCT) then
-                    ATTRIBUTE_VALUE := GET_STATIC_VALUE(PARAMETER);
+                    declare
+                        VAL_TMP: TREE := GET_STATIC_VALUE(PARAMETER);
+                        BS: constant TREE := GET_BASE_STRUCT(PREFIX_TYPE);
+                        RNG: TREE := CONST_VOID;
+                    begin
+                        if VAL_TMP /= CONST_VOID and then BS /= CONST_VOID
+                        and then KIND(BS) in DN_ENUMERATION .. DN_INTEGER then
+                            RNG := D(SM_RANGE, BS);
+                            if RNG /= CONST_VOID and then KIND(RNG) = DN_RANGE then
+                                if not (GET_STATIC_VALUE(D(AS_EXP1, RNG)) <= VAL_TMP
+                                        and then VAL_TMP <= GET_STATIC_VALUE(D(AS_EXP2, RNG))) then
+                                    VAL_TMP := CONST_VOID;
+                                end if;
+                            end if;
+                        end if;
+                        ATTRIBUTE_VALUE := VAL_TMP;
+                    end;
                 end if;
             when VALUE =>
                 REQUIRE_TYPE(PREDEFINED_STRING, PARAMETER, PARAM_TYPESET);
@@ -1333,24 +1444,20 @@ package body ATTWALK is
                 INDEX_LIST: SEQ_TYPE;
                 PREFIX_SUBSTRUCT: TREE := PREFIX_TYPE;
             begin
-                if KIND(PREFIX_SUBSTRUCT) in DN_PRIVATE .. DN_L_PRIVATE then
-                    PREFIX_SUBSTRUCT := D(SM_TYPE_SPEC, PREFIX_SUBSTRUCT);
-                elsif KIND(PREFIX_SUBSTRUCT) = DN_INCOMPLETE then
-                    PREFIX_SUBSTRUCT := D(XD_FULL_TYPE_SPEC, PREFIX_SUBSTRUCT);
-                end if;
+                PREFIX_SUBSTRUCT := GET_SUBSTRUCT(PREFIX_SUBSTRUCT);
                 if KIND(PREFIX_SUBSTRUCT) = DN_ACCESS
                 or else KIND(PREFIX_SUBSTRUCT) = DN_CONSTRAINED_ACCESS then
                     PREFIX_SUBSTRUCT := D(SM_DESIG_TYPE,PREFIX_SUBSTRUCT);
                 end if;
-                if KIND(PREFIX_SUBSTRUCT) in DN_PRIVATE .. DN_L_PRIVATE then
-                    PREFIX_SUBSTRUCT := D(SM_TYPE_SPEC, PREFIX_SUBSTRUCT);
-                elsif KIND(PREFIX_SUBSTRUCT) = DN_INCOMPLETE then
-                    PREFIX_SUBSTRUCT := D(XD_FULL_TYPE_SPEC, PREFIX_SUBSTRUCT);
-                end if;
+                PREFIX_SUBSTRUCT := GET_SUBSTRUCT(PREFIX_SUBSTRUCT);
 
                 if KIND(PREFIX_SUBSTRUCT)
                         in CLASS_SCALAR
                 then
+                    if KIND(PREFIX_ID) not in CLASS_TYPE_NAME then
+                        ERROR(D(LX_SRCPOS, ATTRIBUTE_NODE),
+                                "Prefix must be a scalar subtype or array");
+                    end if;
                     -- $$$$ make sure we get subtype
                     INDEX := PREFIX_SUBSTRUCT;
                     ATTRIBUTE_SUBTYPE := GET_BASE_TYPE(INDEX);

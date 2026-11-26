@@ -61,8 +61,8 @@ package body CHKSTAT is
 	    return IS_STATIC_RANGE(A);
 	when DN_USED_NAME_ID =>
 	    return D(SM_DEFN,A) /= CONST_VOID
-		    and then IS_STATIC_DISCRETE_RANGE
-				( D(SM_EXP_TYPE,D(SM_DEFN,A)) );
+		    and then KIND(D(SM_DEFN,A)) in CLASS_TYPE_NAME
+		    and then IS_STATIC_SUBTYPE(D(SM_TYPE_SPEC, D(SM_DEFN,A)));
 	when DN_SELECTED =>
 	    return IS_STATIC_DISCRETE_RANGE(D(AS_DESIGNATOR,A));
 	when others =>

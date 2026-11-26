@@ -60,10 +60,12 @@ package body LSCAN is
       elsif TTYPE = ERROR then
 	TTYPE_TEMP := LT_ERROR;
       else -- TTYPE = IDENT or PUNCT
-	if ATTRIBUTE_CONTEXT and then TTYPE = IDENT then
+	TTYPE_TEMP := HASH_SEARCH(TO_STRING(TEXT_OUT));
+	if ATTRIBUTE_CONTEXT and then TTYPE = IDENT
+	and then (TTYPE_TEMP = LT_DELTA
+		  or else TTYPE_TEMP = LT_DIGITS
+		  or else TTYPE_TEMP = LT_RANGE) then
 	  TTYPE_TEMP := LT_IDENTIFIER;
-	else
-	  TTYPE_TEMP := HASH_SEARCH(TO_STRING(TEXT_OUT));
 	end if;
 	if TTYPE_TEMP = LT_IDENTIFIER then
 	  if TTYPE = IDENT then
@@ -127,6 +129,7 @@ package body LSCAN is
     LINE_LENGTH := SOURCE_LINE.LEN;
     W_COL := COL + 1;
 
+  <<START>>
     while W_COL <= LINE_LENGTH loop
       CHR := SL.BDY (W_COL);
       exit
@@ -153,8 +156,13 @@ package body LSCAN is
       TTYPE := IDENT;
       goto SCAN_IDENT;
     when '_' =>
-      -- Allow leading underscore for system programming -- switch some day
+      -- Allow leading underscore only for predefined _standrd identifiers;
+      -- reject bare '_' and consecutive '__'.
       TTYPE := IDENT;
+      if CHR not in 'A' .. 'Z' and then CHR not in 'a' .. 'z'
+      and then CHR not in '0' .. '9' then
+        TTYPE := ERROR;
+      end if;
       goto SCAN_IDENT;
     when 'a' .. 'z' =>
       TEXT (1) := CHARACTER'VAL(CHARACTER'POS(TEXT(1)) - CASE_MAGIC);
@@ -535,6 +543,13 @@ package body LSCAN is
       while W_COL <= LINE_LENGTH loop
 	CHR := SL.BDY (W_COL);
 	W_COL := W_COL + 1;
+	if CHR = ASCII.VT or else CHR = ASCII.FF or else CHR = ASCII.CR then
+	  if TTYPE = ERROR then
+	    exit;
+	  else
+	    goto START;
+	  end if;
+	end if;
         if CHR not in ' ' .. '~'
 	and then CHR not in ASCII.HT .. ASCII.CR then
 	  TTYPE := ERROR;

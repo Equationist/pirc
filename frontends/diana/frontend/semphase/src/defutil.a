@@ -95,7 +95,12 @@ package body DEFUTIL is
 	while not IS_EMPTY(DEFLIST) loop
 	    POP(DEFLIST, PRIOR_DEF);
 	    if PRIOR_DEF /= DEF
-	    and then D(XD_REGION_DEF, PRIOR_DEF) = REGION_DEF then
+	    and then D(XD_REGION_DEF, PRIOR_DEF) = REGION_DEF
+	    and then KIND(D(XD_SOURCE_NAME, PRIOR_DEF)) /= DN_BLTN_OPERATOR_ID
+	    and then (KIND(D(XD_SOURCE_NAME, PRIOR_DEF)) not in CLASS_SUBPROG_NAME
+		      or else (KIND(D(SM_UNIT_DESC, D(XD_SOURCE_NAME, PRIOR_DEF))) /= DN_DERIVED_SUBPROG
+			       and then KIND(D(SM_UNIT_DESC, D(XD_SOURCE_NAME, PRIOR_DEF))) /= DN_IMPLICIT_NOT_EQ))
+	    then
 		return PRIOR_DEF;
 	    end if;
 	end loop;
@@ -568,7 +573,7 @@ package body DEFUTIL is
 
     function IS_COMPATIBLE_EXPRESSION (EXP_1, EXP_2: TREE) return BOOLEAN is
 	-- arguments are expressions or ranges or void
-	-- return true if compatible (within param or dscrmt list)
+	-- return true if compatible (within param or dscrmt list, LRM 6.3.1)
     begin
 	if (EXP_1 = CONST_VOID) xor (EXP_2 = CONST_VOID) then
 	    return FALSE;
@@ -576,33 +581,79 @@ package body DEFUTIL is
 	if EXP_1 = CONST_VOID then
 	    return TRUE;
 	end if;
+	if KIND(EXP_1) = DN_PARENTHESIZED and then KIND(EXP_2) = DN_PARENTHESIZED then
+	    return IS_COMPATIBLE_EXPRESSION(D(AS_EXP, EXP_1), D(AS_EXP, EXP_2));
+	elsif KIND(EXP_1) = DN_PARENTHESIZED or else KIND(EXP_2) = DN_PARENTHESIZED then
+	    return FALSE;
+	end if;
 	-- LRM 6.3.1(5): numeric literals must have identical numeric value
 	if KIND(EXP_1) = DN_NUMERIC_LITERAL and then KIND(EXP_2) = DN_NUMERIC_LITERAL then
 	    if D(SM_VALUE, EXP_1) /= CONST_VOID and then D(SM_VALUE, EXP_2) /= CONST_VOID then
 		return UARITH.U_EQUAL(D(SM_VALUE, EXP_1), D(SM_VALUE, EXP_2));
 	    end if;
+	    return TRUE;
 	end if;
-	-- LRM 6.3.1(6): simple name and expanded name only conform for identifiers, NOT operator/char literals
+	-- LRM 6.3.1(6): simple name and expanded name only conform for identifiers (same defn), NOT operator/char literals
 	if KIND(EXP_1) = DN_SELECTED and then KIND(EXP_2) /= DN_SELECTED then
 	    declare
 		DES: constant TREE := D(AS_DESIGNATOR, EXP_1);
 	    begin
-		if DES /= CONST_VOID and then (KIND(DES) = DN_USED_OP or else KIND(DES) = DN_USED_CHAR) then
+		if DES = CONST_VOID or else KIND(DES) = DN_USED_OP or else KIND(DES) = DN_USED_CHAR then
 		    return FALSE;
 		end if;
+		return IS_COMPATIBLE_EXPRESSION(DES, EXP_2);
 	    end;
 	elsif KIND(EXP_2) = DN_SELECTED and then KIND(EXP_1) /= DN_SELECTED then
 	    declare
 		DES: constant TREE := D(AS_DESIGNATOR, EXP_2);
 	    begin
-		if DES /= CONST_VOID and then (KIND(DES) = DN_USED_OP or else KIND(DES) = DN_USED_CHAR) then
+		if DES = CONST_VOID or else KIND(DES) = DN_USED_OP or else KIND(DES) = DN_USED_CHAR then
 		    return FALSE;
 		end if;
+		return IS_COMPATIBLE_EXPRESSION(EXP_1, DES);
 	    end;
-	elsif KIND(EXP_1) = DN_FUNCTION_CALL and then KIND(EXP_2) = DN_FUNCTION_CALL then
-	    return IS_COMPATIBLE_EXPRESSION(D(AS_NAME, EXP_1), D(AS_NAME, EXP_2));
+	elsif KIND(EXP_1) /= KIND(EXP_2) then
+	    return FALSE;
 	end if;
-	return TRUE;
+	case KIND(EXP_1) is
+	when DN_USED_OBJECT_ID | DN_USED_NAME_ID | DN_USED_OP | DN_USED_CHAR =>
+	    if D(SM_DEFN, EXP_1) /= CONST_VOID and then D(SM_DEFN, EXP_2) /= CONST_VOID then
+		return D(SM_DEFN, EXP_1) = D(SM_DEFN, EXP_2);
+	    end if;
+	    return TRUE;
+	when DN_STRING_LITERAL =>
+	    return PRINTNAME(D(LX_SYMREP, EXP_1)) = PRINTNAME(D(LX_SYMREP, EXP_2));
+	when DN_SELECTED =>
+	    return IS_COMPATIBLE_EXPRESSION(D(AS_DESIGNATOR, EXP_1), D(AS_DESIGNATOR, EXP_2));
+	when DN_FUNCTION_CALL =>
+	    if not IS_COMPATIBLE_EXPRESSION(D(AS_NAME, EXP_1), D(AS_NAME, EXP_2)) then
+		return FALSE;
+	    end if;
+	    declare
+		L1: SEQ_TYPE := LIST(D(AS_GENERAL_ASSOC_S, EXP_1));
+		L2: SEQ_TYPE := LIST(D(AS_GENERAL_ASSOC_S, EXP_2));
+		A1, A2: TREE;
+	    begin
+		while not IS_EMPTY(L1) and then not IS_EMPTY(L2) loop
+		    POP(L1, A1);
+		    POP(L2, A2);
+		    if KIND(A1) = DN_ASSOC and then KIND(A2) = DN_ASSOC then
+			if not IS_COMPATIBLE_EXPRESSION(D(AS_EXP, A1), D(AS_EXP, A2)) then
+			    return FALSE;
+			end if;
+		    elsif KIND(A1) /= DN_ASSOC and then KIND(A2) /= DN_ASSOC then
+			if not IS_COMPATIBLE_EXPRESSION(A1, A2) then
+			    return FALSE;
+			end if;
+		    else
+			return FALSE;
+		    end if;
+		end loop;
+		return IS_EMPTY(L1) and then IS_EMPTY(L2);
+	    end;
+	when others =>
+	    return TRUE;
+	end case;
     end IS_COMPATIBLE_EXPRESSION;
 
 
@@ -631,7 +682,11 @@ package body DEFUTIL is
 	SOURCE_NAME: TREE := D(XD_SOURCE_NAME, DEF);
     begin
 	if KIND(HEADER) = DN_FUNCTION_SPEC then
-	    return GET_BASE_TYPE(D(AS_NAME,HEADER));
+	    if ALL_PARAMETERS_HAVE_DEFAULTS(HEADER) then
+		return GET_BASE_TYPE(D(AS_NAME,HEADER));
+	    else
+		return CONST_VOID;
+	    end if;
 	elsif KIND(SOURCE_NAME) in CLASS_OBJECT_NAME then
 	    return GET_BASE_TYPE(D(SM_OBJ_TYPE, D(XD_SOURCE_NAME, DEF)));
 	elsif KIND(SOURCE_NAME) in CLASS_TYPE_SPEC then
@@ -724,9 +779,13 @@ package body DEFUTIL is
 
 
     function GET_BASE_PACKAGE(PACKAGE_ID: TREE) return TREE is
-	UNIT_DESC: TREE := D(SM_UNIT_DESC, PACKAGE_ID);
+	UNIT_DESC: TREE;
 	BASE_ID: TREE;
     begin
+	if PACKAGE_ID = CONST_VOID or else KIND(PACKAGE_ID) /= DN_PACKAGE_ID then
+	    return PACKAGE_ID;
+	end if;
+	UNIT_DESC := D(SM_UNIT_DESC, PACKAGE_ID);
 	if KIND(UNIT_DESC) = DN_RENAMES_UNIT then
 	    BASE_ID := GET_NAME_DEFN(D(AS_NAME, UNIT_DESC));
 	    if BASE_ID /= CONST_VOID then

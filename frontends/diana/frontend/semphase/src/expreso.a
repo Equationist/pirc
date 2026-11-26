@@ -506,7 +506,25 @@ package body EXPRESO is
 		FREEZE_TYPE(SUBTYPE_SPEC);
 		if SUBTYPE_SPEC /= CONST_VOID
 		and then CHKSTAT.IS_STATIC_SUBTYPE(SUBTYPE_SPEC) then
-		    D(SM_VALUE, EXP, GET_STATIC_VALUE(EXP_NODE));
+		    declare
+			SV: TREE := GET_STATIC_VALUE(EXP_NODE);
+			RNG: TREE;
+			LO_V, HI_V: TREE;
+		    begin
+			if SV /= CONST_VOID and then KIND(SUBTYPE_SPEC) in CLASS_SCALAR then
+			    RNG := D(SM_RANGE, SUBTYPE_SPEC);
+			    if RNG /= CONST_VOID and then KIND(RNG) = DN_RANGE then
+				LO_V := GET_STATIC_VALUE(D(AS_EXP1, RNG));
+				HI_V := GET_STATIC_VALUE(D(AS_EXP2, RNG));
+				if LO_V /= CONST_VOID and then HI_V /= CONST_VOID then
+				    if not (UARITH."<="(LO_V, SV) and then UARITH."<="(SV, HI_V)) then
+					SV := CONST_VOID;
+				    end if;
+				end if;
+			    end if;
+			end if;
+			D(SM_VALUE, EXP, SV);
+		    end;
 		else
 		    D(SM_VALUE, EXP, CONST_VOID);
 		end if;
@@ -516,8 +534,59 @@ package body EXPRESO is
 	when DN_PARENTHESIZED =>
 	    declare
 		EXP_NODE: TREE := D(AS_EXP, EXP);
+		function PAR_HAS_OTH(AN: TREE; DIMS_REM: NATURAL) return BOOLEAN is
+		    AL: SEQ_TYPE;
+		    IT: TREE;
+		    CS: SEQ_TYPE;
+		    CH: TREE;
+		begin
+		    if AN = CONST_VOID or else KIND(AN) /= DN_AGGREGATE or else DIMS_REM = 0 then return FALSE; end if;
+		    AL := LIST(D(AS_GENERAL_ASSOC_S, AN));
+		    while not IS_EMPTY(AL) loop
+			POP(AL, IT);
+			if KIND(IT) = DN_ASSOC or else KIND(IT) = DN_NAMED then
+			    CS := LIST(D(AS_CHOICE_S, IT));
+			    while not IS_EMPTY(CS) loop
+				POP(CS, CH);
+				if KIND(CH) = DN_CHOICE_OTHERS then return TRUE; end if;
+			    end loop;
+			    if DIMS_REM > 1 and then PAR_HAS_OTH(D(AS_EXP, IT), DIMS_REM - 1) then return TRUE; end if;
+			elsif DIMS_REM > 1 and then PAR_HAS_OTH(IT, DIMS_REM - 1) then
+			    return TRUE;
+			end if;
+		    end loop;
+		    return FALSE;
+		end PAR_HAS_OTH;
 	    begin
-		EXP_NODE := RESOLVE_EXP(EXP_NODE, TYPE_SPEC);
+		if EXP_NODE /= CONST_VOID and then KIND(EXP_NODE) = DN_AGGREGATE
+		and then TYPE_SPEC /= CONST_VOID and then KIND(GET_BASE_STRUCT(TYPE_SPEC)) = DN_ARRAY then
+		    declare
+			NDIMS: NATURAL := 1;
+			BSTR: constant TREE := GET_BASE_STRUCT(TYPE_SPEC);
+		    begin
+			if D(SM_INDEX_S, BSTR) /= CONST_VOID then
+			    declare
+				IL: SEQ_TYPE := LIST(D(SM_INDEX_S, BSTR));
+				IT_I: TREE;
+				CNT: NATURAL := 0;
+			    begin
+				while not IS_EMPTY(IL) loop
+				    POP(IL, IT_I);
+				    CNT := CNT + 1;
+				end loop;
+				if CNT > 0 then NDIMS := CNT; end if;
+			    end;
+			end if;
+			if PAR_HAS_OTH(EXP_NODE, NDIMS) then
+			    ERROR(D(LX_SRCPOS, EXP_NODE), "OTHERS not allowed in parenthesized array aggregate");
+			end if;
+		    end;
+		end if;
+		if TYPE_SPEC /= CONST_VOID and then KIND(TYPE_SPEC) = DN_CONSTRAINED_ARRAY then
+		    EXP_NODE := RESOLVE_EXP(EXP_NODE, GET_BASE_TYPE(TYPE_SPEC));
+		else
+		    EXP_NODE := RESOLVE_EXP(EXP_NODE, TYPE_SPEC);
+		end if;
 		D(AS_EXP, EXP, EXP_NODE);
 		D(SM_EXP_TYPE, EXP, D(SM_EXP_TYPE, EXP_NODE));
 		D(SM_VALUE, EXP, GET_STATIC_VALUE(EXP_NODE));
@@ -537,8 +606,19 @@ package body EXPRESO is
 	    begin
 		-- (Note: required type ignored in resolve_exp)
 		QUALIFIED := RESOLVE_EXP(QUALIFIED, CONST_VOID);
-		if QUALIFIED /= CONST_VOID and then CONTAINS_UNCOMPLETED_PRIVATE(D(SM_EXP_TYPE, QUALIFIED)) then
-		    ERROR(D(LX_SRCPOS, QUALIFIED), "Premature use of uncompleted private type in allocator");
+		if QUALIFIED /= CONST_VOID then
+		    declare
+			QT: constant TREE := D(SM_EXP_TYPE, QUALIFIED);
+		    begin
+			if CONTAINS_UNCOMPLETED_PRIVATE(QT) then
+			    ERROR(D(LX_SRCPOS, QUALIFIED), "Premature use of uncompleted private type in allocator");
+			elsif QT /= CONST_VOID and then IS_LIMITED_TYPE(QT) then
+			    ERROR(D(LX_SRCPOS, QUALIFIED), "Qualified allocator not allowed for limited type");
+			elsif QT /= CONST_VOID and then KIND(GET_BASE_STRUCT(QT)) = DN_INCOMPLETE
+			and then D(XD_FULL_TYPE_SPEC, GET_BASE_STRUCT(QT)) = CONST_VOID then
+			    ERROR(D(LX_SRCPOS, QUALIFIED), "Premature use of incomplete type in allocator");
+			end if;
+		    end;
 		end if;
 		FREEZE_TYPE(TYPE_SPEC);
 		D(SM_EXP_TYPE, EXP, TYPE_SPEC);
@@ -775,6 +855,10 @@ package body EXPRESO is
 		    WALK_RANGE
 			    ( GET_BASE_TYPE(TYPE_STRUCT)
 			    , CONSTRAINT );
+		elsif KIND(CONSTRAINT) = DN_RANGE_ATTRIBUTE
+		and then D(SM_TYPE_SPEC, CONSTRAINT) /= CONST_VOID
+		and then GET_BASE_TYPE(D(SM_TYPE_SPEC, CONSTRAINT)) /= GET_BASE_TYPE(TYPE_STRUCT) then
+		    ERROR(D(LX_SRCPOS, CONSTRAINT), "Range attribute type does not match subtype");
 		end if;
 		-- $$$$ is this right for a range attribute?
 		if KIND(NEW_TYPE_SPEC) in CLASS_PRIVATE_SPEC then
@@ -784,7 +868,7 @@ package body EXPRESO is
 		end if;
 		D(SM_TYPE_SPEC, CONSTRAINT, NEW_TYPE_SPEC);
 
-		NEW_TYPE_SPEC := COPY_NODE(TYPE_STRUCT);
+		NEW_TYPE_SPEC := COPY_NODE(NEW_TYPE_SPEC);
 		D(SM_RANGE, NEW_TYPE_SPEC, CONSTRAINT);
 		D(SM_DERIVED, NEW_TYPE_SPEC, CONST_VOID);
 	    else
@@ -821,33 +905,61 @@ package body EXPRESO is
 			begin
 			    D(XD_NUMER, REAL_ONE, U_VAL(1));
 			    D(XD_DENOM, REAL_ONE, U_VAL(1));
-			    if not (D(XD_NUMER, ACCURACY) <= U_VAL(0)) then
-				SUB_SMALL := REAL_ONE;
-				if ACCURACY >= REAL_ONE then
-				    while SUB_SMALL * P2_16 <= ACCURACY loop
-					SUB_SMALL := SUB_SMALL * P2_16;
-				    end loop;
-				    while SUB_SMALL * P2_1 <= ACCURACY loop
-					SUB_SMALL := SUB_SMALL * P2_1;
-				    end loop;
-				else
-				    while not (SUB_SMALL / P2_16 <= ACCURACY) loop
-					SUB_SMALL := SUB_SMALL / P2_16;
-				    end loop;
-				    while not (SUB_SMALL <= ACCURACY) loop
-					SUB_SMALL := SUB_SMALL / P2_1;
-				    end loop;
-				end if;
+			    if D(XD_NUMER, ACCURACY) <= U_VAL(0) then
+				ERROR(D(LX_SRCPOS, EXP), "Delta must be positive");
+			    else
+				-- Ada 83 LRM 3.5.9(8,10), AI83-00099: subtype 'SMALL must be a power-of-2 multiple
+				-- of the base type's 'SMALL (so S'SMALL >= S'SAFE_SMALL even for custom 'SMALL like DURATION).
+				declare
+				    BASE_SM: constant TREE := D(CD_IMPL_SMALL, GET_BASE_TYPE(NEW_TYPE_SPEC));
+				begin
+				    if BASE_SM /= CONST_VOID and then KIND(BASE_SM) = DN_REAL_VAL
+				    and then not (D(XD_NUMER, BASE_SM) <= U_VAL(0)) then
+					SUB_SMALL := BASE_SM;
+					if SUB_SMALL <= ACCURACY then
+					    while SUB_SMALL * P2_16 <= ACCURACY loop
+						SUB_SMALL := SUB_SMALL * P2_16;
+					    end loop;
+					    while SUB_SMALL * P2_1 <= ACCURACY loop
+						SUB_SMALL := SUB_SMALL * P2_1;
+					    end loop;
+					end if;
+				    else
+					SUB_SMALL := REAL_ONE;
+					if ACCURACY >= REAL_ONE then
+					    while SUB_SMALL * P2_16 <= ACCURACY loop
+						SUB_SMALL := SUB_SMALL * P2_16;
+					    end loop;
+					    while SUB_SMALL * P2_1 <= ACCURACY loop
+						SUB_SMALL := SUB_SMALL * P2_1;
+					    end loop;
+					else
+					    while not (SUB_SMALL / P2_16 <= ACCURACY) loop
+						SUB_SMALL := SUB_SMALL / P2_16;
+					    end loop;
+					    while not (SUB_SMALL <= ACCURACY) loop
+						SUB_SMALL := SUB_SMALL / P2_1;
+					    end loop;
+					end if;
+				    end if;
+				end;
 				D(CD_IMPL_SMALL, NEW_TYPE_SPEC, SUB_SMALL);
 			    end if;
 			end;
 		    end if;
 
 		    if D(AS_RANGE, CONSTRAINT) /= CONST_VOID then
-			WALK_RANGE
-				( GET_BASE_TYPE(TYPE_STRUCT)
-				, RANGE_NODE );
-			D(SM_RANGE, NEW_TYPE_SPEC, RANGE_NODE);
+			declare
+			    ORIG_PAR_T: constant TREE := D(SM_TYPE_SPEC, GET_NAME_DEFN(D(AS_NAME, RESOLVE_SUBTYPE_INDICATION.EXP)));
+			begin
+			    WALK_RANGE
+				    ( GET_BASE_TYPE(TYPE_STRUCT)
+				    , RANGE_NODE );
+			    if ORIG_PAR_T /= CONST_VOID and then KIND(ORIG_PAR_T) in CLASS_SCALAR then
+				D(SM_TYPE_SPEC, RANGE_NODE, ORIG_PAR_T);
+			    end if;
+			    D(SM_RANGE, NEW_TYPE_SPEC, RANGE_NODE);
+			end;
 		    end if;
 		end;
 	    else
@@ -873,15 +985,24 @@ package body EXPRESO is
 		    ACCURACY := GET_STATIC_VALUE(EXP);
 		    if ACCURACY = CONST_VOID then
                         ERROR(D(LX_SRCPOS,EXP), "Static digits required");
+		    elsif UARITH."<="(ACCURACY, UARITH.U_VAL(0)) then
+                        ERROR(D(LX_SRCPOS,EXP), "Digits must be positive");
 		    else
 			D(SM_ACCURACY, NEW_TYPE_SPEC, ACCURACY);
 		    end if;
 
 		    if D(AS_RANGE, CONSTRAINT) /= CONST_VOID then
-			WALK_RANGE
-				( GET_BASE_TYPE(TYPE_STRUCT)
-				, RANGE_NODE );
-			D(SM_RANGE, NEW_TYPE_SPEC, RANGE_NODE);
+			declare
+			    ORIG_PAR_T: constant TREE := D(SM_TYPE_SPEC, GET_NAME_DEFN(D(AS_NAME, RESOLVE_SUBTYPE_INDICATION.EXP)));
+			begin
+			    WALK_RANGE
+				    ( GET_BASE_TYPE(TYPE_STRUCT)
+				    , RANGE_NODE );
+			    if ORIG_PAR_T /= CONST_VOID and then KIND(ORIG_PAR_T) in CLASS_SCALAR then
+				D(SM_TYPE_SPEC, RANGE_NODE, ORIG_PAR_T);
+			    end if;
+			    D(SM_RANGE, NEW_TYPE_SPEC, RANGE_NODE);
+			end;
 		    end if;
 		end;
 	    else

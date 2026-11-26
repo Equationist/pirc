@@ -308,14 +308,25 @@ package body EXPTYPE is
 
 	when DN_NUMERIC_LITERAL =>
 	    declare
-		VALUE: TREE := UARITH.U_VALUE(PRINTNAME(D(LX_NUMREP, EXP)));
+		TXT: constant STRING := PRINTNAME(D(LX_NUMREP, EXP));
+		VALUE: TREE := UARITH.U_VALUE(TXT);
+		HAS_DOT: BOOLEAN := FALSE;
 	    begin
 		-- always a static value
 		-- save the value in sm_value attribute
 		D(SM_VALUE, EXP, VALUE);
 
+		if VALUE = CONST_VOID then
+		    for I in TXT'RANGE loop
+			if TXT(I) = '.' then
+			    HAS_DOT := TRUE;
+			    exit;
+			end if;
+		    end loop;
+		end if;
 		-- and construct type according as there was a decimal point
-		if KIND(VALUE) = DN_REAL_VAL then
+		if KIND(VALUE) = DN_REAL_VAL
+		or else (VALUE = CONST_VOID and then HAS_DOT) then
 		    ADD_TO_TYPESET(NEW_TYPESET, MAKE(DN_ANY_REAL));
 		else
 		    ADD_TO_TYPESET(NEW_TYPESET, MAKE(DN_ANY_INTEGER));

@@ -34,4 +34,6 @@ package NODWALK is
 
     procedure CHECK_COMPLETIONS(ITEM_S: TREE);
 
+    procedure RESET_UNIT_BODIES;
+
 end NODWALK;

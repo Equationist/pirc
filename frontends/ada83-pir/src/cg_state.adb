@@ -15,6 +15,11 @@ package body Cg_State is
       return Ada.Containers.Hash_Type (K);
    end Hash_U32;
 
+   function Hash_U64 (K : Unsigned_64) return Ada.Containers.Hash_Type is
+   begin
+      return Ada.Containers.Hash_Type ((K xor Shift_Right (K, 32)) and 16#FFFF_FFFF#);
+   end Hash_U64;
+
    function Align_Up (Val, Al : Natural) return Natural is
    begin
       if Al <= 1 then
@@ -173,8 +178,13 @@ package body Cg_State is
    end Emit_Elem_Ptr;
 
    procedure Ensure_Runtime_Externs (Ctx : in out Context) is
+      Arr_Desc_Decl : Unbounded_String := To_Unbounded_String ("type @__ada_arr_desc = { ptr");
    begin
-      Add_Type_Decl (Ctx.E, "type @__ada_arr_desc = { ptr, i32, i32, i32, i32, i32, i32, i32, i32 }");
+      for D in 1 .. Max_Array_Dims loop
+         Append (Arr_Desc_Decl, ", i32, i32");
+      end loop;
+      Append (Arr_Desc_Decl, " }");
+      Add_Type_Decl (Ctx.E, To_String (Arr_Desc_Decl));
       Add_Extern_Func (Ctx.E, "@__ada_raise",
         "extern func @__ada_raise(%tag: ptr) -> void cc ""c"" noreturn");
       Add_Extern_Func (Ctx.E, "@__ada_unhandled_exception",
@@ -255,6 +265,12 @@ package body Cg_State is
         "extern func @__ada_fixed_large_ticks(%lo: i64, %hi: i64, %bs: f64, %ss: f64) -> i64 cc ""c"" nounwind");
       Add_Extern_Func (Ctx.E, "@__ada_fixed_fore",
         "extern func @__ada_fixed_fore(%lo: i64, %hi: i64, %bs: f64) -> i32 cc ""c"" nounwind");
+      Add_Extern_Func (Ctx.E, "@__ada_fixed_fore_rat",
+        "extern func @__ada_fixed_fore_rat(%lo: i64, %hi: i64, %sn: i64, %sd: i64) -> i32 cc ""c"" nounwind");
+      Add_Extern_Func (Ctx.E, "@__ada_fixed_mul_i64",
+        "extern func @__ada_fixed_mul_i64(%a: i64, %b: i64, %sn: i64, %sd: i64, %lo: i64, %hi: i64, %chk: i32) -> i64 cc ""c""");
+      Add_Extern_Func (Ctx.E, "@__ada_fixed_div_i64",
+        "extern func @__ada_fixed_div_i64(%a: i64, %b: i64, %sn: i64, %sd: i64, %lo: i64, %hi: i64, %chk: i32) -> i64 cc ""c""");
       -- Chapter 14 I/O runtime (ada_io.c)
       Add_Extern_Func (Ctx.E, "@__ada_tio_create",
         "extern func @__ada_tio_create(%f: ptr, %m: i32, %np: ptr, %nl: i32, %fp: ptr, %fl: i32) -> void cc ""c""");
@@ -370,6 +386,10 @@ package body Cg_State is
         "extern func @__ada_seq_read_framed(%f: ptr, %it: ptr, %esz: i64) -> void cc ""c""");
       Add_Extern_Func (Ctx.E, "@__ada_seq_write_framed",
         "extern func @__ada_seq_write_framed(%f: ptr, %it: ptr, %esz: i64) -> void cc ""c""");
+      Add_Extern_Func (Ctx.E, "@__ada_seq_read_framed_nd",
+        "extern func @__ada_seq_read_framed_nd(%f: ptr, %it: ptr, %nd: i32, %lens: ptr, %esz: i64) -> void cc ""c""");
+      Add_Extern_Func (Ctx.E, "@__ada_seq_write_framed_nd",
+        "extern func @__ada_seq_write_framed_nd(%f: ptr, %it: ptr, %nd: i32, %lens: ptr, %esz: i64) -> void cc ""c""");
       Add_Extern_Func (Ctx.E, "@__ada_seq_eof",
         "extern func @__ada_seq_eof(%f: ptr) -> i8 cc ""c""");
       Add_Extern_Func (Ctx.E, "@__ada_dir_read",
@@ -431,8 +451,16 @@ package body Cg_State is
         "extern func @__ada_task_abort(%t: ptr) -> void cc ""c"" nounwind");
       Add_Extern_Func (Ctx.E, "@__ada_task_abort_list",
         "extern func @__ada_task_abort_list(%ts: ptr, %n: i32) -> void cc ""c"" nounwind");
+      Add_Extern_Func (Ctx.E, "@__ada_check_abort",
+        "extern func @__ada_check_abort() -> void cc ""c"" nounwind");
       Add_Extern_Func (Ctx.E, "@__ada_task_set_priority",
         "extern func @__ada_task_set_priority(%t: ptr, %p: i32) -> void cc ""c"" nounwind");
+      Add_Extern_Func (Ctx.E, "@__ada_set_main_priority",
+        "extern func @__ada_set_main_priority(%p: i32) -> void cc ""c"" nounwind");
+      Add_Extern_Func (Ctx.E, "@__ada_get_active_master",
+        "extern func @__ada_get_active_master() -> ptr cc ""c"" nounwind");
+      Add_Extern_Func (Ctx.E, "@__ada_set_active_master",
+        "extern func @__ada_set_active_master(%m: ptr) -> ptr cc ""c"" nounwind");
       Add_Extern_Func (Ctx.E, "@__ada_task_set_stack_size",
         "extern func @__ada_task_set_stack_size(%t: ptr, %sz: i64) -> void cc ""c"" nounwind");
       Add_Extern_Func (Ctx.E, "@__ada_task_completed",
@@ -460,9 +488,10 @@ package body Cg_State is
    end Ensure_Runtime_Externs;
 
    procedure Register_Task_Spec
-     (Ctx         : in out Context;
-      Task_Spec   : TREE;
-      Parent_Subp : Unsigned_32)
+     (Ctx          : in out Context;
+      Task_Spec    : TREE;
+      Parent_Subp  : Unsigned_32;
+      Force_Rebind : Boolean := False)
    is
       TS  : constant TREE := Resolve_Type_Spec (Subst_Tree (Ctx, Task_Spec));
       TK  : Unsigned_32;
@@ -474,6 +503,9 @@ package body Cg_State is
       end if;
       TK := Tree_Key (TS);
       if Ctx.Tasks.Contains (TK) then
+         if not Force_Rebind then
+            return;
+         end if;
          if Length (Ctx.Tasks.Element (TK).Inst_Tag) = 0
            or else Ctx.Tasks.Element (TK).Inst_Tag = Ctx.Gen_Inst_Tag
          then
@@ -494,20 +526,30 @@ package body Cg_State is
             end;
          end loop;
          if Root_TS /= TS then
-            Register_Task_Spec (Ctx, Root_TS, Parent_Subp);
+            Register_Task_Spec (Ctx, Root_TS, Parent_Subp, Force_Rebind => False);
             declare
                Root_TI : constant Task_Info := Ctx.Tasks.Element (Tree_Key (Root_TS));
             begin
-               TI.Body_Fn     := Root_TI.Body_Fn;
-               TI.Parent_Subp := Root_TI.Parent_Subp;
+               TI.Body_Fn       := Root_TI.Body_Fn;
+               TI.Parent_Subp   := Root_TI.Parent_Subp;
+               TI.Elab_Flag     := Root_TI.Elab_Flag;
+               TI.Elab_Is_Local := Root_TI.Elab_Is_Local;
+               TI.Elab_Owner    := Root_TI.Elab_Owner;
+               TI.Elab_Cap_Slot := Root_TI.Elab_Cap_Slot;
+               TI.Elab_Fallback := Root_TI.Elab_Fallback;
             end;
          else
             declare
                Src : constant TREE := D (XD_SOURCE_NAME, TS);
                Nm  : constant String := (if not Is_Void_Tree (Src) then Qualified_Ada_Name (Src) else "task");
+               Is_Sep_Task : constant Boolean :=
+                 Ctx.Has_Stubs or else Ctx.In_Subunit or else not Is_Void_Tree (D (XD_STUB, TS));
             begin
-               if not Is_Void_Tree (Src) and then Is_Library_Level (Src) and then Length (Ctx.Gen_Inst_Tag) = 0 then
+               if not Is_Void_Tree (Src) and then (Is_Library_Level (Src) or else Is_Sep_Task) then
                   TI.Body_Fn := To_Unbounded_String ("@ada_task__" & Nm);
+                  if Is_Library_Level (Src) and then Ctx.Enable_Checks then
+                     TI.Elab_Flag := To_Unbounded_String ("@ada_telab__" & Nm);
+                  end if;
                else
                   TI.Body_Fn := To_Unbounded_String ("@ada_task__" & Nm & "_" & Tree_Key_Str (TS) & To_String (Ctx.Gen_Inst_Tag));
                end if;
@@ -542,9 +584,15 @@ package body Cg_State is
                                  A1 := D (AS_EXP, A1);
                               end if;
                               SV := Safe_SM_Value (A1);
-                              if Has_Static_Val (SV) then
-                                 TI.Has_Priority := True;
-                                 TI.Priority := Integer (Eval_Int64 (SV));
+                              if Has_Static_Val (SV) and then KIND (SV) = DN_NUM_VAL then
+                                 declare
+                                    PV : constant Integer_64 := Eval_Int64 (SV);
+                                 begin
+                                    if PV >= 0 and then PV <= 10 then
+                                       TI.Has_Priority := True;
+                                       TI.Priority := Integer (PV);
+                                    end if;
+                                 end;
                               end if;
                            end;
                         end if;
@@ -559,6 +607,11 @@ package body Cg_State is
                         EI.Task_Key     := TK;
                         EI.Base_Idx     := Next_Slot;
                         EI.Entry_Header := Hdr;
+                        -- P3-6.10: Record interrupt entry address clause if present (LRM 13.5.1)
+                        if not Is_Void_Tree (D (SM_ADDRESS, EID)) then
+                           EI.Has_Address := True;
+                           EI.Addr_Exp    := D (SM_ADDRESS, EID);
+                        end if;
                         -- Check for entry family discrete range
                         if not Is_Void_Tree (Hdr) and then KIND (Hdr) = DN_ENTRY
                           and then not Is_Void_Tree (D (AS_DISCRETE_RANGE, Hdr))
@@ -597,23 +650,28 @@ package body Cg_State is
                                              Hi := Eval_Int64 (E2);
                                           end if;
                                        end;
+                                    elsif not Is_Void_Tree (C_N) and then KIND (C_N) = DN_RANGE_ATTRIBUTE then
+                                       St := False;
                                     elsif KIND (SI_N) = DN_SUBTYPE_INDICATION then
                                        Get_Discrete_Bounds (Subst_Tree (Ctx, D (SM_TYPE_SPEC, Get_Name_Defn (D (AS_NAME, SI_N)))), St, Lo, Hi);
                                     else
                                        Get_Discrete_Bounds (Subst_Tree (Ctx, D (SM_TYPE_SPEC, Get_Name_Defn (SI_N))), St, Lo, Hi);
                                     end if;
                                  end;
+                              elsif KIND (DR) = DN_RANGE_ATTRIBUTE then
+                                 St := False;
                               end if;
                               EI.Fam_Is_Static := St;
                               if St and then Hi < Lo then
                                  EI.Fam_Lo := Lo;
                                  EI.Fam_Hi := Hi;
-                              elsif St and then Hi >= Lo and then (Hi - Lo) < 4096 then
+                              elsif St and then Hi >= Lo and then (Hi - Lo) < 1_000_000 then
                                  EI.Fam_Lo := Lo;
                                  EI.Fam_Hi := Hi;
                                  Next_Slot := Next_Slot + Natural (Hi - Lo + 1);
                               else
                                  EI.Fam_Is_Static := False;
+                                 TI.Has_Dyn_Entries := True;
                                  EI.Fam_Lo := 0;
                                  EI.Fam_Hi := 63;
                                  Next_Slot := Next_Slot + 64;
@@ -621,6 +679,35 @@ package body Cg_State is
                            end;
                         else
                            Next_Slot := Next_Slot + 1;
+                        end if;
+                        if TI.Has_Dyn_Entries then
+                           declare
+                              Src_T  : constant TREE := D (XD_SOURCE_NAME, TS);
+                              Is_Lib : constant Boolean := not Is_Void_Tree (Src_T) and then Is_Library_Level (Src_T);
+                              EQName : constant String := Qualified_Ada_Name (EID);
+                           begin
+                              if Is_Lib then
+                                 EI.Fam_Exported := True;
+                                 EI.Fam_Base_Sym := To_Unbounded_String ("@ada_efb__" & EQName);
+                                 if EI.Is_Family and then not EI.Fam_Is_Static then
+                                    EI.Fam_Lo_Sym := To_Unbounded_String ("@ada_efl__" & EQName);
+                                    EI.Fam_Hi_Sym := To_Unbounded_String ("@ada_efh__" & EQName);
+                                 end if;
+                                 if Length (TI.Dyn_Entries_Sym) = 0 then
+                                    TI.Dyn_Entries_Sym := To_Unbounded_String ("@ada_efn__" & Qualified_Ada_Name (Src_T));
+                                    TI.Dyn_Entries_Exp := True;
+                                 end if;
+                              else
+                                 EI.Fam_Base_Sym := To_Unbounded_String ("@ada_efb_" & Tree_Key_Str (EID) & To_String (Ctx.Gen_Inst_Tag));
+                                 if EI.Is_Family and then not EI.Fam_Is_Static then
+                                    EI.Fam_Lo_Sym := To_Unbounded_String ("@ada_efl_" & Tree_Key_Str (EID) & To_String (Ctx.Gen_Inst_Tag));
+                                    EI.Fam_Hi_Sym := To_Unbounded_String ("@ada_efh_" & Tree_Key_Str (EID) & To_String (Ctx.Gen_Inst_Tag));
+                                 end if;
+                                 if Length (TI.Dyn_Entries_Sym) = 0 then
+                                    TI.Dyn_Entries_Sym := To_Unbounded_String ("@ada_efn_" & Tree_Key_Str (TS) & To_String (Ctx.Gen_Inst_Tag));
+                                 end if;
+                              end if;
+                           end;
                         end if;
 
                         -- Build PIR parameter packet struct type for entry formal parameters
@@ -763,7 +850,7 @@ package body Cg_State is
    end Emit_Enclosing_Task_Self_By_Key;
 
    function Get_Arr_Desc_Type (Ctx : in out Context; NDims : Natural) return String is
-      ND   : constant Natural := (if NDims < 1 then 1 elsif NDims > 4 then 4 else NDims);
+      ND   : constant Natural := (if NDims < 1 then 1 elsif NDims > Max_Array_Dims then Max_Array_Dims else NDims);
       Name : constant String := "@__ada_arr_desc_" & Img (ND);
       Decl : Unbounded_String := To_Unbounded_String ("type " & Name & " = { ptr");
    begin
@@ -774,6 +861,24 @@ package body Cg_State is
       Add_Type_Decl (Ctx.E, To_String (Decl));
       return Name;
    end Get_Arr_Desc_Type;
+
+   function Elem_Storage_Size (ETI : Type_Info) return Natural is
+      EAl : Natural;
+   begin
+      if ETI.Kind = TK_Constrained_Array and then ETI.Is_Dynamic then
+         return Arr_Desc_Size;
+      end if;
+      EAl := Natural'Max (1, ETI.Align);
+      return Natural'Max (1, ((ETI.Byte_Size + EAl - 1) / EAl) * EAl);
+   end Elem_Storage_Size;
+
+   function Elem_Storage_Align (ETI : Type_Info) return Natural is
+   begin
+      if ETI.Kind = TK_Constrained_Array and then ETI.Is_Dynamic then
+         return 8;
+      end if;
+      return Natural'Max (1, ETI.Align);
+   end Elem_Storage_Align;
 
    procedure Ensure_Std_Exc_Extern (Ctx : in out Context; Sym : String) is
    begin
@@ -818,6 +923,8 @@ package body Cg_State is
          if Name = "CONSTRAINT_ERROR" then
             return Constraint_Error_Tag (Ctx);
          elsif Name = "NUMERIC_ERROR" then
+            -- ACVC 1.11 (cb2004a): keep NUMERIC_ERROR distinct on explicit raise/catch
+            -- while arithmetic checks raise CONSTRAINT_ERROR per AI-00387.
             Ensure_Std_Exc_Extern (Ctx, "@__ada_exc_numeric_error");
             return "@__ada_exc_numeric_error";
          elsif Name = "PROGRAM_ERROR" then
@@ -844,8 +951,8 @@ package body Cg_State is
          return To_String (Ctx.Exc_Tags.Element (Key).Pir_Type);
       end if;
 
-      -- Library-level user exception declared in another compilation unit: reference via extern symbol
-      if Is_Library_Level (Can) then
+      -- Library-level user exception or ancestor exception accessed from a subunit: reference via extern symbol
+      if Is_Library_Level (Can) or else Ctx.In_Subunit then
          declare
             Sym : constant String := "@__ada_exc__" & Qualified_Ada_Name (Can);
             TI  : Type_Info;
@@ -887,7 +994,7 @@ package body Cg_State is
          FE      : Field_Entry;
          Is_DynA : constant Boolean := FT.Kind = TK_Constrained_Array and then FT.Is_Dynamic;
          F_Pir   : constant String := (if Is_DynA then "@__ada_arr_desc" else To_String (FT.Pir_Type));
-         F_Sz    : constant Natural := (if Is_DynA then 40 else FT.Byte_Size);
+         F_Sz    : constant Natural := (if Is_DynA then Arr_Desc_Size else FT.Byte_Size);
          F_Al    : constant Natural := (if Is_DynA then 8 else FT.Align);
          Off_Al  : constant Natural := Align_Up (Offset, F_Al);
       begin
@@ -993,7 +1100,7 @@ package body Cg_State is
                                                 FT      : constant Type_Info := Get_Type_Info (Ctx, CT);
                                                 Is_DynA : constant Boolean := FT.Kind = TK_Constrained_Array and then FT.Is_Dynamic;
                                                 F_Pir   : constant String := (if Is_DynA then "@__ada_arr_desc" else To_String (FT.Pir_Type));
-                                                F_Sz    : constant Natural := (if Is_DynA then 40 else FT.Byte_Size);
+                                                F_Sz    : constant Natural := (if Is_DynA then Arr_Desc_Size else FT.Byte_Size);
                                                 F_Al    : constant Natural := (if Is_DynA then 8 else FT.Align);
                                                 V_Off_A : constant Natural := Align_Up (V_Off, F_Al);
                                                 FE      : Field_Entry;
@@ -1311,7 +1418,17 @@ package body Cg_State is
                                     FE.Has_Explicit_Offset := True;
                                     FE.Byte_Offset := Natural (Start_Bit / 8);
                                     FE.Bit_Offset  := Natural (Start_Bit mod 8);
-                                    FE.Bit_Size    := Natural (End_Bit - Start_Bit + 1);
+                                    -- P3-6.3: Only treat scalar fields as scalar bitfields; composite fields at byte boundary use byte offset
+                                    declare
+                                       CT_R : constant TREE := Subst_Tree (Ctx, D (SM_OBJ_TYPE, CID));
+                                       FT_R : constant Type_Info := Get_Type_Info (Ctx, CT_R);
+                                    begin
+                                       if FT_R.Kind = TK_Scalar then
+                                          FE.Bit_Size := Natural (End_Bit - Start_Bit + 1);
+                                       else
+                                          FE.Bit_Size := 0;
+                                       end if;
+                                    end;
                                     Ctx.Fields.Include (CK, FE);
                                     Placed.Append (CK);
                                     if End_Byte > Max_End then
@@ -1330,6 +1447,26 @@ package body Cg_State is
                if Max_End = 0 then
                   Max_End := 1;
                end if;
+               -- P3-6.5: Honor explicit `for R'Size use N;` if larger than placed fields
+               declare
+                  Sz_A : constant TREE := D (SM_SIZE, Base_Rec);
+               begin
+                  if Has_Static_Val (Sz_A) then
+                     declare
+                        SB : constant Integer_64 := Eval_Int64 (Sz_A);
+                     begin
+                        if SB > 0 and then SB < 8_000_000 then
+                           declare
+                              Min_B : constant Natural := Natural ((SB + 7) / 8);
+                           begin
+                              if Min_B > Max_End then
+                                 Max_End := Min_B;
+                              end if;
+                           end;
+                        end if;
+                     end;
+                  end if;
+               end;
                Offset := Align_Up (Max_End, Rep_Al);
                Max_Al := Rep_Al;
                Add_Type_Decl (Ctx.E, "type " & TName & " = { [" & Img (Offset) & " x i8] }");
@@ -1422,8 +1559,9 @@ package body Cg_State is
          begin
             Info.Kind := TK_Constrained_Array;
             Info.Elem_Type := Elem_T;
-            while not IS_EMPTY (List_S) and then Dim < 4 loop
+            while not IS_EMPTY (List_S) and then Dim < Max_Array_Dims loop
                POP (List_S, Idx_T);
+               Idx_T := Subst_Resolve_Type (Ctx, Idx_T);
                Dim := Dim + 1;
                declare
                   St : Boolean;
@@ -1460,7 +1598,7 @@ package body Cg_State is
             declare
                Is_Dyn_Elem : constant Boolean := EI.Kind = TK_Constrained_Array and then EI.Is_Dynamic;
                E_Pir       : constant String := (if Is_Dyn_Elem then "@__ada_arr_desc" else To_String (EI.Pir_Type));
-               E_Sz        : constant Natural := (if Is_Dyn_Elem then 40 else EI.Byte_Size);
+               E_Sz        : constant Natural := (if Is_Dyn_Elem then Arr_Desc_Size else EI.Byte_Size);
                E_Al        : constant Natural := (if Is_Dyn_Elem then 8 else EI.Align);
             begin
                Info.Align := E_Al;
@@ -1511,10 +1649,10 @@ package body Cg_State is
          begin
             Info.Kind := TK_Unconstrained_Array;
             Info.Elem_Type := Elem_T;
-            while not IS_EMPTY (IL) and then Dim < 4 loop
+            while not IS_EMPTY (IL) and then Dim < Max_Array_Dims loop
                POP (IL, Idx_N);
                Dim := Dim + 1;
-               Info.Dims (Dim).Idx_Type := D (SM_TYPE_SPEC, Idx_N);
+               Info.Dims (Dim).Idx_Type := Subst_Resolve_Type (Ctx, D (SM_TYPE_SPEC, Idx_N));
             end loop;
             Info.NDims := Dim;
             Info.Pir_Type := To_Unbounded_String ("ptr");
@@ -1798,13 +1936,22 @@ package body Cg_State is
       return False;
    end Needs_Constrained_Param;
 
+   function Explicit_Field_Align (FE : Field_Entry; Nat_Align : Natural) return Natural is
+   begin
+      if FE.Has_Explicit_Offset then
+         return 1;
+      end if;
+      return Natural'Max (1, Nat_Align);
+   end Explicit_Field_Align;
+
    function Build_Param_Sig
-     (Ctx        : in out Context;
-      Spec_Node  : TREE;
-      Needs_SL   : Boolean;
-      Ret_Comp   : Boolean;
-      Ret_Type   : TREE;
-      With_Names : Boolean) return String
+     (Ctx            : in out Context;
+      Spec_Node      : TREE;
+      Needs_SL       : Boolean;
+      Ret_Comp       : Boolean;
+      Ret_Type       : TREE;
+      With_Names     : Boolean;
+      Is_C_Interface : Boolean := False) return String
    is
       Buf   : Unbounded_String;
       First : Boolean := True;
@@ -1822,10 +1969,10 @@ package body Cg_State is
          end if;
       end Add_P;
    begin
-      if Needs_SL then
+      if Needs_SL and then not Is_C_Interface then
          Add_P ("%__sl", "ptr");
       end if;
-      if Ret_Comp then
+      if Ret_Comp and then not Is_C_Interface then
          Add_P ("%__ret", "ptr");
       end if;
       if not Is_Void_Tree (Spec_Node) then
@@ -1855,13 +2002,15 @@ package body Cg_State is
                              or else (TI.Kind = TK_Constrained_Array and then TI.Is_Dynamic)
                            then
                               Add_P (PN & "_ptr", "ptr");
-                              for D_Idx in 1 .. TI.NDims loop
-                                 Add_P (PN & "_f" & Img (D_Idx), "i32");
-                                 Add_P (PN & "_l" & Img (D_Idx), "i32");
-                              end loop;
+                              if not Is_C_Interface then
+                                 for D_Idx in 1 .. TI.NDims loop
+                                    Add_P (PN & "_f" & Img (D_Idx), "i32");
+                                    Add_P (PN & "_l" & Img (D_Idx), "i32");
+                                 end loop;
+                              end if;
                            elsif TI.Kind = TK_Record or else TI.Kind = TK_Constrained_Array then
                               Add_P (PN, "ptr");
-                              if Needs_Constrained_Param (Ctx, PT, Mode) then
+                              if not Is_C_Interface and then Needs_Constrained_Param (Ctx, PT, Mode) then
                                  Add_P (PN & "_con", "i8");
                               end if;
                            elsif Mode = DN_OUT or else Mode = DN_IN_OUT then
@@ -1886,14 +2035,24 @@ package body Cg_State is
       Ret : Unbounded_String;
       Is_C : constant Boolean := Info.Is_C_Interface or else Is_C_Interfaced (Subp_Id);
       Params : constant String :=
-        Build_Param_Sig (Ctx, Info.Spec_Node, (if Is_C then False else Info.Needs_SL), Info.Ret_Composite, Info.Ret_Type, True);
+        Build_Param_Sig (Ctx, Info.Spec_Node, (if Is_C then False else Info.Needs_SL), Info.Ret_Composite, Info.Ret_Type, True, Is_C_Interface => Is_C);
       CC  : constant String := (if Is_C then """c""" else """internal""");
    begin
       if Has_Symbol (Ctx.E, Sym) then
          return;
       end if;
-      if not Info.Is_Function or else Info.Ret_Composite then
+      if not Info.Is_Function then
          Ret := To_Unbounded_String ("void");
+      elsif Info.Ret_Composite then
+         if Is_C then
+            declare
+               RTI : constant Type_Info := Get_Type_Info (Ctx, Info.Ret_Type);
+            begin
+               Ret := To_Unbounded_String (if RTI.Kind = TK_Scalar then To_String (RTI.Pir_Type) else "ptr");
+            end;
+         else
+            Ret := To_Unbounded_String ("void");
+         end if;
       else
          Ret := Get_Type_Info (Ctx, Info.Ret_Type).Pir_Type;
       end if;
@@ -2015,5 +2174,69 @@ package body Cg_State is
          return To_String (V.Pir_Name);
       end if;
    end Emit_Var_Addr;
+
+   function Emit_Captured_Slot_Ptr (Ctx : in out Context; Owner_Subp : Unsigned_32; Slot : Integer) return String is
+   begin
+      if Owner_Subp = Ctx.Cur_Subp_Key and then Length (Ctx.Cur_Frame_Reg) > 0
+        and then Ctx.Subps.Contains (Owner_Subp)
+      then
+         declare
+            SI : constant Subp_Info := Ctx.Subps.Element (Owner_Subp);
+            FP : constant String := Next_Reg (Ctx.E, "csp");
+         begin
+            Emit_Inst (Ctx.E, FP & " = field_ptr " & To_String (SI.Frame_Type) & ", " &
+              To_String (Ctx.Cur_Frame_Reg) & ", " & Img (Slot));
+            return FP;
+         end;
+      end if;
+      if Length (Ctx.Cur_SL_Reg) = 0 or else Slot <= 0 then
+         return "0";
+      end if;
+      declare
+         Cur_K : Unsigned_32 := Ctx.Cur_Subp_Key;
+         SL    : Unbounded_String := Ctx.Cur_SL_Reg;
+      begin
+         for Hop in 1 .. 16 loop
+            exit when not Ctx.Subps.Contains (Cur_K);
+            declare
+               SI       : constant Subp_Info := Ctx.Subps.Element (Cur_K);
+               Parent_K : constant Unsigned_32 := SI.Parent_Subp;
+            begin
+               exit when Parent_K = 0 or else not Ctx.Subps.Contains (Parent_K);
+               if Parent_K = Owner_Subp then
+                  declare
+                     PI : constant Subp_Info := Ctx.Subps.Element (Parent_K);
+                     FP : constant String := Next_Reg (Ctx.E, "csp");
+                  begin
+                     if not PI.Has_Frame or else Length (PI.Frame_Type) = 0 then
+                        return "0";
+                     end if;
+                     Emit_Entry_Alloca (Ctx.E,
+                       FP & " = field_ptr " & To_String (PI.Frame_Type) & ", " &
+                       To_String (SL) & ", " & Img (Slot));
+                     return FP;
+                  end;
+               else
+                  declare
+                     PI  : constant Subp_Info := Ctx.Subps.Element (Parent_K);
+                     FP  : constant String := Next_Reg (Ctx.E, "slp");
+                     NSL : constant String := Next_Reg (Ctx.E, "sl");
+                  begin
+                     if not PI.Has_Frame or else Length (PI.Frame_Type) = 0 then
+                        exit;
+                     end if;
+                     Emit_Entry_Alloca (Ctx.E,
+                       FP & " = field_ptr " & To_String (PI.Frame_Type) & ", " &
+                       To_String (SL) & ", 0");
+                     Emit_Entry_Alloca (Ctx.E, NSL & " = load.ptr " & FP & ", align 8");
+                     SL := To_Unbounded_String (NSL);
+                     Cur_K := Parent_K;
+                  end;
+               end if;
+            end;
+         end loop;
+      end;
+      return "0";
+   end Emit_Captured_Slot_Ptr;
 
 end Cg_State;

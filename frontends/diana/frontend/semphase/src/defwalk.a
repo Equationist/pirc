@@ -129,6 +129,7 @@ package body DEFWALK is
                     PRIOR_DEF := GET_PRIOR_HOMOGRAPH_DEF(DEF);
                     if PRIOR_DEF /= CONST_VOID
                     and then (not IS_OVERLOADABLE_HEADER(D(XD_HEADER,DEF))
+                              or else EXPRESSION_TYPE_OF_DEF(DEF) = BASE_TYPE
                               or else EXPRESSION_TYPE_OF_DEF(DEF) = TYPE_SPEC)
                     then
                         ERROR(D(LX_SRCPOS,TYPE_DEF)
@@ -155,7 +156,9 @@ package body DEFWALK is
                                         ( ENUM_LITERAL_COUNT - 1 ))));
 
                 -- compute size and store in enumeration node
-                if ENUM_LITERAL_COUNT > 2 ** 8 then
+                if ENUM_LITERAL_COUNT > 2 ** 16 then
+                    DI(CD_IMPL_SIZE, TYPE_SPEC, 32);
+                elsif ENUM_LITERAL_COUNT > 2 ** 8 then
                     DI(CD_IMPL_SIZE, TYPE_SPEC, 16);
                 else
                     DI(CD_IMPL_SIZE, TYPE_SPEC, 8);
@@ -221,22 +224,28 @@ package body DEFWALK is
                 -- if both bounds are static
                 if LOWER_BOUND /= CONST_VOID and UPPER_BOUND /= CONST_VOID then
 
-                    -- if range fits within short_integer
+                    -- if both bounds fit within short_integer (including null ranges)
                     if LOWER_BOUND >= PREDEFINED_SHORT_INTEGER_FIRST
+                    and LOWER_BOUND <= PREDEFINED_SHORT_INTEGER_LAST
+                    and UPPER_BOUND >= PREDEFINED_SHORT_INTEGER_FIRST
                     and UPPER_BOUND <= PREDEFINED_SHORT_INTEGER_LAST
                     and PREDEFINED_SHORT_INTEGER /= CONST_VOID then
                         -- use short_integer
                         ANCESTOR_TYPE := PREDEFINED_SHORT_INTEGER;
 
-                    -- else if range fits within integer
+                    -- else if both bounds fit within integer
                     elsif LOWER_BOUND >= PREDEFINED_INTEGER_FIRST
+                    and LOWER_BOUND <= PREDEFINED_INTEGER_LAST
+                    and UPPER_BOUND >= PREDEFINED_INTEGER_FIRST
                     and UPPER_BOUND <= PREDEFINED_INTEGER_LAST then
 
                         -- use integer
                         ANCESTOR_TYPE := PREDEFINED_INTEGER;
 
-                    -- else if range fits within long_integer
+                    -- else if both bounds fit within long_integer
                     elsif LOWER_BOUND >= PREDEFINED_LONG_INTEGER_FIRST
+                    and LOWER_BOUND <= PREDEFINED_LONG_INTEGER_LAST
+                    and UPPER_BOUND >= PREDEFINED_LONG_INTEGER_FIRST
                     and UPPER_BOUND <= PREDEFINED_LONG_INTEGER_LAST then
 
                         -- use long_integer
@@ -353,6 +362,9 @@ package body DEFWALK is
 
                 -- if accuracy and both bounds (if given) are static
                 -- and accuracy is positive
+                if ACCURACY /= CONST_VOID and then ACCURACY <= U_VAL(0) then
+                    ERROR(D(LX_SRCPOS, EXP), "Digits must be positive");
+                end if;
                 if ACCURACY /= CONST_VOID
                 and then (RANGE_NODE = CONST_VOID
                           or else (LOWER_BOUND /= CONST_VOID
@@ -360,24 +372,25 @@ package body DEFWALK is
                 and then not (ACCURACY <= U_VAL(0))
                 then
 
-                    -- if range fits within float
+                    -- if both bounds fit within float
                     if ACCURACY <= PREDEFINED_FLOAT_ACCURACY
                     and then (RANGE_NODE = CONST_VOID
                               or else (LOWER_BOUND >= PREDEFINED_FLOAT_FIRST
-                                    and then UPPER_BOUND
-                                                <= PREDEFINED_FLOAT_LAST))
+                                    and then LOWER_BOUND <= PREDEFINED_FLOAT_LAST
+                                    and then UPPER_BOUND >= PREDEFINED_FLOAT_FIRST
+                                    and then UPPER_BOUND <= PREDEFINED_FLOAT_LAST))
                     then
 
                         -- use float
                         ANCESTOR_TYPE := PREDEFINED_FLOAT;
 
-                    -- if range fits within long_float
+                    -- if both bounds fit within long_float
                     elsif ACCURACY <= PREDEFINED_LONG_FLOAT_ACCURACY
                     and then (RANGE_NODE = CONST_VOID
-                              or else (LOWER_BOUND
-                                                >= PREDEFINED_LONG_FLOAT_FIRST
-                                    and then UPPER_BOUND
-                                                <= PREDEFINED_LONG_FLOAT_LAST))
+                              or else (LOWER_BOUND >= PREDEFINED_LONG_FLOAT_FIRST
+                                    and then LOWER_BOUND <= PREDEFINED_LONG_FLOAT_LAST
+                                    and then UPPER_BOUND >= PREDEFINED_LONG_FLOAT_FIRST
+                                    and then UPPER_BOUND <= PREDEFINED_LONG_FLOAT_LAST))
                     then
 
                         -- use long_float
@@ -588,16 +601,20 @@ package body DEFWALK is
                     end loop;
                 end if;
 
-                -- if bounds fit within 32-bit fixed type
+                -- if both bounds fit within 32-bit fixed type (including null ranges)
                 if not (UPPER_BOUND >= IMPL_SMALL * POWER_31)
+                and UPPER_BOUND >= - IMPL_SMALL * POWER_31
+                and not (LOWER_BOUND >= IMPL_SMALL * POWER_31)
                 and LOWER_BOUND >= - IMPL_SMALL * POWER_31
                 then
                     FIX_BITS := 32;
                     FIX_PWR  := POWER_31;
 
-                -- else if bounds fit within 64-bit fixed type (MAX_MANTISSA = 63; LRM 3.5.9 allows +/- 2^63 * small)
+                -- else if both bounds fit within 64-bit fixed type (MAX_MANTISSA = 63; LRM 3.5.9 allows +/- 2^63 * small)
                 elsif UPPER_BOUND <= IMPL_SMALL * POWER_63
-                and LOWER_BOUND >= - IMPL_SMALL * POWER_63 - IMPL_SMALL
+                and UPPER_BOUND >= - IMPL_SMALL * POWER_63
+                and LOWER_BOUND <= IMPL_SMALL * POWER_63
+                and LOWER_BOUND >= - IMPL_SMALL * POWER_63
                 then
                     FIX_BITS := 64;
                     FIX_PWR  := POWER_63;
@@ -823,12 +840,16 @@ package body DEFWALK is
 
                     -- if type mark was accepted
                     if TYPE_MARK /= CONST_VOID then
-
-                        --store index subtype in index node
-                        D(SM_TYPE_SPEC
-                                , INDEX
-                                , D(SM_TYPE_SPEC, GET_NAME_DEFN(TYPE_MARK)));
-                        --$$$$ ???? check this
+                        declare
+                            IDX_TS: constant TREE := D(SM_TYPE_SPEC, GET_NAME_DEFN(TYPE_MARK));
+                        begin
+                            if not IS_DISCRETE_TYPE(GET_BASE_TYPE(IDX_TS)) then
+                                ERROR(D(LX_SRCPOS, TYPE_MARK), "Array index subtype must be discrete");
+                                ERROR_SEEN := TRUE;
+                            end if;
+                            --store index subtype in index node
+                            D(SM_TYPE_SPEC, INDEX, IDX_TS);
+                        end;
 
                     -- else -- since type mark was in error
                     else
@@ -935,6 +956,10 @@ package body DEFWALK is
                 PARENT_TYPE := EVAL_SUBTYPE_INDICATION(SUBTYPE_INDICATION);
                 parent_type := get_base_struct(parent_type);
                 RESOLVE_SUBTYPE_INDICATION(SUBTYPE_INDICATION, PARENT_SUBTYPE);
+                if PARENT_SUBTYPE /= CONST_VOID
+                and then (PARENT_TYPE = CONST_VOID or else KIND(PARENT_TYPE) /= DN_ACCESS) then
+                    FREEZE_TYPE(PARENT_SUBTYPE);
+                end if;
 
                 -- check that parent type is derivable at this point
                 if KIND(PARENT_TYPE) not in CLASS_DERIVABLE_SPEC then
@@ -955,8 +980,7 @@ package body DEFWALK is
                     begin
                         if PID /= CONST_VOID and then D(XD_REGION, PID) /= CONST_VOID
                         and then KIND(D(XD_REGION, PID)) /= DN_GENERIC_ID
-                        and then H.REGION_DEF /= CONST_VOID
-                        and then D(XD_REGION, PID) = D(XD_SOURCE_NAME, H.REGION_DEF) then
+                        and then DI(XD_LEX_LEVEL, GET_DEF_FOR_ID(D(XD_REGION, PID))) > 0 then
                             ERROR(D(LX_SRCPOS, SUBTYPE_INDICATION),
                                   "Premature derivation from uncompleted private type");
                         end if;
@@ -1288,7 +1312,7 @@ package body DEFWALK is
                         ID_DEF := MAKE_DEF_FOR_ID(ID, H);
                         MAKE_DEF_VISIBLE(ID_DEF);
                     else
-                        D(XD_REGION, ID, H.REGION_DEF);
+                        D(XD_REGION, ID, D(XD_SOURCE_NAME, H.REGION_DEF));
                     end if;
                     NEW_ID_LIST := APPEND(NEW_ID_LIST, ID);
                 end loop;
@@ -1368,7 +1392,19 @@ package body DEFWALK is
                         when WHICH_SUBSCRIPT = 0;
                 end loop;
                 if KIND(INDEX) = DN_INDEX then
-                    return D(SM_TYPE_SPEC, INDEX);
+                    declare
+                        IDX_TS : constant TREE := D(SM_TYPE_SPEC, INDEX);
+                        RES    : TREE;
+                    begin
+                        if IDX_TS /= CONST_VOID and then KIND(IDX_TS) in CLASS_SCALAR then
+                            RES := COPY_NODE(GET_BASE_STRUCT(IDX_TS));
+                            D(SM_RANGE, RES, DISCRETE_RANGE);
+                            D(SM_DERIVED, RES, CONST_VOID);
+                            DB(SM_IS_ANONYMOUS, RES, TRUE);
+                            return RES;
+                        end if;
+                        return IDX_TS;
+                    end;
                 else
                     return INDEX;
                 end if;

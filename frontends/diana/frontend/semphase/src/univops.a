@@ -70,23 +70,28 @@ package body UNIVOPS is
 
   function U_REAL(N:TREE; D:TREE) return TREE is
     N_SPREAD, D_SPREAD: VECTOR;
-    THE_REAL: TREE := MAKE(DN_REAL_VAL);
+    THE_REAL: TREE;
   begin
+    if N = CONST_VOID or else D = CONST_VOID then
+	return CONST_VOID;
+    end if;
     SPREAD(N, N_SPREAD);
     SPREAD(D, D_SPREAD);
 
-    if D_SPREAD.L = 2
-    and then D_SPREAD.D(1) = 0
-    and then D_SPREAD.D(2) = 0 then
+    if D_SPREAD.L = 1 and then D_SPREAD.D(1) = 0 then
 	return CONST_VOID; -- denominator is zero
     end if;
 
     N_SPREAD.S := N_SPREAD.S * D_SPREAD.S;
     D_SPREAD.S := +1;
     V_LOWEST_TERMS(N_SPREAD, D_SPREAD);
+    THE_REAL := MAKE(DN_REAL_VAL);
     DIANA.D(XD_NUMER, THE_REAL, U_INT(N_SPREAD));
     DIANA.D(XD_DENOM, THE_REAL, U_INT(D_SPREAD));
     return THE_REAL;
+  exception
+    when ASSERTION_ERROR =>
+	return CONST_VOID;
   end U_REAL;
 
   procedure SPREAD(I: TREE; U:in out VECTOR) is

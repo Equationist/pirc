@@ -33,20 +33,24 @@ package Cg_Expr is
    function Emit_LValue (Ctx : in out Context; Node : TREE) return Expr_Val;
 
    -- Emit scalar cast/widening/narrowing between PIR types (int, float, ptr)
+   function Int_Bits_Of_Pir (Pir_Ty : String) return Natural;
+
    function Emit_Int_Convert
-     (Ctx      : in out Context;
-      Val_Reg  : String;
-      From_Ty  : String;
-      To_Ty    : String) return String;
+     (Ctx         : in out Context;
+      Val_Reg     : String;
+      From_Ty     : String;
+      To_Ty       : String;
+      Is_Unsigned : Boolean := False) return String;
 
    function Emit_Scalar_Coerce
-     (Ctx      : in out Context;
-      Val_Reg  : String;
-      From_Ty  : String;
-      To_Ty    : String) return String;
+     (Ctx         : in out Context;
+      Val_Reg     : String;
+      From_Ty     : String;
+      To_Ty       : String;
+      Is_Unsigned : Boolean := False) return String;
 
-   -- Emit runtime checks (Constraint_Error)
-   procedure Emit_Check_Fail_If (Ctx : in out Context; Cond_Reg : String);
+   -- Emit runtime checks (Constraint_Error by default, or explicit exception tag)
+   procedure Emit_Check_Fail_If (Ctx : in out Context; Cond_Reg : String; Tag : String := "");
    procedure Emit_Null_Check (Ctx : in out Context; Ptr_Reg : String);
    procedure Emit_Discriminant_Check
      (Ctx        : in out Context;
@@ -92,7 +96,14 @@ package Cg_Expr is
    -- Compute runtime 'CONSTRAINED i8 value (0 or 1) for an actual record expression
    function Emit_Actual_Constrained (Ctx : in out Context; Act : TREE) return String;
 
-   -- Save a scalar value into a stack/global slot for later reuse without re-evaluation
+   -- Save/load a scalar value into/from a stack/global slot for reuse without re-evaluation
+   function Load_Saved_Slot
+     (Ctx     : in out Context;
+      Ptr_Str : String;
+      Pir_Ty  : String;
+      Align   : Natural;
+      Is_Glob : Boolean) return String;
+
    procedure Save_Scalar_Slot
      (Ctx         : in out Context;
       Val_Reg     : String;
@@ -119,6 +130,15 @@ package Cg_Expr is
      (Ctx     : in out Context;
       Dur_Exp : TREE) return String;
 
+   -- True if Node denotes a pragma SHARED variable (walking SM_RENAMES_OBJ and Var_Info.Is_Shared)
+   function Is_Shared_Object (Ctx : Context; Node : TREE) return Boolean;
+
+   -- Compute i32 entry index for EI (and optional family index Fam_Exp), honoring saved dynamic bounds (P3-4.10)
+   function Emit_Entry_Index_Reg
+     (Ctx     : in out Context;
+      EI      : Entry_Info;
+      Fam_Exp : TREE) return String;
+
    -- Emit composite copy from Src to Dst
    procedure Emit_Copy_Composite
      (Ctx      : in out Context;
@@ -128,6 +148,13 @@ package Cg_Expr is
 
    -- Bitfield helpers for record representation clauses (LRM 13.4)
    function Is_Bitfield (FE : Field_Entry) return Boolean;
+
+   procedure Emit_Variant_Check_For_Field
+     (Ctx       : in out Context;
+      Rec_Ptr   : String;
+      Rec_T     : TREE;
+      Field_Def : TREE;
+      Use_CK    : Unsigned_32);
 
    function Emit_Bitfield_Load
      (Ctx       : in out Context;
@@ -169,6 +196,16 @@ package Cg_Expr is
      (Ctx      : in out Context;
       First_32 : String;
       Last_32  : String) return String;
+
+   -- Compute super-null-safe, overflow-checked total element count & byte size (raises STORAGE_ERROR on overflow)
+   procedure Emit_Array_Byte_Size_I64
+     (Ctx       : in out Context;
+      Firsts    : Str_Array_4;
+      Lasts     : Str_Array_4;
+      NDims     : Natural;
+      Elem_Sz   : Natural;
+      Tot_Elems : out Unbounded_String;
+      Tot_Bytes : out Unbounded_String);
 
    -- Emit Ada 83 LRM 5.2.1(2) array length check across dims 1..NDims (with null-to-null allowance)
    procedure Emit_Array_Length_Check

@@ -23,6 +23,8 @@ package body REPCLAU is
     SEEN_REC_CNT: NATURAL := 0;
     SEEN_SS: array (1 .. MAX_SEEN_REP) of TREE;
     SEEN_SS_CNT: NATURAL := 0;
+    SEEN_SIZE: array (1 .. MAX_SEEN_REP) of TREE;
+    SEEN_SIZE_CNT: NATURAL := 0;
 
     procedure CHECK_TYPE_IN_CURRENT_REGION(ID: TREE; SRCPOS: TREE; H: H_TYPE) is
 	DEF: TREE;
@@ -282,7 +284,7 @@ package body REPCLAU is
 		        if STATIC_VALUE /= CONST_VOID and then UARITH.U_POS(UARITH."<"(STATIC_VALUE, UARITH.U_VAL(0))) = 0 then
 			    declare
 			        use UARITH;
-			        PFX_SUB: TREE := D(SM_TYPE_SPEC, D(SM_DEFN, PREFIX));
+			        PFX_SUB: TREE := D(SM_TYPE_SPEC, GET_NAME_DEFN(PREFIX));
 			        RNG: TREE;
 			        V1, V2: TREE;
 			        REQ_BITS: INTEGER := 0;
@@ -429,6 +431,10 @@ package body REPCLAU is
 				D(CD_IMPL_SIZE, PREFIX_TYPE, STATIC_VALUE);
 			    end if;
 		        end if;
+		        if SEEN_SIZE_CNT < MAX_SEEN_REP then
+			    SEEN_SIZE_CNT := SEEN_SIZE_CNT + 1;
+			    SEEN_SIZE(SEEN_SIZE_CNT) := PREFIX_TYPE;
+		        end if;
 		    elsif KIND(PREFIX_TYPE) = DN_ACCESS then
 		        if STATIC_VALUE /= CONST_VOID and then UARITH.U_POS(UARITH."<"(STATIC_VALUE, UARITH.U_VAL(64))) /= 0 then
 			    ERROR(D(LX_SRCPOS, EXP), "Size too small for access type");
@@ -439,7 +445,7 @@ package body REPCLAU is
 			-- Check constrained array minimum size & static bounds (bd2a12a, bd2a67a)
 			declare
 			    use UARITH;
-			    PFX_SUB: constant TREE := D(SM_TYPE_SPEC, D(SM_DEFN, PREFIX));
+			    PFX_SUB: constant TREE := D(SM_TYPE_SPEC, GET_NAME_DEFN(PREFIX));
 			begin
 			    if PFX_SUB /= CONST_VOID and then KIND(PFX_SUB) = DN_CONSTRAINED_ARRAY then
 				declare
@@ -473,10 +479,57 @@ package body REPCLAU is
 				    if HAS_NONSTAT or else HAS_NONSTATIC_CONSTRAINT(COMP_T) then
 					ERROR(D(LX_SRCPOS, PREFIX), "Size clause not allowed for array with non-static bounds");
 				    elsif STATIC_VALUE /= CONST_VOID and then COMP_T /= CONST_VOID then
-					if KIND(COMP_T) in CLASS_SCALAR and then DI(CD_IMPL_SIZE, COMP_T) > 0 then
+					if KIND(COMP_T) in DN_ENUMERATION .. DN_INTEGER then
+					    declare
+						CRNG: constant TREE := D(SM_RANGE, COMP_T);
+						CSZ: TREE := CONST_VOID;
+						CV1, CV2, CDIFF, CPOW2: TREE;
+					    begin
+						for K in 1 .. SEEN_SIZE_CNT loop
+						    if SEEN_SIZE(K) = COMP_T then
+							CSZ := D(CD_IMPL_SIZE, COMP_T);
+							exit;
+						    end if;
+						end loop;
+						if CSZ /= CONST_VOID and then KIND(CSZ) = DN_NUM_VAL then
+						    COMP_BITS := U_POS(CSZ);
+						elsif CRNG /= CONST_VOID and then KIND(CRNG) = DN_RANGE then
+						    CV1 := GET_STATIC_VALUE(D(AS_EXP1, CRNG));
+						    CV2 := GET_STATIC_VALUE(D(AS_EXP2, CRNG));
+						    if CV1 /= CONST_VOID and then CV2 /= CONST_VOID
+						    and then U_POS(CV1 <= CV2) /= 0 then
+							if U_POS(CV1 < U_VAL(0)) /= 0 then
+							    CDIFF := U_VAL(0) - CV1;
+							    if U_POS(CV2 >= CDIFF) /= 0 then
+								CDIFF := CV2 + U_VAL(1);
+							    end if;
+							    CPOW2 := U_VAL(1);
+							    COMP_BITS := 1;
+							    while U_POS(CPOW2 < CDIFF) /= 0 and then COMP_BITS < 64 loop
+								CPOW2 := CPOW2 + CPOW2;
+								COMP_BITS := COMP_BITS + 1;
+							    end loop;
+							else
+							    CPOW2 := U_VAL(2);
+							    COMP_BITS := 1;
+							    while U_POS(CPOW2 <= CV2) /= 0 and then COMP_BITS < 64 loop
+								CPOW2 := CPOW2 + CPOW2;
+								COMP_BITS := COMP_BITS + 1;
+							    end loop;
+							end if;
+						    elsif KIND(COMP_T) = DN_ENUMERATION then
+							COMP_BITS := 1;
+						    elsif DI(CD_IMPL_SIZE, COMP_T) > 0 then
+							COMP_BITS := DI(CD_IMPL_SIZE, COMP_T);
+						    end if;
+						elsif KIND(COMP_T) = DN_ENUMERATION then
+						    COMP_BITS := 1;
+						elsif DI(CD_IMPL_SIZE, COMP_T) > 0 then
+						    COMP_BITS := DI(CD_IMPL_SIZE, COMP_T);
+						end if;
+					    end;
+					elsif KIND(COMP_T) in CLASS_SCALAR and then DI(CD_IMPL_SIZE, COMP_T) > 0 then
 					    COMP_BITS := DI(CD_IMPL_SIZE, COMP_T);
-					elsif KIND(COMP_T) = DN_ENUMERATION then
-					    COMP_BITS := 1;
 					end if;
 					if U_POS(STATIC_VALUE < TOT_EL * U_VAL(COMP_BITS)) /= 0 then
 					    ERROR(D(LX_SRCPOS, EXP), "Size too small for array type");
@@ -577,7 +630,10 @@ package body REPCLAU is
 		REQUIRE_INTEGER_TYPE(EXP, TYPESET);
 		REQUIRE_UNIQUE_TYPE(EXP, TYPESET);
 		EXP := RESOLVE_EXP(EXP, TYPESET);
-		if KIND(PREFIX_TYPE) /= DN_TASK_SPEC
+		if GET_NAME_DEFN(PREFIX) /= CONST_VOID
+		and then KIND(GET_NAME_DEFN(PREFIX)) = DN_SUBTYPE_ID then
+		    ERROR(D(LX_SRCPOS, PREFIX), "Storage_Size clause not allowed for subtype");
+		elsif KIND(PREFIX_TYPE) /= DN_TASK_SPEC
 		and KIND(PREFIX_TYPE) /= DN_ACCESS then
 		    ERROR(D(LX_SRCPOS,ATTRIBUTE)
                             , "Must be access or task type");
@@ -615,12 +671,17 @@ package body REPCLAU is
                         ERROR(D(LX_SRCPOS,EXP), "Static expression required");
 		    end if;
 		end if;
-		if KIND(PREFIX_TYPE) /= DN_FIXED then
+		if GET_NAME_DEFN(PREFIX) /= CONST_VOID
+		and then KIND(GET_NAME_DEFN(PREFIX)) = DN_SUBTYPE_ID then
+		    ERROR(D(LX_SRCPOS, PREFIX), "Small clause not allowed for subtype");
+		elsif KIND(PREFIX_TYPE) /= DN_FIXED then
 		    ERROR(D(LX_SRCPOS,ATTRIBUTE)
                             , "Must be fixed point type");
 		else
 		    declare
 			DUP_SM: BOOLEAN := FALSE;
+			PFX_SUB_SM: TREE := D(SM_TYPE_SPEC, GET_NAME_DEFN(PREFIX));
+			ACC_NODE: TREE;
 		    begin
 			for K in 1 .. SEEN_SMALL_CNT loop
 			    if SEEN_SMALL(K) = PREFIX_TYPE then
@@ -634,21 +695,37 @@ package body REPCLAU is
 			    SEEN_SMALL_CNT := SEEN_SMALL_CNT + 1;
 			    SEEN_SMALL(SEEN_SMALL_CNT) := PREFIX_TYPE;
 			end if;
-		    end;
-		    if STATIC_VALUE /= CONST_VOID then
-			if UARITH."<="(D(XD_NUMER, STATIC_VALUE), UARITH.U_VAL(0)) then
-			    ERROR(D(LX_SRCPOS, EXP), "Small must be positive");
-			elsif D(SM_ACCURACY, PREFIX_TYPE) /= CONST_VOID
-			and then not UARITH."<="(STATIC_VALUE, D(SM_ACCURACY, PREFIX_TYPE)) then
-			    ERROR(D(LX_SRCPOS, EXP), "Small must not exceed delta");
+			if PFX_SUB_SM /= CONST_VOID and then KIND(PFX_SUB_SM) in DN_PRIVATE .. DN_L_PRIVATE then
+			    PFX_SUB_SM := D(SM_TYPE_SPEC, PFX_SUB_SM);
+			elsif PFX_SUB_SM /= CONST_VOID and then KIND(PFX_SUB_SM) = DN_INCOMPLETE then
+			    PFX_SUB_SM := D(XD_FULL_TYPE_SPEC, PFX_SUB_SM);
 			end if;
-		    end if;
+			if PFX_SUB_SM /= CONST_VOID and then KIND(PFX_SUB_SM) = DN_FIXED
+			and then D(SM_ACCURACY, PFX_SUB_SM) /= CONST_VOID then
+			    ACC_NODE := D(SM_ACCURACY, PFX_SUB_SM);
+			else
+			    ACC_NODE := D(SM_ACCURACY, PREFIX_TYPE);
+			end if;
+			if STATIC_VALUE /= CONST_VOID then
+			    if UARITH."<="(D(XD_NUMER, STATIC_VALUE), UARITH.U_VAL(0)) then
+				ERROR(D(LX_SRCPOS, EXP), "Small must be positive");
+			    elsif ACC_NODE /= CONST_VOID
+			    and then not UARITH."<="(STATIC_VALUE, ACC_NODE) then
+				ERROR(D(LX_SRCPOS, EXP), "Small must not exceed delta");
+			    end if;
+			end if;
+		    end;
 		    D(CD_IMPL_SMALL, PREFIX_TYPE, STATIC_VALUE);
 		    declare
 			use UARITH;
 			PREFIX_SUBTYPE: TREE
-				 := D(SM_TYPE_SPEC, D(SM_DEFN,PREFIX));
-			POW_32: TREE := U_VALUE("16#100000000#");
+				 := D(SM_TYPE_SPEC, GET_NAME_DEFN(PREFIX));
+			POWER_31: constant TREE := U_VALUE("16#80000000#");
+			POWER_63: constant TREE := U_VALUE("16#8000000000000000#");
+			CUR_BITS: INTEGER := DI(CD_IMPL_SIZE, PREFIX_TYPE);
+			FIX_PWR:  TREE := POWER_31;
+			SUB_RNG:  TREE := CONST_VOID;
+			LO_B, HI_B: TREE := CONST_VOID;
 		    begin
 			if KIND(PREFIX_SUBTYPE) in DN_PRIVATE .. DN_L_PRIVATE
 			then
@@ -659,11 +736,37 @@ package body REPCLAU is
 			end if;
 			if KIND(PREFIX_SUBTYPE) = DN_FIXED then
 			    D(CD_IMPL_SMALL, PREFIX_SUBTYPE, STATIC_VALUE);
+			    SUB_RNG := D(SM_RANGE, PREFIX_SUBTYPE);
+			    if SUB_RNG /= CONST_VOID and then KIND(SUB_RNG) = DN_RANGE then
+				LO_B := D(SM_VALUE, D(AS_EXP1, SUB_RNG));
+				HI_B := D(SM_VALUE, D(AS_EXP2, SUB_RNG));
+			    end if;
+			end if;
+			if CUR_BITS > 32 then
+			    FIX_PWR := POWER_63;
+			elsif LO_B /= CONST_VOID and then HI_B /= CONST_VOID then
+			    if not (HI_B <= (POWER_31 - U_VAL(1)) * STATIC_VALUE
+				and then LO_B >= (- POWER_31) * STATIC_VALUE)
+			    then
+				DI(CD_IMPL_SIZE, PREFIX_TYPE, 64);
+				if KIND(PREFIX_SUBTYPE) = DN_FIXED then
+				    DI(CD_IMPL_SIZE, PREFIX_SUBTYPE, 64);
+				end if;
+				FIX_PWR := POWER_63;
+			    end if;
+			end if;
+			if STATIC_VALUE /= CONST_VOID and then LO_B /= CONST_VOID and then HI_B /= CONST_VOID
+			and then U_POS(D(XD_NUMER, STATIC_VALUE) > U_VAL(0)) /= 0 then
+			    if not (HI_B <= (POWER_63 - U_VAL(1)) * STATIC_VALUE
+				and then LO_B >= (- POWER_63) * STATIC_VALUE)
+			    then
+				ERROR(D(LX_SRCPOS, EXP), "Fixed point range exceeds 64-bit representation for specified Small");
+			    end if;
 			end if;
 			D(SM_VALUE, D(AS_EXP1, D(SM_RANGE,PREFIX_TYPE))
-				, (- POW_32) * STATIC_VALUE );
+				, (- FIX_PWR) * STATIC_VALUE );
 			D(SM_VALUE, D(AS_EXP2, D(SM_RANGE,PREFIX_TYPE))
-				, (POW_32 - U_VAL(1)) * STATIC_VALUE );
+				, (FIX_PWR - U_VAL(1)) * STATIC_VALUE );
 		    end;
 		end if;
 	    when others =>
@@ -737,6 +840,11 @@ package body REPCLAU is
 	    return;
 	end if;
 
+	declare
+	    FIRST_REP: TREE := CONST_VOID;
+	    LAST_REP:  TREE := CONST_VOID;
+	    CHOICE_V2: TREE;
+	begin
 	while not IS_EMPTY(ENUM_LIST) loop
 	    POP(ENUM_LIST, ENUM);
 	    if IS_EMPTY(ITEM_LIST) then
@@ -753,10 +861,10 @@ package body REPCLAU is
 		and then KIND(D(AS_DISCRETE_RANGE,CHOICE)) = DN_RANGE then
 		    CHOICE_VALUE := GET_STATIC_VALUE
 			    ( D(AS_EXP1, D(AS_DISCRETE_RANGE,CHOICE)) );
-		    if CHOICE_VALUE /= CONST_VOID
-		    and then not UARITH.U_EQUAL
-			    ( CHOICE_VALUE
-			    , D(AS_EXP2, D(AS_DISCRETE_RANGE,CHOICE)) )
+		    CHOICE_V2 := GET_STATIC_VALUE
+			    ( D(AS_EXP2, D(AS_DISCRETE_RANGE,CHOICE)) );
+		    if CHOICE_VALUE /= CONST_VOID and then CHOICE_V2 /= CONST_VOID
+		    and then not UARITH.U_EQUAL(CHOICE_VALUE, CHOICE_V2)
 		    then
                         ERROR(D(LX_SRCPOS,CHOICE), "Duplicates not allowed");
 			return;
@@ -784,6 +892,10 @@ package body REPCLAU is
             and then UARITH."<="(CURRENT_VALUE, PRIOR_VALUE) then
                 ERROR(D(LX_SRCPOS,EXP), "Values must be in order");
 	    end if;
+	    if FIRST_REP = CONST_VOID then
+		FIRST_REP := CURRENT_VALUE;
+	    end if;
+	    LAST_REP := CURRENT_VALUE;
 	    PRIOR_VALUE := CURRENT_VALUE;
 	    D(SM_REP, ENUM, CURRENT_VALUE);
 	end loop;
@@ -791,6 +903,76 @@ package body REPCLAU is
 	if not IS_EMPTY(ITEM_LIST) then
             ERROR(D(LX_SRCPOS,HEAD(ITEM_LIST)), "Too many values");
 	end if;
+
+	-- P3-6.2: Update CD_IMPL_SIZE and check against prior 'Size clause (LRM 13.3(5))
+	if FIRST_REP /= CONST_VOID and then LAST_REP /= CONST_VOID then
+	    declare
+		use UARITH;
+		MIN_64: constant TREE := - U_VALUE("16#8000000000000000#");
+		MAX_64: constant TREE := U_VALUE("16#7FFFFFFFFFFFFFFF#");
+		REQ_BITS: INTEGER := 1;
+		IMPL_BITS: INTEGER := 8;
+		DIFF, POW2: TREE;
+		HAS_EXPLICIT_SZ: BOOLEAN := FALSE;
+		PRIOR_SZ: TREE := CONST_VOID;
+	    begin
+		for K in 1 .. SEEN_SIZE_CNT loop
+		    if SEEN_SIZE(K) = ENUM_TYPE then
+			HAS_EXPLICIT_SZ := TRUE;
+			exit;
+		    end if;
+		end loop;
+		if HAS_EXPLICIT_SZ then
+		    PRIOR_SZ := D(CD_IMPL_SIZE, ENUM_TYPE);
+		end if;
+		if not (MIN_64 <= FIRST_REP) or else not (LAST_REP <= MAX_64) then
+		    ERROR(D(LX_SRCPOS, EXP), "Enumeration representation code out of range");
+		else
+		    if U_POS(FIRST_REP < U_VAL(0)) /= 0 then
+			DIFF := U_VAL(0) - FIRST_REP;
+			if U_POS(LAST_REP >= DIFF) /= 0 then
+			    DIFF := LAST_REP + U_VAL(1);
+			end if;
+			POW2 := U_VAL(1);
+			REQ_BITS := 1;
+			while U_POS(POW2 < DIFF) /= 0 and then REQ_BITS < 64 loop
+			    POW2 := POW2 + POW2;
+			    REQ_BITS := REQ_BITS + 1;
+			end loop;
+		    else
+			POW2 := U_VAL(2);
+			REQ_BITS := 1;
+			while U_POS(POW2 <= LAST_REP) /= 0 and then REQ_BITS < 64 loop
+			    POW2 := POW2 + POW2;
+			    REQ_BITS := REQ_BITS + 1;
+			end loop;
+		    end if;
+		    if HAS_EXPLICIT_SZ and then PRIOR_SZ /= CONST_VOID then
+			if KIND(PRIOR_SZ) = DN_NUM_VAL then
+			    if U_POS(PRIOR_SZ < U_VAL(REQ_BITS)) /= 0 then
+				ERROR(D(LX_SRCPOS, EXP), "Enumeration representation code does not fit in specified Size");
+			    end if;
+			elsif DI(CD_IMPL_SIZE, ENUM_TYPE) < REQ_BITS then
+			    ERROR(D(LX_SRCPOS, EXP), "Enumeration representation code does not fit in specified Size");
+			end if;
+		    else
+			if REQ_BITS <= 8 then
+			    IMPL_BITS := 8;
+			elsif REQ_BITS <= 16 then
+			    IMPL_BITS := 16;
+			elsif REQ_BITS <= 32 then
+			    IMPL_BITS := 32;
+			else
+			    IMPL_BITS := 64;
+			end if;
+			if IMPL_BITS > DI(CD_IMPL_SIZE, ENUM_TYPE) then
+			    DI(CD_IMPL_SIZE, ENUM_TYPE, IMPL_BITS);
+			end if;
+		    end if;
+		end if;
+	    end;
+	end if;
+	end;
     end;
 
     procedure RESOLVE_ADDRESS_REP
@@ -926,9 +1108,20 @@ package body REPCLAU is
 	    REQUIRE_INTEGER_TYPE(D(AS_EXP,ALIGNMENT),TYPESET);
 	    REQUIRE_UNIQUE_TYPE(D(AS_EXP,ALIGNMENT),TYPESET);
 	    D(AS_EXP, ALIGNMENT, RESOLVE_EXP(D(AS_EXP,ALIGNMENT),TYPESET));
-	    if not IS_EMPTY(TYPESET)
-	    and then GET_STATIC_VALUE(D(AS_EXP,ALIGNMENT)) = CONST_VOID then
-                ERROR(D(LX_SRCPOS,ALIGNMENT), "Alignment not static");
+	    if not IS_EMPTY(TYPESET) then
+		declare
+		    use UARITH;
+		    AV: constant TREE := GET_STATIC_VALUE(D(AS_EXP,ALIGNMENT));
+		begin
+		    if AV = CONST_VOID then
+			ERROR(D(LX_SRCPOS,ALIGNMENT), "Alignment not static");
+		    elsif not (U_EQUAL(AV, U_VAL(1)) or else U_EQUAL(AV, U_VAL(2))
+			or else U_EQUAL(AV, U_VAL(4)) or else U_EQUAL(AV, U_VAL(8))
+			or else U_EQUAL(AV, U_VAL(16)) or else U_EQUAL(AV, U_VAL(32))
+			or else U_EQUAL(AV, U_VAL(64))) then
+			ERROR(D(LX_SRCPOS,ALIGNMENT), "Alignment must be a positive power of two");
+		    end if;
+		end;
 	    end if;
 	end if;
 

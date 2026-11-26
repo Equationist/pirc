@@ -67,6 +67,9 @@ package Diana_Util is
       First  : out Integer_64;
       Last   : out Integer_64);
 
+   -- True for unsigned scalar storage (all enumerations, and unsigned exact-width integers)
+   function Is_Unsigned_Scalar (T : TREE; Pir_Type : String) return Boolean;
+
    -- Check if a symbol belongs to a predefined RTL package (STANDARD, TEXT_IO, CALENDAR, etc.)
    function Enclosing_Package_Name (Id : TREE) return String;
    function Qualified_Ada_Name (Id : TREE) return String;
@@ -75,5 +78,19 @@ package Diana_Util is
 
    -- Convert a DIANA string literal node's symbol text into raw characters (unquoting "")
    function Decode_Ada_String_Lit (Raw : String) return String;
+
+   -- Exact rational representation of a fixed-point type's base 'Small (Num / Den), when representable in i64
+   procedure Fixed_Small_Rational
+     (T   : TREE;
+      Ok  : out Boolean;
+      Num : out Integer_64;
+      Den : out Integer_64);
+
+   -- Exact rational fixed-point tick evaluation with asymmetric [-2^(Bits-1) .. 2^(Bits-1)-1] overflow check
+   procedure Eval_Fixed_Ticks_Exact_Checked
+     (SV      : TREE;
+      Fixed_T : TREE;
+      Val     : out Integer_64;
+      Ovf     : out Boolean);
 
 end Diana_Util;

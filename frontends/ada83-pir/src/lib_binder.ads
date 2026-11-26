@@ -15,12 +15,16 @@ package Lib_Binder is
    -- so both diana2pir and ada83_bind agree on spec/body task activation groups.
    function Lib_Pkg_Task_Group_Id (Name : String) return Long_Long_Integer;
 
+   -- True if a package declarative list requires a package body (LRM 7.1(4))
+   function Decl_List_Requires_Body (Decl_S : TREE; Is_Private_Part : Boolean := False) return Boolean;
+
    -- Record all compilation units from an attributed DIANA Comp_Node into
-   -- <Lib_Dir>/UNITS.IDX, associating them with Obj_Path.
+   -- <Lib_Dir>/UNITS.IDX, associating them with Obj_Path (or per-CU Obj_Path when Per_CU_Obj = True).
    procedure Record_Compilation_Units
-     (Comp_Node : TREE;
-      Obj_Path  : String;
-      Lib_Dir   : String := "ADA__LIB");
+     (Comp_Node  : TREE;
+      Obj_Path   : String;
+      Lib_Dir    : String := "ADA__LIB";
+      Per_CU_Obj : Boolean := False);
 
    -- Bind a program library (<Lib_Dir>/UNITS.IDX):
    --   * Performs LRM 10.3 missing/obsolete body, subunit, and withed-unit checks

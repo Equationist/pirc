@@ -77,17 +77,64 @@ begin
          return;
       end if;
 
-      Cg_State.Init_Context
-        (Ctx           => Ctx,
-         Target_Triple => To_String (Target_Triple),
-         Enable_Checks => Enable_Checks,
-         Emit_Main     => Emit_Main);
+      declare
+         function Trim_Img (N : Natural) return String is
+            S : constant String := Natural'Image (N);
+         begin
+            return S (S'First + 1 .. S'Last);
+         end Trim_Img;
 
-      Cg_Stmt.Emit_Compilation (Ctx, Structure);
-      Pir_Emit.Write_Module (Ctx.E, To_String (Output_Path));
-      if Length (Record_Obj) > 0 then
-         Lib_Binder.Record_Compilation_Units (Structure, To_String (Record_Obj), To_String (Lib_Dir));
-      end if;
+         CU_Count : Natural := 0;
+         SL_Cnt   : SEQ_TYPE := LIST (D (AS_COMPLTN_UNIT_S, Structure));
+         Tmp_CU   : TREE;
+      begin
+         while not IS_EMPTY (SL_Cnt) loop
+            POP (SL_Cnt, Tmp_CU);
+            CU_Count := CU_Count + 1;
+         end loop;
+
+         -- P3-5.12: In library mode with multiple CUs in one source file, emit one .pir/.o per CU
+         -- so partial superseding on later recompilation never causes duplicate-symbol link errors!
+         if not Emit_Main and then Length (Record_Obj) > 0 and then CU_Count > 1 then
+            declare
+               Out_S   : constant String := To_String (Output_Path);
+               Out_Base : constant String :=
+                 (if Out_S'Length > 4 and then Out_S (Out_S'Last - 3 .. Out_S'Last) = ".pir"
+                  then Out_S (Out_S'First .. Out_S'Last - 4) else Out_S);
+            begin
+               for CU_I in 1 .. CU_Count loop
+                  declare
+                     CU_Ctx : Cg_State.Context;
+                  begin
+                     Cg_State.Init_Context
+                       (Ctx           => CU_Ctx,
+                        Target_Triple => To_String (Target_Triple),
+                        Enable_Checks => Enable_Checks,
+                        Emit_Main     => False);
+                     Cg_Stmt.Emit_Compilation (CU_Ctx, Structure, Only_CU => CU_I);
+                     Pir_Emit.Write_Module (CU_Ctx.E, Out_Base & "__cu" & Trim_Img (CU_I) & ".pir");
+                  end;
+               end loop;
+               Lib_Binder.Record_Compilation_Units (Structure, To_String (Record_Obj), To_String (Lib_Dir), Per_CU_Obj => True);
+            end;
+         else
+            Cg_State.Init_Context
+              (Ctx           => Ctx,
+               Target_Triple => To_String (Target_Triple),
+               Enable_Checks => Enable_Checks,
+               Emit_Main     => Emit_Main);
+
+            Cg_Stmt.Emit_Compilation (Ctx, Structure);
+            Pir_Emit.Write_Module (Ctx.E, To_String (Output_Path));
+            if Length (Record_Obj) > 0 then
+               Lib_Binder.Record_Compilation_Units (Structure, To_String (Record_Obj), To_String (Lib_Dir));
+            end if;
+         end if;
+      end;
    end;
    CLOSE_DIANA;
+exception
+   when Cg_Stmt.Elab_Cycle_Error =>
+      CLOSE_DIANA;
+      Ada.Command_Line.Set_Exit_Status (Ada.Command_Line.Failure);
 end Diana2Pir;

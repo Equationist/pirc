@@ -39,6 +39,11 @@ package body NODWALK is
     BODY_IDS: array (1 .. MAX_BODIES) of TREE;
     BODY_COUNT: NATURAL := 0;
 
+    procedure RESET_UNIT_BODIES is
+    begin
+	BODY_COUNT := 0;
+    end RESET_UNIT_BODIES;
+
     procedure RECORD_BODY(ID: TREE) is
     begin
 	if ID = CONST_VOID then return; end if;
@@ -355,7 +360,13 @@ package body NODWALK is
 		EVAL_EXP_TYPES(EXP, TYPESET);
 		REQUIRE_TYPE(GET_BASE_TYPE(TYPE_SPEC), EXP, TYPESET);
 		REQUIRE_NONLIMITED_TYPE(EXP, TYPESET);
-		EXP := RESOLVE_EXP(EXP, TYPESET);
+		if EXP /= CONST_VOID and then KIND(EXP) = DN_AGGREGATE
+		and then not IS_EMPTY(TYPESET)
+		and then TYPE_SPEC /= CONST_VOID and then KIND(TYPE_SPEC) = DN_CONSTRAINED_ARRAY then
+		    EXP := RESOLVE_EXP(EXP, TYPE_SPEC);
+		else
+		    EXP := RESOLVE_EXP(EXP, TYPESET);
+		end if;
 		D(AS_EXP, NODE, EXP);
 		CHECK_NO_OUT_READ(EXP);
 		-- LRM 4.3.2(6) (bc3220b): check OTHERS context in array aggregate init of constant
@@ -493,7 +504,13 @@ package body NODWALK is
 			EVAL_EXP_TYPES(EXP, TYPESET);
 			REQUIRE_TYPE(GET_BASE_TYPE(TYPE_SPEC), EXP, TYPESET);
 			REQUIRE_NONLIMITED_TYPE(EXP, TYPESET);
-			EXP := RESOLVE_EXP(EXP, TYPESET);
+			if EXP /= CONST_VOID and then KIND(EXP) = DN_AGGREGATE
+			and then not IS_EMPTY(TYPESET)
+			and then TYPE_SPEC /= CONST_VOID and then KIND(TYPE_SPEC) = DN_CONSTRAINED_ARRAY then
+			    EXP := RESOLVE_EXP(EXP, TYPE_SPEC);
+			else
+			    EXP := RESOLVE_EXP(EXP, TYPESET);
+			end if;
 			D(AS_EXP, NODE, EXP);
 			IN_DEFAULT_EXP := PREV_DEF_E;
 			ALLOW_DEFERRED_CONST := PREV_ALLOW_DC;
@@ -584,6 +601,11 @@ package body NODWALK is
 		REQUIRE_UNIQUE_TYPE(EXP, TYPESET);
 		TYPE_SPEC := GET_THE_TYPE(TYPESET);
 		EXP := RESOLVE_EXP(EXP, TYPE_SPEC);
+		if TYPE_SPEC /= CONST_VOID and then EXP /= CONST_VOID
+		and then KIND(EXP) /= DN_NUMERIC_LITERAL
+		and then GET_STATIC_VALUE(EXP) = CONST_VOID then
+		    ERROR(D(LX_SRCPOS, EXP), "Static expression required for number declaration");
+		end if;
 
 		-- complete source_name definitions and make visible
 		INSERT_OBJ_TYPE_AND_INIT_EXP_IN_S(SOURCE_NAME_S
@@ -626,13 +648,24 @@ package body NODWALK is
 		D(AS_NAME, NODE, NAME);
 
 		-- check that current declaration is in visible part
-		-- ... and that type is private type is defined in this region
-		-- ... (outside the package, sm_type_spec is not void)
-		if not H.IS_IN_SPEC
-		or else KIND(GET_BASE_TYPE(TYPE_SPEC)) not in CLASS_PRIVATE_SPEC
-		then
-                    ERROR(D(LX_SRCPOS,NODE), "Deferred constant not allowed");
-		end if;
+		-- ... and that type is private type declared in this region (uncompleted)
+		declare
+		    BT: constant TREE := GET_BASE_TYPE(TYPE_SPEC);
+		    BT_ID: TREE := CONST_VOID;
+		begin
+		    if BT /= CONST_VOID and then KIND(BT) in CLASS_PRIVATE_SPEC then
+			BT_ID := D(XD_SOURCE_NAME, BT);
+		    end if;
+		    if not H.IS_IN_SPEC
+		    or else KIND(BT) not in CLASS_PRIVATE_SPEC
+		    or else D(SM_TYPE_SPEC, BT) /= CONST_VOID
+		    or else BT_ID = CONST_VOID
+		    or else H.REGION_DEF = CONST_VOID
+		    or else D(XD_REGION, BT_ID) /= D(XD_SOURCE_NAME, H.REGION_DEF)
+		    then
+			ERROR(D(LX_SRCPOS,NODE), "Deferred constant not allowed");
+		    end if;
+		end;
 
 		-- complete source_name definitions and make visible
 		INSERT_OBJ_TYPE_AND_INIT_EXP_IN_S(SOURCE_NAME_S
@@ -842,6 +875,30 @@ package body NODWALK is
 					    end if;
 					end loop;
 				    end if;
+				    -- LRM 7.4.2(7): regenerate predefined operators for visible composite types
+				    -- containing this newly completed private type so "=" is available in the private part.
+				    if H.REGION_DEF /= CONST_VOID
+				    and then D(XD_SOURCE_NAME, H.REGION_DEF) /= CONST_VOID
+				    and then (KIND(D(XD_SOURCE_NAME, H.REGION_DEF)) = DN_PACKAGE_ID
+					      or else KIND(D(XD_SOURCE_NAME, H.REGION_DEF)) = DN_GENERIC_ID)
+				    and then D(SM_SPEC, D(XD_SOURCE_NAME, H.REGION_DEF)) /= CONST_VOID
+				    and then KIND(D(SM_SPEC, D(XD_SOURCE_NAME, H.REGION_DEF))) = DN_PACKAGE_SPEC then
+					declare
+					    VL: SEQ_TYPE := LIST(D(AS_DECL_S1, D(SM_SPEC, D(XD_SOURCE_NAME, H.REGION_DEF))));
+					    VD: TREE;
+					begin
+					    while not IS_EMPTY(VL) loop
+						POP(VL, VD);
+						if KIND(VD) = DN_TYPE_DECL
+						and then (KIND(D(AS_TYPE_DEF, VD)) = DN_RECORD_DEF
+							  or else KIND(D(AS_TYPE_DEF, VD))
+								  in DN_CONSTRAINED_ARRAY_DEF .. DN_UNCONSTRAINED_ARRAY_DEF) then
+						    PREFCNS.GEN_PREDEFINED_OPERATORS
+							    (D(SM_TYPE_SPEC, D(AS_SOURCE_NAME, VD)), H);
+						end if;
+					    end loop;
+					end;
+				    end if;
 				end if;
 			    end if;
 			end if;
@@ -862,11 +919,17 @@ package body NODWALK is
 		SUBTYPE_INDICATION: TREE := D(AS_SUBTYPE_INDICATION, NODE);
 
 		SOURCE_DEF: TREE := MAKE_DEF_FOR_ID(SOURCE_NAME, H);
+		PRIOR_DEF: TREE;
 		TYPE_SPEC: TREE;
 	    begin
 		TYPE_SPEC := EVAL_TYPE_DEF(SUBTYPE_INDICATION, SOURCE_NAME, H);
 		D(SM_TYPE_SPEC, SOURCE_NAME, TYPE_SPEC);
-		if TYPE_SPEC /= CONST_VOID then
+		PRIOR_DEF := GET_PRIOR_DEF(SOURCE_DEF);
+		if PRIOR_DEF /= CONST_VOID then
+		    ERROR(D(LX_SRCPOS, SOURCE_NAME),
+			  "Duplicate declaration - " & PRINTNAME(D(LX_SYMREP, SOURCE_NAME)));
+		    MAKE_DEF_IN_ERROR(SOURCE_DEF);
+		elsif TYPE_SPEC /= CONST_VOID then
 		    MAKE_DEF_VISIBLE(SOURCE_DEF);
 		else
 		    MAKE_DEF_IN_ERROR(SOURCE_DEF);
@@ -993,7 +1056,14 @@ package body NODWALK is
 		--end if;
 		WALK_HEADER(HEADER, H);
 		LEAVE_REGION(SOURCE_DEF, S);
-		MAKE_DEF_VISIBLE(SOURCE_DEF, HEADER);
+		if GET_PRIOR_DEF(SOURCE_DEF) /= CONST_VOID then
+		    ERROR(D(LX_SRCPOS, SOURCE_NAME),
+			  "Duplicate generic declaration - " & PRINTNAME(D(LX_SYMREP, SOURCE_NAME)));
+		    MAKE_DEF_IN_ERROR(SOURCE_DEF);
+		else
+		    -- LRM 8.3(1), 12.1(4): generic units are not overloadable and cannot be called uninstantiated
+		    MAKE_DEF_VISIBLE(SOURCE_DEF);
+		end if;
 	    end;
 
 
@@ -1077,8 +1147,13 @@ package body NODWALK is
 		D(SM_SPEC, SOURCE_NAME, HEADER);
 		D(SM_UNIT_DESC, SOURCE_NAME, UNIT_KIND);
 
-		CHECK_UNIQUE_DEF(SOURCE_DEF);
-		WALK_UNIT_DESC(SOURCE_NAME, UNIT_KIND, H);
+		if UNIT_KIND /= CONST_VOID and then KIND(UNIT_KIND) = DN_RENAMES_UNIT then
+		    WALK_UNIT_DESC(SOURCE_NAME, UNIT_KIND, H);
+		    CHECK_UNIQUE_DEF(SOURCE_DEF);
+		else
+		    CHECK_UNIQUE_DEF(SOURCE_DEF);
+		    WALK_UNIT_DESC(SOURCE_NAME, UNIT_KIND, H);
+		end if;
 		MAKE_DEF_VISIBLE(SOURCE_DEF);
 		if HEADER /= CONST_VOID then
 		    ENTER_REGION(SOURCE_DEF, H, S);
@@ -1112,16 +1187,66 @@ package body NODWALK is
 		EVAL_EXP_TYPES(NAME, TYPESET);
 		REQUIRE_TYPE(BASE_TYPE, NAME, TYPESET);
 		NAME := RESOLVE_EXP(NAME, TYPESET);
-		-- LRM 8.5(5): object renaming cannot rename string literal, nor a variant/discriminant-dependent
-		-- subcomponent of an unconstrained variable with defaulted discriminants!
+		-- LRM 8.5(5): object renaming requires an object name (not literal, named number,
+		-- attribute, aggregate, qualified expr, allocator, or discriminant-dependent
+		-- subcomponent of an unconstrained variable with defaulted discriminants).
 		if NAME /= CONST_VOID then
 		    if KIND(NAME) = DN_STRING_LITERAL then
 			ERROR(D(LX_SRCPOS, NAME), "Cannot rename a string literal");
+		    elsif KIND(NAME) = DN_NUMERIC_LITERAL
+		    or else KIND(NAME) = DN_NULL_ACCESS
+		    or else KIND(NAME) = DN_AGGREGATE
+		    or else KIND(NAME) = DN_QUALIFIED
+		    or else KIND(NAME) = DN_CONVERSION
+		    or else KIND(NAME) = DN_FUNCTION_CALL
+		    or else KIND(NAME) = DN_NULLARY_CALL
+		    or else KIND(NAME) = DN_SHORT_CIRCUIT
+		    or else KIND(NAME) = DN_RANGE_MEMBERSHIP
+		    or else KIND(NAME) = DN_TYPE_MEMBERSHIP
+		    or else KIND(NAME) = DN_QUALIFIED_ALLOCATOR
+		    or else KIND(NAME) = DN_SUBTYPE_ALLOCATOR
+		    or else KIND(NAME) = DN_ATTRIBUTE
+		    or else KIND(NAME) = DN_USED_CHAR
+		    or else KIND(NAME) = DN_PARENTHESIZED then
+			ERROR(D(LX_SRCPOS, NAME), "Object name required in object renaming");
 		    else
 			declare
 			    CUR: TREE := NAME;
 			    DEP_DISCR: BOOLEAN := FALSE;
 			    UNCON_DEP: BOOLEAN := FALSE;
+			    function EXPR_USES_DISCR(E: TREE) return BOOLEAN is
+			    begin
+				if E = CONST_VOID then return FALSE; end if;
+				case KIND(E) is
+				when DN_USED_OBJECT_ID =>
+				    return D(SM_DEFN, E) /= CONST_VOID
+					   and then KIND(D(SM_DEFN, E)) = DN_DISCRIMINANT_ID;
+				when DN_PARENTHESIZED =>
+				    return EXPR_USES_DISCR(D(AS_EXP, E));
+				when DN_CONVERSION =>
+				    return EXPR_USES_DISCR(D(AS_EXP, E));
+				when DN_QUALIFIED =>
+				    return EXPR_USES_DISCR(D(AS_EXP, E));
+				when DN_FUNCTION_CALL =>
+				    declare
+					AL: SEQ_TYPE := LIST(D(AS_GENERAL_ASSOC_S, E));
+					A: TREE;
+				    begin
+					while not IS_EMPTY(AL) loop
+					    POP(AL, A);
+					    if KIND(A) = DN_ASSOC then
+						if EXPR_USES_DISCR(D(AS_EXP, A)) then return TRUE; end if;
+					    else
+						if EXPR_USES_DISCR(A) then return TRUE; end if;
+					    end if;
+					end loop;
+				    end;
+				    return FALSE;
+				when others =>
+				    return FALSE;
+				end case;
+			    end EXPR_USES_DISCR;
+
 			    function TYPE_DEP_ON_DISCR(CT: TREE) return BOOLEAN is
 			    begin
 				if CT = CONST_VOID then return FALSE; end if;
@@ -1134,7 +1259,7 @@ package body NODWALK is
 					if DS_N /= CONST_VOID then EL := LIST(DS_N); end if;
 					while not IS_EMPTY(EL) loop
 					    POP(EL, E);
-					    if GET_STATIC_VALUE(E) = CONST_VOID then
+					    if EXPR_USES_DISCR(E) then
 						return TRUE;
 					    end if;
 					end loop;
@@ -1150,8 +1275,8 @@ package body NODWALK is
 					    POP(IL, IT);
 					    if IT /= CONST_VOID and then D(SM_RANGE, IT) /= CONST_VOID
 					    and then KIND(D(SM_RANGE, IT)) = DN_RANGE then
-						if GET_STATIC_VALUE(D(AS_EXP1, D(SM_RANGE, IT))) = CONST_VOID
-						or else GET_STATIC_VALUE(D(AS_EXP2, D(SM_RANGE, IT))) = CONST_VOID then
+						if EXPR_USES_DISCR(D(AS_EXP1, D(SM_RANGE, IT)))
+						or else EXPR_USES_DISCR(D(AS_EXP2, D(SM_RANGE, IT))) then
 						    return TRUE;
 						end if;
 					    end if;
@@ -1202,6 +1327,26 @@ package body NODWALK is
 				return FALSE;
 			    end COMP_VAR_OR_DEP;
 			begin
+			    -- Reject renaming of named numbers and enumeration literals
+			    declare
+				HEAD_DEFN: TREE := CONST_VOID;
+				HEAD_NODE: TREE := NAME;
+			    begin
+				if KIND(HEAD_NODE) = DN_SELECTED then
+				    HEAD_NODE := D(AS_DESIGNATOR, HEAD_NODE);
+				end if;
+				if HEAD_NODE /= CONST_VOID
+				and then (KIND(HEAD_NODE) = DN_USED_OBJECT_ID
+					  or else KIND(HEAD_NODE) in CLASS_USED_NAME) then
+				    HEAD_DEFN := D(SM_DEFN, HEAD_NODE);
+				end if;
+				if HEAD_DEFN /= CONST_VOID
+				and then (KIND(HEAD_DEFN) = DN_NUMBER_ID
+					  or else KIND(HEAD_DEFN) = DN_ENUMERATION_ID
+					  or else KIND(HEAD_DEFN) = DN_CHARACTER_ID) then
+				    ERROR(D(LX_SRCPOS, NAME), "Cannot rename a literal or named number");
+				end if;
+			    end;
 			    while CUR /= CONST_VOID loop
 				case KIND(CUR) is
 				when DN_SELECTED =>
@@ -1226,6 +1371,8 @@ package body NODWALK is
 						    end if;
 						    if COMP_VAR_OR_DEP(PT, DF) then
 							DEP_DISCR := TRUE;
+						    end if;
+						    if DEP_DISCR then
 							if KIND(PT) /= DN_CONSTRAINED_RECORD
 							and then PB /= CONST_VOID and then KIND(PB) = DN_RECORD
 							and then D(SM_DISCRIMINANT_S, PB) /= CONST_VOID
@@ -1253,6 +1400,12 @@ package body NODWALK is
 					end if;
 					CUR := PFX;
 				    end;
+				when DN_CONVERSION =>
+				    ERROR(D(LX_SRCPOS, NAME), "Cannot rename a type conversion");
+				    exit;
+				when DN_FUNCTION_CALL | DN_NULLARY_CALL =>
+				    ERROR(D(LX_SRCPOS, NAME), "Cannot rename a subcomponent of a function call value");
+				    exit;
 				when DN_ALL =>
 				    UNCON_DEP := FALSE;
 				    DEP_DISCR := FALSE;
@@ -1421,8 +1574,11 @@ package body NODWALK is
 			NAME := D(AS_NAME, D(SM_UNIT_DESC, NAME_DEFN));
 		    end loop;
 
-		    -- if it is indeed a package id
-		    if KIND(NAME_DEFN) = DN_PACKAGE_ID then
+		    -- if it is indeed a package id (or enclosing generic package)
+		    if KIND(NAME_DEFN) = DN_PACKAGE_ID
+		    or else (KIND(NAME_DEFN) = DN_GENERIC_ID
+			     and then D(SM_SPEC, NAME_DEFN) /= CONST_VOID
+			     and then KIND(D(SM_SPEC, NAME_DEFN)) = DN_PACKAGE_SPEC) then
 
 			-- get the def corresponding to the package
 			PACKAGE_DEF := GET_DEF_FOR_ID(NAME_DEFN);
@@ -1462,6 +1618,7 @@ package body NODWALK is
 		BODY_NODE: TREE := D(AS_BODY, NODE);
 		FIRST_HEADER: TREE := CONST_VOID;
 		HEADER: TREE := D(AS_HEADER, NODE);
+		IS_SEPARATE_CU: constant BOOLEAN := (FIRST_NAME /= SOURCE_NAME);
 
 		H: H_TYPE := WALK.H;
 		S: S_TYPE;
@@ -1561,16 +1718,33 @@ package body NODWALK is
 		end if;
 
 		if FIRST_NAME /= SOURCE_NAME then
+		    if not IS_SEPARATE_CU and then HAS_RECORDED_BODY(FIRST_NAME) then
+			ERROR(D(LX_SRCPOS, NODE),
+			      "Duplicate body for subprogram - "
+			      & PRINTNAME(D(LX_SYMREP, SOURCE_NAME)));
+		    end if;
 		    RECORD_BODY(FIRST_NAME);
 		    if KIND(FIRST_NAME) in CLASS_SUBPROG_NAME
 		    and then D(SM_INTERFACE, FIRST_NAME) /= CONST_VOID then
 			ERROR(D(LX_SRCPOS, NODE), "Body not allowed for interfaced subprogram");
+		    elsif KIND(FIRST_NAME) in CLASS_SUBPROG_NAME
+		    and then D(SM_UNIT_DESC, FIRST_NAME) /= CONST_VOID
+		    and then (KIND(D(SM_UNIT_DESC, FIRST_NAME)) = DN_RENAMES_UNIT
+			      or else KIND(D(SM_UNIT_DESC, FIRST_NAME)) = DN_INSTANTIATION) then
+			ERROR(D(LX_SRCPOS, NODE), "Body not allowed for subprogram renaming or instantiation");
 		    end if;
 		    --D(XD_BODY, FIRST_NAME, BODY_NODE);
 		    D(SM_SPEC, SOURCE_NAME, D(SM_SPEC, FIRST_NAME));
 		    CONFORM_PARAMETER_LISTS
 				( D(AS_PARAM_S, D(SM_SPEC, FIRST_NAME))
 				, D(AS_PARAM_S, HEADER) );
+		    if KIND(HEADER) = DN_FUNCTION_SPEC
+		    and then KIND(D(SM_SPEC, FIRST_NAME)) = DN_FUNCTION_SPEC
+		    and then not IS_COMPATIBLE_EXPRESSION
+				( D(AS_NAME, D(SM_SPEC, FIRST_NAME))
+				, D(AS_NAME, HEADER) ) then
+			ERROR(D(LX_SRCPOS, HEADER), "Return subtype does not conform to specification");
+		    end if;
 		    REMOVE_DEF_FROM_ENVIRONMENT(SOURCE_DEF);
 		    SOURCE_DEF := PRIOR_DEF;
 		end if;
@@ -1706,7 +1880,9 @@ package body NODWALK is
 			      or else KIND(D(SM_UNIT_DESC, FIRST_NAME)) = DN_RENAMES_UNIT)
 		    then
 			ERROR(D(LX_SRCPOS, NODE), "Body not allowed for package instantiation or renaming");
-		    elsif D(XD_BODY, FIRST_NAME) /= CONST_VOID then
+		    elsif D(XD_BODY, FIRST_NAME) /= CONST_VOID
+		    or else (D(SM_FIRST, SOURCE_NAME) = SOURCE_NAME
+			     and then HAS_RECORDED_BODY(FIRST_NAME)) then
 			ERROR(D(LX_SRCPOS,NODE)
                                     , "Duplicate body for package - "
 				      & PRINTNAME(D(LX_SYMREP,SOURCE_NAME)) );
@@ -1719,9 +1895,7 @@ package body NODWALK is
 		D(XD_REGION, SOURCE_NAME, D(XD_REGION, FIRST_NAME));
 		RECORD_BODY(FIRST_NAME);
 		if KIND(BODY_NODE) = DN_STUB then
-		    null;
-		    -- D(XD_STUB, SOURCE_NAME, SOURCE_NAME);
-		    -- D(XD_STUB, FIRST_NAME, SOURCE_NAME);
+		    WALK_UNIT_DESC(SOURCE_NAME, BODY_NODE, H);
 		else
 		    -- D(XD_BODY, FIRST_NAME, NODE);
 		    -- D(XD_BODY, SOURCE_NAME, NODE);
@@ -1846,18 +2020,28 @@ package body NODWALK is
 		else
 		    REMOVE_DEF_FROM_ENVIRONMENT(SOURCE_DEF);
 		    PRIOR_NAME := D(XD_SOURCE_NAME, PRIOR_DEF);
-		    D(SM_FIRST, SOURCE_NAME, PRIOR_NAME);
-		    if D(XD_BODY, TASK_TYPE) /= CONST_VOID
-		    or else (D(XD_STUB, TASK_TYPE) /= CONST_VOID
-				and then KIND(BODY_NODE) = DN_STUB)
-		    then
-			ERROR(D(LX_SRCPOS,SOURCE_NAME),
-                                    "Duplicate body or stub declaration");
-			TASK_TYPE := CONST_VOID;
-		    else
-			SOURCE_DEF := PRIOR_DEF;
-			--D(SM_BODY, TASK_TYPE, BODY_NODE);
-		    end if;
+		    declare
+			IS_SEP_T: constant BOOLEAN := (D(SM_FIRST, SOURCE_NAME) /= SOURCE_NAME);
+		    begin
+			D(SM_FIRST, SOURCE_NAME, PRIOR_NAME);
+			if KIND(PRIOR_NAME) = DN_SUBTYPE_ID
+			or else D(SM_DERIVED, TASK_TYPE) /= CONST_VOID then
+			    ERROR(D(LX_SRCPOS, SOURCE_NAME),
+				  "Task body not allowed for subtype or derived type");
+			    TASK_TYPE := CONST_VOID;
+			elsif D(XD_BODY, TASK_TYPE) /= CONST_VOID
+			or else (not IS_SEP_T and then HAS_RECORDED_BODY(PRIOR_NAME))
+			or else (D(XD_STUB, TASK_TYPE) /= CONST_VOID
+				    and then KIND(BODY_NODE) = DN_STUB)
+			then
+			    ERROR(D(LX_SRCPOS,SOURCE_NAME),
+					"Duplicate body or stub declaration");
+			    TASK_TYPE := CONST_VOID;
+			else
+			    SOURCE_DEF := PRIOR_DEF;
+			    --D(SM_BODY, TASK_TYPE, BODY_NODE);
+			end if;
+		    end;
 		end if;
 
 		if TASK_TYPE /= CONST_VOID then
@@ -2363,7 +2547,20 @@ package body NODWALK is
 		    end if;
 		    EVAL_EXP_TYPES(EXP, TYPESET);
 		    REQUIRE_TYPE(GET_BASE_TYPE(TYPE_SPEC), EXP, TYPESET);
-		    EXP := RESOLVE_EXP(EXP, TYPESET);
+		    declare
+			SUB_T: TREE := TYPE_SPEC;
+		    begin
+			if SUB_T /= CONST_VOID and then NAME /= CONST_VOID and then GET_NAME_DEFN(NAME) /= CONST_VOID then
+			    SUB_T := D(SM_TYPE_SPEC, GET_NAME_DEFN(NAME));
+			end if;
+			if EXP /= CONST_VOID and then KIND(EXP) = DN_AGGREGATE
+			and then not IS_EMPTY(TYPESET)
+			and then SUB_T /= CONST_VOID and then KIND(SUB_T) = DN_CONSTRAINED_ARRAY then
+			    EXP := RESOLVE_EXP(EXP, SUB_T);
+			else
+			    EXP := RESOLVE_EXP(EXP, TYPESET);
+			end if;
+		    end;
 		    IN_DEFAULT_EXP := PREV_DEF_E;
 		    ALLOW_DEFERRED_CONST := PREV_ALLOW_DC;
 		end;
@@ -2396,9 +2593,6 @@ package body NODWALK is
 		    and then (KIND(D(SM_UNIT_DESC, H_SN)) = DN_RENAMES_UNIT
 			      or else KIND(D(SM_UNIT_DESC, H_SN)) in DN_BOX_DEFAULT .. DN_NO_DEFAULT)
 		    then
-			ALLOWED := TRUE;
-		    elsif ENC_REG /= CONST_VOID
-		    and then KIND(D(XD_SOURCE_NAME, ENC_REG)) = DN_GENERIC_ID then
 			ALLOWED := TRUE;
 		    end if;
 		end if;
@@ -2492,7 +2686,13 @@ package body NODWALK is
 
 	    EVAL_EXP_TYPES(EXP, TYPESET);
 	    REQUIRE_TYPE(GET_BASE_TYPE(TYPE_SPEC), EXP, TYPESET);
-	    EXP := RESOLVE_EXP(EXP, TYPESET);
+	    if EXP /= CONST_VOID and then KIND(EXP) = DN_AGGREGATE
+	    and then not IS_EMPTY(TYPESET)
+	    and then TYPE_SPEC /= CONST_VOID and then KIND(TYPE_SPEC) = DN_CONSTRAINED_ARRAY then
+		EXP := RESOLVE_EXP(EXP, TYPE_SPEC);
+	    else
+		EXP := RESOLVE_EXP(EXP, TYPESET);
+	    end if;
 	end if;
 
 	INSERT_OBJ_TYPE_AND_INIT_EXP_IN_S(SOURCE_NAME_S
@@ -2615,16 +2815,67 @@ package body NODWALK is
 
 
     function IS_CONSTANT_EXP (EXP: TREE) return BOOLEAN is
-	-- returns True if Exp is a name of a constant
-	-- (for purposes of renames)
+	-- returns True if Exp is a name of a constant (or constant value)
+	-- (for purposes of renames, LRM 3.2.1(12) / 8.5(5))
     begin
-	if KIND(EXP) = DN_SELECTED then
-	    return IS_CONSTANT_EXP(D(AS_DESIGNATOR, EXP));
-	elsif KIND(EXP) = DN_USED_OBJECT_ID then
-	    return KIND(D(SM_DEFN,EXP)) = DN_CONSTANT_ID;
-	else
+	if EXP = CONST_VOID then
 	    return FALSE;
 	end if;
+	case KIND(EXP) is
+	when DN_USED_OBJECT_ID =>
+	    declare
+		DF: constant TREE := D(SM_DEFN, EXP);
+	    begin
+		return DF /= CONST_VOID
+		       and then (KIND(DF) = DN_CONSTANT_ID
+				 or else KIND(DF) = DN_IN_ID
+				 or else KIND(DF) = DN_ITERATION_ID
+				 or else KIND(DF) = DN_DISCRIMINANT_ID
+				 or else KIND(DF) = DN_NUMBER_ID
+				 or else KIND(DF) = DN_ENUMERATION_ID
+				 or else KIND(DF) = DN_CHARACTER_ID);
+	    end;
+	when DN_SELECTED =>
+	    declare
+		PFX: constant TREE := D(AS_NAME, EXP);
+		DES: constant TREE := D(AS_DESIGNATOR, EXP);
+		DF: TREE := CONST_VOID;
+	    begin
+		if DES /= CONST_VOID and then KIND(DES) = DN_USED_OBJECT_ID then
+		    DF := D(SM_DEFN, DES);
+		end if;
+		if DF /= CONST_VOID and then KIND(DF) = DN_DISCRIMINANT_ID then
+		    return TRUE;
+		elsif DF /= CONST_VOID and then KIND(DF) = DN_COMPONENT_ID then
+		    if PFX /= CONST_VOID and then D(SM_EXP_TYPE, PFX) /= CONST_VOID
+		    and then KIND(GET_BASE_STRUCT(D(SM_EXP_TYPE, PFX))) = DN_ACCESS then
+			return FALSE;
+		    end if;
+		    return IS_CONSTANT_EXP(PFX);
+		else
+		    return IS_CONSTANT_EXP(DES);
+		end if;
+	    end;
+	when DN_INDEXED | DN_SLICE =>
+	    declare
+		PFX: constant TREE := D(AS_NAME, EXP);
+	    begin
+		if PFX /= CONST_VOID and then D(SM_EXP_TYPE, PFX) /= CONST_VOID
+		and then KIND(GET_BASE_STRUCT(D(SM_EXP_TYPE, PFX))) = DN_ACCESS then
+		    return FALSE;
+		end if;
+		return IS_CONSTANT_EXP(PFX);
+	    end;
+	when DN_ALL =>
+	    return FALSE;
+	when DN_CONVERSION =>
+	    return IS_CONSTANT_EXP(D(AS_EXP, EXP));
+	when DN_FUNCTION_CALL | DN_STRING_LITERAL | DN_AGGREGATE | DN_QUALIFIED
+	   | DN_NUMERIC_LITERAL | DN_USED_CHAR | DN_ATTRIBUTE =>
+	    return TRUE;
+	when others =>
+	    return FALSE;
+	end case;
     end IS_CONSTANT_EXP;
 
 
@@ -2636,6 +2887,7 @@ package body NODWALK is
 	ITEM: TREE;
 	ITEM_DEFN: TREE;
 	ITEM_DEF: TREE;
+	HOPS: NATURAL;
     begin
 	if DECL_S = CONST_VOID then
 	    return;
@@ -2648,15 +2900,26 @@ package body NODWALK is
 		ITEM_LIST := LIST(D(AS_NAME_S, DECL));
 		while not IS_EMPTY(ITEM_LIST) loop
 		    POP(ITEM_LIST, ITEM);
-		    if KIND(ITEM) = DN_SELECTED then
-			ITEM := D(AS_DESIGNATOR, ITEM);
-		    end if;
-		    if KIND(ITEM) = DN_USED_NAME_ID then
-			ITEM_DEFN := D(SM_DEFN, ITEM);
-		    else
-			ITEM_DEFN := CONST_VOID;
-		    end if;
-		    if KIND(ITEM_DEFN) = DN_PACKAGE_ID then
+		    HOPS := 0;
+		    loop
+			if KIND(ITEM) = DN_SELECTED then
+			    ITEM := D(AS_DESIGNATOR, ITEM);
+			end if;
+			if KIND(ITEM) = DN_USED_NAME_ID then
+			    ITEM_DEFN := D(SM_DEFN, ITEM);
+			else
+			    ITEM_DEFN := CONST_VOID;
+			end if;
+			HOPS := HOPS + 1;
+			exit when HOPS > 32
+			    or else ITEM_DEFN = CONST_VOID
+			    or else KIND(ITEM_DEFN) /= DN_PACKAGE_ID
+			    or else D(SM_UNIT_DESC, ITEM_DEFN) = CONST_VOID
+			    or else KIND(D(SM_UNIT_DESC, ITEM_DEFN))
+					/= DN_RENAMES_UNIT;
+			ITEM := D(AS_NAME, D(SM_UNIT_DESC, ITEM_DEFN));
+		    end loop;
+		    if ITEM_DEFN /= CONST_VOID and then KIND(ITEM_DEFN) = DN_PACKAGE_ID then
 			ITEM_DEF := GET_DEF_FOR_ID(ITEM_DEFN);
 			if DI(XD_LEX_LEVEL, ITEM_DEF) <= 0
 			and then not DB(XD_IS_USED, ITEM_DEF) then
@@ -2728,6 +2991,7 @@ package body NODWALK is
 	    D(SM_BASE_TYPE
 			, CONSTRAINED_SPEC
 			, UNCONSTRAINED_SPEC );
+	    D(SM_OBJ_TYPE, SOURCE_NAME, CONSTRAINED_SPEC);
 
 	    -- generate predefined operators for created type
 	    PREFCNS.GEN_PREDEFINED_OPERATORS
@@ -2764,13 +3028,52 @@ package body NODWALK is
             ERROR(D(LX_SRCPOS,OPERATOR_ID), "Definition of ""/="" operator");
 	end if;
 
+	-- LRM 6.7(2): operator declarations may not have default parameter values and must have valid arity
+	declare
+	    OP_STR: constant STRING := PRINTNAME(SYMREP);
+	    F_SPEC: constant TREE := D(SM_SPEC, OPERATOR_ID);
+	    P_LIST: SEQ_TYPE;
+	    P_DECL: TREE;
+	    SN_LIST: SEQ_TYPE;
+	    SN: TREE;
+	    P_CNT: NATURAL := 0;
+	begin
+	    if F_SPEC /= CONST_VOID and then KIND(F_SPEC) = DN_FUNCTION_SPEC then
+		P_LIST := LIST(D(AS_PARAM_S, F_SPEC));
+		while not IS_EMPTY(P_LIST) loop
+		    POP(P_LIST, P_DECL);
+		    if D(AS_EXP, P_DECL) /= CONST_VOID then
+			ERROR(D(LX_SRCPOS, P_DECL), "Default expression not allowed for operator parameter");
+		    end if;
+		    SN_LIST := LIST(D(AS_SOURCE_NAME_S, P_DECL));
+		    while not IS_EMPTY(SN_LIST) loop
+			POP(SN_LIST, SN);
+			P_CNT := P_CNT + 1;
+		    end loop;
+		end loop;
+		if OP_STR = """NOT""" or else OP_STR = """ABS""" then
+		    if P_CNT /= 1 then
+			ERROR(D(LX_SRCPOS, OPERATOR_ID), "Unary operator must have exactly one parameter");
+		    end if;
+		elsif OP_STR = """+""" or else OP_STR = """-""" then
+		    if P_CNT /= 1 and then P_CNT /= 2 then
+			ERROR(D(LX_SRCPOS, OPERATOR_ID), "Operator must have one or two parameters");
+		    end if;
+		elsif SYMREP /= EQUAL_SYM and then SYMREP /= NOT_EQUAL_SYM then
+		    if P_CNT /= 2 then
+			ERROR(D(LX_SRCPOS, OPERATOR_ID), "Binary operator must have exactly two parameters");
+		    end if;
+		end if;
+	    end if;
+	end;
+
 	if SYMREP = EQUAL_SYM then
-	    -- LRM 6.7(4): explicit "=" only allowed if both params have the same limited type
-	    -- and the result type is Boolean (except subprogram renamings, which may rename "="
-	    -- for non-limited types).
-	    if D(SM_UNIT_DESC, OPERATOR_ID) = CONST_VOID
-	    or else KIND(D(SM_UNIT_DESC, OPERATOR_ID)) /= DN_RENAMES_UNIT then
+	    -- LRM 6.7(4) / 8.5(11): explicit "=" requires two parameters of same type
+	    -- returning Boolean; non-renaming declarations also require a limited type.
 	    declare
+		IS_RENAMING: constant BOOLEAN :=
+		    D(SM_UNIT_DESC, OPERATOR_ID) /= CONST_VOID
+		    and then KIND(D(SM_UNIT_DESC, OPERATOR_ID)) = DN_RENAMES_UNIT;
 		F_SPEC: constant TREE := D(SM_SPEC, OPERATOR_ID);
 		P_LIST: SEQ_TYPE;
 		P_DECL: TREE;
@@ -2807,20 +3110,19 @@ package body NODWALK is
 		    then
 			STILL_LIMITED := TRUE;
 		    end if;
-		    if P_CNT /= 2
-		    or else T1 = CONST_VOID or else T2 = CONST_VOID
-		    or else T1 /= T2
-		    or else RET_T /= PREDEFINED_BOOLEAN
-		    or else (IS_NONLIMITED_TYPE(T1) and then not STILL_LIMITED)
+		    if P_CNT /= 2 then
+			ERROR(D(LX_SRCPOS, OPERATOR_ID),
+			      "Explicit ""="" requires two parameters of same limited type returning Boolean");
+		    elsif T1 /= CONST_VOID and then T2 /= CONST_VOID and then RET_T /= CONST_VOID
+		    and then (T1 /= T2
+			      or else RET_T /= PREDEFINED_BOOLEAN
+			      or else (not IS_RENAMING and then IS_NONLIMITED_TYPE(T1) and then not STILL_LIMITED))
 		    then
-			if T1 /= CONST_VOID and then T2 /= CONST_VOID and then RET_T /= CONST_VOID then
-			    ERROR(D(LX_SRCPOS, OPERATOR_ID),
-				  "Explicit ""="" requires two parameters of same limited type returning Boolean");
-			end if;
+			ERROR(D(LX_SRCPOS, OPERATOR_ID),
+			      "Explicit ""="" requires two parameters of same limited type returning Boolean");
 		    end if;
 		end if;
 	    end;
-	    end if;
 	    NEW_ID := COPY_NODE(OPERATOR_ID);
 	    -- set sm_first to the created id
 	    D(SM_FIRST, NEW_ID, NEW_ID);

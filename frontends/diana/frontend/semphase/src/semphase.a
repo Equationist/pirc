@@ -114,6 +114,7 @@ procedure SEMPHASE is
 	    --	  end if;
 	    --end loop;
 
+	    NODWALK.RESET_UNIT_BODIES;
 	    H.REGION_DEF := PREDEFINED_STANDARD_DEF;
 	    H.LEX_LEVEL := 2;
 	    H.IS_IN_SPEC := TRUE;

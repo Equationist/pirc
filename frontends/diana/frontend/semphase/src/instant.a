@@ -295,6 +295,21 @@ package body INSTANT is
                 ERROR(D(LX_SRCPOS, ACTUAL), "Positional parameter after named");
 	    else
 		ACTUAL_SYM := D(LX_SYMREP, D(AS_USED_NAME, ACTUAL));
+		if KIND(D(AS_USED_NAME, ACTUAL)) = DN_USED_OP
+		or else KIND(D(AS_USED_NAME, ACTUAL)) = DN_STRING_LITERAL then
+		    declare
+			S_ORIG: constant STRING := PRINTNAME(ACTUAL_SYM);
+			S: STRING(S_ORIG'RANGE) := S_ORIG;
+		    begin
+			for K in S'RANGE loop
+			    if S(K) in 'a' .. 'z' then
+				S(K) := CHARACTER'VAL(CHARACTER'POS(S(K)) - 32);
+			    end if;
+			end loop;
+			ACTUAL_SYM := STORESYM(S);
+			D(LX_SYMREP, D(AS_USED_NAME, ACTUAL), ACTUAL_SYM);
+		    end;
+		end if;
 
 		-- search formals for (unique) matching id
 		FORMAL_SUB := 0;
@@ -314,6 +329,8 @@ package body INSTANT is
 		-- if ok match, save actual
 		if FORMAL_SUB = 0 then
                     ERROR(D(LX_SRCPOS, ACTUAL), "No matching generic formal");
+		elsif FORMAL(FORMAL_SUB).ACTUAL /= CONST_VOID then
+		    ERROR(D(LX_SRCPOS, ACTUAL), "Duplicate generic argument assoc");
 		else
 		    ACTUAL_TO_FORMAL(ACTUAL_SUB) := FORMAL_SUB;
 		    FORMAL(FORMAL_SUB).ACTUAL := ACTUAL;
@@ -599,6 +616,35 @@ package body INSTANT is
 			and then D(SM_DISCRIMINANT_S, BT) /= CONST_VOID
 			and then not IS_EMPTY(LIST(D(SM_DISCRIMINANT_S, BT))) then
 			    declare
+				function EXPR_USES_DISCR_G(E: TREE) return BOOLEAN is
+				begin
+				    if E = CONST_VOID then return FALSE; end if;
+				    case KIND(E) is
+				    when DN_USED_OBJECT_ID =>
+					return D(SM_DEFN, E) /= CONST_VOID
+					       and then KIND(D(SM_DEFN, E)) = DN_DISCRIMINANT_ID;
+				    when DN_PARENTHESIZED | DN_CONVERSION | DN_QUALIFIED =>
+					return EXPR_USES_DISCR_G(D(AS_EXP, E));
+				    when DN_FUNCTION_CALL =>
+					declare
+					    AL: SEQ_TYPE := LIST(D(AS_GENERAL_ASSOC_S, E));
+					    A: TREE;
+					begin
+					    while not IS_EMPTY(AL) loop
+						POP(AL, A);
+						if KIND(A) = DN_ASSOC then
+						    if EXPR_USES_DISCR_G(D(AS_EXP, A)) then return TRUE; end if;
+						elsif EXPR_USES_DISCR_G(A) then
+						    return TRUE;
+						end if;
+					    end loop;
+					end;
+					return FALSE;
+				    when others =>
+					return FALSE;
+				    end case;
+				end EXPR_USES_DISCR_G;
+
 				function CT_DEP(T_IN: TREE) return BOOLEAN is
 				begin
 				    if T_IN = CONST_VOID then return FALSE; end if;
@@ -611,7 +657,7 @@ package body INSTANT is
 					    if DS_N /= CONST_VOID then EL := LIST(DS_N); end if;
 					    while not IS_EMPTY(EL) loop
 						POP(EL, E);
-						if GET_STATIC_VALUE(E) = CONST_VOID then
+						if EXPR_USES_DISCR_G(E) then
 						    return TRUE;
 						end if;
 					    end loop;
@@ -627,8 +673,8 @@ package body INSTANT is
 						POP(IL, IT);
 						if IT /= CONST_VOID and then D(SM_RANGE, IT) /= CONST_VOID
 						and then KIND(D(SM_RANGE, IT)) = DN_RANGE then
-						    if GET_STATIC_VALUE(D(AS_EXP1, D(SM_RANGE, IT))) = CONST_VOID
-						    or else GET_STATIC_VALUE(D(AS_EXP2, D(SM_RANGE, IT))) = CONST_VOID then
+						    if EXPR_USES_DISCR_G(D(AS_EXP1, D(SM_RANGE, IT)))
+						    or else EXPR_USES_DISCR_G(D(AS_EXP2, D(SM_RANGE, IT))) then
 							return TRUE;
 						    end if;
 						end if;
@@ -650,7 +696,9 @@ package body INSTANT is
 			case KIND(CUR) is
 			when DN_PARENTHESIZED | DN_FUNCTION_CALL | DN_NULLARY_CALL | DN_CONVERSION
 			   | DN_QUALIFIED | DN_ATTRIBUTE | DN_AGGREGATE | DN_NUMERIC_LITERAL
-			   | DN_STRING_LITERAL | DN_NULL_ACCESS =>
+			   | DN_STRING_LITERAL | DN_NULL_ACCESS | DN_USED_CHAR
+			   | DN_AND_THEN | DN_OR_ELSE | DN_RANGE_MEMBERSHIP | DN_TYPE_MEMBERSHIP
+			   | DN_QUALIFIED_ALLOCATOR | DN_SUBTYPE_ALLOCATOR =>
 			    BAD_IO := TRUE;
 			    exit;
 			when DN_INDEXED | DN_SLICE =>
@@ -771,6 +819,10 @@ package body INSTANT is
 		    if ACT_ID /= CONST_VOID and then KIND(ACT_ID) in CLASS_TYPE_NAME then
 			if CONTAINS_UNCOMPLETED_PRIVATE(D(SM_TYPE_SPEC, ACT_ID)) then
 			    ERROR(SRC_POS, "Premature use of uncompleted private type as generic actual");
+			elsif D(SM_TYPE_SPEC, ACT_ID) /= CONST_VOID
+			and then KIND(GET_BASE_STRUCT(D(SM_TYPE_SPEC, ACT_ID))) = DN_INCOMPLETE
+			and then D(XD_FULL_TYPE_SPEC, GET_BASE_STRUCT(D(SM_TYPE_SPEC, ACT_ID))) = CONST_VOID then
+			    ERROR(SRC_POS, "Premature use of incomplete type as generic actual");
 			end if;
 			FREEZE_TYPE(D(SM_TYPE_SPEC, ACT_ID));
 		    end if;
@@ -930,6 +982,10 @@ package body INSTANT is
 		    if ACT_ID /= CONST_VOID and then KIND(ACT_ID) in CLASS_TYPE_NAME then
 			if CONTAINS_UNCOMPLETED_PRIVATE(D(SM_TYPE_SPEC, ACT_ID)) then
 			    ERROR(SRC_POS, "Premature use of uncompleted private type as generic actual");
+			elsif D(SM_TYPE_SPEC, ACT_ID) /= CONST_VOID
+			and then KIND(GET_BASE_STRUCT(D(SM_TYPE_SPEC, ACT_ID))) = DN_INCOMPLETE
+			and then D(XD_FULL_TYPE_SPEC, GET_BASE_STRUCT(D(SM_TYPE_SPEC, ACT_ID))) = CONST_VOID then
+			    ERROR(SRC_POS, "Premature use of incomplete type as generic actual");
 			end if;
 			FREEZE_TYPE(D(SM_TYPE_SPEC, ACT_ID));
 		    end if;
@@ -1393,18 +1449,25 @@ package body INSTANT is
 			if F_DS /= CONST_VOID and then A_DS /= CONST_VOID then
 			    FL := LIST(F_DS);
 			    AL := LIST(A_DS);
-			    while not IS_EMPTY(FL) and then not IS_EMPTY(AL) loop
-				POP(FL, FD);
-				POP(AL, AD);
-				if KIND(FD) = DN_DSCRMT_DECL and then KIND(AD) = DN_DSCRMT_DECL then
-				    FNL := LIST(D(AS_SOURCE_NAME_S, FD));
-				    ANL := LIST(D(AS_SOURCE_NAME_S, AD));
-				    while not IS_EMPTY(FNL) and then not IS_EMPTY(ANL) loop
-					POP(FNL, FID);
-					POP(ANL, AID);
-					INSERT_NODE_HASH(NODE_HASH, AID, FID);
-				    end loop;
-				end if;
+			    FNL := MAKE;
+			    ANL := MAKE;
+			    loop
+				while IS_EMPTY(FNL) and then not IS_EMPTY(FL) loop
+				    POP(FL, FD);
+				    if KIND(FD) = DN_DSCRMT_DECL then
+					FNL := LIST(D(AS_SOURCE_NAME_S, FD));
+				    end if;
+				end loop;
+				while IS_EMPTY(ANL) and then not IS_EMPTY(AL) loop
+				    POP(AL, AD);
+				    if KIND(AD) = DN_DSCRMT_DECL then
+					ANL := LIST(D(AS_SOURCE_NAME_S, AD));
+				    end if;
+				end loop;
+				exit when IS_EMPTY(FNL) or else IS_EMPTY(ANL);
+				POP(FNL, FID);
+				POP(ANL, AID);
+				INSERT_NODE_HASH(NODE_HASH, AID, FID);
 			    end loop;
 			end if;
 		    end;
@@ -1440,9 +1503,15 @@ package body INSTANT is
 	when DN_FUNCTION_ID | DN_OPERATOR_ID =>
 	    HEADER := D(SM_SPEC, FORMAL_ID);
 	    SUBSTITUTE (HEADER, NODE_HASH, H);
-	    NEW_ID := MAKE_FUNCTION_ID
-			( SM_SPEC => HEADER
-			, SM_UNIT_DESC => CONST_VOID );
+	    if KIND(FORMAL_ID) = DN_OPERATOR_ID then
+		NEW_ID := MAKE_OPERATOR_ID
+			    ( SM_SPEC => HEADER
+			    , SM_UNIT_DESC => CONST_VOID );
+	    else
+		NEW_ID := MAKE_FUNCTION_ID
+			    ( SM_SPEC => HEADER
+			    , SM_UNIT_DESC => CONST_VOID );
+	    end if;
 	    D(SM_FIRST, NEW_ID, NEW_ID);
 	    NEW_DECL := MAKE_SUBPROG_ENTRY_DECL
 			( LX_SRCPOS => SRCPOS
@@ -1451,6 +1520,22 @@ package body INSTANT is
 			, AS_UNIT_KIND => MAKE_RENAMES_UNIT
 				( LX_SRCPOS => SRCPOS
 				, AS_NAME => ACTUAL_EXP ) );
+	    if KIND(FORMAL_ID) = DN_OPERATOR_ID
+	    and then D(XD_NOT_EQUAL, FORMAL_ID) /= CONST_VOID then
+		declare
+		    OLD_NE: constant TREE := D(XD_NOT_EQUAL, FORMAL_ID);
+		    NEW_NE: constant TREE := MAKE_OPERATOR_ID
+			( LX_SRCPOS => SRCPOS
+			, LX_SYMREP => D(LX_SYMREP, OLD_NE)
+			, SM_SPEC => HEADER
+			, SM_UNIT_DESC => MAKE_IMPLICIT_NOT_EQ(SM_EQUAL => NEW_ID) );
+		begin
+		    D(SM_FIRST, NEW_NE, NEW_NE);
+		    MAKE_DEF_VISIBLE(MAKE_DEF_FOR_ID(NEW_NE, H), HEADER);
+		    D(XD_NOT_EQUAL, NEW_ID, NEW_NE);
+		    INSERT_NODE_HASH(NODE_HASH, NEW_NE, OLD_NE);
+		end;
+	    end if;
 
 	when others =>
             QUIT("Bad generic actual id");
@@ -1648,8 +1733,18 @@ package body INSTANT is
 		    declare
 			NS: constant SEQ_TYPE := LIST(D(AS_SOURCE_NAME_S, IT));
 		    begin
-			if not IS_EMPTY(NS) and then TS_USES_F(D(SM_OBJ_TYPE, HEAD(NS))) then
-			    return TRUE;
+			if not IS_EMPTY(NS) then
+			    declare
+				OT: constant TREE := D(SM_OBJ_TYPE, HEAD(NS));
+			    begin
+				if TS_USES_F(OT) then
+				    return TRUE;
+				elsif OT /= CONST_VOID
+				and then (KIND(OT) = DN_ARRAY or else KIND(OT) = DN_CONSTRAINED_ARRAY)
+				and then TS_USES_F(D(SM_COMP_TYPE, GET_BASE_TYPE(OT))) then
+				    return TRUE;
+				end if;
+			    end;
 			end if;
 		    end;
 		    if EXP_BAD(D(AS_EXP, IT)) then return TRUE; end if;
@@ -1756,6 +1851,23 @@ package body INSTANT is
 			    end loop;
 			end;
 		    end if;
+		    if STM_S_BAD(D(AS_STM_S, S), DEPTH + 1) then return TRUE; end if;
+		when DN_CASE =>
+		    if D(AS_ALTERNATIVE_S, S) /= CONST_VOID then
+			declare
+			    AL: SEQ_TYPE := LIST(D(AS_ALTERNATIVE_S, S));
+			    A_IT: TREE;
+			begin
+			    while not IS_EMPTY(AL) loop
+				POP(AL, A_IT);
+				if KIND(A_IT) = DN_ALTERNATIVE
+				and then STM_S_BAD(D(AS_STM_S, A_IT), DEPTH + 1) then
+				    return TRUE;
+				end if;
+			    end loop;
+			end;
+		    end if;
+		when DN_ACCEPT =>
 		    if STM_S_BAD(D(AS_STM_S, S), DEPTH + 1) then return TRUE; end if;
 		when DN_LABELED =>
 		    if STM_S_BAD(D(AS_STM, S), DEPTH + 1) then return TRUE; end if;

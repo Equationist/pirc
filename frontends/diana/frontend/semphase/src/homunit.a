@@ -44,8 +44,55 @@ package body HOMUNIT is
 
 	if KIND(NEW_NAME) = DN_ATTRIBUTE then
 	    EVAL_ATTRIBUTE(NEW_NAME, TYPESET, dummy_flag, is_function => true);
-	    -- $$$$ should check for valid attribute
 	    NEW_NAME := RESOLVE_ATTRIBUTE(NEW_NAME);
+	    -- LRM 8.5(7): attribute renaming must have a function specification matching attribute profile
+	    if HEADER = CONST_VOID or else KIND(HEADER) /= DN_FUNCTION_SPEC then
+		ERROR(D(LX_SRCPOS, UNIT_NAME), "Attribute can only be renamed as a function");
+	    elsif KIND(NEW_NAME) = DN_ATTRIBUTE
+	    and then D(AS_USED_NAME_ID, NEW_NAME) /= CONST_VOID
+	    and then D(SM_DEFN, D(AS_USED_NAME_ID, NEW_NAME)) /= CONST_VOID
+	    and then KIND(D(SM_DEFN, D(AS_USED_NAME_ID, NEW_NAME))) = DN_ATTRIBUTE_ID then
+		declare
+		    ATTR_K: constant PRENAME.DEFINED_ATTRIBUTES :=
+			PRENAME.DEFINED_ATTRIBUTES'VAL(DI(XD_POS, D(SM_DEFN, D(AS_USED_NAME_ID, NEW_NAME))));
+		    PFX_T: constant TREE := GET_BASE_TYPE(D(AS_NAME, NEW_NAME));
+		    RET_T: constant TREE := GET_BASE_TYPE(D(AS_NAME, HEADER));
+		    PC1: PARAM_CURSOR_TYPE;
+		    P1_ID: TREE := CONST_VOID;
+		    P2_ID: TREE := CONST_VOID;
+		    P1_T: TREE := CONST_VOID;
+		begin
+		    INIT_PARAM_CURSOR(PC1, LIST(D(AS_PARAM_S, HEADER)));
+		    ADVANCE_PARAM_CURSOR(PC1);
+		    P1_ID := PC1.ID;
+		    if P1_ID /= CONST_VOID then
+			P1_T := GET_BASE_TYPE(D(SM_OBJ_TYPE, P1_ID));
+			ADVANCE_PARAM_CURSOR(PC1);
+			P2_ID := PC1.ID;
+		    end if;
+		    if P1_ID = CONST_VOID or else P2_ID /= CONST_VOID
+		    or else KIND(P1_ID) /= DN_IN_ID then
+			ERROR(D(LX_SRCPOS, UNIT_NAME), "Attribute renaming requires single IN parameter");
+		    elsif PFX_T /= CONST_VOID and then RET_T /= CONST_VOID and then P1_T /= CONST_VOID then
+			case ATTR_K is
+			when PRENAME.PRED | PRENAME.SUCC =>
+			    if P1_T /= PFX_T or else RET_T /= PFX_T then
+				ERROR(D(LX_SRCPOS, UNIT_NAME), "Attribute renaming profile mismatch");
+			    end if;
+			when PRENAME.IMAGE =>
+			    if P1_T /= PFX_T or else RET_T /= SEMGLOB.PREDEFINED_STRING then
+				ERROR(D(LX_SRCPOS, UNIT_NAME), "Attribute renaming profile mismatch");
+			    end if;
+			when PRENAME.VALUE =>
+			    if P1_T /= SEMGLOB.PREDEFINED_STRING or else RET_T /= PFX_T then
+				ERROR(D(LX_SRCPOS, UNIT_NAME), "Attribute renaming profile mismatch");
+			    end if;
+			when others =>
+			    null;
+			end case;
+		    end if;
+		end;
+	    end if;
 	    -- LRM 8.5(7) / 4.3.2(6) (b85013d): 'VALUE has unconstrained STRING formal -> OTHERS illegal in default
 	    if KIND(NEW_NAME) = DN_ATTRIBUTE
 	    and then D(AS_USED_NAME_ID, NEW_NAME) /= CONST_VOID
@@ -94,11 +141,13 @@ package body HOMUNIT is
 		    DEF := GET_DEF(DEFINTERP);
 		    DEF_HEADER := D(XD_HEADER, DEF);
 		    if INDEX = CONST_VOID then
-			if KIND(DEF_HEADER)
+			if (KIND(D(XD_SOURCE_NAME, DEF)) /= DN_GENERIC_ID
+			    or else DI(XD_LEX_LEVEL, DEF) > 0)
+			and then (KIND(DEF_HEADER)
 				in DN_PROCEDURE_SPEC .. DN_FUNCTION_SPEC
 			or else ( KIND(DEF_HEADER) = DN_ENTRY
 				and then D(AS_DISCRETE_RANGE, DEF_HEADER)
-					= CONST_VOID )
+					= CONST_VOID ))
 			then
 			    if ARE_HOMOGRAPH_HEADERS (HEADER, DEF_HEADER, CHECK_MODES => FALSE)
 			    then
@@ -111,7 +160,8 @@ package body HOMUNIT is
 			    DEF_HEADER := D(SM_SPEC, D(XD_SOURCE_NAME,DEF));
 			end if;
 
-			if KIND(DEF_HEADER) = DN_ENTRY
+			if KIND(HEADER) = DN_PROCEDURE_SPEC
+			and then KIND(DEF_HEADER) = DN_ENTRY
 			and then D(AS_DISCRETE_RANGE, DEF_HEADER) /= CONST_VOID
 			then
 			    CHECK_ACTUAL_TYPE
@@ -232,9 +282,14 @@ package body HOMUNIT is
 		    if IS_EMPTY(DEFSET) then
 			INDEX := RESOLVE_EXP(INDEX, CONST_VOID);
 		    else
-			INDEX := RESOLVE_EXP(INDEX,
-				GET_TYPE_OF_DISCRETE_RANGE
-					( D(AS_DISCRETE_RANGE, DEF_HEADER) ));
+			declare
+			    U_DEF2: constant TREE := GET_DEF(HEAD(DEFSET));
+			    U_HDR2: constant TREE := D(SM_SPEC, D(XD_SOURCE_NAME, U_DEF2));
+			begin
+			    INDEX := RESOLVE_EXP(INDEX,
+				    GET_TYPE_OF_DISCRETE_RANGE
+					    ( D(AS_DISCRETE_RANGE, U_HDR2) ));
+			end;
 		    end if;
 		    NEW_NAME := MAKE_INDEXED
 			    ( AS_NAME => NEW_NAME
