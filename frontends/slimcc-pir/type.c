@@ -233,11 +233,14 @@ Type *add_qual(QualMask msk, Type *ty, Token *tok) {
   if (!msk)
     return ty;
 
-  if (is_array(ty))
+  if (is_array(ty)) {
+    if (tok && (msk & Q_ATOMIC))
+      error_tok(tok, "invalid qualifier for type");
     return copy_array_ty(add_qual2(msk, get_elem(ty), tok), ty);
+  }
 
   Type *ret = add_qual2(msk, ty, tok);
-  if (ty->size < 0) {
+  if (ret != ty && ty->size < 0) {
     ret->decl_next = ty->decl_next;
     ty->decl_next = ret;
   }
@@ -253,6 +256,9 @@ bool chk_qual_type(QualMask qual, Type *ty) {
   if (qual & Q_ATOMIC)
     if (is_decay_ty(ty) || ty->kind == TY_VOID)
       return true;
+  if (is_iso_std && (qual & (Q_CONST | Q_VOLATILE)) &&
+      (ty->kind == TY_FUNC || ty->kind == TY_FUNC_INCMP))
+    return true;
   return false;
 }
 
@@ -623,6 +629,7 @@ Type *composite_type(Type *t1, Type *t2) {
   }
   if (t1->kind == TY_PTR && t2->kind == TY_PTR) {
     Type *res = copy_type(t1);
+    res->origin = NULL;
     res->base = composite_type(t1->base, t2->base);
     return res;
   }
@@ -691,7 +698,7 @@ void array_setty(Type *ty, Type *base, int64_t len) {
   ty->kind = TY_ARRAY;
   if (base->size > 0 && len > INT64_MAX / base->size)
     error("array size is too large");
-  ty->size = base->size * len;
+  ty->size = (len < 0) ? -1 : base->size * len;
   ty->align = base->align;
   ty->array_len = len;
 }
@@ -747,9 +754,11 @@ Node *assign_cast(Type *to_ty, Node *expr) {
           error_tok(expr->tok, "incompatible pointer types");
         if ((!expr->tok || !expr->tok->file || !expr->tok->file->is_syshdr)) {
           Type *tb = to_ty->base, *eb = expr->ty->base;
-          if ((tb->qual & Q_ATOMIC) != (eb->qual & Q_ATOMIC))
+          QualMask tq = (tb->kind == TY_VOID || !is_array(tb)) ? tb->qual : get_elem(tb)->qual;
+          QualMask eq = (eb->kind == TY_VOID || !is_array(eb)) ? eb->qual : get_elem(eb)->qual;
+          if ((tq & Q_ATOMIC) != (eq & Q_ATOMIC))
             error_tok(expr->tok, "incompatible pointer types");
-          if (eb->qual & ~tb->qual & (Q_CONST | Q_VOLATILE | Q_RESTRICT))
+          if (eq & ~tq & (Q_CONST | Q_VOLATILE | Q_RESTRICT))
             error_tok(expr->tok, "assignment discards qualifiers from pointer target type");
           while (is_array(tb) && is_array(eb)) {
             tb = tb->base;
@@ -856,6 +865,7 @@ static Type *cond_ptr_conv2(Type *ty1, Type *ty2, Node **cond, Obj **cond_var) {
   }
   if (ty1->kind == TY_PTR) {
     Type *newty = copy_type(ty1);
+    newty->origin = NULL;
     newty->base = cond_ptr_conv2(ty1->base, ty2->base, cond, cond_var);
     return add_qual(ty2->qual, newty, NULL);
   }
@@ -883,7 +893,9 @@ static Type *cond_ptr_conv(Node **lhs, Node **rhs, Node **cond) {
     if (ty1->base->kind == TY_VOID || ty2->base->kind == TY_VOID) {
       if (is_iso_std && (ty1->base->kind == TY_FUNC || ty2->base->kind == TY_FUNC))
         error_tok((*lhs)->tok, "incompatible pointer types in conditional expression");
-      return pointer_to(add_qual(ty1->base->qual | ty2->base->qual, ty_void, NULL));
+      QualMask q1 = is_array(ty1->base) ? get_elem(ty1->base)->qual : ty1->base->qual;
+      QualMask q2 = is_array(ty2->base) ? get_elem(ty2->base)->qual : ty2->base->qual;
+      return pointer_to(add_qual(q1 | q2, ty_void, NULL));
     }
 
     if (is_compatible(ty1->base, ty2->base) &&

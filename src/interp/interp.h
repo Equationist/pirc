@@ -63,6 +63,7 @@ typedef struct {
     int                  exit_code;
     char                 err_msg[256];
     uint32_t             call_depth;
+    uint32_t             next_frame_id;
     /* Shadow-stack exception unwinding state (M4) */
     bool                 unwinding;
     PirPtr               unwind_target_jb;

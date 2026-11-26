@@ -132,7 +132,8 @@ static void classify_sysv_agg(const PirModule *mod, const PirTargetSpec *target,
             if (w.f64_cnt[i] == 0u && w.f32_cnt[i] >= 1u && ((uint64_t)i * 8u + 4u >= ly.size)) {
                 st = pir_type_scalar(PIR_SCALAR_F32);
             } else if (w.f64_cnt[i] == 0u && w.f32_cnt[i] >= 2u) {
-                st = pir_type_vec(PIR_VEC_V2F32);
+                st = (target->caps.max_simd_bits >= 64u)
+                     ? pir_type_vec(PIR_VEC_V2F32) : pir_type_scalar(PIR_SCALAR_F64);
             }
             out->regs[out->reg_count++] = st;
             out->fp_used++;

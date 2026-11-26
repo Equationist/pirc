@@ -13,6 +13,7 @@
 #include <string.h>
 
 #define PIR_MAX_CALL_DEPTH 1024u
+#define PIR_MAX_ALLOC_SIZE (UINT64_C(1) << 30)
 
 /* =========================================================================
  * Diagnostics & Provenance Memory Engine
@@ -34,6 +35,12 @@ static uint64_t align_up_u64(uint64_t v, uint64_t align) {
 
 uint32_t pir_interp_alloc_new(PirInterp *it, size_t size, uint32_t align,
                               bool readonly, bool is_heap, bool is_dyn, bool zero_init) {
+    if ((uint64_t)size > PIR_MAX_ALLOC_SIZE) {
+        if (!is_heap) {
+            pir_interp_fail(it, PIR_INTERP_ERR, "allocation size %zu exceeds interpreter limit", size);
+        }
+        return 0u;
+    }
     if (align == 0u) align = 1u;
     uint64_t a_align = align < 16u ? 16u : (uint64_t)align;
     uint64_t base = align_up_u64(it->next_addr, a_align);
@@ -44,7 +51,14 @@ uint32_t pir_interp_alloc_new(PirInterp *it, size_t size, uint32_t align,
     size_t alloc_sz = size > 0u ? size : 1u;
     al.bytes        = (uint8_t *)calloc(alloc_sz, 1u);
     al.init_bits    = (uint8_t *)calloc(alloc_sz, 1u);
-    if (!al.bytes || !al.init_bits) abort();
+    if (!al.bytes || !al.init_bits) {
+        free(al.bytes);
+        free(al.init_bits);
+        if (!is_heap) {
+            pir_interp_fail(it, PIR_INTERP_ERR, "out of memory allocating %zu bytes", size);
+        }
+        return 0u;
+    }
     if (zero_init && size > 0u) {
         memset(al.init_bits, 1, size);
     }
@@ -505,6 +519,7 @@ static bool eval_fcmp_lane(PirOpcode op, double a, double b) {
 
 typedef struct {
     const PirFunction *fn;
+    uint32_t           frame_id;
     PirVal            *vals;
     PIR_VEC(uint32_t)  stack_allocs;
     const PirVal      *varargs;
@@ -617,11 +632,16 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
     CallFrame fr;
     memset(&fr, 0, sizeof(fr));
     fr.fn = fn;
+    fr.frame_id = ++it->next_frame_id;
     fr.vals = (PirVal *)calloc(fn->values.len + 1u, sizeof(PirVal));
     if (!fr.vals) abort();
-    for (uint32_t i = 0u; i < fn->param_count && i < arg_count; ++i) {
+    for (uint32_t i = 0u; i < fn->param_count; ++i) {
         if (fn->params[i].val_id < fn->values.len) {
-            fr.vals[fn->params[i].val_id] = args[i];
+            if (i < arg_count) {
+                fr.vals[fn->params[i].val_id] = args[i];
+            } else {
+                fr.vals[fn->params[i].val_id].ty = fn->params[i].type;
+            }
         }
     }
     if (fn->is_variadic && arg_count > fn->param_count) {
@@ -1016,10 +1036,14 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
 
                 case PIR_OP_BITCAST: {
                     PirVal src = eval_operand(it, &fr, &inst->operands[0]);
-                    if (src.ty.kind == PIR_TYPE_SCALAR && src.ty.u.scalar == PIR_SCALAR_PTR) {
+                    bool src_is_ptr = (src.ty.kind == PIR_TYPE_SCALAR && src.ty.u.scalar == PIR_SCALAR_PTR);
+                    bool dst_is_ptr = (inst->ty.kind == PIR_TYPE_SCALAR && inst->ty.u.scalar == PIR_SCALAR_PTR);
+                    if (src_is_ptr && dst_is_ptr) {
+                        r0.ptr = src.ptr;
+                    } else if (src_is_ptr) {
                         uint64_t a = pir_interp_ptr_to_int(it, src.ptr);
                         memcpy(r0.bytes, &a, it->ptr_bytes);
-                    } else if (inst->ty.kind == PIR_TYPE_SCALAR && inst->ty.u.scalar == PIR_SCALAR_PTR) {
+                    } else if (dst_is_ptr) {
                         uint64_t a = 0u;
                         memcpy(&a, src.bytes, it->ptr_bytes);
                         r0.ptr = pir_interp_int_to_ptr(it, a);
@@ -1072,6 +1096,7 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                 case PIR_OP_ALLOCA_PTR: {
                     uint32_t aid = pir_interp_alloc_new(it, (size_t)inst->imm_u64, inst->align,
                                                         false, false, false, false);
+                    if (aid == 0u) break;
                     PIR_VEC_PUSH(&fr.stack_allocs, aid);
                     r0.ptr.alloc_id = aid;
                     r0.ptr.offset   = 0;
@@ -1083,6 +1108,7 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                     uint64_t sz = pir_val_get_u64(&szv);
                     uint32_t aid = pir_interp_alloc_new(it, (size_t)sz, inst->align,
                                                         false, false, true, false);
+                    if (aid == 0u) break;
                     PIR_VEC_PUSH(&fr.stack_allocs, aid);
                     r0.ptr.alloc_id = aid;
                     r0.ptr.offset   = 0;
@@ -1090,26 +1116,31 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                 }
 
                 case PIR_OP_STACKSAVE: {
-                    /* Encode current stack_allocs watermark inside a sentinel pointer. */
-                    r0.ptr.alloc_id = 0xFFFFFFFEu;
+                    /* Encode frame_id + current stack_allocs watermark inside a sentinel pointer. */
+                    r0.ptr.alloc_id = 0x80000000u | (fr.frame_id & 0x7FFFFFFFu);
                     r0.ptr.offset   = (int64_t)fr.stack_allocs.len;
                     break;
                 }
 
                 case PIR_OP_STACKRESTORE: {
                     PirVal sp = eval_operand(it, &fr, &inst->operands[0]);
-                    if (sp.ptr.alloc_id != 0xFFFFFFFEu || sp.ptr.offset < 0 ||
+                    uint32_t expected_tag = 0x80000000u | (fr.frame_id & 0x7FFFFFFFu);
+                    if (sp.ptr.alloc_id != expected_tag || sp.ptr.offset < 0 ||
                         (uint64_t)sp.ptr.offset > fr.stack_allocs.len) {
                         pir_interp_fail(it, PIR_INTERP_UB, "invalid stackrestore token");
                         break;
                     }
                     uint32_t mark = (uint32_t)sp.ptr.offset;
+                    uint32_t keep = mark;
                     for (uint32_t k = mark; k < fr.stack_allocs.len; ++k) {
                         uint32_t aid = fr.stack_allocs.data[k];
                         if (it->allocs.data[aid].is_dyn_stack) {
                             it->allocs.data[aid].alive = false;
+                        } else {
+                            fr.stack_allocs.data[keep++] = aid;
                         }
                     }
+                    fr.stack_allocs.len = keep;
                     break;
                 }
 
@@ -1282,7 +1313,16 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                         break;
                     }
                     PirFuncId cid = it->allocs.data[fn_ptr.ptr.alloc_id].func_id;
+                    const PirFunction *callee = &it->mod->funcs.data[cid];
                     uint32_t nargs = inst->operand_count - 1u;
+                    if ((!callee->is_variadic && nargs != callee->param_count) ||
+                        (callee->is_variadic && nargs < callee->param_count)) {
+                        pir_interp_fail(it, PIR_INTERP_UB,
+                                        "call_indirect argument count mismatch for '@%s' (expected %s%u, got %u)",
+                                        callee->name, callee->is_variadic ? "at least " : "",
+                                        callee->param_count, nargs);
+                        break;
+                    }
                     PirVal *cargs = nargs ? (PirVal *)malloc(nargs * sizeof(PirVal)) : NULL;
                     for (uint32_t k = 0u; k < nargs; ++k) {
                         cargs[k] = eval_operand(it, &fr, &inst->operands[1u + k]);
@@ -1387,8 +1427,9 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
  * ========================================================================= */
 
 static size_t compute_global_size(const PirGlobal *g, uint8_t ptr_bytes) {
-    if (g->has_type && !g->is_braced) {
-        return type_byte_size(g->type, ptr_bytes);
+    if (g->has_type && (!g->is_braced || g->type.kind == PIR_TYPE_VECTOR)) {
+        size_t sz = type_byte_size(g->type, ptr_bytes);
+        return sz > 0u ? sz : 1u;
     }
     size_t total = 0u;
     for (uint32_t k = 0u; k < g->item_count; ++k) {
@@ -1429,6 +1470,7 @@ static bool init_globals(PirInterp *it) {
         size_t sz = compute_global_size(g, it->ptr_bytes);
         uint32_t al = g->align ? g->align : 1u;
         uint32_t aid = pir_interp_alloc_new(it, sz, al, false, false, false, true);
+        if (aid == 0u) return false;
         it->global_allocs[i] = aid;
     }
 
@@ -1437,18 +1479,50 @@ static bool init_globals(PirInterp *it) {
         const PirGlobal *g = &mod->globals.data[i];
         uint32_t aid = it->global_allocs[i];
         PirPtr base = { aid, 0 };
-        if (g->has_type && !g->is_braced && !g->is_zeroinit && g->item_count == 1u) {
+        if (g->has_type && g->type.kind == PIR_TYPE_VECTOR && g->is_braced && !g->is_zeroinit) {
+            PirScalarType elem = pir_vec_elem_scalar(g->type.u.vec);
+            size_t esz = pir_scalar_bits(elem, it->ptr_bytes) / 8u;
+            size_t total_sz = type_byte_size(g->type, it->ptr_bytes);
+            size_t off = 0u;
+            for (uint32_t k = 0u; k < g->item_count && off + esz <= total_sz; ++k) {
+                const PirGlobalItem *gi = &g->items[k];
+                PirPtr dst = { aid, (int64_t)off };
+                if (gi->kind == PIR_GITEM_INT && esz <= 8u) {
+                    uint64_t x = gi->int_neg ? (UINT64_C(0) - gi->int_lo) : gi->int_lo;
+                    pir_interp_mem_write(it, dst, &x, esz, 1u);
+                } else if (gi->kind == PIR_GITEM_FLOAT && esz <= 8u) {
+                    uint64_t fb = gi->float_bits;
+                    if (elem == PIR_SCALAR_F32) {
+                        double dv = 0.0;
+                        memcpy(&dv, &fb, sizeof(dv));
+                        float fv = (float)dv;
+                        pir_interp_mem_write(it, dst, &fv, 4u, 1u);
+                    } else {
+                        pir_interp_mem_write(it, dst, &fb, 8u, 1u);
+                    }
+                }
+                off += esz;
+            }
+        } else if (g->has_type && !g->is_braced && !g->is_zeroinit && g->item_count == 1u) {
             const PirGlobalItem *gi = &g->items[0];
             size_t sz = type_byte_size(g->type, it->ptr_bytes);
             if (gi->kind == PIR_GITEM_INT) {
                 uint64_t x = gi->int_neg ? (UINT64_C(0) - gi->int_lo) : gi->int_lo;
                 if (g->type.kind == PIR_TYPE_SCALAR && g->type.u.scalar == PIR_SCALAR_PTR) {
                     pir_interp_mem_write_ptr(it, base, pir_interp_int_to_ptr(it, x), 1u);
-                } else {
+                } else if (sz <= sizeof(x)) {
                     pir_interp_mem_write(it, base, &x, sz, 1u);
+                } else {
+                    pir_interp_fail(it, PIR_INTERP_ERR, "invalid scalar integer global size %zu", sz);
+                    return false;
                 }
             } else if (gi->kind == PIR_GITEM_FLOAT) {
-                pir_interp_mem_write(it, base, &gi->float_bits, sz, 1u);
+                if (sz <= sizeof(gi->float_bits)) {
+                    pir_interp_mem_write(it, base, &gi->float_bits, sz, 1u);
+                } else {
+                    pir_interp_fail(it, PIR_INTERP_ERR, "invalid scalar float global size %zu", sz);
+                    return false;
+                }
             } else if (gi->kind == PIR_GITEM_RELOC) {
                 PirOperand tmp;
                 memset(&tmp, 0, sizeof(tmp));

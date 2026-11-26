@@ -261,8 +261,9 @@ typedef enum {
   TK_PP_NUM, // Preprocessing numbers
   TK_PP_NUM_PPEV = TK_PP_NUM + 1,
   TK_INTMAX_NUM,
-  TK_FMARK,  // Filemarkers for -E
-  TK_PMARK,  // Placermarkers
+  TK_FMARK,    // Filemarkers for -E
+  TK_PMARK,    // Placermarkers
+  TK_INCL_END, // End-of-#include sentinel for #if nesting balance
   TK_ATTR,   // GNU attribute
   TK_BATTR,  // C23 attribute
   TK_PRAGMA, // #pragma's
@@ -413,6 +414,7 @@ struct Token {
   bool is_root : 1;
   bool is_live : 1;
   bool has_ucn : 1;
+  bool is_pragma_op : 1;
   int len;         // Token length
   const char *loc; // Token location
   File *file;

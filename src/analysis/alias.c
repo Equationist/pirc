@@ -17,12 +17,12 @@ static uint64_t gcd_u64(uint64_t a, uint64_t b) {
 }
 
 static int64_t imm_to_i64(const PirOperand *c) {
-    if (c->type.kind == PIR_TYPE_SCALAR && c->type.u.scalar == PIR_SCALAR_I32 &&
-        !c->u.imm_int.is_negative) {
-        return (int64_t)(int32_t)(uint32_t)c->u.imm_int.lo;
+    uint64_t v = c->u.imm_int.is_negative ? (UINT64_C(0) - c->u.imm_int.lo)
+                                          : c->u.imm_int.lo;
+    if (c->type.kind == PIR_TYPE_SCALAR && c->type.u.scalar == PIR_SCALAR_I32) {
+        return (int64_t)(int32_t)(uint32_t)v;
     }
-    return c->u.imm_int.is_negative ? (int64_t)(UINT64_C(0) - c->u.imm_int.lo)
-                                    : (int64_t)c->u.imm_int.lo;
+    return (int64_t)v;
 }
 
 static bool get_const_i64(const PirFunction *fn, PirOperand op, int64_t *out) {
@@ -54,10 +54,12 @@ static uint64_t extract_var_stride(const PirFunction *fn, PirOperand off_op) {
                      (get_const_i64(fn, ins->operands[1], &c) && c > 1 && c <= 65536);
         if (found) {
             uint64_t u = (uint64_t)c;
-            if ((ins->flags & (PIR_FLAG_UNSAFE_S | PIR_FLAG_UNSAFE_U)) != 0u) {
+            bool is_i64 = (ins->ty.kind == PIR_TYPE_SCALAR && ins->ty.u.scalar == PIR_SCALAR_I64);
+            if ((is_i64 && (ins->flags & (PIR_FLAG_UNSAFE_S | PIR_FLAG_UNSAFE_U)) != 0u) ||
+                (!is_i64 && (ins->flags & PIR_FLAG_UNSAFE_S) != 0u)) {
                 return u;
             }
-            /* Wrapping mul mod 2^64 only guarantees alignment to the largest pow2 factor of c. */
+            /* Wrapping mul mod 2^32 / 2^64 only guarantees alignment to the largest pow2 factor of c. */
             return u & (0u - u);
         }
     } else if (ins->op == PIR_OP_SHL && ins->operand_count == 2u) {
@@ -81,7 +83,14 @@ PirPtrInfo pir_alias_decompose(const PirFunction *fn, PirOperand op) {
         if (op.kind == PIR_OPER_SYM) {
             info.kind        = PIR_PTR_GLOBAL;
             info.global_name = op.u.sym.name;
-            info.offset     += op.u.sym.offset;
+            int64_t so = op.u.sym.offset;
+            if ((so > 0 && info.offset > INT64_MAX - so) ||
+                (so < 0 && info.offset < INT64_MIN - so)) {
+                info.has_offset = false;
+                info.stride     = 1u;
+            } else {
+                info.offset += so;
+            }
             return info;
         }
         if (op.kind != PIR_OPER_VAL || op.u.val >= fn->values.len) {
@@ -114,7 +123,13 @@ PirPtrInfo pir_alias_decompose(const PirFunction *fn, PirOperand op) {
         if (ins->op == PIR_OP_PTR_ADD) {
             int64_t d = 0;
             if (get_const_i64(fn, ins->operands[1], &d)) {
-                info.offset += d;
+                if ((d > 0 && info.offset > INT64_MAX - d) ||
+                    (d < 0 && info.offset < INT64_MIN - d)) {
+                    info.has_offset = false;
+                    info.stride     = 1u;
+                } else {
+                    info.offset += d;
+                }
             } else {
                 uint64_t st = extract_var_stride(fn, ins->operands[1]);
                 info.stride = info.has_offset ? st : gcd_u64(info.stride, st);
@@ -152,7 +167,12 @@ PirAliasResult pir_alias_query(const PirFunction *fn,
     if (same_base(&a, &b)) {
         if (a.has_offset && b.has_offset) {
             if (a.offset == b.offset && sz1 == sz2) return PIR_ALIAS_MUST;
-            if (a.offset + (int64_t)sz1 <= b.offset || b.offset + (int64_t)sz2 <= a.offset) {
+            if (a.offset < b.offset &&
+                (uint64_t)b.offset - (uint64_t)a.offset >= (uint64_t)sz1) {
+                return PIR_ALIAS_NO;
+            }
+            if (b.offset < a.offset &&
+                (uint64_t)a.offset - (uint64_t)b.offset >= (uint64_t)sz2) {
                 return PIR_ALIAS_NO;
             }
             return PIR_ALIAS_MAY;

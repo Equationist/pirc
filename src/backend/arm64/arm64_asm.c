@@ -165,14 +165,22 @@ static void fmt_v(char *buf, size_t cap, MPReg p) {
 
 static void emit_section_directive(FILE *out, const PirTargetSpec *target,
                                    const char *custom_sec, PirGlobalSeg seg,
-                                   bool has_reloc, bool is_zero) {
+                                   bool has_reloc, bool is_zero, bool is_func) {
     if (custom_sec && custom_sec[0] != '\0') {
         if (!is_macho(target)) {
-            fprintf(out, "\t.section %s\n", custom_sec);
+            if (is_func && strchr(custom_sec, ',') == NULL) {
+                fprintf(out, "\t.section %s,\"ax\",@progbits\n", custom_sec);
+            } else {
+                fprintf(out, "\t.section %s\n", custom_sec);
+            }
             return;
         }
         if (strchr(custom_sec, ',') != NULL) {
             fprintf(out, "\t.section %s\n", custom_sec);
+            return;
+        }
+        if (is_func) {
+            fprintf(out, "\t.section __TEXT,__text,regular,pure_instructions\n");
             return;
         }
         /* Map ELF-style custom section names to valid Mach-O SEGMENT,section syntax. */
@@ -884,7 +892,11 @@ static void emit_inst(A64AsmCtx *ctx, const MFunc *mf, const MInst *ins) {
                 fprintf(out, "\tsub x16, %s, x17\n", r0);
             }
             fprintf(out, "\tcmp x16, #%u\n", jt->num_entries - 1u);
-            fprintf(out, "\tb.hi %sBB%u_%u\n", lp, mf->fn_index, redir_blk(ctx, jt->default_blk));
+            if (ctx->need_branch_relax) {
+                fprintf(out, "\tb.ls .+8\n\tb %sBB%u_%u\n", lp, mf->fn_index, redir_blk(ctx, jt->default_blk));
+            } else {
+                fprintf(out, "\tb.hi %sBB%u_%u\n", lp, mf->fn_index, redir_blk(ctx, jt->default_blk));
+            }
             if (is_macho(target)) {
                 fprintf(out, "\tadrp x17, %sJT%u_%u@PAGE\n", lp, mf->fn_index, jtid);
                 fprintf(out, "\tadd x17, x17, %sJT%u_%u@PAGEOFF\n", lp, mf->fn_index, jtid);
@@ -960,7 +972,7 @@ static bool a64_emit_function(PirCodeEmitter *em, const PirModule *mod, const MF
     const char *lp = lbl_pfx(target);
 
     if (fn->section && fn->section[0] != '\0') {
-        emit_section_directive(out, target, fn->section, PIR_GSEG_RODATA, false, false);
+        emit_section_directive(out, target, fn->section, PIR_GSEG_RODATA, false, false, true);
     } else if (is_macho(target)) {
         fprintf(out, "\t.section __TEXT,__text,regular,pure_instructions\n");
     } else {
@@ -1031,7 +1043,18 @@ static bool a64_emit_function(PirCodeEmitter *em, const PirModule *mod, const MF
     /* Relax 19-bit conditional branches (b.cond/cbz/cbnz, +-1 MiB) when function exceeds ~512 KiB. */
     uint64_t est_insts = 0u;
     for (uint32_t b = 0u; b < nblks; ++b) {
-        if (!blk_skip[b]) est_insts += (uint64_t)mf->blocks.data[b].insts.len + 1u;
+        if (blk_skip[b]) continue;
+        const MBlock *blk = &mf->blocks.data[b];
+        est_insts += 1u;
+        for (uint32_t j = 0u; j < blk->insts.len; ++j) {
+            MOpcode op = blk->insts.data[j].op;
+            if (op == MI_A64_SWITCH_TBL)       est_insts += 12u;
+            else if (op == MI_A64_ATOMIC_CAS)  est_insts += 10u;
+            else if (op == MI_A64_ATOMIC_RMW)  est_insts += 6u;
+            else if (op == MI_A64_TLS_ADDR)    est_insts += 4u;
+            else if (op == MI_A64_SYM_ADDR)    est_insts += 2u;
+            else                               est_insts += 1u;
+        }
     }
     ctx->need_branch_relax = (est_insts * 4u > 524288u);
 
@@ -1278,7 +1301,7 @@ static bool a64_emit_globals(PirCodeEmitter *em, const PirModule *mod,
         }
 
         bool has_rel = global_has_reloc(g);
-        emit_section_directive(out, target, g->section, g->seg, has_rel, all_zero);
+        emit_section_directive(out, target, g->section, g->seg, has_rel, all_zero, false);
 
         if (g->linkage == PIR_LINK_EXPORT) {
             fprintf(out, "\t.globl %s\n", g_asym);

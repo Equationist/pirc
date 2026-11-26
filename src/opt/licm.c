@@ -30,7 +30,35 @@ static bool all_ops_invariant(const PirFunction *fn, const PirLoop *lp, const Pi
     return true;
 }
 
-static bool is_pure_hoistable_op(const PirInst *ins) {
+static bool operand_is_proven_bool_i8(const PirFunction *fn, PirOperand op) {
+    if (op.kind == PIR_OPER_IMM_INT) {
+        uint64_t v = op.u.imm_int.is_negative ? (UINT64_C(0) - op.u.imm_int.lo) : op.u.imm_int.lo;
+        return (v & 0xffu) <= 1u;
+    }
+    if (op.kind == PIR_OPER_VAL && op.u.val < fn->values.len) {
+        PirInstId did = fn->values.data[op.u.val].def_inst;
+        if (did == PIR_INVALID_ID) return false;
+        const PirInst *d = &fn->insts.data[did];
+        if ((d->op >= PIR_OP_CMP_EQ && d->op <= PIR_OP_CMP_GE_U) ||
+            (d->op >= PIR_OP_FCMP_OEQ && d->op <= PIR_OP_FCMP_UGE)) {
+            return true;
+        }
+        if ((d->op >= PIR_OP_ADD_OVF_S && d->op <= PIR_OP_MUL_OVF_U) ||
+            d->op == PIR_OP_ADD_CARRY || d->op == PIR_OP_SUB_BORROW) {
+            return d->results[1] == op.u.val;
+        }
+        if (d->op == PIR_OP_CONST && d->operand_count == 1u &&
+            d->operands[0].kind == PIR_OPER_IMM_INT) {
+            uint64_t v = d->operands[0].u.imm_int.is_negative
+                         ? (UINT64_C(0) - d->operands[0].u.imm_int.lo)
+                         : d->operands[0].u.imm_int.lo;
+            return (v & 0xffu) <= 1u;
+        }
+    }
+    return false;
+}
+
+static bool is_pure_hoistable_op(const PirFunction *fn, const PirInst *ins) {
     uint32_t trap_ub = PIR_FLAG_TRAP | PIR_FLAG_TRAP_S | PIR_FLAG_TRAP_U |
                        PIR_FLAG_UNSAFE | PIR_FLAG_NONZERO | PIR_FLAG_VOLATILE;
     if (ins->flags & trap_ub) return false;
@@ -59,13 +87,15 @@ static bool is_pure_hoistable_op(const PirInst *ins) {
         case PIR_OP_FCMP_OLE: case PIR_OP_FCMP_OGT: case PIR_OP_FCMP_OGE:
         case PIR_OP_FCMP_UEQ: case PIR_OP_FCMP_UNE: case PIR_OP_FCMP_ULT:
         case PIR_OP_FCMP_ULE: case PIR_OP_FCMP_UGT: case PIR_OP_FCMP_UGE:
-        case PIR_OP_SELECT:
         case PIR_OP_ZEXT: case PIR_OP_SEXT: case PIR_OP_TRUNC:
         case PIR_OP_SITOFP: case PIR_OP_UITOFP: case PIR_OP_FPEXT: case PIR_OP_FPTRUNC:
         case PIR_OP_BITCAST: case PIR_OP_PTRTOINT: case PIR_OP_INTTOPTR:
         case PIR_OP_PTR_ADD: case PIR_OP_SPLAT: case PIR_OP_EXTRACT:
         case PIR_OP_INSERT: case PIR_OP_SHUFFLE:
             return true;
+        case PIR_OP_SELECT:
+            return ins->ty.kind == PIR_TYPE_SCALAR && ins->operand_count == 3u &&
+                   operand_is_proven_bool_i8(fn, ins->operands[0]);
         case PIR_OP_FPTOSI: case PIR_OP_FPTOUI:
             return (ins->flags & PIR_FLAG_SAT) != 0u;
         case PIR_OP_DIV_S: case PIR_OP_DIV_U: case PIR_OP_REM_S: case PIR_OP_REM_U:
@@ -185,10 +215,33 @@ static bool loop_has_real_call(const PirFunction *fn, const PirLoop *lp) {
     return false;
 }
 
+static bool alloca_init_dominates(const PirFunction *fn, const PirDom *dom,
+                                  PirBlockId target_blk, PirInstId alloca_id,
+                                  uint64_t load_off, uint32_t load_sz, uint8_t ptr_bytes) {
+    for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
+        if (b == target_blk || !pir_dom_dominates(dom, b, target_blk)) continue;
+        const PirBlock *blk = &fn->blocks.data[b];
+        for (uint32_t j = 0u; j < blk->insts.len; ++j) {
+            const PirInst *st = &fn->insts.data[blk->insts.data[j]];
+            if (st->op != PIR_OP_STORE || st->operand_count != 2u) continue;
+            uint32_t ssz = pir_type_bits(st->ty, ptr_bytes) / 8u;
+            if (ssz < load_sz) continue;
+            PirPtrInfo spi = pir_alias_decompose(fn, st->operands[1]);
+            if (spi.kind == PIR_PTR_ALLOCA && spi.obj_id == alloca_id &&
+                spi.has_offset && spi.offset >= 0 &&
+                (uint64_t)spi.offset <= load_off &&
+                load_off - (uint64_t)spi.offset <= (uint64_t)(ssz - load_sz)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static bool load_is_safe_to_hoist(const PirModule *mod, const PirFunction *fn,
-                                  const PirTargetSpec *target, const PirLoop *lp,
-                                  PirBlockId b, uint32_t inst_idx, const PirInst *ins,
-                                  bool has_barrier) {
+                                  const PirTargetSpec *target, const PirDom *dom,
+                                  const PirLoop *lp, PirBlockId b, uint32_t inst_idx,
+                                  const PirInst *ins, bool has_barrier) {
     if (ins->op != PIR_OP_LOAD || (ins->flags & PIR_FLAG_VOLATILE) || has_barrier) return false;
     if (!op_is_invariant(fn, lp, ins->operands[0])) return false;
 
@@ -229,18 +282,32 @@ static bool load_is_safe_to_hoist(const PirModule *mod, const PirFunction *fn,
         for (uint32_t gi = 0u; gi < mod->globals.len; ++gi) {
             const PirGlobal *g = &mod->globals.data[gi];
             if (g->name && strcmp(g->name, pi.global_name) == 0) {
-                PirTypeLayout gly = pir_type_layout(mod, target, g->type);
-                if (gly.size > 0u && (uint64_t)pi.offset + (uint64_t)lsz <= gly.size) {
-                    return true;
+                if (g->has_type) {
+                    PirTypeLayout gly = pir_type_layout(mod, target, g->type);
+                    uint32_t ga = g->align ? g->align : gly.align;
+                    if (gly.size > 0u &&
+                        (uint64_t)pi.offset <= gly.size &&
+                        (uint64_t)lsz <= gly.size - (uint64_t)pi.offset &&
+                        (ins->align <= 1u ||
+                         (ga >= ins->align && ((uint64_t)pi.offset % ins->align) == 0u))) {
+                        return true;
+                    }
                 }
                 break;
             }
         }
     }
     if (pi.kind == PIR_PTR_ALLOCA && pi.has_offset && pi.offset >= 0 &&
-        pi.obj_id < fn->insts.len && fn->insts.data[pi.obj_id].op == PIR_OP_ALLOCA_PTR &&
-        (uint64_t)pi.offset + (uint64_t)lsz <= fn->insts.data[pi.obj_id].imm_u64) {
-        return true;
+        pi.obj_id < fn->insts.len && fn->insts.data[pi.obj_id].op == PIR_OP_ALLOCA_PTR) {
+        const PirInst *al = &fn->insts.data[pi.obj_id];
+        if ((uint64_t)pi.offset <= al->imm_u64 &&
+            (uint64_t)lsz <= al->imm_u64 - (uint64_t)pi.offset &&
+            (ins->align <= 1u ||
+             (al->align >= ins->align && ((uint64_t)pi.offset % ins->align) == 0u)) &&
+            alloca_init_dominates(fn, dom, lp->header, pi.obj_id,
+                                  (uint64_t)pi.offset, lsz, target->ptr_bytes)) {
+            return true;
+        }
     }
     return false;
 }
@@ -267,6 +334,9 @@ static void hoist_inst(PirFunction *fn, PirBlockId from_b, uint32_t idx, PirBloc
         (ins->flags & (PIR_FLAG_UNSAFE_S | PIR_FLAG_UNSAFE_U)) != 0u) {
         ins->flags &= ~(uint32_t)(PIR_FLAG_UNSAFE_S | PIR_FLAG_UNSAFE_U);
         ins->flags |= PIR_FLAG_WRAP;
+    }
+    if (ins->op == PIR_OP_PTR_ADD) {
+        ins->flags &= ~(uint32_t)PIR_FLAG_INBOUNDS;
     }
     if (ins->results[0] != PIR_INVALID_ID) fn->values.data[ins->results[0]].def_block = pre;
     if (ins->results[1] != PIR_INVALID_ID) fn->values.data[ins->results[1]].def_block = pre;
@@ -318,14 +388,14 @@ void pir_opt_licm(PirModule *mod, PirFunction *fn, const PirTargetSpec *target) 
                         const PirInst *ins = &fn->insts.data[iid];
                         bool can_hoist = false;
 
-                        if (is_pure_hoistable_op(ins) && all_ops_invariant(fn, lp, ins)) {
+                        if (is_pure_hoistable_op(fn, ins) && all_ops_invariant(fn, lp, ins)) {
                             /* 128-bit vector regs are caller-saved on AAPCS64 and SysV x64, and
                              * trivial constants are cheaper to rematerialize than to hold in a
                              * callee-saved register or spill slot across a call. */
                             if (!(has_call && (ins->ty.kind == PIR_TYPE_VECTOR || ins->op == PIR_OP_CONST))) {
                                 can_hoist = true;
                             }
-                        } else if (load_is_safe_to_hoist(mod, fn, target, lp, b, j, ins, has_barrier)) {
+                        } else if (load_is_safe_to_hoist(mod, fn, target, &dom, lp, b, j, ins, has_barrier)) {
                             can_hoist = true;
                         }
 

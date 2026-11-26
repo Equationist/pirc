@@ -38,6 +38,7 @@ static struct {
   int32_t capacity;
   int32_t cnt;
 } cond_incl;
+static int32_t incl_cond_base;
 
 static Macro *locked_macros;
 static HashMap macros;
@@ -184,6 +185,8 @@ static Token *skip_cond_incl(Token *tok) {
   Token *last = NULL;
   int lvl = 0;
   for (; tok->kind != TK_EOF; last = tok, tok = tok->next) {
+    if (tok->kind == TK_INCL_END)
+      error_tok(tok, "unterminated conditional directive");
     if (Is_hash(tok)) {
       if ((equal(tok->next, "if") ||
            equal(tok->next, "ifdef") ||
@@ -359,6 +362,13 @@ static Token *read_pp_const_expr(Token *tok) {
   Macro *start_m = locked_macros;
 
   for (; tok->kind != TK_EOF; pop_macro_lock(tok)) {
+    if (tok->kind == TK_INCL_END) {
+      if (cond_incl.cnt != incl_cond_base)
+        error_tok(cond_incl.data[cond_incl.cnt - 1].tok, "unterminated conditional directive");
+      incl_cond_base = (int32_t)tok->ival;
+      tok = tok->next;
+      continue;
+    }
     if (tok->kind == TK_IDENT && !tok->dont_expand) {
       Macro *m = hashmap_get2(&macros, tok->loc, tok->len);
       if (m && m->handler == &pragma_macro) {
@@ -437,7 +447,7 @@ static void push_cond_incl(Token *tok, bool active) {
 }
 
 static bool get_cond_incl(CondIncl **cond) {
-  if (cond_incl.cnt <= 0)
+  if (cond_incl.cnt <= incl_cond_base)
     return false;
 
   *cond = &cond_incl.data[cond_incl.cnt - 1];
@@ -492,10 +502,13 @@ static Macro *new_funclike_macro(char *name, Token **rest, Token *tok) {
         error_tok(tok, "unterminated macro parameter list");
       *rest = skip_tk(tok, TK_RPAREN);
       static Token va_args = {.loc = "__VA_ARGS__", .len = 11};
+      va_args.file = tok->file;
       add_macro_param(&cur, head.next, &va_args);
       m->has_va_arg = true;
       break;
     }
+    if (is_iso_std && !tok->file->is_syshdr && equal(tok, "__VA_ARGS__"))
+      error_tok(tok, "'__VA_ARGS__' cannot be used as a macro parameter name");
     if (tok->next->kind == TK_DOT3) {
       if (is_iso_std && !tok->file->is_syshdr)
         error_tok(tok, "named variadic macros are a GNU extension");
@@ -520,6 +533,8 @@ static Macro *read_macro_name(Token **rest, Token *tok) {
   if (is_iso_std && !tok->file->is_syshdr) {
     if (equal(tok, "defined"))
       error_tok(tok, "'defined' cannot be used as a macro name");
+    if (equal(tok, "__VA_ARGS__"))
+      error_tok(tok, "'__VA_ARGS__' cannot be used as a macro name");
     if (is_predefined_macro_name(tok))
       error_tok(tok, "redefining predefined macro '%.*s'", tok->len, tok->loc);
   }
@@ -580,7 +595,8 @@ static void chk_macro_hash(Macro *m) {
             break;
           }
         }
-        if (!found && m->has_va_arg && equal(nxt, "__VA_ARGS__"))
+        if (!found && m->has_va_arg &&
+            (equal(nxt, "__VA_ARGS__") || (opt_std >= STD_C23 && equal(nxt, "__VA_OPT__"))))
           found = true;
       }
       if (!found)
@@ -696,6 +712,13 @@ static Token *expand_tok(Token *tok) {
   Macro *start_m = locked_macros;
 
   for (; tok->kind != TK_EOF; pop_macro_lock(tok)) {
+    if (tok->kind == TK_INCL_END) {
+      if (cond_incl.cnt != incl_cond_base)
+        error_tok(cond_incl.data[cond_incl.cnt - 1].tok, "unterminated conditional directive");
+      incl_cond_base = (int32_t)tok->ival;
+      tok = tok->next;
+      continue;
+    }
     if (tok->kind == TK_IDENT && !tok->dont_expand) {
       Macro *m = hashmap_get2(&macros, tok->loc, tok->len);
       if (m && expand_macro(&tok, tok, m, false))
@@ -881,9 +904,9 @@ static Token *subst(Token *tok, MacroContext *ctx) {
     if (tok->kind == TK_COMMA && tok->next->kind == TK_HASH2 && ctx->m->has_va_arg) {
       MacroArg *arg = find_arg(NULL, tok->next->next, ctx);
       if (arg && (arg == &ctx->args[ctx->m->arg_cnt - 1])) {
-        if (is_iso_std && !tok->file->is_syshdr)
-          error_tok(tok, "GNU ', ## __VA_ARGS__' extension is not allowed in ISO C");
         if (ctx->omit_comma) {
+          if (is_iso_std && !tok->file->is_syshdr)
+            error_tok(tok, "GNU ', ## __VA_ARGS__' extension is not allowed in ISO C");
           tok = tok->next->next->next;
           continue;
         }
@@ -1241,7 +1264,9 @@ static char *read_filename(Token **rest, Token *tok, const char **dir) {
   }
 
   char *filename = NULL;
-  if (tok->kind == TK_STR) {
+  if (tok->kind == TK_STR ||
+      (tok->kind == TK_INVALID && tok->len >= 2 &&
+       tok->loc[0] == '"' && tok->loc[tok->len - 1] == '"')) {
     // Pattern 1: #include "foo.h"
     // A double-quoted filename for #include is a special kind of
     // token, and we don't want to interpret any escape sequences in it.
@@ -1311,7 +1336,14 @@ static Token *include_file(Token *tok, const char *path, Token *filename_tok, In
       equal(end, "endif"))
     start->next->is_incl_guard = end->is_incl_guard = true;
 
-  end->next = tok;
+  Token *iend = copy_token(end);
+  iend->kind = TK_INCL_END;
+  iend->len = 0;
+  iend->at_bol = true;
+  iend->ival = incl_cond_base;
+  iend->next = tok;
+  incl_cond_base = cond_incl.cnt;
+  end->next = iend;
   return add_fmark(start);
 }
 
@@ -1442,13 +1474,20 @@ void preprocess2(Token *tok, Token **cur) {
   Macro *start_m = locked_macros;
 
   for (; tok->kind != TK_EOF; pop_macro_lock(tok)) {
+    if (tok->kind == TK_INCL_END) {
+      if (cond_incl.cnt != incl_cond_base)
+        error_tok(cond_incl.data[cond_incl.cnt - 1].tok, "unterminated conditional directive");
+      incl_cond_base = (int32_t)tok->ival;
+      tok = tok->next;
+      continue;
+    }
     if (tok->kind == TK_IDENT && !tok->dont_expand) {
       Macro *m = hashmap_get2(&macros, tok->loc, tok->len);
       if (m && expand_macro(&tok, tok, m, true))
         continue;
     }
 
-    if (Is_hash(tok) && !locked_macros) {
+    if (Is_hash(tok) && (!locked_macros || tok->is_pragma_op)) {
       tok = directives(cur, tok, true);
       continue;
     }
@@ -1507,6 +1546,8 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
   }
 
   if (equal(tok, "include_next")) {
+    if (is_iso_std && !start->file->is_syshdr)
+      error_tok(tok, "'#include_next' is a GNU extension");
     Token *file_tok = tok->next;
     const char *dir = NULL;
     char *filename = read_include_filename(split_line(&tok, file_tok), &dir);
@@ -1652,6 +1693,8 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
   }
 
   if (tok->kind == TK_PP_NUM) {
+    if (is_iso_std && !start->file->is_syshdr)
+      error_tok(tok, "GNU linemarker directive is not allowed in ISO C");
     read_line_marker(&tok, tok, false);
     return tok;
   }
@@ -1672,10 +1715,12 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
   if (is_root) {
     if (equal(tok, "pragma")) {
       if (equal(tok->next, "once")) {
-        char realpathbuf[PATH_MAX];
-        get_realpath(tok->file->name, realpathbuf);
-
-        hashmap_put(&pragma_once, arena_strdup(&cc1_arena, realpathbuf), (void *)1);
+        Token *orig = tok->origin ? tok->origin : tok;
+        if (orig->file && !orig->file->is_placeholder && strcmp(orig->file->name, "-") != 0) {
+          char realpathbuf[PATH_MAX];
+          if (realpath(orig->file->name, realpathbuf))
+            hashmap_put(&pragma_once, arena_strdup(&cc1_arena, realpathbuf), (void *)1);
+        }
         return skip_line(tok->next->next);
       }
       return pass_line(cur, start);
@@ -1691,31 +1736,39 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
 
 void define_macro_cli(const char *str) {
   static File file = {.name = "<command-line>", .is_placeholder = true};
+  const char *eq = strchr(str, '=');
+  if (eq) {
+    char *lhs = arena_copy_string(&pp_arena, str, (size_t)(eq - str));
+    file.contents = lhs;
+    Token *tok = tokenize(&file, NULL, NULL);
+    Macro *m = read_macro_name(&tok, tok);
+    if (tok->kind != TK_EOF)
+      error_tok(tok, "invalid macro name in -D option");
+
+    file.contents = eq + 1;
+    Token *body = tokenize(&file, NULL, NULL);
+    Token *last = body;
+    if (body->kind != TK_EOF) {
+      body->has_space = true;
+      while (last->next && last->next->kind != TK_EOF)
+        last = last->next;
+    }
+    m->body = body;
+    chk_macro_startend(m->body, last);
+    chk_macro_hash(m);
+    file.contents = NULL;
+    return;
+  }
+
   file.contents = str;
   Token *tok = tokenize(&file, NULL, NULL);
-
   Macro *m = read_macro_name(&tok, tok);
+  if (tok->kind != TK_EOF)
+    error_tok(tok, "invalid macro name in -D option");
 
-  Token head = {0};
-  Token *cur = &head;
-  bool has_eq = false;
-  for (; tok->kind != TK_EOF;) {
-    if (!has_eq && consume_tk(&tok, tok, TK_EQ)) {
-      tok->has_space = true;
-      has_eq = true;
-      continue;
-    }
-    cur = cur->next = tok;
-    tok = tok->next;
-  }
-  if (!has_eq) {
-    cur = cur->next = make_token("1", tok, NULL);
-    cur->has_space = true;
-  }
-  cur->next = tok;
-  m->body = head.next;
-  chk_macro_startend(m->body, cur);
-  chk_macro_hash(m);
+  Token *one = make_token("1", tok, tok);
+  one->has_space = true;
+  m->body = one;
   file.contents = NULL;
 }
 
@@ -1756,6 +1809,8 @@ static Token *line_macro(Token *start) {
   int64_t val = tok->line_no;
   val += tok->display_line_no;
   val += tok->file->line_delta;
+  if (val < 0)
+    val = 0;
   return new_num_token(val, tok, start->next);
 }
 
@@ -1878,6 +1933,7 @@ static Token *pragma_macro(Token *start) {
   Token *end;
   Token *hash = tokenize_buf(buf, start, &end);
   hash->at_bol = true;
+  hash->is_pragma_op = true;
   end->next = tok;
   return hash;
 }

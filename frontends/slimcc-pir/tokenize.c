@@ -89,13 +89,19 @@ void verror_at_tok(Token *tok, const char *fmt, va_list ap) {
 }
 
 void error_at(const char *loc, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  if (!current_file || !current_file->contents) {
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+    cleanup_exit(1);
+  }
   int line_no = 1;
   for (const char *p = current_file->contents; p < loc; p++)
     if (*p == '\n')
       line_no++;
 
-  va_list ap;
-  va_start(ap, fmt);
   verror_at(current_file->name, current_file->contents, line_no, loc, fmt, ap);
   va_end(ap);
   cleanup_exit(1);
@@ -709,7 +715,7 @@ static Token *read_utf32_string_literal(const char *start, const char *quote, Ty
 static Token *read_char_literal(const char *start) {
   const char *p = start + 1;
   if (*p == '\'')
-    error_at(p, "empty character literal");
+    return new_token(TK_INVALID, start, p + 1);
 
   uint64_t val = 0;
   bool is_multi = false;
@@ -754,7 +760,7 @@ static Token *read_unicode_char_literal(const char *start, const char *quote, Ty
   bool invalid = false;
   const char *p = quote + 1;
   if (*p == '\'')
-    error_at(p, "empty character literal");
+    return new_token(TK_INVALID, start, p + 1);
   if (*p == '\0' || *p == '\n')
     error_at(start, "unclosed character literal");
 
@@ -764,8 +770,17 @@ static Token *read_unicode_char_literal(const char *start, const char *quote, Ty
   else
     c = decode_utf8(&p, p);
 
-  if (*p != '\'')
-    error_at(p, "invalid unicode character literal");
+  if (*p != '\'') {
+    while (*p && *p != '\'' && *p != '\n') {
+      if (*p == '\\' && p[1] && p[1] != '\n')
+        p += 2;
+      else
+        p++;
+    }
+    if (*p != '\'')
+      error_at(start, "unclosed character literal");
+    return new_token(TK_INVALID, start, p + 1);
+  }
 
   if (invalid)
     return new_token(TK_INVALID, start, p + 1);

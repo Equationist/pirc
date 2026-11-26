@@ -155,6 +155,15 @@ static PirBlockId lower_va_arg_sysv_agg(PirModule *mod, const PirTargetSpec *tar
     PirAbiRegState st0 = { 0u, 0u };
     PirAbiArgInfo info;
     bool classified = pir_abi_classify_param(mod, target, &pd, &st0, &info);
+    bool is_empty   = (ly.size == 0u) ||
+                      (classified && info.kind == PIR_ABI_DIRECT && info.reg_count == 0u);
+    if (is_empty) {
+        PirBlockId cont_blk = split_block_tail_noparam(mod, fn, b, j, head, ln);
+        PirInst jc = pir_make_inst(PIR_OP_JMP, tvoid, ln, lc);
+        jc.targets[0].target = cont_blk;
+        pir_fn_append_inst(fn, &fn->blocks.data[b].insts, jc);
+        return cont_blk;
+    }
     bool use_regs   = classified && info.kind == PIR_ABI_DIRECT &&
                       info.reg_count > 0u && (info.gp_used > 0u || info.fp_used > 0u);
 
@@ -566,6 +575,13 @@ static PirBlockId lower_va_arg_aapcs64_linux(PirModule *mod, const PirTargetSpec
     PirType arg_ty = is_buf ? inst->aux_type : inst->ty;
     PirOperand ap  = is_buf ? inst->operands[1] : inst->operands[0];
     PirTypeLayout ly = pir_type_layout(mod, target, arg_ty);
+    if (is_buf && ly.size == 0u) {
+        PirBlockId cont_blk = split_block_tail_noparam(mod, fn, b, j, head, ln);
+        PirInst jc = pir_make_inst(PIR_OP_JMP, tvoid, ln, lc);
+        jc.targets[0].target = cont_blk;
+        pir_fn_append_inst(fn, &fn->blocks.data[b].insts, jc);
+        return cont_blk;
+    }
     bool indirect = is_buf && va_agg_is_indirect(mod, target, arg_ty);
     uint64_t step = indirect ? 8u : va_align_up(ly.size > 0u ? ly.size : 8u, 8u);
 
@@ -812,6 +828,20 @@ static void lower_va_arg_ptr_cursor(PirModule *mod, const PirTargetSpec *target,
     PirType arg_ty = is_buf ? inst->aux_type : inst->ty;
     PirOperand ap  = is_buf ? inst->operands[1] : inst->operands[0];
     PirTypeLayout ly = pir_type_layout(mod, target, arg_ty);
+    if (is_buf) {
+        if (ly.size == 0u) return;
+        PirParamDecl pd;
+        memset(&pd, 0, sizeof(pd));
+        pd.abi_kind = PIR_PARAM_BYVAL;
+        pd.abi_type = arg_ty;
+        pd.type     = tptr;
+        PirAbiRegState st0 = { 0u, 0u };
+        PirAbiArgInfo info;
+        if (pir_abi_classify_param(mod, target, &pd, &st0, &info) &&
+            info.kind == PIR_ABI_DIRECT && info.reg_count == 0u) {
+            return;
+        }
+    }
     bool indirect = is_buf && va_agg_is_indirect(mod, target, arg_ty);
     uint64_t step = indirect ? 8u : va_align_up(ly.size > 0u ? ly.size : 8u, 8u);
 

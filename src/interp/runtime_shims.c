@@ -74,8 +74,37 @@ static bool shim_printf(PirInterp *it, const PirVal *args, uint32_t arg_count, i
         char fbuf[32];
         size_t fl = 0u;
         fbuf[fl++] = '%';
-        while (*s && (strchr("-+ #0123456789.", *s) != NULL) && fl < sizeof(fbuf) - 4u) {
+        while (*s && strchr("-+ #0", *s) != NULL) {
+            if (fl >= sizeof(fbuf) - 4u) {
+                free(fmt);
+                pir_interp_fail(it, PIR_INTERP_UB, "printf format specifier too long");
+                return false;
+            }
             fbuf[fl++] = *s++;
+        }
+        while (*s >= '0' && *s <= '9') {
+            if (fl >= sizeof(fbuf) - 4u) {
+                free(fmt);
+                pir_interp_fail(it, PIR_INTERP_UB, "printf format specifier too long");
+                return false;
+            }
+            fbuf[fl++] = *s++;
+        }
+        if (*s == '.') {
+            if (fl >= sizeof(fbuf) - 4u) {
+                free(fmt);
+                pir_interp_fail(it, PIR_INTERP_UB, "printf format specifier too long");
+                return false;
+            }
+            fbuf[fl++] = *s++;
+            while (*s >= '0' && *s <= '9') {
+                if (fl >= sizeof(fbuf) - 4u) {
+                    free(fmt);
+                    pir_interp_fail(it, PIR_INTERP_UB, "printf format specifier too long");
+                    return false;
+                }
+                fbuf[fl++] = *s++;
+            }
         }
         int long_cnt = 0;
         while (*s == 'l' && long_cnt < 2) {
@@ -238,8 +267,13 @@ bool pir_interp_try_shim(PirInterp *it, const char *name,
 
     if (strcmp(name, "malloc") == 0) {
         if (arg_count != 1u) { pir_interp_fail(it, PIR_INTERP_UB, "malloc arity"); return true; }
-        size_t sz = (size_t)pir_val_get_u64(&args[0]);
-        uint32_t id = pir_interp_alloc_new(it, sz, 16u, false, true, false, false);
+        uint64_t sz = pir_val_get_u64(&args[0]);
+        if (sz > (UINT64_C(1) << 30)) {
+            out_ret->ptr.alloc_id = 0u;
+            out_ret->ptr.offset   = 0;
+            return true;
+        }
+        uint32_t id = pir_interp_alloc_new(it, (size_t)sz, 16u, false, true, false, false);
         out_ret->ptr.alloc_id = id;
         out_ret->ptr.offset   = 0;
         return true;
@@ -248,6 +282,11 @@ bool pir_interp_try_shim(PirInterp *it, const char *name,
         if (arg_count != 2u) { pir_interp_fail(it, PIR_INTERP_UB, "calloc arity"); return true; }
         uint64_t n = pir_val_get_u64(&args[0]);
         uint64_t s = pir_val_get_u64(&args[1]);
+        if (n != 0u && s > (UINT64_C(1) << 30) / n) {
+            out_ret->ptr.alloc_id = 0u;
+            out_ret->ptr.offset   = 0;
+            return true;
+        }
         size_t total = (size_t)(n * s);
         uint32_t id = pir_interp_alloc_new(it, total, 16u, false, true, false, true);
         out_ret->ptr.alloc_id = id;
@@ -277,7 +316,13 @@ bool pir_interp_try_shim(PirInterp *it, const char *name,
     if (strcmp(name, "realloc") == 0) {
         if (arg_count != 2u) { pir_interp_fail(it, PIR_INTERP_UB, "realloc arity"); return true; }
         PirPtr p = args[0].ptr;
-        size_t new_sz = (size_t)pir_val_get_u64(&args[1]);
+        uint64_t new_sz_u64 = pir_val_get_u64(&args[1]);
+        if (new_sz_u64 > (UINT64_C(1) << 30)) {
+            out_ret->ptr.alloc_id = 0u;
+            out_ret->ptr.offset   = 0;
+            return true;
+        }
+        size_t new_sz = (size_t)new_sz_u64;
         if (p.alloc_id == 0u) {
             uint32_t id = pir_interp_alloc_new(it, new_sz, 16u, false, true, false, false);
             out_ret->ptr.alloc_id = id;
@@ -295,6 +340,11 @@ bool pir_interp_try_shim(PirInterp *it, const char *name,
         }
         size_t old_sz = old_a->size;
         uint32_t new_id = pir_interp_alloc_new(it, new_sz, 16u, false, true, false, false);
+        if (new_id == 0u) {
+            out_ret->ptr.alloc_id = 0u;
+            out_ret->ptr.offset   = 0;
+            return true;
+        }
         size_t copy_sz = old_sz < new_sz ? old_sz : new_sz;
         PirPtr np = { new_id, 0 };
         if (copy_sz > 0u) {

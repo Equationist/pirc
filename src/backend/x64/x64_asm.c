@@ -185,14 +185,22 @@ static void fmt_mem_idx(char *buf, size_t cap, MPReg base, MPReg idx, uint8_t sh
 
 static void emit_section_directive(FILE *out, const PirTargetSpec *target,
                                    const char *custom_sec, PirGlobalSeg seg,
-                                   bool has_reloc, bool is_zero) {
+                                   bool has_reloc, bool is_zero, bool is_func) {
     if (custom_sec && custom_sec[0] != '\0') {
         if (!is_macho(target)) {
-            fprintf(out, "\t.section %s\n", custom_sec);
+            if (is_func && strchr(custom_sec, ',') == NULL) {
+                fprintf(out, "\t.section %s,\"ax\",@progbits\n", custom_sec);
+            } else {
+                fprintf(out, "\t.section %s\n", custom_sec);
+            }
             return;
         }
         if (strchr(custom_sec, ',') != NULL) {
             fprintf(out, "\t.section %s\n", custom_sec);
+            return;
+        }
+        if (is_func) {
+            fprintf(out, "\t.section __TEXT,__text,regular,pure_instructions\n");
             return;
         }
         if (strncmp(custom_sec, ".rodata", 7u) == 0) {
@@ -831,7 +839,7 @@ static bool x64_emit_function(PirCodeEmitter *em, const PirModule *mod, const MF
     const char *fn_asym = fmt_asm_sym(fn_sbuf, sizeof(fn_sbuf), target, fn->name, NULL);
 
     if (fn->section && fn->section[0] != '\0') {
-        emit_section_directive(out, target, fn->section, PIR_GSEG_RODATA, false, false);
+        emit_section_directive(out, target, fn->section, PIR_GSEG_RODATA, false, false, true);
     } else if (is_macho(target)) {
         fprintf(out, "\t.section __TEXT,__text,regular,pure_instructions\n");
     } else {
@@ -1117,7 +1125,7 @@ static bool x64_emit_globals(PirCodeEmitter *em, const PirModule *mod,
         }
 
         bool has_rel = global_has_reloc(g);
-        emit_section_directive(out, target, g->section, g->seg, has_rel, all_zero);
+        emit_section_directive(out, target, g->section, g->seg, has_rel, all_zero, false);
 
         if (g->linkage == PIR_LINK_EXPORT) {
             fprintf(out, "\t.globl %s\n", g_asym);

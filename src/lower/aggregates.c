@@ -368,6 +368,11 @@ static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirT
         emit_zero_gitem(out, ly.size);
         return;
     }
+    if (src[*idx].kind == PIR_GITEM_ZERO) {
+        (*idx)++;
+        emit_zero_gitem(out, ly.size);
+        return;
+    }
     if (ty.kind == PIR_TYPE_SCALAR) {
         const PirGlobalItem *it = &src[(*idx)++];
         if (it->kind == PIR_GITEM_ZERO) {
@@ -426,10 +431,12 @@ static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirT
                 uint8_t buf[8];
                 encode_u64_bytes(buf, db, 8u, target->is_big_endian);
                 emit_bytes_gitem(mod, out, buf, 8u);
-            } else {
+            } else if (ly.size <= 8u) {
                 uint8_t buf[8];
                 encode_u64_bytes(buf, lo, (uint32_t)ly.size, target->is_big_endian);
                 emit_bytes_gitem(mod, out, buf, ly.size);
+            } else {
+                emit_zero_gitem(out, ly.size);
             }
         }
         return;
@@ -452,7 +459,8 @@ static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirT
                 agg->elem_type.kind == PIR_TYPE_SCALAR &&
                 agg->elem_type.u.scalar == PIR_SCALAR_I8) {
                 const PirGlobalItem *bi = &src[(*idx)++];
-                uint64_t cn = (bi->len < ly.size) ? bi->len : ly.size;
+                uint64_t cap_n = (agg->array_len < ly.size) ? agg->array_len : ly.size;
+                uint64_t cn = (bi->len < cap_n) ? bi->len : cap_n;
                 emit_bytes_gitem(mod, out, bi->bytes, cn);
                 if (cn < ly.size) emit_zero_gitem(out, ly.size - cn);
             } else {

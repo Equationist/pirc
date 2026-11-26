@@ -2,6 +2,7 @@
 
 typedef struct {
   Obj *var;
+  Type *var_ty;
   Type *type_def;
   EnumVal *enum_val;
 } VarScope;
@@ -201,7 +202,7 @@ static Node *expression(Token **rest, Token *tok);
 static int64_t align_expr(Token **rest, Token *tok);
 static int64_t eval(Node *node);
 static int64_t eval2(Node *node, EvalContext *ctx);
-static Obj *eval_var(Node *node, int *ofs, bool let_volatile);
+static Obj *eval_var(Node *node, int64_t *ofs, bool let_volatile);
 static bool is_static_const_var(Obj *var);
 static Node *assign(Token **rest, Token *tok);
 static long_double_t eval_double(Node *node);
@@ -235,7 +236,13 @@ static Node *resolve_local_gotos(void);
 static void push_goto(Node *node);
 
 static bool is_const_context(void) {
-  return fnctx ? fnctx->is_static_init_context : !scope->parent;
+  if (fnctx)
+    return fnctx->is_static_init_context;
+  for (Scope *sc = scope; sc; sc = sc->parent) {
+    if (sc->is_fn_base)
+      return false;
+  }
+  return true;
 }
 
 static void enter_scope(void) {
@@ -520,12 +527,14 @@ static void set_init(Initializer *init, int kind) {
 static void prepare_array_init(Initializer *init, Type *ty) {
   if (init->kind == INIT_LIST)
     return;
+  if (ty->array_len > 64LL * 1024 * 1024)
+    error("array initializer is too large");
 
   if (init->kind == INIT_NUM_SEQ) {
     Token *t = init->numseq.start;
 
     init->kind = INIT_LIST;
-    init->list.cnt = ty->array_len;
+    init->list.cnt = (int32_t)ty->array_len;
     init->list.data = calloc(init->list.cnt, sizeof(Initializer));
 
     int32_t i = 0;
@@ -626,10 +635,15 @@ static void push_var_name(Token *name, Obj *var) {
   push_var_name2(name->loc, name->len, name, var);
 }
 
-static void push_gvar_name(Token *name, Obj *var) {
+static VarScope *push_gvar_name2(Token *name, Obj *var) {
   VarScope *vsc = push_var_scope(name->loc, name->len, var);
   if (vsc && var != vsc->var)
     error_tok(name, "invalid redefinition of '%.*s'", name->len, name->loc);
+  return vsc ? vsc : hashmap_get2(&decl_scope()->vars, name->loc, name->len);
+}
+
+static void push_gvar_name(Token *name, Obj *var) {
+  (void)push_gvar_name2(name, var);
 }
 
 static Obj *alloc_ast_var(Type *ty) {
@@ -2116,6 +2130,9 @@ static Token *skip_excess_scalar(Token *tok) {
 static void string_initializer(Token *tok, Initializer *init) {
   if (tok->ty->base->size != init->ty->base->size)
     error_tok(tok, "array initialization with string of incompatible size");
+  if (is_iso_std && tok->ty->base->size > 1 &&
+      tok->ty->base->is_unsigned != init->ty->base->is_unsigned && !tok->file->is_syshdr)
+    error_tok(tok, "array initialization with string of incompatible type");
 
   if (init->kind == INIT_FLEX)
     init->ty = array_of(init->ty->base, tok->ty->array_len);
@@ -2127,19 +2144,21 @@ static void string_initializer(Token *tok, Initializer *init) {
 }
 
 static void array_designator(Token **rest, Token *tok, Type *ty, int *begin, int *end) {
-  *begin = const_expr(&tok, tok->next);
+  int64_t b = const_expr(&tok, tok->next);
 
-  if (*begin < 0 || *begin >= ty->array_len)
+  if (b < 0 || b >= ty->array_len || b > INT32_MAX)
     error_tok(tok, "array designator index out of bounds");
+  *begin = (int)b;
 
   if (tok->kind == TK_DOT3) {
     if (is_iso_std && !tok->file->is_syshdr)
       error_tok(tok, "GNU array designator range is not allowed in ISO C");
-    *end = const_expr(&tok, tok->next);
-    if (*end < 0 || *end >= ty->array_len)
+    int64_t e = const_expr(&tok, tok->next);
+    if (e < 0 || e >= ty->array_len || e > INT32_MAX)
       error_tok(tok, "array designator index out of bounds");
-    if (*end < *begin)
-      error_tok(tok, "array designator range [%d, %d] is empty", *begin, *end);
+    if (e < b)
+      error_tok(tok, "array designator range [%" PRIi64 ", %" PRIi64 "] is empty", b, e);
+    *end = (int)e;
   } else {
     *end = *begin;
   }
@@ -2238,17 +2257,18 @@ static int count_array_init_elements(Token *tok, Type *ty, int i) {
   enter_isolated_scope();
 
   Initializer dummy = {.ty = ty->base};
-  int max = i;
+  int64_t idx = i;
+  int64_t max = i;
 
-  while (braced_list(&tok, &tok, i)) {
+  while (braced_list(&tok, &tok, (int)idx)) {
     if (tok->kind == TK_LBRACK) {
-      i = const_expr(&tok, tok->next);
-      if (i < 0)
-        error_tok(tok, "array designator index cannot be negative");
+      idx = const_expr(&tok, tok->next);
+      if (idx < 0 || idx >= INT32_MAX)
+        error_tok(tok, "array designator index out of bounds");
       if (tok->kind == TK_DOT3) {
-        i = const_expr(&tok, tok->next);
-        if (i < 0)
-          error_tok(tok, "array designator index cannot be negative");
+        idx = const_expr(&tok, tok->next);
+        if (idx < 0 || idx >= INT32_MAX)
+          error_tok(tok, "array designator index out of bounds");
       }
       tok = skip_tk(tok, TK_RBRACK);
       designation(&tok, tok, &dummy, true, NULL);
@@ -2256,12 +2276,15 @@ static int count_array_init_elements(Token *tok, Type *ty, int i) {
       initializer2(&tok, tok, &dummy);
     }
 
-    i++;
-    max = MAX(max, i);
+    if (idx >= INT32_MAX)
+      error_tok(tok, "array initializer is too large");
+    idx++;
+    if (idx > max)
+      max = idx;
   }
   free_initializers(&dummy);
   leave_scope();
-  return max;
+  return (int)max;
 }
 
 static void aggregate_initializer(Token **rest, Token *tok, Initializer *init, Node *expr,
@@ -2711,7 +2734,7 @@ static void write_gvar_data(Relocation **cur, Initializer *init, char *buf, int 
 
     // Direct initialization with a const variable
     if (init->kind == INIT_EXPR) {
-      int sofs;
+      int64_t sofs;
       Obj *var = NULL;
       if (is_compatible(init->ty, init->expr->ty))
         var = eval_var(init->expr, &sofs, false);
@@ -2722,9 +2745,9 @@ static void write_gvar_data(Relocation **cur, Initializer *init, char *buf, int 
         while (srel && srel->offset < sofs)
           srel = srel->next;
 
-        int end = MIN(init->ty->size, var->ty->size - sofs);
+        int64_t end = MIN((int64_t)init->ty->size, (int64_t)var->ty->size - sofs);
         char *data = var->init_data ? var->init_data : var->constexpr_data;
-        for (int pos = 0; pos < end;) {
+        for (int64_t pos = 0; pos < end;) {
           if (srel && srel->offset == pos + sofs) {
             Relocation *rel = arena_calloc(fnctx ? &ast_arena : &cc1_arena,
                                            sizeof(Relocation));
@@ -2831,14 +2854,16 @@ static void write_gvar_data(Relocation **cur, Initializer *init, char *buf, int 
             int sz = next_pow_of_two(mem->bit_offset + mem->bit_width) / 8;
             uint64_t oldval = read_buf(loc, sz);
             uint64_t mask = (mem->bit_width >= 64) ? ~UINT64_C(0) : (((uint64_t)1 << mem->bit_width) - 1);
-            uint64_t combined = oldval | ((val & mask) << mem->bit_offset);
+            uint64_t combined = (oldval & ~(mask << mem->bit_offset)) | ((val & mask) << mem->bit_offset);
             memcpy(loc, &combined, sz);
             continue;
           }
           int rem = mem->bit_offset + mem->bit_width;
           if (mem->bit_offset) {
             int shft = 8 - mem->bit_offset;
-            *loc = ((uint8_t)(*loc << shft) >> shft) | (val << mem->bit_offset);
+            uint8_t cur_b = (uint8_t)*loc;
+            *loc = (char)((uint8_t)((uint8_t)(cur_b << shft) >> shft) |
+                          (uint8_t)((val & 0xFFu) << mem->bit_offset));
             val >>= shft;
             rem -= 8;
             loc++;
@@ -2847,11 +2872,12 @@ static void write_gvar_data(Relocation **cur, Initializer *init, char *buf, int 
             if (rem != start)
               val >>= 8;
             if (rem >= 8) {
-              *loc = val;
+              *loc = (char)val;
               continue;
             }
-            val &= (1 << rem) - 1;
-            *loc = (*loc >> rem) << rem | val;
+            val &= (1u << rem) - 1u;
+            uint8_t cur_b = (uint8_t)*loc;
+            *loc = (char)((uint8_t)((cur_b >> rem) << rem) | (uint8_t)val);
             break;
           }
           continue;
@@ -3490,7 +3516,7 @@ static bool eval_non_var_ofs(Node *node, int64_t *ofs) {
   return false;
 }
 
-static Obj *eval_var_ofs(Node *node, int *ofs, EvalVarSpec vspec) {
+static Obj *eval_var_ofs(Node *node, int64_t *ofs, EvalVarSpec vspec) {
   if (node->kind == ND_VAR) {
     if (((vspec & EV_VOLATILE) || !(node->ty->qual & Q_VOLATILE)) &&
         ((vspec & EV_ATOMIC) || !(node->ty->qual & Q_ATOMIC))) {
@@ -3510,7 +3536,7 @@ static Obj *eval_var_ofs(Node *node, int *ofs, EvalVarSpec vspec) {
   return NULL;
 }
 
-static Obj *eval_var(Node *node, int *ofs, bool let_volatile) {
+static Obj *eval_var(Node *node, int64_t *ofs, bool let_volatile) {
   EvalVarSpec vkind = EV_ARRAY | EV_ATOMIC;
   if (let_volatile)
     vkind |= EV_VOLATILE;
@@ -3533,11 +3559,11 @@ static bool is_constexpr_complit(Node *node, Obj **var) {
   return false;
 }
 
-static bool is_non_relo_read(Obj *var, int ofs, int read_sz) {
+static bool is_non_relo_read(Obj *var, int64_t ofs, int64_t read_sz) {
   for (Relocation *rel = var->rel; rel; rel = rel->next) {
-    if ((rel->offset + ty_nullptr->size) <= ofs)
+    if ((int64_t)rel->offset + ty_nullptr->size <= ofs)
       continue;
-    if ((ofs + read_sz) <= rel->offset)
+    if (ofs <= (int64_t)rel->offset - read_sz)
       break;
     return false;
   }
@@ -3545,7 +3571,7 @@ static bool is_non_relo_read(Obj *var, int ofs, int read_sz) {
 }
 
 static char *eval_constexpr_data(Node *node) {
-  int32_t ofs = 0;
+  int64_t ofs = 0;
   Obj *var = NULL;
 
   if (!is_constexpr_complit(node, &var))
@@ -3553,10 +3579,10 @@ static char *eval_constexpr_data(Node *node) {
 
   if (var && (var->is_string_lit ||
               (is_static_const_var(var) && is_non_relo_read(var, ofs, node->ty->size)))) {
-    int32_t access_sz = !is_bitfield(node) ? node->ty->size
+    int64_t access_sz = !is_bitfield(node) ? node->ty->size
                                            : bitfield_footprint(node->m.member);
 
-    if (ofs < 0 || (var->ty->size < (ofs + access_sz)))
+    if (ofs < 0 || ofs > var->ty->size || access_sz > var->ty->size - ofs)
       return (char *)eval_error2(node, "constexpr access out of bounds");
 
     char *data = var->init_data ? var->init_data : var->constexpr_data;
@@ -3604,6 +3630,39 @@ static int64_t eval_cmp(Node *node) {
     case ND_GT: return eval_double(lhs) > eval_double(rhs);
     case ND_GE: return eval_double(lhs) >= eval_double(rhs);
     }
+  } else if (is_ptr(lhs->ty) || is_ptr(rhs->ty)) {
+    EvalContext lctx = {.kind = EV_LABEL};
+    EvalContext rctx = {.kind = EV_LABEL};
+    int64_t lv = eval2(lhs, &lctx);
+    int64_t rv = eval2(rhs, &rctx);
+    if (eval_recover && *eval_recover)
+      return 0;
+    if (lctx.var == rctx.var) {
+      if (!lctx.var) {
+        switch (node->kind) {
+        case ND_EQ: return (uint64_t)lv == (uint64_t)rv;
+        case ND_NE: return (uint64_t)lv != (uint64_t)rv;
+        case ND_LT: return (uint64_t)lv < (uint64_t)rv;
+        case ND_LE: return (uint64_t)lv <= (uint64_t)rv;
+        case ND_GT: return (uint64_t)lv > (uint64_t)rv;
+        case ND_GE: return (uint64_t)lv >= (uint64_t)rv;
+        }
+      }
+      switch (node->kind) {
+      case ND_EQ: return lv == rv;
+      case ND_NE: return lv != rv;
+      case ND_LT: return lv < rv;
+      case ND_LE: return lv <= rv;
+      case ND_GT: return lv > rv;
+      case ND_GE: return lv >= rv;
+      }
+    }
+    if ((node->kind == ND_EQ || node->kind == ND_NE) &&
+        ((lctx.var && !lctx.var->is_weak && !rctx.var && rv == 0) ||
+         (rctx.var && !rctx.var->is_weak && !lctx.var && lv == 0))) {
+      return node->kind == ND_NE;
+    }
+    return eval_error(node);
   } else if (lhs->ty->is_unsigned) {
     switch (node->kind) {
     case ND_EQ: return (uint64_t)eval(lhs) == (uint64_t)eval(rhs);
@@ -3832,27 +3891,29 @@ static int64_t eval2(Node *node, EvalContext *ctx) {
         if (fp->kind != ND_NUM)
           return eval_error(lhs);
       }
+      long_double_t d = eval_double(lhs);
       if (ty->kind == TY_BOOL)
-        return !!eval_double(lhs);
-      if (ty->size == 8 && ty->is_unsigned)
-        return (uint64_t)eval_double(lhs);
-      return eval_sign_extend(ty, eval_double(lhs));
+        return d != 0;
+      if (!(d == d))
+        return 0;
+      if (ty->size == 8 && ty->is_unsigned) {
+        if (d < 0.0 || d >= 18446744073709551616.0)
+          return 0;
+        return (int64_t)(uint64_t)d;
+      }
+      if (d < -9223372036854775808.0 || d >= 9223372036854775808.0)
+        return 0;
+      return eval_sign_extend(ty, (int64_t)d);
     }
 
     if (ty->kind == TY_BOOL && !eval_strict) {
-      Node *n = lhs;
-      while (n->kind == ND_CAST &&
-             n->ty->size == 8 &&
-             (n->ty->kind == TY_PTR || is_integer(n->ty)))
-        n = n->m.lhs;
-
-      Obj *var = NULL;
-      if (n->kind == ND_ADDR && n->m.lhs->kind == ND_VAR)
-        var = n->m.lhs->m.var;
-      else if (n->kind == ND_VAR && is_decay_ty(n->ty))
-        var = n->m.var;
-
-      if (var && !var->is_weak)
+      bool rec = false;
+      bool *prev_rec = eval_recover;
+      eval_recover = &rec;
+      EvalContext lctx = {.kind = EV_LABEL};
+      (void)eval2(lhs, &lctx);
+      eval_recover = prev_rec;
+      if (!rec && lctx.var && !lctx.var->is_weak)
         return 1;
     }
 
@@ -3907,7 +3968,7 @@ static int64_t eval2(Node *node, EvalContext *ctx) {
 
   if (ctx->kind == EV_LABEL) {
     if (!ctx->var) {
-      int ofs;
+      int64_t ofs;
       Obj *var = NULL;
       if (node->kind == ND_ADDR)
         var = eval_var(lhs, &ofs, true);
@@ -4537,10 +4598,8 @@ static Node *assign(Token **rest, Token *tok) {
 }
 
 static Node *vla_cond_result_len2(Type *ty) {
-  if (!ty->vla_len_expr)
+  if (!ty->vla_len_expr || !ty->vla_len_val)
     return NULL;
-  if (!ty->vla_len_val)
-    internal_error();
   return new_var_node(ty->vla_len_val, ty->vla_len_expr->tok);
 }
 
@@ -5073,6 +5132,7 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
     }
 
     VarAttr attr = {0};
+    Token *decl_start = tok;
     Type *basety = declspec(&tok, tok, &attr, SC_NONE);
 
     // Anonymous struct member
@@ -5081,13 +5141,25 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
         error_tok(tok, "member has incomplete type");
       if (is_iso_std && basety->is_flexible && !tok->file->is_syshdr)
         error_tok(tok, "struct with flexible array member cannot be a member in ISO C");
-      if (basety->tag && !opt_ms_anon_struct)
+      bool has_struct_kw = false;
+      for (Token *t = decl_start; t && t != tok; t = t->next) {
+        if (t->kind == TK_struct || t->kind == TK_union) {
+          has_struct_kw = true;
+          break;
+        }
+      }
+      if ((basety->tag || (is_iso_std && !has_struct_kw && !tok->file->is_syshdr)) &&
+          !opt_ms_anon_struct)
         error_tok(tok,
                   "enable MSVC anonymous struct extension with `-fms-anonymous-structs`");
       chk_mem_name(&names, basety->members);
 
       Member *mem = calloc(1, sizeof(Member));
       mem->ty = basety;
+      if (attr.alignas_val > 0 && mem->ty->align > 0 && attr.alignas_val < mem->ty->align)
+        error_tok(tok, "_Alignas cannot reduce natural alignment");
+      aligned_attr(NULL, tok, &attr, &mem->alt_align);
+      mem_attr(NULL, tok, &attr, mem);
 
       tok = tok->next;
       cur = cur->next = mem;
@@ -5365,6 +5437,8 @@ static Type *union_decl(Type *ty, int align, int pack_align) {
     ty->size = MAX(ty->size, sz);
   }
   ty->align = MAX(align, 1);
+  if (ty->size > INT64_MAX - ty->align)
+    error("union size is too large");
   ty->size = align_to(MAX(ty->size, 0), ty->align);
   return ty;
 }
@@ -5580,7 +5654,7 @@ static Node *generic_selection(Token **rest, Token *tok) {
     add_type(node);
     if (is_compatible2(t1, t2)) {
       if (ret)
-        internal_error();
+        error_tok(start, "controlling expression compatible with multiple generic associations");
       ret = node;
     }
   }
@@ -5645,7 +5719,7 @@ static Node *compound_literal(Token **rest, Token *tok) {
   tok = skip_tk(tok, TK_RPAREN);
 
   if (is_const_context() || (attr.strg & SC_STATIC)) {
-    if (is_iso_std && scope->parent && is_const_context() && !(attr.strg & SC_STATIC) &&
+    if (is_iso_std && fnctx && is_const_context() && !(attr.strg & SC_STATIC) &&
         !start->file->is_syshdr)
       error_tok(start, "block-scope compound literal is not a constant expression");
     Obj *var = new_anon_gvar(ty);
@@ -5915,8 +5989,12 @@ static Node *primary(Token **rest, Token *tok) {
     *rest = tok->next;
 
     if (sc) {
-      if (sc->var)
-        return new_var_node(sc->var, tok);
+      if (sc->var) {
+        Node *n = new_var_node(sc->var, tok);
+        if (sc->var_ty)
+          n->ty = sc->var_ty;
+        return n;
+      }
       if (sc->enum_val) {
         if (sc->enum_val->ty->kind == TY_BITINT) {
           Node *n = new_node(ND_NUM, tok);
@@ -6458,6 +6536,7 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
 
     HashEntry *ent = hashmap_get_or_insert(&symbols, name->loc, name->len);
     Obj *var = ent->val;
+    Type *scoped_ty = NULL;
     if (var) {
       if (!is_compatible2(var->ty, ty))
         error_tok(name, "incompatible redeclaration");
@@ -6467,14 +6546,20 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
       if ((var->kind == OBJ_TLS) != !!(attr->strg & SC_THREAD))
         error_tok(name, "redeclaration with%s thread local",
                   var->kind == OBJ_TLS ? "out" : "");
-      var->ty = composite_type(var->ty, ty);
+      if (scope->parent) {
+        scoped_ty = composite_type(var->ty, ty);
+      } else {
+        var->ty = composite_type(var->ty, ty);
+      }
     } else {
       var = ent->val = new_gvar(get_ident(&cc1_arena, name), ty);
       var->is_static = (attr->strg & SC_STATIC) || (attr->strg & SC_CONSTEXPR);
       if (attr->strg & SC_THREAD)
         var->kind = OBJ_TLS;
     }
-    push_gvar_name(name, var);
+    VarScope *vsc = push_gvar_name2(name, var);
+    if (scoped_ty && vsc)
+      vsc->var_ty = vsc->var_ty ? composite_type(vsc->var_ty, scoped_ty) : scoped_ty;
 
     assembler_name(&tok, tok, var);
     if (attr->alignas_val > 0 && ty->align > 0 && attr->alignas_val < ty->align)

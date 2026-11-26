@@ -415,7 +415,8 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
                     pir_fn_append_inst(fn, &new_insts, st);
                 }
             } else if (copy.op == PIR_OP_BITCAST) {
-                PirValueId src_v = copy.operands[0].u.val;
+                PirValueId src_v = (copy.operands[0].kind == PIR_OPER_VAL)
+                                   ? copy.operands[0].u.val : PIR_INVALID_ID;
                 const VecSplit *ssp = (src_v < orig_vals && splits[src_v].count > 0u) ? &splits[src_v] : NULL;
                 if (ssp && rsp && ssp->count == rsp->count &&
                     pir_type_bits(ssp->piece_ty, target->ptr_bytes) ==
@@ -445,9 +446,16 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
                             pir_fn_append_inst(fn, &new_insts, st);
                         }
                     } else {
-                        PirInst st = pir_make_inst(PIR_OP_STORE, copy.operands[0].type, ln, lc);
+                        PirType st_ty = copy.operands[0].type;
+                        PirOperand st_op = copy.operands[0];
+                        if (st_op.kind == PIR_OPER_IMM_INT &&
+                            !(st_ty.kind == PIR_TYPE_SCALAR && pir_scalar_is_int(st_ty.u.scalar))) {
+                            st_ty = pir_type_scalar(total_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
+                            st_op.type = st_ty;
+                        }
+                        PirInst st = pir_make_inst(PIR_OP_STORE, st_ty, ln, lc);
                         st.align = total_bytes; st.operand_count = 2u; st.operands = pir_alloc_ops(mod, 2u);
-                        st.operands[0] = copy.operands[0];
+                        st.operands[0] = st_op;
                         st.operands[1] = pir_op_val(al.results[0], tptr);
                         pir_fn_append_inst(fn, &new_insts, st);
                     }
@@ -766,6 +774,72 @@ bool pir_legalize_simd(PirModule *mod, const PirTargetSpec *target, PirDiag *dia
     }
     for (uint32_t si = 0u; si < mod->sigs.len; ++si) {
         split_simd_decl(mod, &mod->sigs.data[si].params, &mod->sigs.data[si].param_count, max_bits);
+    }
+
+    /* Flatten oversized typed vector globals (> max_simd_bits) into raw byte/zeroinit data. */
+    for (uint32_t gi = 0u; gi < mod->globals.len; ++gi) {
+        PirGlobal *g = &mod->globals.data[gi];
+        if (!g->has_type || g->type.kind != PIR_TYPE_VECTOR) continue;
+        if (pir_vec_bits(g->type.u.vec) <= max_bits) continue;
+        PirVecType vt = g->type.u.vec;
+        PirScalarType elem = pir_vec_elem_scalar(vt);
+        uint32_t lanes = pir_vec_lanes(vt);
+        uint32_t esz = pir_scalar_bits(elem, target->ptr_bytes) / 8u;
+        uint32_t total_bytes = lanes * esz;
+        if (g->align < total_bytes) g->align = total_bytes;
+        g->has_type = false;
+        g->type     = pir_type_scalar(PIR_SCALAR_VOID);
+        if (g->is_zeroinit || g->item_count == 0u ||
+            (g->item_count == 1u && g->items[0].kind == PIR_GITEM_ZERO)) {
+            g->is_zeroinit   = true;
+            g->is_braced     = false;
+            g->item_count    = 1u;
+            g->items         = PIR_ARENA_NEW_ARRAY(&mod->arena, PirGlobalItem, 1u);
+            g->items[0].kind = PIR_GITEM_ZERO;
+            g->items[0].len  = total_bytes;
+        } else {
+            uint8_t *buf = PIR_ARENA_NEW_ARRAY(&mod->arena, uint8_t, total_bytes);
+            memset(buf, 0, total_bytes);
+            for (uint32_t l = 0u; l < lanes && l < g->item_count; ++l) {
+                const PirGlobalItem *it = &g->items[l];
+                uint64_t raw = 0u;
+                if (it->kind == PIR_GITEM_INT) {
+                    uint64_t v = it->int_neg ? (UINT64_C(0) - it->int_lo) : it->int_lo;
+                    if (elem == PIR_SCALAR_F32) {
+                        float fv = it->int_neg ? -(float)it->int_lo : (float)it->int_lo;
+                        uint32_t fb = 0u;
+                        memcpy(&fb, &fv, 4u);
+                        raw = fb;
+                    } else if (elem == PIR_SCALAR_F64) {
+                        double dv = it->int_neg ? -(double)it->int_lo : (double)it->int_lo;
+                        memcpy(&raw, &dv, 8u);
+                    } else {
+                        raw = v;
+                    }
+                } else if (it->kind == PIR_GITEM_FLOAT) {
+                    if (elem == PIR_SCALAR_F32) {
+                        double dv = 0.0;
+                        memcpy(&dv, &it->float_bits, 8u);
+                        float fv = (float)dv;
+                        uint32_t fb = 0u;
+                        memcpy(&fb, &fv, 4u);
+                        raw = fb;
+                    } else {
+                        raw = it->float_bits;
+                    }
+                }
+                for (uint32_t k = 0u; k < esz; ++k) {
+                    uint32_t sh = target->is_big_endian ? ((esz - 1u - k) * 8u) : (k * 8u);
+                    buf[l * esz + k] = (uint8_t)((raw >> sh) & 0xFFu);
+                }
+            }
+            g->is_braced      = true;
+            g->item_count     = 1u;
+            g->items          = PIR_ARENA_NEW_ARRAY(&mod->arena, PirGlobalItem, 1u);
+            g->items[0].kind  = PIR_GITEM_BYTES;
+            g->items[0].bytes = buf;
+            g->items[0].len   = total_bytes;
+        }
     }
     return true;
 }

@@ -69,7 +69,7 @@ static bool fold_const_terminators(PirFunction *fn) {
         if (term->op == PIR_OP_BR) {
             uint64_t cv = 0u;
             if (eval_const_int(fn, term->operands[0], &cv)) {
-                uint32_t taken = (cv != 0u) ? 0u : 1u;
+                uint32_t taken = ((cv & 0xffu) != 0u) ? 0u : 1u;
                 PirBranchTarget chosen = term->targets[taken];
                 term->op = PIR_OP_JMP;
                 term->operand_count = 0u;
@@ -271,7 +271,35 @@ static bool thread_empty_jumps(PirFunction *fn, const PirCfg *cfg) {
     return changed;
 }
 
-static bool is_pure_speculatable_alu(const PirInst *ins, bool allow_cmp) {
+static bool operand_is_proven_bool_i8(const PirFunction *fn, PirOperand op) {
+    if (op.kind == PIR_OPER_IMM_INT) {
+        uint64_t v = op.u.imm_int.is_negative ? (UINT64_C(0) - op.u.imm_int.lo) : op.u.imm_int.lo;
+        return (v & 0xffu) <= 1u;
+    }
+    if (op.kind == PIR_OPER_VAL && op.u.val < fn->values.len) {
+        PirInstId did = fn->values.data[op.u.val].def_inst;
+        if (did == PIR_INVALID_ID) return false;
+        const PirInst *d = &fn->insts.data[did];
+        if ((d->op >= PIR_OP_CMP_EQ && d->op <= PIR_OP_CMP_GE_U) ||
+            (d->op >= PIR_OP_FCMP_OEQ && d->op <= PIR_OP_FCMP_UGE)) {
+            return true;
+        }
+        if ((d->op >= PIR_OP_ADD_OVF_S && d->op <= PIR_OP_MUL_OVF_U) ||
+            d->op == PIR_OP_ADD_CARRY || d->op == PIR_OP_SUB_BORROW) {
+            return d->results[1] == op.u.val;
+        }
+        if (d->op == PIR_OP_CONST && d->operand_count == 1u &&
+            d->operands[0].kind == PIR_OPER_IMM_INT) {
+            uint64_t v = d->operands[0].u.imm_int.is_negative
+                         ? (UINT64_C(0) - d->operands[0].u.imm_int.lo)
+                         : d->operands[0].u.imm_int.lo;
+            return (v & 0xffu) <= 1u;
+        }
+    }
+    return false;
+}
+
+static bool is_pure_speculatable_alu(const PirFunction *fn, const PirInst *ins, bool allow_cmp) {
     if (ins->results[0] == PIR_INVALID_ID || ins->results[1] != PIR_INVALID_ID) return false;
     if (ins->ty.kind != PIR_TYPE_SCALAR) return false;
     uint32_t bad_flags = PIR_FLAG_TRAP | PIR_FLAG_TRAP_S | PIR_FLAG_TRAP_U |
@@ -284,11 +312,14 @@ static bool is_pure_speculatable_alu(const PirInst *ins, bool allow_cmp) {
     }
 
     PirOpcode op = ins->op;
+    if (op == PIR_OP_SELECT) {
+        return ins->operand_count == 3u && operand_is_proven_bool_i8(fn, ins->operands[0]);
+    }
     if (op == PIR_OP_CONST || op == PIR_OP_ADD || op == PIR_OP_SUB || op == PIR_OP_MUL ||
         op == PIR_OP_AND || op == PIR_OP_OR || op == PIR_OP_XOR ||
         op == PIR_OP_SHL || op == PIR_OP_SHR || op == PIR_OP_SAR ||
         op == PIR_OP_ZEXT || op == PIR_OP_SEXT || op == PIR_OP_TRUNC ||
-        op == PIR_OP_SELECT || op == PIR_OP_FADD || op == PIR_OP_FSUB ||
+        op == PIR_OP_FADD || op == PIR_OP_FSUB ||
         op == PIR_OP_FMUL || op == PIR_OP_FNEG || op == PIR_OP_SITOFP ||
         op == PIR_OP_UITOFP || op == PIR_OP_FPEXT || op == PIR_OP_FPTRUNC ||
         op == PIR_OP_BITCAST || op == PIR_OP_PTR_ADD) {
@@ -333,7 +364,7 @@ static bool if_convert_diamonds(PirModule *mod, PirFunction *fn, const PirCfg *c
 
             bool alu_ok = true;
             for (uint32_t j = 0u; j < n_alu; ++j) {
-                if (!is_pure_speculatable_alu(&fn->insts.data[sb->insts.data[j]], false)) {
+                if (!is_pure_speculatable_alu(fn, &fn->insts.data[sb->insts.data[j]], false)) {
                     alu_ok = false;
                     break;
                 }
@@ -366,6 +397,9 @@ static bool if_convert_diamonds(PirModule *mod, PirFunction *fn, const PirCfg *c
                     (sins->flags & (PIR_FLAG_UNSAFE_S | PIR_FLAG_UNSAFE_U)) != 0u) {
                     sins->flags &= ~(uint32_t)(PIR_FLAG_UNSAFE_S | PIR_FLAG_UNSAFE_U);
                     sins->flags |= PIR_FLAG_WRAP;
+                }
+                if (sins->op == PIR_OP_PTR_ADD) {
+                    sins->flags &= ~(uint32_t)PIR_FLAG_INBOUNDS;
                 }
                 PIR_VEC_PUSH(&fn->blocks.data[b].insts, siid);
                 PirValueId rv = sins->results[0];
@@ -425,10 +459,10 @@ static bool if_convert_diamonds(PirModule *mod, PirFunction *fn, const PirCfg *c
                                fjmp->targets[0].arg_count == nparams &&
                                nparams <= 4u);
                     for (uint32_t j = 0u; j < nt && ok; ++j) {
-                        if (!is_pure_speculatable_alu(&fn->insts.data[tb->insts.data[j]], false)) ok = false;
+                        if (!is_pure_speculatable_alu(fn, &fn->insts.data[tb->insts.data[j]], false)) ok = false;
                     }
                     for (uint32_t j = 0u; j < nf && ok; ++j) {
-                        if (!is_pure_speculatable_alu(&fn->insts.data[fb->insts.data[j]], false)) ok = false;
+                        if (!is_pure_speculatable_alu(fn, &fn->insts.data[fb->insts.data[j]], false)) ok = false;
                     }
                     for (uint32_t k = 0u; k < nparams && ok; ++k) {
                         if (fn->values.data[fn->blocks.data[mblk].params.data[k]].type.kind != PIR_TYPE_SCALAR) {
@@ -451,6 +485,9 @@ static bool if_convert_diamonds(PirModule *mod, PirFunction *fn, const PirCfg *c
                                 sins->flags &= ~(uint32_t)(PIR_FLAG_UNSAFE_S | PIR_FLAG_UNSAFE_U);
                                 sins->flags |= PIR_FLAG_WRAP;
                             }
+                            if (sins->op == PIR_OP_PTR_ADD) {
+                                sins->flags &= ~(uint32_t)PIR_FLAG_INBOUNDS;
+                            }
                             PIR_VEC_PUSH(&fn->blocks.data[b].insts, siid);
                             if (sins->results[0] != PIR_INVALID_ID) fn->values.data[sins->results[0]].def_block = b;
                         }
@@ -461,6 +498,9 @@ static bool if_convert_diamonds(PirModule *mod, PirFunction *fn, const PirCfg *c
                                 (sins->flags & (PIR_FLAG_UNSAFE_S | PIR_FLAG_UNSAFE_U)) != 0u) {
                                 sins->flags &= ~(uint32_t)(PIR_FLAG_UNSAFE_S | PIR_FLAG_UNSAFE_U);
                                 sins->flags |= PIR_FLAG_WRAP;
+                            }
+                            if (sins->op == PIR_OP_PTR_ADD) {
+                                sins->flags &= ~(uint32_t)PIR_FLAG_INBOUNDS;
                             }
                             PIR_VEC_PUSH(&fn->blocks.data[b].insts, siid);
                             if (sins->results[0] != PIR_INVALID_ID) fn->values.data[sins->results[0]].def_block = b;
@@ -1106,7 +1146,7 @@ static bool try_rotate_one_loop(PirModule *mod, PirFunction *fn, const PirCfg *c
 
         bool alu_ok = true;
         for (uint32_t j = 0u; j < n_alu; ++j) {
-            if (!is_pure_speculatable_alu(&fn->insts.data[hb->insts.data[j]], true)) {
+            if (!is_pure_speculatable_alu(fn, &fn->insts.data[hb->insts.data[j]], true)) {
                 alu_ok = false;
                 break;
             }

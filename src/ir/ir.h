@@ -415,6 +415,7 @@ typedef struct {
     uint64_t        call_byval_size;  /* SysV x64 variadic inline stack byval size (0 = none) */
     uint32_t        call_byval_align; /* SysV x64 variadic inline stack byval alignment */
     uint32_t        call_stack_align; /* Call-site outgoing stack alignment override (0 = default) */
+    bool            call_force_stack; /* Force variadic arg onto stack (e.g. SysV i128 at gp==5) */
     union {
         PirValueId val;
         struct {

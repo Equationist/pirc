@@ -279,6 +279,13 @@ static void rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
                         vinfo.regs[k] = pir_type_vec(PIR_VEC_V2F32);
                     }
                 }
+            } else if (target->arch == PIR_ARCH_ARM64 && target->os != PIR_OS_MACOS) {
+                for (uint32_t p = 0u; p < vinfo.pad_gp_before; ++p) {
+                    PIR_VEC_PUSH(&new_ops, pir_op_imm_i(0u, false, ti64));
+                }
+                for (uint32_t p = 0u; p < vinfo.pad_fp_before; ++p) {
+                    PIR_VEC_PUSH(&new_ops, pir_op_imm_f(0u, pir_type_scalar(PIR_SCALAR_F64)));
+                }
             }
             arg.call_abi          = PIR_PARAM_NORMAL;
             arg.has_explicit_type = false;
@@ -291,9 +298,24 @@ static void rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
                 vpd.type     = arg.type;
                 PirAbiArgInfo vinfo;
                 pir_abi_classify_param(mod, target, &vpd, &va_st, &vinfo);
-                if (target->arch == PIR_ARCH_ARM64 && target->os == PIR_OS_MACOS &&
-                    arg.type.kind == PIR_TYPE_SCALAR && arg.type.u.scalar == PIR_SCALAR_I128) {
-                    arg.call_stack_align = 16u;
+                if (target->arch == PIR_ARCH_ARM64 && target->os == PIR_OS_MACOS) {
+                    if ((arg.type.kind == PIR_TYPE_SCALAR && arg.type.u.scalar == PIR_SCALAR_I128) ||
+                        (arg.type.kind == PIR_TYPE_VECTOR && pir_vec_bits(arg.type.u.vec) == 128u)) {
+                        arg.call_stack_align = 16u;
+                    }
+                } else {
+                    for (uint32_t p = 0u; p < vinfo.pad_gp_before; ++p) {
+                        PIR_VEC_PUSH(&new_ops, pir_op_imm_i(0u, false, ti64));
+                    }
+                    for (uint32_t p = 0u; p < vinfo.pad_fp_before; ++p) {
+                        PIR_VEC_PUSH(&new_ops, pir_op_imm_f(0u, pir_type_scalar(PIR_SCALAR_F64)));
+                    }
+                    if (vinfo.force_stack) {
+                        arg.call_force_stack = true;
+                    }
+                    if (vinfo.stack_align > 0u) {
+                        arg.call_stack_align = vinfo.stack_align;
+                    }
                 }
             }
             PIR_VEC_PUSH(&new_ops, arg);
@@ -644,7 +666,9 @@ bool pir_lower_cabi(PirModule *mod, const PirTargetSpec *target, PirDiag *diag) 
                     for (uint32_t k = 1u; k < copy.operand_count; ++k) {
                         if (copy.operands[k].call_abi == PIR_PARAM_BYVAL ||
                             (copy.operands[k].type.kind == PIR_TYPE_SCALAR &&
-                             copy.operands[k].type.u.scalar == PIR_SCALAR_I128)) {
+                             copy.operands[k].type.u.scalar == PIR_SCALAR_I128) ||
+                            (copy.operands[k].type.kind == PIR_TYPE_VECTOR &&
+                             pir_vec_bits(copy.operands[k].type.u.vec) == 128u)) {
                             has_va_special = true;
                             break;
                         }

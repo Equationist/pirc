@@ -752,7 +752,7 @@ static bool try_vectorize_loop(PirModule *mod, PirFunction *fn, const PirTargetS
                 uint64_t trips = 0u;
                 if (is_signed) {
                     if (sl > si || (is_inclusive && sl == si)) {
-                        trips = (uint64_t)(sl - si) + (is_inclusive ? 1u : 0u);
+                        trips = ((uint64_t)sl - (uint64_t)si) + (is_inclusive ? 1u : 0u);
                     }
                 } else {
                     if (c_lim > c_init || (is_inclusive && c_lim == c_init)) {

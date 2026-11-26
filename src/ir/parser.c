@@ -46,6 +46,7 @@ typedef struct {
     PirDiag   *diag;
     bool      *agg_defined;     /* Dynamically sized bitmap of defined named aggregates */
     uint32_t   agg_defined_cap;
+    uint32_t   type_depth;
     PIR_VEC(PendingTarget) pending_targets;
     PIR_VEC(PendingValRef) pending_vals;
     PIR_VEC(PendingSigRef) pending_sigs;
@@ -212,58 +213,70 @@ static PirTypeId intern_anon_pad(Parser *p, uint64_t len, uint32_t line) {
 }
 
 static bool parse_type(Parser *p, PirType *out) {
+    if (p->type_depth >= 256u) {
+        pir_diag_error(p->diag, p->cur.line, p->cur.col, "type nesting depth exceeds limit (256)");
+        return false;
+    }
+    p->type_depth++;
+    bool ok = false;
     if (p->cur.kind == TOK_IDENT) {
         if (strcmp(p->cur.text, "pad") == 0) {
             uint32_t line = p->cur.line;
             advance_tok(p);
             if (p->cur.kind != TOK_INT || p->cur.int_neg || p->cur.int_hi != 0u || p->cur.int_lo == 0u) {
                 pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected positive integer byte count after 'pad'");
-                return false;
+                goto done;
             }
             uint64_t plen = p->cur.int_lo;
             advance_tok(p);
             *out = pir_type_agg(intern_anon_pad(p, plen, line));
-            return true;
+            ok = true;
+            goto done;
         }
         if (parse_builtin_type_name(p->cur.text, out)) {
             advance_tok(p);
-            return true;
+            ok = true;
+            goto done;
         }
         pir_diag_error(p->diag, p->cur.line, p->cur.col, "unknown type '%s'", p->cur.text);
-        return false;
+        goto done;
     }
     if (p->cur.kind == TOK_GLOBAL) {
         PirTypeId id = intern_named_agg(p, p->cur.text, p->cur.line);
         advance_tok(p);
         *out = pir_type_agg(id);
-        return true;
+        ok = true;
+        goto done;
     }
     if (p->cur.kind == TOK_LBRACKET) {
         uint32_t line = p->cur.line;
         advance_tok(p);
         if (p->cur.kind != TOK_INT || p->cur.int_neg || p->cur.int_hi != 0u) {
             pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected array length integer");
-            return false;
+            goto done;
         }
         uint64_t alen = p->cur.int_lo;
         advance_tok(p);
         if (!is_ident(p, "x")) {
             pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected 'x' in array type");
-            return false;
+            goto done;
         }
         advance_tok(p);
         PirType elem;
         if (!parse_type(p, &elem)) {
-            return false;
+            goto done;
         }
         if (!expect_tok(p, TOK_RBRACKET, "']'")) {
-            return false;
+            goto done;
         }
         *out = pir_type_agg(intern_anon_array(p, alen, elem, line));
-        return true;
+        ok = true;
+        goto done;
     }
     pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected type");
-    return false;
+done:
+    p->type_depth--;
+    return ok;
 }
 
 static bool parse_opcode_name(const char *s, PirOpcode *out) {
@@ -1755,14 +1768,14 @@ static bool parse_global_decl(Parser *p, PirLinkage linkage) {
         advance_tok(p);
         if (match_tok(p, TOK_RBRACKET)) {
             /* Flattened LIR byte-count zeroinit global: `[<bytes>] = zeroinit, align <n>` */
-            g.has_type = false;
+            g.has_type    = false;
+            g.is_zeroinit = true;
             if (match_tok(p, TOK_EQ)) {
                 if (!is_ident(p, "zeroinit")) {
                     PIR_VEC_FREE(&items);
                     pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected 'zeroinit'");
                     return false;
                 }
-                g.is_zeroinit = true;
                 advance_tok(p);
             }
             PirGlobalItem zi;
@@ -1967,23 +1980,26 @@ static bool parse_func_decl(Parser *p, PirLinkage linkage) {
             while (p->cur.kind != TOK_LABEL && p->cur.kind != TOK_RBRACE && p->cur.kind != TOK_EOF) {
                 if (is_ident(p, "loc")) {
                     advance_tok(p);
-                    if (p->cur.kind != TOK_INT || p->cur.int_neg || p->cur.int_hi != 0u) {
-                        pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected file id in loc");
+                    if (p->cur.kind != TOK_INT || p->cur.int_neg || p->cur.int_hi != 0u ||
+                        p->cur.int_lo > UINT32_MAX) {
+                        pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected 32-bit file id in loc");
                         return false;
                     }
                     PirSourceLoc loc;
                     loc.file_id = (uint32_t)p->cur.int_lo;
                     advance_tok(p);
                     if (!expect_tok(p, TOK_COMMA, "','")) return false;
-                    if (p->cur.kind != TOK_INT || p->cur.int_neg || p->cur.int_hi != 0u) {
-                        pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected line in loc");
+                    if (p->cur.kind != TOK_INT || p->cur.int_neg || p->cur.int_hi != 0u ||
+                        p->cur.int_lo > UINT32_MAX) {
+                        pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected 32-bit line in loc");
                         return false;
                     }
                     loc.line = (uint32_t)p->cur.int_lo;
                     advance_tok(p);
                     if (!expect_tok(p, TOK_COMMA, "','")) return false;
-                    if (p->cur.kind != TOK_INT || p->cur.int_neg || p->cur.int_hi != 0u) {
-                        pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected col in loc");
+                    if (p->cur.kind != TOK_INT || p->cur.int_neg || p->cur.int_hi != 0u ||
+                        p->cur.int_lo > UINT32_MAX) {
+                        pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected 32-bit col in loc");
                         return false;
                     }
                     loc.col = (uint32_t)p->cur.int_lo;
@@ -2233,8 +2249,9 @@ bool pir_parse_module(const char *src, size_t len, const char *filename,
     while (p.cur.kind != TOK_EOF && !pir_diag_has_errors(diag)) {
         if (is_ident(&p, "file")) {
             advance_tok(&p);
-            if (p.cur.kind != TOK_INT || p.cur.int_neg || p.cur.int_hi != 0u) {
-                pir_diag_error(diag, p.cur.line, p.cur.col, "expected file id integer");
+            if (p.cur.kind != TOK_INT || p.cur.int_neg || p.cur.int_hi != 0u ||
+                p.cur.int_lo > UINT32_MAX) {
+                pir_diag_error(diag, p.cur.line, p.cur.col, "expected 32-bit file id integer");
                 break;
             }
             PirFileDecl fd;

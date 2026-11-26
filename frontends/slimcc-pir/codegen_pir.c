@@ -312,6 +312,25 @@ typedef struct {
   int count;
 } HfaCheck;
 
+static bool is_unnamed_bf_only_agg(Type *ty) {
+  if (!ty || (ty->kind != TY_STRUCT && ty->kind != TY_UNION) || ty->size <= 0)
+    return false;
+  for (Member *m = ty->members; m; m = m->next) {
+    if (m->is_bitfield) {
+      if (m->name && m->bit_width > 0)
+        return false;
+      continue;
+    }
+    if (m->ty->size <= 0)
+      continue;
+    if ((m->ty->kind == TY_STRUCT || m->ty->kind == TY_UNION) &&
+        is_unnamed_bf_only_agg(m->ty))
+      continue;
+    return false;
+  }
+  return true;
+}
+
 static void check_hfa_walk(Type *ty, int64_t base_off, HfaCheck *hc) {
   if (!hc->valid)
     return;
@@ -346,7 +365,7 @@ static void check_hfa_walk(Type *ty, int64_t base_off, HfaCheck *hc) {
     for (Member *m = ty->members; m && hc->valid; m = m->next) {
       if (m->is_bitfield && m->bit_width == 0)
         continue;
-      if (m->is_bitfield || m->is_packed) {
+      if (m->is_bitfield) {
         hc->valid = false;
         return;
       }
@@ -363,10 +382,12 @@ static void check_hfa_walk(Type *ty, int64_t base_off, HfaCheck *hc) {
     for (Member *m = ty->members; m && hc->valid; m = m->next) {
       if (m->is_bitfield && m->bit_width == 0)
         continue;
-      if (m->is_bitfield || m->is_packed) {
+      if (m->is_bitfield) {
         hc->valid = false;
         return;
       }
+      if (m->ty->size <= 0 || is_unnamed_bf_only_agg(m->ty))
+        continue;
       HfaCheck mc = {.valid = true, .elem_kind = TY_VOID, .count = 0};
       check_hfa_walk(m->ty, base_off + m->offset, &mc);
       int64_t esz = (mc.elem_kind == TY_FLOAT) ? 4 : 8;
@@ -507,6 +528,27 @@ static const char *get_pir_agg_type_name(Type *ty) {
       ty->size > 0 && ty->size <= 16) {
     SysvX64Walk w = {0};
     walk_sysv_x64_agg(ty, 0, &w);
+    if (w.unaligned && sz >= 3) {
+      /* SysV AMD64 §3.2.3: any unaligned field forces the entire aggregate to
+       * MEMORY class (passed on the stack / returned via hidden sret pointer).
+       * Emit a packed PIR struct containing an unaligned i16 at offset 1 so
+       * abi_sysv_x64 classifies it as MEMORY while preserving exact size/align. */
+      SBuf sb;
+      sb_init(&sb);
+      if (sz == 3)
+        sb_printf(&sb, "packed { i8, i16 }");
+      else
+        sb_printf(&sb, "packed { i8, i16, [%" PRIi64 " x i8] }", sz - 3);
+      if (al > 1) {
+        int32_t p2al = 1;
+        while (p2al < al && p2al < 4096)
+          p2al <<= 1;
+        sb_printf(&sb, ", align %d", p2al);
+      }
+      const char *res = register_pir_type_def(sb.buf);
+      sb_free(&sb);
+      return res;
+    }
     bool has_special_eb = (w.cls[0] == 1 || w.cls[1] == 1 ||
                            w.cls[0] == 0 || (sz > 8 && w.cls[1] == 0));
     if (!w.unaligned && has_special_eb) {
@@ -604,12 +646,29 @@ static const char *get_pir_agg_type_name(Type *ty) {
     }
   }
 
+  /* 0b. On ARM64, aggregates containing only unnamed bitfields (and/or empty
+   *     aggregates) are pure padding; Darwin AAPCS64 passes them in 0 registers. */
+  if (!is_x64_pir_target() && is_unnamed_bf_only_agg(ty)) {
+    SBuf sb;
+    sb_init(&sb);
+    sb_printf(&sb, "{ pad %" PRIi64 " }", sz);
+    if (al > 1) {
+      int32_t p2al = 1;
+      while (p2al < al && p2al < 4096)
+        p2al <<= 1;
+      sb_printf(&sb, ", align %d", p2al);
+    }
+    const char *res = register_pir_type_def(sb.buf);
+    sb_free(&sb);
+    return res;
+  }
+
   /* 1. Check for HFA (1..4 float or double elements, exact packed size) */
   if ((ty->kind == TY_STRUCT || ty->kind == TY_UNION) && ty->size > 0) {
     HfaCheck hc = {.valid = true, .elem_kind = TY_VOID, .count = 0};
     check_hfa_walk(ty, 0, &hc);
     int64_t esz = (hc.elem_kind == TY_FLOAT) ? 4 : 8;
-    if (hc.valid && hc.count >= 1 && hc.count <= 4 && sz == hc.count * esz) {
+    if (hc.valid && hc.count >= 1 && hc.count <= 4 && sz == hc.count * esz && al >= esz) {
       const char *et = (hc.elem_kind == TY_FLOAT) ? "f32" : "f64";
       SBuf sb;
       sb_init(&sb);
@@ -788,6 +847,9 @@ typedef struct {
   /* Pending LHS value for ND_NULL_EXPR inside ND_ARITH_ASSIGN / ND_POST_INCDEC */
   PirVal null_expr_val;
   bool has_null_expr_val;
+
+  /* Local variable currently being brace-initialized by ND_INIT_SEQ */
+  Obj *init_seq_var;
 
   /* Referenced module-level Obj*s (for liveness & extern emission) */
   Obj **refs;
@@ -1067,6 +1129,22 @@ static int pir_ty_bits(const char *t) {
   return 64;
 }
 
+static PirVal emit_bitint_norm(PirVal v, Type *ty) {
+  if (!ty || ty->kind != TY_BITINT || ty->bit_cnt > 64)
+    return v;
+  int db = pir_ty_bits(v.ty);
+  if ((int)ty->bit_cnt >= db)
+    return v;
+  int sh = db - (int)ty->bit_cnt;
+  int t1 = new_tid();
+  int t2 = new_tid();
+  sb_printf(&fc->body_sb, "    %%t%d = shl.%s %%t%d, %d [mask]\n", t1, v.ty, v.id, sh);
+  sb_printf(&fc->body_sb, "    %%t%d = %s.%s %%t%d, %d [mask]\n",
+            t2, ty->is_unsigned ? "shr" : "sar", v.ty, t1, sh);
+  PirVal res = {t2, v.ty};
+  return res;
+}
+
 static PirVal emit_cast_val(PirVal v, Type *from_ty, Type *to_ty) {
   ensure_open_block();
   if (to_ty->kind == TY_VOID)
@@ -1104,12 +1182,12 @@ static PirVal emit_cast_val(PirVal v, Type *from_ty, Type *to_ty) {
     sb_printf(&fc->body_sb, "    %%t%d = ptrtoint.i64 %%t%d\n", p64, v.id);
     if (!strcmp(dst_t, "i64")) {
       PirVal res = {p64, "i64"};
-      return res;
+      return emit_bitint_norm(res, to_ty);
     }
     int r = new_tid();
     sb_printf(&fc->body_sb, "    %%t%d = trunc.%s %%t%d\n", r, dst_t, p64);
     PirVal res = {r, dst_t};
-    return res;
+    return emit_bitint_norm(res, to_ty);
   }
 
   /* Float <-> Float */
@@ -1145,14 +1223,14 @@ static PirVal emit_cast_val(PirVal v, Type *from_ty, Type *to_ty) {
                 w, is_u ? "fptoui" : "fptosi", v.id);
       sb_printf(&fc->body_sb, "    %%t%d = trunc.%s %%t%d\n", r, dst_t, w);
       PirVal res = {r, dst_t};
-      return res;
+      return emit_bitint_norm(res, to_ty);
     }
     int r = new_tid();
     /* C standard float->int conversion (use [sat] for deterministic safe lowering) */
     sb_printf(&fc->body_sb, "    %%t%d = %s.%s %%t%d [sat]\n",
               r, is_u ? "fptoui" : "fptosi", dst_t, v.id);
     PirVal res = {r, dst_t};
-    return res;
+    return emit_bitint_norm(res, to_ty);
   }
 
   /* Int -> Int */
@@ -1173,16 +1251,7 @@ static PirVal emit_cast_val(PirVal v, Type *from_ty, Type *to_ty) {
   }
 
   /* Narrow _BitInt normalization if destination is sub-storage _BitInt(N) */
-  if (to_ty->kind == TY_BITINT && to_ty->bit_cnt < db) {
-    int sh = db - (int)to_ty->bit_cnt;
-    int t1 = new_tid();
-    int t2 = new_tid();
-    sb_printf(&fc->body_sb, "    %%t%d = shl.%s %%t%d, %d [mask]\n", t1, dst_t, cur.id, sh);
-    sb_printf(&fc->body_sb, "    %%t%d = %s.%s %%t%d, %d [mask]\n",
-              t2, to_ty->is_unsigned ? "shr" : "sar", dst_t, t1, sh);
-    cur.id = t2;
-  }
-  return cur;
+  return emit_bitint_norm(cur, to_ty);
 }
 
 static PirVal emit_load_scalar(PirVal addr, Type *ty, int32_t align_hint) {
@@ -1472,6 +1541,31 @@ static PirVal emit_load_node(Node *node, PirVal addr) {
       return v;
     }
   }
+  if (is_mem_val_ty(node->ty) && (node->ty->qual & Q_VOLATILE) && node->ty->size > 0) {
+    ensure_open_block();
+    int32_t al = node->ty->align > 0 ? node->ty->align : 1;
+    if (node->kind == ND_MEMBER && node->m.member->is_packed)
+      al = 1;
+    int slot = emit_entry_alloca(node->ty->size, al);
+    int tmp = new_tid();
+    sb_printf(&fc->body_sb, "    %%t%d = ptr_add.i64 %%loc_%d, 0\n", tmp, slot);
+    int64_t off = 0;
+    while (off < node->ty->size) {
+      int64_t rem = node->ty->size - off;
+      int32_t step = (rem >= 8 && al >= 8) ? 8
+                   : (rem >= 4 && al >= 4) ? 4
+                   : (rem >= 2 && al >= 2) ? 2 : 1;
+      const char *ct = (step == 8) ? "i64" : (step == 4) ? "i32" : (step == 2) ? "i16" : "i8";
+      PirVal sp = emit_ptr_add_imm(addr, off);
+      PirVal dp = emit_ptr_add_imm((PirVal){tmp, "ptr"}, off);
+      int lv = new_tid();
+      sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d [volatile]\n", lv, ct, sp.id, step);
+      sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d\n", ct, lv, dp.id, step);
+      off += step;
+    }
+    PirVal v = {tmp, "ptr"};
+    return v;
+  }
   if (is_mem_val_ty(node->ty) || node->ty->kind == TY_ARRAY ||
       node->ty->kind == TY_VLA || node->ty->kind == TY_FUNC)
     return addr;
@@ -1517,8 +1611,25 @@ static PirVal emit_store_node(Node *lhs, PirVal val, PirVal addr) {
       int32_t p2 = 1;
       while (p2 * 2 <= al)
         p2 *= 2;
-      sb_printf(&fc->body_sb, "    memcpy %%t%d, %%t%d, %" PRIi64 ", align %d\n",
-                addr.id, val.id, lhs->ty->size, p2);
+      if (lhs->ty->qual & Q_VOLATILE) {
+        int64_t off = 0;
+        while (off < lhs->ty->size) {
+          int64_t rem = lhs->ty->size - off;
+          int32_t step = (rem >= 8 && p2 >= 8) ? 8
+                       : (rem >= 4 && p2 >= 4) ? 4
+                       : (rem >= 2 && p2 >= 2) ? 2 : 1;
+          const char *ct = (step == 8) ? "i64" : (step == 4) ? "i32" : (step == 2) ? "i16" : "i8";
+          PirVal sp = emit_ptr_add_imm(val, off);
+          PirVal dp = emit_ptr_add_imm(addr, off);
+          int lv = new_tid();
+          sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", lv, ct, sp.id, step);
+          sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d [volatile]\n", ct, lv, dp.id, step);
+          off += step;
+        }
+      } else {
+        sb_printf(&fc->body_sb, "    memcpy %%t%d, %%t%d, %" PRIi64 ", align %d\n",
+                  addr.id, val.id, lhs->ty->size, p2);
+      }
     }
     return addr;
   }
@@ -1567,11 +1678,19 @@ static PirVal gen_addr(Node *node) {
   case ND_DEREF:
     return gen_expr(node->m.lhs);
   case ND_COMMA:
+    gen_expr(node->m.lhs);
+    if (is_mem_val_ty(node->m.rhs->ty) && (node->m.rhs->ty->qual & (Q_ATOMIC | Q_VOLATILE)))
+      return gen_expr(node->m.rhs);
+    return gen_addr(node->m.rhs);
   case ND_CHAIN:
     gen_expr(node->m.lhs);
     return gen_addr(node->m.rhs);
   case ND_MEMBER: {
-    PirVal base = (is_mem_val_ty(node->m.lhs->ty) && (node->m.lhs->ty->qual & Q_ATOMIC))
+    bool is_init_target = (node->m.lhs->kind == ND_VAR &&
+                           fc->init_seq_var != NULL &&
+                           node->m.lhs->m.var == fc->init_seq_var);
+    PirVal base = (!is_init_target && is_mem_val_ty(node->m.lhs->ty) &&
+                   (node->m.lhs->ty->qual & Q_ATOMIC))
                       ? gen_expr(node->m.lhs)
                       : gen_addr(node->m.lhs);
     return emit_ptr_add_imm(base, node->m.member->offset);
@@ -1796,12 +1915,12 @@ static PirVal gen_ckd_arith(Node *node) {
   const char *rt = pir_scalar_ty_name(res_ty);
   int trunc_v = new_tid();
   sb_printf(&fc->body_sb, "    %%t%d = trunc.%s %%t%d\n", trunc_v, rt, exact);
-  PirVal store_v = {trunc_v, rt};
+  PirVal store_v = emit_bitint_norm((PirVal){trunc_v, rt}, res_ty);
   emit_store_scalar(store_v, dst_ptr, res_ty, res_ty->align);
 
   int back128 = new_tid();
   sb_printf(&fc->body_sb, "    %%t%d = %s.i128 %%t%d\n",
-            back128, res_ty->is_unsigned ? "zext" : "sext", trunc_v);
+            back128, res_ty->is_unsigned ? "zext" : "sext", store_v.id);
   int ovf = new_tid();
   sb_printf(&fc->body_sb, "    %%t%d = cmp_ne.i128 %%t%d, %%t%d\n", ovf, back128, exact);
   PirVal res = {ovf, "i8"};
@@ -1944,7 +2063,7 @@ static PirVal gen_expr(Node *node) {
       sb_printf(&fc->body_sb, "    %%t%d = sub.%s 0, %%t%d [wrap]\n", r, lv.ty, lv.id);
     }
     PirVal v = {r, lv.ty};
-    return v;
+    return emit_bitint_norm(v, node->ty);
   }
 
   case ND_BITNOT: {
@@ -1953,7 +2072,7 @@ static PirVal gen_expr(Node *node) {
     int r = new_tid();
     sb_printf(&fc->body_sb, "    %%t%d = xor.%s %%t%d, -1\n", r, lv.ty, lv.id);
     PirVal v = {r, lv.ty};
-    return v;
+    return emit_bitint_norm(v, node->ty);
   }
 
   case ND_NOT: {
@@ -2054,11 +2173,30 @@ static PirVal gen_expr(Node *node) {
     while (p2 * 2 <= al)
       p2 *= 2;
     if (node->m.var->ty->size > 0) {
-      sb_printf(&fc->body_sb, "    memset %%loc_%d, 0, %" PRIi64 ", align %d\n",
-                li->slot_id, node->m.var->ty->size, p2);
+      if (node->m.var->ty->qual & Q_VOLATILE) {
+        int base_p = new_tid();
+        sb_printf(&fc->body_sb, "    %%t%d = ptr_add.i64 %%loc_%d, 0\n", base_p, li->slot_id);
+        int64_t off = 0;
+        while (off < node->m.var->ty->size) {
+          int64_t rem = node->m.var->ty->size - off;
+          int32_t step = (rem >= 8 && p2 >= 8) ? 8
+                       : (rem >= 4 && p2 >= 4) ? 4
+                       : (rem >= 2 && p2 >= 2) ? 2 : 1;
+          const char *ct = (step == 8) ? "i64" : (step == 4) ? "i32" : (step == 2) ? "i16" : "i8";
+          PirVal dp = emit_ptr_add_imm((PirVal){base_p, "ptr"}, off);
+          sb_printf(&fc->body_sb, "    store.%s 0, %%t%d, align %d [volatile]\n", ct, dp.id, step);
+          off += step;
+        }
+      } else {
+        sb_printf(&fc->body_sb, "    memset %%loc_%d, 0, %" PRIi64 ", align %d\n",
+                  li->slot_id, node->m.var->ty->size, p2);
+      }
     }
+    Obj *saved_init_var = fc->init_seq_var;
+    fc->init_seq_var = node->m.var;
     for (Node *n = node->m.lhs; n; n = n->next)
       gen_expr(n);
+    fc->init_seq_var = saved_init_var;
     return pir_void_val();
   }
 
@@ -2294,7 +2432,7 @@ static PirVal gen_expr(Node *node) {
     sb_printf(&fc->body_sb, "    %%t%d = atomic_rmw.xchg.%s %%t%d, %%t%d [seq_cst]\n",
               r, pt, addr.id, val.id);
     PirVal v = {r, pt};
-    return v;
+    return emit_bitint_norm(v, node->ty);
   }
 
   case ND_CAS: {
@@ -2399,11 +2537,13 @@ static PirVal gen_expr(Node *node) {
     Type *ty = node->ty->base;
     ensure_open_block();
     if (is_mem_val_ty(ty)) {
-      int slot = emit_entry_alloca(ty->size, ty->align);
+      int slot = emit_entry_alloca(ty->size > 0 ? ty->size : 1, ty->align);
       int p = new_tid();
       sb_printf(&fc->body_sb, "    %%t%d = ptr_add.i64 %%loc_%d, 0\n", p, slot);
-      sb_printf(&fc->body_sb, "    va_arg_buf @%s, %%t%d, %%t%d\n",
-                get_pir_agg_type_name(ty), p, ap_ptr.id);
+      if (ty->size > 0) {
+        sb_printf(&fc->body_sb, "    va_arg_buf @%s, %%t%d, %%t%d\n",
+                  get_pir_agg_type_name(ty), p, ap_ptr.id);
+      }
       PirVal v = {p, "ptr"};
       return v;
     } else {
@@ -2580,7 +2720,7 @@ static PirVal gen_expr(Node *node) {
       internal_error();
     }
     PirVal v = {r, pt};
-    return v;
+    return emit_bitint_norm(v, node->ty);
   }
 
   default:
@@ -2742,7 +2882,7 @@ static void gen_stmt(Node *node) {
     uint64_t expanded_cases = 0;
     int case_cnt = 0;
     for (CaseRange *cr = node->ctrl.sw_cases; cr; cr = cr->next) {
-      if (!cr->label->cases.id)
+      if (cr->label->kind != ND_DEFAULT && !cr->label->cases.id)
         cr->label->cases.id = ++case_cnt;
       bool bad_order = is_u ? ((uint64_t)cr->hi < (uint64_t)cr->lo) : (cr->hi < cr->lo);
       if (bad_order) {
@@ -2767,12 +2907,16 @@ static void gen_stmt(Node *node) {
       sb_printf(&fc->body_sb, "    switch.%s %%t%d, default .%s [\n", val.ty, val.id, def_lbl);
       bool first_case = true;
       for (CaseRange *cr = node->ctrl.sw_cases; cr; cr = cr->next) {
+        char tgt_lbl[64];
+        if (cr->label->kind == ND_DEFAULT)
+          snprintf(tgt_lbl, sizeof(tgt_lbl), "sw_def_%d", c);
+        else
+          snprintf(tgt_lbl, sizeof(tgt_lbl), "sw_c_%d_%" PRIi64, c, cr->label->cases.id);
         uint64_t diff = (uint64_t)cr->hi - (uint64_t)cr->lo;
         for (uint64_t off = 0; off <= diff; off++) {
           int64_t v = (int64_t)((uint64_t)cr->lo + off);
           if (!first_case) sb_printf(&fc->body_sb, ",\n");
-          sb_printf(&fc->body_sb, "        %" PRIi64 " -> .sw_c_%d_%" PRIi64,
-                    v, c, cr->label->cases.id);
+          sb_printf(&fc->body_sb, "        %" PRIi64 " -> .%s", v, tgt_lbl);
           first_case = false;
         }
       }
@@ -2782,13 +2926,18 @@ static void gen_stmt(Node *node) {
     } else {
       /* Emit range-supporting compare/branch chain */
       for (CaseRange *cr = node->ctrl.sw_cases; cr; cr = cr->next) {
+        char tgt_lbl[64];
+        if (cr->label->kind == ND_DEFAULT)
+          snprintf(tgt_lbl, sizeof(tgt_lbl), "sw_def_%d", c);
+        else
+          snprintf(tgt_lbl, sizeof(tgt_lbl), "sw_c_%d_%" PRIi64, c, cr->label->cases.id);
         int nxt = new_bid();
         if (cr->lo == cr->hi) {
           int eq = new_tid();
           sb_printf(&fc->body_sb, "    %%t%d = cmp_eq.%s %%t%d, %" PRIi64 "\n",
                     eq, val.ty, val.id, cr->lo);
-          sb_printf(&fc->body_sb, "    br %%t%d, .sw_c_%d_%" PRIi64 ", .sw_chk_%d\n",
-                    eq, c, cr->label->cases.id, nxt);
+          sb_printf(&fc->body_sb, "    br %%t%d, .%s, .sw_chk_%d\n",
+                    eq, tgt_lbl, nxt);
         } else {
           int c1 = new_tid();
           int c2 = new_tid();
@@ -2798,8 +2947,8 @@ static void gen_stmt(Node *node) {
           sb_printf(&fc->body_sb, "    %%t%d = %s.%s %%t%d, %" PRIi64 "\n",
                     c2, is_u ? "cmp_le_u" : "cmp_le_s", val.ty, val.id, cr->hi);
           sb_printf(&fc->body_sb, "    %%t%d = and.i8 %%t%d, %%t%d\n", both, c1, c2);
-          sb_printf(&fc->body_sb, "    br %%t%d, .sw_c_%d_%" PRIi64 ", .sw_chk_%d\n",
-                    both, c, cr->label->cases.id, nxt);
+          sb_printf(&fc->body_sb, "    br %%t%d, .%s, .sw_chk_%d\n",
+                    both, tgt_lbl, nxt);
         }
         fc->terminated = true;
         sb_printf(&fc->body_sb, "\n.sw_chk_%d:\n", nxt);

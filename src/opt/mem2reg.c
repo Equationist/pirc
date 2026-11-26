@@ -314,12 +314,12 @@ typedef struct {
 } SroaCand;
 
 static int64_t sroa_imm_to_i64(const PirOperand *c) {
-    if (c->type.kind == PIR_TYPE_SCALAR && c->type.u.scalar == PIR_SCALAR_I32 &&
-        !c->u.imm_int.is_negative) {
-        return (int64_t)(int32_t)(uint32_t)c->u.imm_int.lo;
+    uint64_t v = c->u.imm_int.is_negative ? (UINT64_C(0) - c->u.imm_int.lo)
+                                          : c->u.imm_int.lo;
+    if (c->type.kind == PIR_TYPE_SCALAR && c->type.u.scalar == PIR_SCALAR_I32) {
+        return (int64_t)(int32_t)(uint32_t)v;
     }
-    return c->u.imm_int.is_negative ? (int64_t)(UINT64_C(0) - c->u.imm_int.lo)
-                                    : (int64_t)c->u.imm_int.lo;
+    return (int64_t)v;
 }
 
 static bool sroa_const_i64(const PirFunction *fn, PirOperand op, int64_t *out) {
@@ -443,9 +443,15 @@ static void run_sroa(PirModule *mod, PirFunction *fn) {
                 if (ci < 0) continue;
                 int64_t delta = 0;
                 if (sroa_const_i64(fn, ins->operands[1], &delta)) {
-                    val_base[ins->results[0]] = ci;
-                    val_off[ins->results[0]]  = val_off[ins->operands[0].u.val] + delta;
-                    changed = true;
+                    int64_t bo = val_off[ins->operands[0].u.val];
+                    if ((delta > 0 && bo > INT64_MAX - delta) ||
+                        (delta < 0 && bo < INT64_MIN - delta)) {
+                        cands.data[ci].ok = false;
+                    } else {
+                        val_base[ins->results[0]] = ci;
+                        val_off[ins->results[0]]  = bo + delta;
+                        changed = true;
+                    }
                 }
             }
         }

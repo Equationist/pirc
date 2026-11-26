@@ -255,6 +255,10 @@ int main(int argc, char **argv) {
     }
 
     if (do_emit_lir || do_interp || do_emit_asm || do_emit_obj) {
+        /* Native ARM64 (NEON) and x86-64 (SSE2) backends support up to 128-bit SIMD vectors. */
+        if ((do_emit_asm || do_emit_obj) && target_ptr && tspec.caps.max_simd_bits > 128u) {
+            tspec.caps.max_simd_bits = 128u;
+        }
         if (!target_ptr || !pir_lower_module(&mod, target_ptr, &diag)) {
             rc = 1;
             goto cleanup;

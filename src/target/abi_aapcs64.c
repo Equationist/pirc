@@ -16,6 +16,19 @@ typedef struct {
     uint32_t count;
 } HfaWalk;
 
+static bool is_pad_only_agg(const PirModule *mod, PirType ty) {
+    if (ty.kind != PIR_TYPE_NAMED_AGG || ty.u.agg_id >= mod->agg_types.len) return false;
+    const PirAggDef *agg = &mod->agg_types.data[ty.u.agg_id];
+    if (agg->kind == PIR_AGG_PAD) return true;
+    if (agg->kind == PIR_AGG_ARRAY) {
+        return agg->array_len == 0u || is_pad_only_agg(mod, agg->elem_type);
+    }
+    for (uint32_t i = 0u; i < agg->field_count; ++i) {
+        if (!is_pad_only_agg(mod, agg->fields[i])) return false;
+    }
+    return true;
+}
+
 static bool is_hfa_leaf(PirType ty) {
     if (ty.kind == PIR_TYPE_SCALAR) {
         return ty.u.scalar == PIR_SCALAR_F32 || ty.u.scalar == PIR_SCALAR_F64;
@@ -61,7 +74,10 @@ static void walk_hfa(const PirModule *mod, const PirTargetSpec *target,
             return;
         }
         uint32_t max_cnt = 0u;
+        bool has_any = false;
         for (uint32_t i = 0u; i < agg->field_count && w->valid; ++i) {
+            if (is_pad_only_agg(mod, agg->fields[i])) continue;
+            has_any = true;
             HfaWalk mw = { true, false, pir_type_scalar(PIR_SCALAR_VOID), 0u };
             walk_hfa(mod, target, agg->fields[i], base_off, &mw);
             if (!mw.valid || !mw.has_base || mw.count < 1u || mw.count > 4u) {
@@ -85,6 +101,10 @@ static void walk_hfa(const PirModule *mod, const PirTargetSpec *target,
                 max_cnt = mw.count;
             }
         }
+        if (!has_any) {
+            w->valid = false;
+            return;
+        }
         if (w->valid) {
             w->count += max_cnt;
             if (w->count > 4u) {
@@ -103,9 +123,11 @@ static void classify_aapcs64_agg(const PirModule *mod, const PirTargetSpec *targ
                                  PirType agg_ty, PirAbiArgInfo *out) {
     memset(out, 0, sizeof(*out));
     PirTypeLayout ly = pir_type_layout(mod, target, agg_ty);
-    if (ly.size == 0u) {
-        out->kind    = PIR_ABI_INDIRECT;
-        out->gp_used = 1u;
+    if (ly.size == 0u || (target->os == PIR_OS_MACOS && is_pad_only_agg(mod, agg_ty))) {
+        out->kind      = PIR_ABI_DIRECT;
+        out->reg_count = 0u;
+        out->gp_used   = 0u;
+        out->fp_used   = 0u;
         return;
     }
 
@@ -150,12 +172,30 @@ bool pir_abi_aapcs64_param(const PirModule *mod, const PirTargetSpec *target,
                 if (st->fp_used + out->fp_used > 8u) {
                     /* AAPCS64 all-or-nothing spill: consume remaining FP regs and pass by value on stack.
                      * On Darwin ARM64, fixed HFA stack alignment is the HFA base element alignment
-                     * (4 for float, 8 for double), ignoring user _Alignas overrides. */
+                     * (4 for float, 8 for double), ignoring user _Alignas overrides.
+                     * On Linux AAPCS64, stack slots are 8B minimum, so pack contiguous f32 pairs into f64
+                     * chunks to avoid 8B strides between individual 4B float elements. */
                     PirTypeLayout bl = pir_type_layout(mod, target, out->regs[0]);
                     out->pad_fp_before = (st->fp_used < 8u) ? (8u - st->fp_used) : 0u;
                     st->fp_used = 8u;
                     out->stack_align = (target->os == PIR_OS_MACOS)
                                        ? bl.align : (ly.align > 8u ? ly.align : 8u);
+                    if (target->os != PIR_OS_MACOS &&
+                        out->regs[0].kind == PIR_TYPE_SCALAR &&
+                        out->regs[0].u.scalar == PIR_SCALAR_F32 &&
+                        out->reg_count >= 2u) {
+                        uint32_t n = out->reg_count;
+                        uint32_t k = 0u;
+                        while (n >= 2u) {
+                            out->regs[k++] = pir_type_scalar(PIR_SCALAR_F64);
+                            n -= 2u;
+                        }
+                        if (n == 1u) {
+                            out->regs[k++] = pir_type_scalar(PIR_SCALAR_F32);
+                        }
+                        out->reg_count = k;
+                        out->fp_used   = k;
+                    }
                 } else {
                     st->fp_used += out->fp_used;
                 }

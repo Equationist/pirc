@@ -167,7 +167,7 @@ static void set_std(bool is_iso, const char *arg) {
   char *end;
   int val = strtoul(arg, &end, 10);
 
-  if (end - arg == 2) {
+  if (end - arg == 2 && *end == '\0') {
     is_iso_std = is_iso;
 
     switch (val) {
@@ -188,7 +188,7 @@ static void set_std_iso(const char *arg) {
   char *end;
   int val = strtoul(arg, &end, 10);
 
-  if (end != arg) {
+  if (end != arg && *end == '\0') {
     is_iso_std = true;
 
     switch (val) {
@@ -923,7 +923,9 @@ static bool needs_space_between(Token *prev, Token *cur) {
       (a == 'e' || a == 'E' || a == 'p' || a == 'P'))
     return true;
   if ((prev->kind == TK_IDENT || prev->kind == TK_PP_NUM) &&
-      (cur->kind == TK_IDENT || cur->kind == TK_PP_NUM || b == '.' || b == '"' || b == '\''))
+      (cur->kind == TK_IDENT || cur->kind == TK_PP_NUM ||
+       cur->kind == TK_STR || cur->kind == TK_CHAR_LIT ||
+       b == '.' || b == '"' || b == '\''))
     return true;
   if (prev->kind >= TK_PUNCT && prev->kind < TK_PUNCT_END &&
       cur->kind >= TK_PUNCT && cur->kind < TK_PUNCT_END) {
@@ -935,10 +937,10 @@ static bool needs_space_between(Token *prev, Token *cur) {
       return true;
     if ((a == '-' && b == '>') || (a == '/' && (b == '*' || b == '/')) ||
         (a == '<' && (b == ':' || b == '%')) || (a == '%' && (b == '>' || b == ':')) ||
-        (a == ':' && b == '>'))
+        (a == ':' && (b == '>' || b == '%')))
       return true;
   }
-  if (prev->kind == TK_PUNCT && a == '.' && (cur->kind == TK_PP_NUM || b == '.'))
+  if (prev->kind == TK_DOT && (cur->kind == TK_PP_NUM || b == '.'))
     return true;
   return false;
 }

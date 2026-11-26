@@ -81,7 +81,10 @@ static void print_float_bits(uint64_t bits, PirType ty, FILE *out) {
     }
 
     if (isnan(val)) {
-        fputs("nan", out);
+        bool neg = (sc == PIR_SCALAR_F32)
+                   ? ((bits & UINT64_C(0x80000000)) != 0u)
+                   : ((bits >> 63u) != 0u);
+        fputs(neg ? "-nan" : "nan", out);
         return;
     }
     if (isinf(val)) {
