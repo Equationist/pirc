@@ -397,7 +397,7 @@ struct File {
   int file_no;
 
   int display_file_no;
-  int line_delta;
+  int64_t line_delta;
   InclIdx incl_idx;
   bool is_syshdr;
   bool is_placeholder;
@@ -494,6 +494,8 @@ struct Obj {
   bool is_compound_lit;
   bool is_string_lit;
   bool is_register;
+  bool has_alignas;
+  int alignas_val;
   int alt_align;
 
   // Local variable
@@ -506,6 +508,7 @@ struct Obj {
   bool is_definition;
   bool is_static;
   bool is_weak;
+  bool is_ext_inline;
   bool is_static_lvar;
   Obj *static_lvars;
   char *alias_name;
@@ -533,7 +536,7 @@ struct Obj {
 
 struct Relocation {
   Relocation *next;
-  int offset;
+  int64_t offset;
   Obj *var;
   int64_t addend;
 };
@@ -897,6 +900,7 @@ struct Type {
   Node *pre_calc;
   bool is_variadic;
   bool is_oldstyle;
+  bool is_oldstyle_def;
 };
 
 // Struct member

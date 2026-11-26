@@ -253,11 +253,11 @@ static void emit_sym_addr(ISelCtx *c, MVReg dst, const char *name, int64_t offse
             cp.op_count = 2u; cp.ops[0] = mop_vreg_def(base); cp.ops[1] = mop_preg_use(A64_GP(0u));
             emit(c, cp);
         } else {
-            /* Linux local-exec TLS: mrs base, TPIDR_EL0; add :tprel_hi12:; add :tprel_lo12_nc: */
+            /* Linux TLS: initial-exec (:gottprel:) for extern/weak, local-exec (:tprel_hi12:) for local. */
             MInst t = minst_make(MI_A64_TLS_ADDR, 8u, loc);
             t.op_count = 2u;
             t.ops[0]   = mop_vreg_def(base);
-            t.ops[1]   = mop_sym(name, 0, false, true, false);
+            t.ops[1]   = mop_sym(name, 0, false, true, use_got);
             emit(c, t);
         }
     } else {
@@ -749,16 +749,6 @@ static bool try_match_ror(const PirFunction *fn, const uint32_t *val_uses,
     return false;
 }
 
-static bool try_match_vec_fminmax(const PirFunction *fn, const uint32_t *val_uses,
-                                  PirBlockId bid, const PirInst *sel,
-                                  PirInstId *out_fcmp_id, MOpcode *out_mop,
-                                  PirOperand *out_a, PirOperand *out_b) {
-    /* PIR fcmp/select carry exact IEEE-754 NaN and signed-zero semantics (no [fast] flag). */
-    (void)fn; (void)val_uses; (void)bid; (void)sel;
-    (void)out_fcmp_id; (void)out_mop; (void)out_a; (void)out_b;
-    return false;
-}
-
 static void emit_vec_cmp(ISelCtx *c, PirOpcode op, MVReg dst, MVReg a, MVReg b,
                          PirVecType vt, uint32_t loc) {
     MVecArr arr = pir_vec_to_arr(vt);
@@ -1242,6 +1232,7 @@ typedef struct {
 
 static void plan_call_args(const PirTargetSpec *target,
                            const PirType *arg_tys, const uint32_t *arg_aligns,
+                           const bool *arg_no_f32_promote,
                            uint32_t arg_count, bool is_variadic, uint32_t fixed_count,
                            ArgLoc *locs, uint64_t *out_stack_bytes,
                            uint32_t *out_gp_used, uint32_t *out_fp_used) {
@@ -1253,6 +1244,7 @@ static void plan_call_args(const PirTargetSpec *target,
         memset(&locs[i], 0, sizeof(locs[i]));
         PirType ty = arg_tys[i];
         bool is_va_arg = is_variadic && (i >= fixed_count);
+        bool no_f32_prom = arg_no_f32_promote && arg_no_f32_promote[i];
         bool is_fp = (pir_type_rclass(ty) == MREG_CLASS_FP);
         uint8_t mb = pir_type_mem_bytes(ty);
         locs[i].mem_bytes = mb;
@@ -1264,7 +1256,7 @@ static void plan_call_args(const PirTargetSpec *target,
             st_off = align_up_u64(st_off, al);
             locs[i].is_reg    = false;
             locs[i].stack_off = (int64_t)st_off;
-            if (ty.kind == PIR_TYPE_SCALAR && ty.u.scalar == PIR_SCALAR_F32) {
+            if (!no_f32_prom && ty.kind == PIR_TYPE_SCALAR && ty.u.scalar == PIR_SCALAR_F32) {
                 locs[i].promote_f32_to_f64 = true;
                 locs[i].mem_bytes = 8u;
                 st_off += 8u;
@@ -1275,7 +1267,8 @@ static void plan_call_args(const PirTargetSpec *target,
         }
 
         if (is_fp) {
-            if (!is_darwin && is_va_arg && ty.kind == PIR_TYPE_SCALAR && ty.u.scalar == PIR_SCALAR_F32) {
+            if (!is_darwin && is_va_arg && !no_f32_prom &&
+                ty.kind == PIR_TYPE_SCALAR && ty.u.scalar == PIR_SCALAR_F32) {
                 locs[i].promote_f32_to_f64 = true;
                 locs[i].mem_bytes = 8u;
                 mb = 8u;
@@ -1433,12 +1426,14 @@ static void emit_call_inst(ISelCtx *c, const PirInst *inst, uint32_t loc) {
 
     PirType  *arg_tys    = pass_nargs ? (PirType *)calloc(pass_nargs, sizeof(PirType)) : NULL;
     uint32_t *arg_aligns = pass_nargs ? (uint32_t *)calloc(pass_nargs, sizeof(uint32_t)) : NULL;
+    bool     *arg_nof32  = pass_nargs ? (bool *)calloc(pass_nargs, sizeof(bool)) : NULL;
     ArgLoc   *alocs      = pass_nargs ? (ArgLoc *)calloc(pass_nargs, sizeof(ArgLoc)) : NULL;
     MVReg    *avregs     = pass_nargs ? (MVReg *)calloc(pass_nargs, sizeof(MVReg)) : NULL;
-    if (pass_nargs && (!arg_tys || !arg_aligns || !alocs || !avregs)) abort();
+    if (pass_nargs && (!arg_tys || !arg_aligns || !arg_nof32 || !alocs || !avregs)) abort();
 
     for (uint32_t i = 0u; i < pass_nargs; ++i) {
-        arg_tys[i] = inst->operands[i + 1u + arg_skip].type;
+        arg_tys[i]   = inst->operands[i + 1u + arg_skip].type;
+        arg_nof32[i] = inst->operands[i + 1u + arg_skip].call_no_f32_promote;
         if (cal_params && (i + arg_skip) < cal_param_count) {
             arg_aligns[i] = cal_params[i + arg_skip].abi_stack_align;
         }
@@ -1447,8 +1442,9 @@ static void emit_call_inst(ISelCtx *c, const PirInst *inst, uint32_t loc) {
         }
     }
     uint64_t stack_bytes = 0u;
-    plan_call_args(c->target, arg_tys, arg_aligns, pass_nargs, is_variadic, pass_fixed,
+    plan_call_args(c->target, arg_tys, arg_aligns, arg_nof32, pass_nargs, is_variadic, pass_fixed,
                    alocs, &stack_bytes, NULL, NULL);
+    free(arg_nof32);
 
     if (stack_bytes > c->mf->max_out_args_bytes) {
         c->mf->max_out_args_bytes = stack_bytes;
@@ -1478,12 +1474,13 @@ static void emit_call_inst(ISelCtx *c, const PirInst *inst, uint32_t loc) {
             if ((pa & (PIR_PATTR_SIGNEXT | PIR_PATTR_ZEROEXT)) != 0u) {
                 v = normalize_int(c, v, arg_tys[i], (pa & PIR_PATTR_SIGNEXT) != 0u, loc);
             }
-        } else if (is_variadic && i >= pass_fixed && c->target->os == PIR_OS_MACOS &&
+        } else if (is_variadic && i >= pass_fixed &&
                    arg_tys[i].kind == PIR_TYPE_SCALAR &&
-                   (arg_tys[i].u.scalar == PIR_SCALAR_I8 || arg_tys[i].u.scalar == PIR_SCALAR_I16 ||
-                    arg_tys[i].u.scalar == PIR_SCALAR_I32)) {
-            /* Zero/sign-safe 8B slot write for Darwin variadic int args */
-            alocs[i].mem_bytes = pir_type_mem_bytes(arg_tys[i]);
+                   (arg_tys[i].u.scalar == PIR_SCALAR_I8 || arg_tys[i].u.scalar == PIR_SCALAR_I16)) {
+            /* Zero-extend sub-32b variadic ints and write a full 32-bit word into stack slots
+             * so upper bytes never hold garbage on either Darwin or AAPCS64 Linux. */
+            v = normalize_int(c, v, arg_tys[i], false, loc);
+            alocs[i].mem_bytes = 4u;
         }
         avregs[i] = v;
     }
@@ -1509,7 +1506,7 @@ static void emit_call_inst(ISelCtx *c, const PirInst *inst, uint32_t loc) {
     /* 2. Move register arguments into fixed x0..x7 / v0..v7. */
     for (uint32_t i = 0u; i < pass_nargs; ++i) {
         if (alocs[i].is_reg) {
-            uint8_t w = pir_type_vreg_bytes(arg_tys[i]);
+            uint8_t w = alocs[i].promote_f32_to_f64 ? 8u : pir_type_vreg_bytes(arg_tys[i]);
             MInst mv = minst_make(MI_COPY, w, loc);
             mv.op_count = 2u;
             mv.ops[0]   = mop_preg_def(alocs[i].preg);
@@ -2378,22 +2375,6 @@ static bool isel_inst(ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
 
         case PIR_OP_SELECT: {
             if (inst->ty.kind == PIR_TYPE_VECTOR) {
-                PirInstId fcid = PIR_INVALID_ID;
-                MOpcode fmop = MI_NOP;
-                PirOperand fa, fb;
-                if (try_match_vec_fminmax(c->fn, c->val_uses, cur_pir_blk, inst, &fcid, &fmop, &fa, &fb) &&
-                    c->inst_fused[fcid]) {
-                    MVReg va = mat_op(c, &fa, loc);
-                    MVReg vb = mat_op(c, &fb, loc);
-                    MInst v = minst_make(fmop, pir_type_vreg_bytes(inst->ty), loc);
-                    v.arr = pir_vec_to_arr(inst->ty.u.vec);
-                    v.op_count = 3u;
-                    v.ops[0] = mop_vreg_def(dst0);
-                    v.ops[1] = mop_vreg_use(va);
-                    v.ops[2] = mop_vreg_use(vb);
-                    emit(c, v);
-                    return true;
-                }
                 MVReg cond = mat_op(c, &inst->operands[0], loc);
                 MVReg tv   = mat_op(c, &inst->operands[1], loc);
                 MVReg fv   = mat_op(c, &inst->operands[2], loc);
@@ -3122,10 +3103,6 @@ static bool isel_inst(ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
                                : (inst->ty.u.scalar == PIR_SCALAR_I16) ? UINT64_C(0xFFFF)
                                : (inst->ty.u.scalar == PIR_SCALAR_I32) ? UINT64_C(0xFFFFFFFF)
                                                                        : ~UINT64_C(0);
-            int64_t signed_max = (inst->ty.u.scalar == PIR_SCALAR_I8)  ? INT64_C(127)
-                               : (inst->ty.u.scalar == PIR_SCALAR_I16) ? INT64_C(32767)
-                               : (inst->ty.u.scalar == PIR_SCALAR_I32) ? INT64_C(2147483647)
-                                                                       : INT64_MAX;
             uint32_t def_mblk = prepare_branch_edge(c, &inst->targets[0], loc);
             uint32_t nc = inst->switch_case_count;
 
@@ -3173,7 +3150,6 @@ static bool isel_inst(ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
                     jt_span    = s_span;
                 }
             }
-            (void)signed_max;
 
             MVReg val = normalize_int(c, mat_op(c, &inst->operands[0], loc),
                                       inst->ty, use_jtable && jt_signed, loc);
@@ -3455,16 +3431,10 @@ static void analyze_fusion(ISelCtx *c, const PirCfg *cfg) {
                 }
             }
 
-            /* Fuse cmp/fcmp + select (scalar csel/fcsel, or vector NEON fmin/fmax). */
-            if (ins->op == PIR_OP_SELECT && ins->operands[0].kind == PIR_OPER_VAL) {
-                if (ins->ty.kind == PIR_TYPE_VECTOR) {
-                    PirInstId fcid = PIR_INVALID_ID;
-                    MOpcode fmop = MI_NOP;
-                    PirOperand fa, fb;
-                    if (try_match_vec_fminmax(fn, c->val_uses, bid, ins, &fcid, &fmop, &fa, &fb)) {
-                        c->inst_fused[fcid] = true;
-                    }
-                } else {
+            /* Fuse cmp/fcmp + scalar select (csel/fcsel). */
+            if (ins->op == PIR_OP_SELECT && ins->ty.kind == PIR_TYPE_SCALAR &&
+                ins->operands[0].kind == PIR_OPER_VAL) {
+                {
                     PirValueId cv = ins->operands[0].u.val;
                     const PirValueDef *vd = &fn->values.data[cv];
                     if (vd->def_inst != PIR_INVALID_ID && vd->def_block == bid &&
@@ -3654,7 +3624,7 @@ bool pir_arm64_isel_func(const PirModule *mod, const PirFunction *fn, uint32_t f
             }
             uint64_t in_stack = 0u;
             uint32_t gp_used = 0u, fp_used = 0u;
-            plan_call_args(target, ptys, paligns, n_in, false, n_in,
+            plan_call_args(target, ptys, paligns, NULL, n_in, false, n_in,
                            plocs, &in_stack, &gp_used, &fp_used);
             out_mf->va_fixed_gp          = gp_used;
             out_mf->va_fixed_fp          = fp_used;

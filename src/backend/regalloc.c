@@ -213,6 +213,7 @@ static void compute_intervals(const MFunc *mf, LiveInterval *v_ivs,
                               LiveInterval *fixed_ivs, LiveInterval *call_iv) {
     uint32_t nb = mf->blocks.len;
     uint32_t nv = mf->vregs.len;
+    if (nb == 0u) return;
     uint32_t words = (nv + 63u) / 64u;
     if (words == 0u) words = 1u;
 
@@ -316,6 +317,12 @@ static void compute_intervals(const MFunc *mf, LiveInterval *v_ivs,
             }
         }
 
+        /* Track intra-block live physical registers backward so fixed preg ranges span
+         * continuously from def to use with zero holes. */
+        uint64_t preg_live = 0u;
+        uint32_t preg_use_end[64];
+        memset(preg_use_end, 0, sizeof(preg_use_end));
+
         for (uint32_t j = blk->insts.len; j-- > 0u; ) {
             const MInst *ins = &blk->insts.data[j];
             uint32_t pos = bs + j * 2u;
@@ -346,20 +353,55 @@ static void compute_intervals(const MFunc *mf, LiveInterval *v_ivs,
                         X64_R8,  X64_R9,  X64_R10, X64_R11
                     };
                     for (uint32_t ci = 0u; ci < sizeof(X64_CALL_CLOB_GP) / sizeof(X64_CALL_CLOB_GP[0]); ++ci) {
-                        iv_add_range(&fixed_ivs[X64_CALL_CLOB_GP[ci]], pos, pos + 1u);
+                        MPReg p = X64_CALL_CLOB_GP[ci];
+                        if ((preg_live & (UINT64_C(1) << p)) != 0u) {
+                            uint32_t end_p = preg_use_end[p] > pos ? preg_use_end[p] : (pos + 1u);
+                            iv_add_range(&fixed_ivs[p], pos, end_p);
+                            preg_live &= ~(UINT64_C(1) << p);
+                        } else {
+                            iv_add_range(&fixed_ivs[p], pos, pos + 1u);
+                        }
                     }
                     for (uint32_t r = 0u; r < 16u; ++r) {
-                        iv_add_range(&fixed_ivs[X64_XMM(r)], pos, pos + 1u);
+                        MPReg p = X64_XMM(r);
+                        if ((preg_live & (UINT64_C(1) << p)) != 0u) {
+                            uint32_t end_p = preg_use_end[p] > pos ? preg_use_end[p] : (pos + 1u);
+                            iv_add_range(&fixed_ivs[p], pos, end_p);
+                            preg_live &= ~(UINT64_C(1) << p);
+                        } else {
+                            iv_add_range(&fixed_ivs[p], pos, pos + 1u);
+                        }
                     }
                 } else {
                     for (uint32_t r = 0u; r <= 15u; ++r) {
-                        iv_add_range(&fixed_ivs[A64_GP(r)], pos, pos + 1u);
+                        MPReg p = A64_GP(r);
+                        if ((preg_live & (UINT64_C(1) << p)) != 0u) {
+                            uint32_t end_p = preg_use_end[p] > pos ? preg_use_end[p] : (pos + 1u);
+                            iv_add_range(&fixed_ivs[p], pos, end_p);
+                            preg_live &= ~(UINT64_C(1) << p);
+                        } else {
+                            iv_add_range(&fixed_ivs[p], pos, pos + 1u);
+                        }
                     }
                     for (uint32_t r = 0u; r <= 7u; ++r) {
-                        iv_add_range(&fixed_ivs[A64_FP(r)], pos, pos + 1u);
+                        MPReg p = A64_FP(r);
+                        if ((preg_live & (UINT64_C(1) << p)) != 0u) {
+                            uint32_t end_p = preg_use_end[p] > pos ? preg_use_end[p] : (pos + 1u);
+                            iv_add_range(&fixed_ivs[p], pos, end_p);
+                            preg_live &= ~(UINT64_C(1) << p);
+                        } else {
+                            iv_add_range(&fixed_ivs[p], pos, pos + 1u);
+                        }
                     }
                     for (uint32_t r = 16u; r <= 31u; ++r) {
-                        iv_add_range(&fixed_ivs[A64_FP(r)], pos, pos + 1u);
+                        MPReg p = A64_FP(r);
+                        if ((preg_live & (UINT64_C(1) << p)) != 0u) {
+                            uint32_t end_p = preg_use_end[p] > pos ? preg_use_end[p] : (pos + 1u);
+                            iv_add_range(&fixed_ivs[p], pos, end_p);
+                            preg_live &= ~(UINT64_C(1) << p);
+                        } else {
+                            iv_add_range(&fixed_ivs[p], pos, pos + 1u);
+                        }
                     }
                 }
             }
@@ -379,7 +421,15 @@ static void compute_intervals(const MFunc *mf, LiveInterval *v_ivs,
                     }
                 } else if (ins->ops[k].kind == MOP_PREG && ins->ops[k].is_def) {
                     MPReg p = ins->ops[k].u.preg;
-                    if (p < 64u) iv_add_range(&fixed_ivs[p], pos, pos + 1u);
+                    if (p < 64u) {
+                        if ((preg_live & (UINT64_C(1) << p)) != 0u) {
+                            uint32_t end_p = preg_use_end[p] > pos ? preg_use_end[p] : (pos + 1u);
+                            iv_add_range(&fixed_ivs[p], pos, end_p);
+                            preg_live &= ~(UINT64_C(1) << p);
+                        } else {
+                            iv_add_range(&fixed_ivs[p], pos, pos + 1u);
+                        }
+                    }
                 }
             }
 
@@ -395,7 +445,23 @@ static void compute_intervals(const MFunc *mf, LiveInterval *v_ivs,
                     }
                 } else if (ins->ops[k].kind == MOP_PREG && ins->ops[k].is_use) {
                     MPReg p = ins->ops[k].u.preg;
-                    if (p < 64u) iv_add_range(&fixed_ivs[p], pos - 1u, pos);
+                    if (p < 64u) {
+                        iv_add_range(&fixed_ivs[p], pos - 1u, pos);
+                        if ((preg_live & (UINT64_C(1) << p)) == 0u) {
+                            preg_live |= (UINT64_C(1) << p);
+                            preg_use_end[p] = pos;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* Any preg live into the top of this block (e.g. ABI args at entry) spans [bs, use_end). */
+        if (preg_live != 0u) {
+            for (uint32_t p = 0u; p < 64u; ++p) {
+                if ((preg_live & (UINT64_C(1) << p)) != 0u) {
+                    uint32_t end_p = preg_use_end[p] > bs ? preg_use_end[p] : (bs + 1u);
+                    iv_add_range(&fixed_ivs[p], bs, end_p);
                 }
             }
         }
@@ -422,12 +488,6 @@ static void compute_intervals(const MFunc *mf, LiveInterval *v_ivs,
 /* =========================================================================
  * Linear Scan Core (Per Register Class)
  * ========================================================================= */
-
-typedef struct {
-    const LiveInterval *ivs;
-    uint32_t           *order;
-    uint32_t            count;
-} SortCtx;
 
 static const LiveInterval *g_sort_ivs = NULL;
 
@@ -859,7 +919,7 @@ static void lower_pcopy_bundle(const MFunc *mf, const MPCopyBundle *pc,
  * Post-Allocation Rewriting (Spill Reloads/Stores + VReg -> PReg)
  * ========================================================================= */
 
-static void rewrite_blocks(MFunc *mf) {
+static bool rewrite_blocks(MFunc *mf, PirDiag *diag) {
     static const MPReg A64_GP_SCRATCH[3] = { A64_SCRATCH_GP0, A64_SCRATCH_GP1, A64_SCRATCH_GP2 };
     static const MPReg A64_FP_SCRATCH[3] = { A64_SCRATCH_FP0, A64_SCRATCH_FP1, A64_SCRATCH_FP2 };
     static const MPReg X64_GP_SCRATCH[3] = { X64_SCRATCH_GP0, X64_SCRATCH_GP1, X64_SCRATCH_GP2 };
@@ -867,6 +927,7 @@ static void rewrite_blocks(MFunc *mf) {
     bool is_x64 = (mf->target->arch == PIR_ARCH_X86_64);
     const MPReg *GP_SCRATCH = is_x64 ? X64_GP_SCRATCH : A64_GP_SCRATCH;
     const MPReg *FP_SCRATCH = is_x64 ? X64_FP_SCRATCH : A64_FP_SCRATCH;
+    MPReg addr_tmp_gp = is_x64 ? X64_SCRATCH_GP1 : A64_SCRATCH_GP1;
 
     for (uint32_t b = 0u; b < mf->blocks.len; ++b) {
         MBlock *blk = &mf->blocks.data[b];
@@ -879,15 +940,88 @@ static void rewrite_blocks(MFunc *mf) {
                 continue;
             }
 
-            /* Assign scratch regs for any spilled operands in this instruction.
-             * Map duplicate spilled vregs within the same instruction to the SAME scratch reg. */
+            /* Collect unique spilled vregs in this instruction; duplicate vregs share one scratch. */
             MVReg mapped_v[MINST_MAX_OPS];
             MPReg mapped_p[MINST_MAX_OPS];
             bool  mapped_need_load[MINST_MAX_OPS];
             bool  mapped_need_store[MINST_MAX_OPS];
+            bool  mapped_ec[MINST_MAX_OPS];
             uint32_t nmapped = 0u;
-            uint32_t next_gp_s = 0u, next_fp_s = 0u;
 
+            for (uint8_t k = 0u; k < ins.op_count; ++k) {
+                if (ins.ops[k].kind != MOP_VREG) continue;
+                MVReg v = ins.ops[k].u.vreg;
+                const MVRegInfo *vi = &mf->vregs.data[v];
+                if (vi->assigned_preg != MREG_NONE) continue;
+
+                uint32_t found = UINT32_MAX;
+                for (uint32_t m = 0u; m < nmapped; ++m) {
+                    if (mapped_v[m] == v) { found = m; break; }
+                }
+                if (found == UINT32_MAX) {
+                    found = nmapped++;
+                    mapped_v[found]          = v;
+                    mapped_p[found]          = MREG_NONE;
+                    mapped_need_load[found]  = false;
+                    mapped_need_store[found] = false;
+                    mapped_ec[found]         = false;
+                }
+                if (ins.ops[k].is_use)           mapped_need_load[found]  = true;
+                if (ins.ops[k].is_def)           mapped_need_store[found] = true;
+                if (ins.ops[k].is_early_clobber) mapped_ec[found]         = true;
+            }
+
+            /* Assign distinct scratch regs without modulo aliasing:
+             * Pass 0: spilled defs/defuses that are uses or early-clobber defs get GP0/GP1 first
+             *         so on ARM64 GP2 (x17) is never a spilled def (kept free as large-offset store tmp).
+             * Pass 1: remaining pure uses take next free scratch.
+             * Pass 2: pure non-early-clobber defs take a free scratch or reuse a pure-use scratch. */
+            uint32_t gp_used = 0u, fp_used = 0u;
+            uint32_t gp_def_mask = 0u, fp_def_mask = 0u;
+            for (uint32_t pass = 0u; pass < 3u; ++pass) {
+                for (uint32_t m = 0u; m < nmapped; ++m) {
+                    bool is_p1 = mapped_need_load[m] || mapped_ec[m];
+                    bool want = (pass == 0u) ? (is_p1 && mapped_need_store[m])
+                              : (pass == 1u) ? (is_p1 && !mapped_need_store[m])
+                                             : (!is_p1);
+                    if (!want) continue;
+                    const MVRegInfo *vi = &mf->vregs.data[mapped_v[m]];
+                    bool is_gp = (vi->rclass == MREG_CLASS_GP);
+                    uint32_t *used_cnt = is_gp ? &gp_used : &fp_used;
+                    uint32_t *def_mask = is_gp ? &gp_def_mask : &fp_def_mask;
+                    const MPReg *pool  = is_gp ? GP_SCRATCH : FP_SCRATCH;
+
+                    uint32_t sidx = UINT32_MAX;
+                    if (pass == 2u) {
+                        /* Prefer GP0/GP1 (index < 2) for pure defs so GP2 (x17) stays free as tmp. */
+                        for (uint32_t s = 0u; s < 3u; ++s) {
+                            if ((*def_mask & (1u << s)) == 0u) {
+                                sidx = s;
+                                break;
+                            }
+                        }
+                        if (sidx >= *used_cnt && sidx < 3u) *used_cnt = sidx + 1u;
+                    } else if (*used_cnt < 3u) {
+                        sidx = (*used_cnt)++;
+                    }
+                    if (sidx == UINT32_MAX) {
+                        pir_diag_error(diag, 0u, 0u,
+                                       "register allocator: instruction requires >3 %s scratch registers",
+                                       is_gp ? "GP" : "FP");
+                        PIR_VEC_FREE(&out);
+                        return false;
+                    }
+                    if (mapped_need_store[m] || mapped_ec[m]) {
+                        *def_mask |= (1u << sidx);
+                    }
+                    mapped_p[m] = pool[sidx];
+                    if (is_x64 && is_gp && sidx == 2u) {
+                        mf->used_callee_gp_mask |= (1u << mreg_num(mapped_p[m]));
+                    }
+                }
+            }
+
+            /* Rewrite operands from VREG to PREG. */
             for (uint8_t k = 0u; k < ins.op_count; ++k) {
                 if (ins.ops[k].kind != MOP_VREG) continue;
                 MVReg v = ins.ops[k].u.vreg;
@@ -895,38 +1029,20 @@ static void rewrite_blocks(MFunc *mf) {
                 if (vi->assigned_preg != MREG_NONE) {
                     ins.ops[k].kind   = MOP_PREG;
                     ins.ops[k].u.preg = vi->assigned_preg;
-                    continue;
-                }
-                /* Spilled vreg */
-                uint32_t found = UINT32_MAX;
-                for (uint32_t m = 0u; m < nmapped; ++m) {
-                    if (mapped_v[m] == v) { found = m; break; }
-                }
-                if (found == UINT32_MAX) {
-                    MPReg sr;
-                    if (vi->rclass == MREG_CLASS_GP) {
-                        uint32_t sidx = next_gp_s++ % 3u;
-                        sr = GP_SCRATCH[sidx];
-                        if (is_x64 && sidx == 2u) {
-                            mf->used_callee_gp_mask |= (1u << x64_reg_num(sr));
+                } else {
+                    for (uint32_t m = 0u; m < nmapped; ++m) {
+                        if (mapped_v[m] == v) {
+                            ins.ops[k].kind   = MOP_PREG;
+                            ins.ops[k].u.preg = mapped_p[m];
+                            break;
                         }
-                    } else {
-                        sr = FP_SCRATCH[next_fp_s++ % 3u];
                     }
-                    found = nmapped++;
-                    mapped_v[found]          = v;
-                    mapped_p[found]          = sr;
-                    mapped_need_load[found]  = false;
-                    mapped_need_store[found] = false;
                 }
-                if (ins.ops[k].is_use) mapped_need_load[found]  = true;
-                if (ins.ops[k].is_def) mapped_need_store[found] = true;
-
-                ins.ops[k].kind   = MOP_PREG;
-                ins.ops[k].u.preg = mapped_p[found];
             }
 
-            /* Emit FP reloads BEFORE GP reloads so frame pass has GP scratch free for FP slot addr! */
+            /* Emit FP reloads BEFORE GP reloads so frame pass has GP scratch free for FP slot addr!
+             * Among GP reloads, emit addr_tmp_gp (x16 / r11) LAST so large-offset frame lowering
+             * of earlier reloads cannot clobber an already-reloaded addr_tmp_gp. */
             for (uint32_t m = 0u; m < nmapped; ++m) {
                 const MVRegInfo *vi = &mf->vregs.data[mapped_v[m]];
                 if (mapped_need_load[m] && vi->rclass == MREG_CLASS_FP) {
@@ -937,9 +1053,12 @@ static void rewrite_blocks(MFunc *mf) {
                     PIR_VEC_PUSH(&out, ld);
                 }
             }
-            for (uint32_t m = 0u; m < nmapped; ++m) {
-                const MVRegInfo *vi = &mf->vregs.data[mapped_v[m]];
-                if (mapped_need_load[m] && vi->rclass == MREG_CLASS_GP) {
+            for (uint32_t phase = 0u; phase < 2u; ++phase) {
+                for (uint32_t m = 0u; m < nmapped; ++m) {
+                    const MVRegInfo *vi = &mf->vregs.data[mapped_v[m]];
+                    if (!mapped_need_load[m] || vi->rclass != MREG_CLASS_GP) continue;
+                    bool is_addr_tmp = (mapped_p[m] == addr_tmp_gp);
+                    if ((phase == 1u) != is_addr_tmp) continue;
                     MInst ld = minst_make(MI_LOAD_SLOT, vi->byte_size, ins.loc_idx);
                     ld.op_count = 2u;
                     ld.ops[0] = mop_preg_def(mapped_p[m]);
@@ -955,10 +1074,14 @@ static void rewrite_blocks(MFunc *mf) {
                 PIR_VEC_PUSH(&out, ins);
             }
 
-            /* Emit stores for spilled defs (GP stores first, then FP stores). */
-            for (uint32_t m = 0u; m < nmapped; ++m) {
-                const MVRegInfo *vi = &mf->vregs.data[mapped_v[m]];
-                if (mapped_need_store[m] && vi->rclass == MREG_CLASS_GP) {
+            /* Emit stores for spilled defs: GP stores first (with addr_tmp_gp FIRST so subsequent
+             * large-offset frame lowering cannot clobber it), then FP stores. */
+            for (uint32_t phase = 0u; phase < 2u; ++phase) {
+                for (uint32_t m = 0u; m < nmapped; ++m) {
+                    const MVRegInfo *vi = &mf->vregs.data[mapped_v[m]];
+                    if (!mapped_need_store[m] || vi->rclass != MREG_CLASS_GP) continue;
+                    bool is_addr_tmp = (mapped_p[m] == addr_tmp_gp);
+                    if ((phase == 0u) != is_addr_tmp) continue;
                     MInst st = minst_make(MI_STORE_SLOT, vi->byte_size, ins.loc_idx);
                     st.op_count = 2u;
                     st.ops[0] = mop_preg_use(mapped_p[m]);
@@ -981,14 +1104,137 @@ static void rewrite_blocks(MFunc *mf) {
         PIR_VEC_FREE(&blk->insts);
         blk->insts = out;
     }
+    return true;
 }
+
+#ifdef PIR_VERIFY_ALL
+static bool verify_mir_common(const MFunc *mf, bool post_ra, PirDiag *diag) {
+    uint32_t nb = mf->blocks.len;
+    uint32_t nv = mf->vregs.len;
+    uint32_t ns = mf->slots.len;
+    uint32_t nj = mf->jtables.len;
+    uint32_t np = mf->pcopies.len;
+
+    for (uint32_t b = 0u; b < nb; ++b) {
+        const MBlock *blk = &mf->blocks.data[b];
+        for (uint32_t s = 0u; s < blk->succs.len; ++s) {
+            if (blk->succs.data[s] >= nb) {
+                pir_diag_error(diag, 0u, 0u, "MIR verifier: invalid succ block %u", blk->succs.data[s]);
+                return false;
+            }
+        }
+        for (uint32_t p = 0u; p < blk->preds.len; ++p) {
+            if (blk->preds.data[p] >= nb) {
+                pir_diag_error(diag, 0u, 0u, "MIR verifier: invalid pred block %u", blk->preds.data[p]);
+                return false;
+            }
+        }
+        for (uint32_t j = 0u; j < blk->insts.len; ++j) {
+            const MInst *ins = &blk->insts.data[j];
+            if (ins->op_count > MINST_MAX_OPS) {
+                pir_diag_error(diag, 0u, 0u, "MIR verifier: op_count %u exceeds max", (unsigned)ins->op_count);
+                return false;
+            }
+            if (ins->op == MI_PCOPY) {
+                if (post_ra) {
+                    pir_diag_error(diag, 0u, 0u, "MIR verifier (post-RA): MI_PCOPY survived regalloc");
+                    return false;
+                }
+                if (ins->aux_id >= np) {
+                    pir_diag_error(diag, 0u, 0u, "MIR verifier: invalid pcopy bundle %u", ins->aux_id);
+                    return false;
+                }
+                const MPCopyBundle *pc = &mf->pcopies.data[ins->aux_id];
+                for (uint32_t k = 0u; k < pc->count; ++k) {
+                    if (pc->entries[k].dst >= nv ||
+                        (!pc->entries[k].src_is_imm && pc->entries[k].src >= nv)) {
+                        pir_diag_error(diag, 0u, 0u, "MIR verifier: out-of-range vreg in MI_PCOPY");
+                        return false;
+                    }
+                    for (uint32_t m = 0u; m < k; ++m) {
+                        if (pc->entries[m].dst == pc->entries[k].dst) {
+                            pir_diag_error(diag, 0u, 0u, "MIR verifier: duplicate dst vreg in MI_PCOPY");
+                            return false;
+                        }
+                    }
+                }
+                continue;
+            }
+            for (uint8_t k = 0u; k < ins->op_count; ++k) {
+                const MOperand *op = &ins->ops[k];
+                switch (op->kind) {
+                    case MOP_NONE:
+                    case MOP_IMM:
+                    case MOP_SYM:
+                    case MOP_COND:
+                        break;
+                    case MOP_VREG:
+                        if (post_ra) {
+                            pir_diag_error(diag, 0u, 0u, "MIR verifier (post-RA): MOP_VREG survived regalloc");
+                            return false;
+                        }
+                        if (op->u.vreg >= nv) {
+                            pir_diag_error(diag, 0u, 0u, "MIR verifier: vreg %u out of range", op->u.vreg);
+                            return false;
+                        }
+                        break;
+                    case MOP_PREG:
+                        if (op->u.preg >= 64u ||
+                            (mf->target && mf->target->arch == PIR_ARCH_X86_64 &&
+                             ((op->u.preg >= 16u && op->u.preg < 32u) || op->u.preg >= 48u))) {
+                            pir_diag_error(diag, 0u, 0u, "MIR verifier: preg %u out of range", (unsigned)op->u.preg);
+                            return false;
+                        }
+                        break;
+                    case MOP_BLOCK:
+                        if (op->u.block_id >= nb) {
+                            pir_diag_error(diag, 0u, 0u, "MIR verifier: block %u out of range", op->u.block_id);
+                            return false;
+                        }
+                        break;
+                    case MOP_SLOT:
+                        if (op->u.slot_id >= ns) {
+                            pir_diag_error(diag, 0u, 0u, "MIR verifier: slot %u out of range", op->u.slot_id);
+                            return false;
+                        }
+                        break;
+                    case MOP_JTABLE:
+                        if (op->u.jtable_id >= nj) {
+                            pir_diag_error(diag, 0u, 0u, "MIR verifier: jtable %u out of range", op->u.jtable_id);
+                            return false;
+                        }
+                        break;
+                }
+            }
+        }
+    }
+    for (uint32_t j = 0u; j < nj; ++j) {
+        const MJTable *jt = &mf->jtables.data[j];
+        for (uint32_t k = 0u; k < jt->num_entries; ++k) {
+            if (jt->targets[k] >= nb) {
+                pir_diag_error(diag, 0u, 0u, "MIR verifier: jtable target block %u out of range",
+                               jt->targets[k]);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool pir_mir_verify_pre_ra(const MFunc *mf, PirDiag *diag) {
+    return verify_mir_common(mf, false, diag);
+}
+
+bool pir_mir_verify_post_ra(const MFunc *mf, PirDiag *diag) {
+    return verify_mir_common(mf, true, diag);
+}
+#endif
 
 /* =========================================================================
  * Public Entry Point
  * ========================================================================= */
 
 bool pir_regalloc_run(MFunc *mf, PirDiag *diag) {
-    (void)diag;
     uint32_t nv = mf->vregs.len;
     LiveInterval *v_ivs = (LiveInterval *)calloc((size_t)nv + 1u, sizeof(LiveInterval));
     LiveInterval fixed_ivs[64];
@@ -1022,18 +1268,18 @@ bool pir_regalloc_run(MFunc *mf, PirDiag *diag) {
             vi->assigned_preg = v_ivs[v].assigned;
             vi->spill_slot    = -1;
             if (is_callee_saved_gp(mf->target->arch, vi->assigned_preg)) {
-                mf->used_callee_gp_mask |= (1u << a64_reg_num(vi->assigned_preg));
+                mf->used_callee_gp_mask |= (1u << mreg_num(vi->assigned_preg));
             } else if (is_callee_saved_fp(mf->target->arch, vi->assigned_preg)) {
-                mf->used_callee_fp_mask |= (1u << a64_reg_num(vi->assigned_preg));
+                mf->used_callee_fp_mask |= (1u << mreg_num(vi->assigned_preg));
             }
         }
     }
 
-    rewrite_blocks(mf);
+    bool ok = rewrite_blocks(mf, diag);
 
     for (uint32_t v = 0u; v < nv; ++v) free(v_ivs[v].ranges);
     for (uint32_t r = 0u; r < 64u; ++r) free(fixed_ivs[r].ranges);
     free(call_iv.ranges);
     free(v_ivs);
-    return true;
+    return ok;
 }

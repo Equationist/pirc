@@ -16,12 +16,18 @@ struct PirArenaBlock {
     unsigned char  data[];
 };
 
-static size_t align_up(size_t n, size_t align) {
-    size_t mask = align - 1u;
-    return (n + mask) & ~mask;
+static size_t aligned_offset(const unsigned char *base, size_t used, size_t align) {
+    uintptr_t cur     = (uintptr_t)(base + used);
+    uintptr_t mask    = (uintptr_t)(align - 1u);
+    uintptr_t aligned = (cur + mask) & ~mask;
+    return used + (size_t)(aligned - cur);
 }
 
 static PirArenaBlock *alloc_block(size_t cap) {
+    if (cap > SIZE_MAX - sizeof(PirArenaBlock)) {
+        fprintf(stderr, "pirc: arena block allocation overflow (%zu bytes)\n", cap);
+        abort();
+    }
     PirArenaBlock *blk = (PirArenaBlock *)malloc(sizeof(PirArenaBlock) + cap);
     if (!blk) {
         fprintf(stderr, "pirc: out of memory allocating arena block (%zu bytes)\n", cap);
@@ -58,10 +64,14 @@ void *pir_arena_alloc_aligned(PirArena *arena, size_t size, size_t align) {
     if (size == 0u) {
         size = 1u;
     }
+    if (size > SIZE_MAX - align) {
+        fprintf(stderr, "pirc: arena allocation size overflow (%zu bytes)\n", size);
+        abort();
+    }
 
     if (arena->head) {
-        size_t offset = align_up(arena->head->used, align);
-        if (offset + size <= arena->head->cap) {
+        size_t offset = aligned_offset(arena->head->data, arena->head->used, align);
+        if (offset <= arena->head->cap && size <= arena->head->cap - offset) {
             void *ptr = arena->head->data + offset;
             memset(ptr, 0, size);
             arena->head->used       = offset + size;
@@ -80,12 +90,20 @@ void *pir_arena_alloc_aligned(PirArena *arena, size_t size, size_t align) {
     blk->next          = arena->head;
     arena->head        = blk;
 
-    size_t offset           = align_up(0u, align);
+    size_t offset           = aligned_offset(blk->data, 0u, align);
     void  *ptr              = blk->data + offset;
     memset(ptr, 0, size);
     blk->used               = offset + size;
     arena->total_allocated += size;
     return ptr;
+}
+
+void *pir_arena_alloc_array(PirArena *arena, size_t count, size_t elem_size, size_t align) {
+    if (elem_size != 0u && count > SIZE_MAX / elem_size) {
+        fprintf(stderr, "pirc: arena array allocation overflow (%zu * %zu)\n", count, elem_size);
+        abort();
+    }
+    return pir_arena_alloc_aligned(arena, count * elem_size, align);
 }
 
 void *pir_arena_alloc(PirArena *arena, size_t size) {

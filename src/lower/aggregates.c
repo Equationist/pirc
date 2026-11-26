@@ -31,8 +31,13 @@ static bool is_pow2_u64(uint64_t v, uint32_t *out_shift) {
 }
 
 static PirTypeLayout pir_type_layout_rec(const PirModule *mod, const PirTargetSpec *target,
-                                         PirType ty, PirTypeLayout *cache, uint8_t *done) {
+                                         PirType ty, PirTypeLayout *cache, uint8_t *done,
+                                         uint32_t depth) {
     PirTypeLayout res = { 0u, 1u, 0u, false };
+    if (depth > 256u) {
+        res.overflow = true;
+        return res;
+    }
     switch (ty.kind) {
         case PIR_TYPE_SCALAR:
             switch (ty.u.scalar) {
@@ -71,7 +76,7 @@ static PirTypeLayout pir_type_layout_rec(const PirModule *mod, const PirTargetSp
                     uint64_t off = 0u;
                     uint32_t max_al = 1u;
                     for (uint32_t i = 0u; i < agg->field_count; ++i) {
-                        PirTypeLayout fl = pir_type_layout_rec(mod, target, agg->fields[i], cache, done);
+                        PirTypeLayout fl = pir_type_layout_rec(mod, target, agg->fields[i], cache, done, depth + 1u);
                         if (fl.overflow) res.overflow = true;
                         off = align_up_u64_chk(off, fl.align, &res.overflow);
                         if (fl.size > UINT64_MAX - off) {
@@ -89,7 +94,7 @@ static PirTypeLayout pir_type_layout_rec(const PirModule *mod, const PirTargetSp
                 case PIR_AGG_PACKED_STRUCT: {
                     uint64_t off = 0u;
                     for (uint32_t i = 0u; i < agg->field_count; ++i) {
-                        PirTypeLayout fl = pir_type_layout_rec(mod, target, agg->fields[i], cache, done);
+                        PirTypeLayout fl = pir_type_layout_rec(mod, target, agg->fields[i], cache, done, depth + 1u);
                         if (fl.overflow) res.overflow = true;
                         if (fl.size > UINT64_MAX - off) {
                             res.overflow = true;
@@ -106,7 +111,7 @@ static PirTypeLayout pir_type_layout_rec(const PirModule *mod, const PirTargetSp
                     uint64_t max_sz = 0u;
                     uint32_t max_al = 1u;
                     for (uint32_t i = 0u; i < agg->field_count; ++i) {
-                        PirTypeLayout fl = pir_type_layout_rec(mod, target, agg->fields[i], cache, done);
+                        PirTypeLayout fl = pir_type_layout_rec(mod, target, agg->fields[i], cache, done, depth + 1u);
                         if (fl.overflow) res.overflow = true;
                         if (fl.size > max_sz) max_sz = fl.size;
                         if (fl.align > max_al) max_al = fl.align;
@@ -116,7 +121,7 @@ static PirTypeLayout pir_type_layout_rec(const PirModule *mod, const PirTargetSp
                     break;
                 }
                 case PIR_AGG_ARRAY: {
-                    PirTypeLayout el = pir_type_layout_rec(mod, target, agg->elem_type, cache, done);
+                    PirTypeLayout el = pir_type_layout_rec(mod, target, agg->elem_type, cache, done, depth + 1u);
                     if (el.overflow) res.overflow = true;
                     uint64_t stride  = align_up_u64_chk(el.size, el.align, &res.overflow);
                     if (stride > 0u && agg->array_len > UINT64_MAX / stride) {
@@ -138,6 +143,9 @@ static PirTypeLayout pir_type_layout_rec(const PirModule *mod, const PirTargetSp
                 res.align = agg->min_align;
                 res.size  = align_up_u64_chk(res.size, res.align, &res.overflow);
             }
+            if (res.size > (UINT64_C(1) << 48) || res.stride > (UINT64_C(1) << 48)) {
+                res.overflow = true;
+            }
             if (cache && done && aid < mod->agg_types.len) {
                 cache[aid] = res;
                 done[aid] = 1u;
@@ -150,7 +158,7 @@ static PirTypeLayout pir_type_layout_rec(const PirModule *mod, const PirTargetSp
 
 PirTypeLayout pir_type_layout(const PirModule *mod, const PirTargetSpec *target, PirType ty) {
     if (ty.kind != PIR_TYPE_NAMED_AGG || !mod || mod->agg_types.len == 0u) {
-        return pir_type_layout_rec(mod, target, ty, NULL, NULL);
+        return pir_type_layout_rec(mod, target, ty, NULL, NULL, 0u);
     }
     uint32_t n = mod->agg_types.len;
     PirTypeLayout stack_cache[64];
@@ -164,7 +172,7 @@ PirTypeLayout pir_type_layout(const PirModule *mod, const PirTargetSpec *target,
     } else {
         memset(done, 0, n);
     }
-    PirTypeLayout res = pir_type_layout_rec(mod, target, ty, cache, done);
+    PirTypeLayout res = pir_type_layout_rec(mod, target, ty, cache, done, 0u);
     if (n > 64u) {
         free(cache);
         free(done);
@@ -219,9 +227,9 @@ static PirScalarType pick_chunk_type(uint64_t rem, uint32_t align, uint32_t *out
     return PIR_SCALAR_I8;
 }
 
-static void lower_mem_intrinsic(PirModule *mod, const PirTargetSpec *target,
+static bool lower_mem_intrinsic(PirModule *mod, const PirTargetSpec *target,
                                 PirFuncId fi, PirBlockId blk_id, PirInstIdVec *out,
-                                const PirInst *inst) {
+                                const PirInst *inst, PirDiag *diag) {
     PirFunction *fn = &mod->funcs.data[fi];
     PirType idx_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
     PirOperand dst = inst->operands[0];
@@ -234,7 +242,7 @@ static void lower_mem_intrinsic(PirModule *mod, const PirTargetSpec *target,
 
     if (const_small && (inst->op == PIR_OP_MEMCPY || inst->op == PIR_OP_MEMMOVE)) {
         if (len.u.imm_int.lo == 0u) {
-            return;
+            return true;
         }
         /* Keep memcpy/memmove as extern @memcpy/@memmove calls rather than typed integer
          * loads/stores so byte-level uninitialized padding and pointer provenance are preserved. */
@@ -263,7 +271,7 @@ static void lower_mem_intrinsic(PirModule *mod, const PirTargetSpec *target,
             pir_fn_append_inst(fn, out, st);
             off += csz;
         }
-        return;
+        return true;
     }
 
     /* Large or dynamic length -> extern C call (@memcpy / @memmove / @memset). */
@@ -275,6 +283,22 @@ static void lower_mem_intrinsic(PirModule *mod, const PirTargetSpec *target,
                                           : pir_type_scalar(PIR_SCALAR_PTR);
     ptys[2] = idx_ty;
     PirFuncId cid = pir_ensure_extern_func(mod, cname, ptys, 3u, pir_type_scalar(PIR_SCALAR_PTR));
+    const PirFunction *callee = &mod->funcs.data[cid];
+    bool sig_ok = (!callee->is_variadic && callee->param_count == 3u &&
+                   callee->cabi_ret.kind == PIR_CABI_RET_NONE &&
+                   pir_type_eq(callee->ret_type, pir_type_scalar(PIR_SCALAR_PTR)));
+    for (uint32_t k = 0u; k < 3u && sig_ok; ++k) {
+        if (callee->params[k].abi_kind != PIR_PARAM_NORMAL ||
+            !pir_type_eq(callee->params[k].type, ptys[k])) {
+            sig_ok = false;
+        }
+    }
+    if (!sig_ok) {
+        pir_diag_error(diag, inst->src_line, 0u,
+                       "predeclared '@%s' has incompatible signature for memory intrinsic lowering",
+                       cname);
+        return false;
+    }
     fn = &mod->funcs.data[fi]; /* Re-fetch after potential mod->funcs realloc */
 
     PirOperand arg1 = src;
@@ -297,6 +321,22 @@ static void lower_mem_intrinsic(PirModule *mod, const PirTargetSpec *target,
     PirOperand arg2 = len;
     if (!pir_type_eq(arg2.type, idx_ty)) {
         if (arg2.kind == PIR_OPER_IMM_INT) {
+            if (idx_ty.u.scalar == PIR_SCALAR_I64 &&
+                arg2.type.kind == PIR_TYPE_SCALAR && arg2.type.u.scalar == PIR_SCALAR_I32) {
+                uint32_t v32 = arg2.u.imm_int.is_negative
+                               ? (0u - (uint32_t)arg2.u.imm_int.lo)
+                               : (uint32_t)arg2.u.imm_int.lo;
+                arg2.u.imm_int.lo          = (uint64_t)v32;
+                arg2.u.imm_int.hi          = 0u;
+                arg2.u.imm_int.is_negative = false;
+            } else if (idx_ty.u.scalar == PIR_SCALAR_I32) {
+                uint32_t v32 = arg2.u.imm_int.is_negative
+                               ? (0u - (uint32_t)arg2.u.imm_int.lo)
+                               : (uint32_t)arg2.u.imm_int.lo;
+                arg2.u.imm_int.lo          = (uint64_t)v32;
+                arg2.u.imm_int.hi          = 0u;
+                arg2.u.imm_int.is_negative = false;
+            }
             arg2.type = idx_ty;
         } else {
             PirOpcode cop = (idx_ty.u.scalar == PIR_SCALAR_I64) ? PIR_OP_ZEXT : PIR_OP_TRUNC;
@@ -320,6 +360,7 @@ static void lower_mem_intrinsic(PirModule *mod, const PirTargetSpec *target,
     call.operands[2]   = arg1;
     call.operands[3]   = arg2;
     pir_fn_append_inst(fn, out, call);
+    return true;
 }
 
 typedef PIR_VEC(PirGlobalItem) GItemVec;
@@ -369,6 +410,28 @@ static uint64_t gitem_vec_bytes_since(const GItemVec *v, uint32_t start, uint8_t
         }
     }
     return total;
+}
+
+static bool is_pad_only_type(const PirModule *mod, PirType ty, uint32_t depth) {
+    if (depth > 256u || ty.kind != PIR_TYPE_NAMED_AGG || ty.u.agg_id >= mod->agg_types.len) {
+        return false;
+    }
+    const PirAggDef *agg = &mod->agg_types.data[ty.u.agg_id];
+    switch (agg->kind) {
+        case PIR_AGG_PAD:
+            return true;
+        case PIR_AGG_ARRAY:
+            return is_pad_only_type(mod, agg->elem_type, depth + 1u);
+        case PIR_AGG_STRUCT:
+        case PIR_AGG_PACKED_STRUCT:
+            for (uint32_t f = 0u; f < agg->field_count; ++f) {
+                if (!is_pad_only_type(mod, agg->fields[f], depth + 1u)) return false;
+            }
+            return true;
+        case PIR_AGG_UNION:
+            return agg->field_count > 0u && is_pad_only_type(mod, agg->fields[0], depth + 1u);
+    }
+    return false;
 }
 
 static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirType ty,
@@ -473,7 +536,9 @@ static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirT
             emit_zero_gitem(out, ly.size);
             break;
         case PIR_AGG_ARRAY:
-            if (*idx < src_cnt && src[*idx].kind == PIR_GITEM_BYTES &&
+            if (is_pad_only_type(mod, agg->elem_type, 0u)) {
+                emit_zero_gitem(out, ly.size);
+            } else if (*idx < src_cnt && src[*idx].kind == PIR_GITEM_BYTES &&
                 agg->elem_type.kind == PIR_TYPE_SCALAR &&
                 agg->elem_type.u.scalar == PIR_SCALAR_I8) {
                 const PirGlobalItem *bi = &src[(*idx)++];
@@ -484,6 +549,10 @@ static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirT
             } else {
                 PirTypeLayout el = pir_type_layout(mod, target, agg->elem_type);
                 for (uint64_t i = 0u; i < agg->array_len; ++i) {
+                    if (*idx >= src_cnt) {
+                        emit_zero_gitem(out, (agg->array_len - i) * ly.stride);
+                        break;
+                    }
                     flatten_agg_global(mod, target, agg->elem_type, src, src_cnt, idx, out);
                     if (ly.stride > el.size) emit_zero_gitem(out, ly.stride - el.size);
                 }
@@ -509,9 +578,10 @@ static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirT
         }
         case PIR_AGG_UNION:
             if (agg->field_count > 0u) {
-                uint32_t start_len = out->len;
+                uint64_t start_bytes = gitem_vec_bytes_since(out, 0u, target->ptr_bytes);
                 flatten_agg_global(mod, target, agg->fields[0], src, src_cnt, idx, out);
-                uint64_t emitted = gitem_vec_bytes_since(out, start_len, target->ptr_bytes);
+                uint64_t end_bytes = gitem_vec_bytes_since(out, 0u, target->ptr_bytes);
+                uint64_t emitted   = (end_bytes >= start_bytes) ? (end_bytes - start_bytes) : 0u;
                 if (ly.size > emitted) emit_zero_gitem(out, ly.size - emitted);
             } else {
                 emit_zero_gitem(out, ly.size);
@@ -567,7 +637,11 @@ bool pir_lower_aggregates(PirModule *mod, const PirTargetSpec *target, PirDiag *
                 } else if (copy.op == PIR_OP_FIELD_PTR) {
                     uint64_t off = pir_field_offset(mod, target, copy.aux_type.u.agg_id,
                                                     (uint32_t)copy.imm_u64);
-                    if (off == 0u && copy.operands[0].kind == PIR_OPER_VAL) {
+                    if (target->ptr_bytes == 4u) {
+                        off &= UINT32_MAX;
+                    }
+                    if (off == 0u && copy.operands[0].kind == PIR_OPER_VAL &&
+                        copy.results[0] != copy.operands[0].u.val) {
                         pir_fn_replace_val_uses(fn, copy.results[0], copy.operands[0].u.val);
                     } else {
                         PirInst *slot = &fn->insts.data[iid];
@@ -606,7 +680,13 @@ bool pir_lower_aggregates(PirModule *mod, const PirTargetSpec *target, PirDiag *
                             k = neg ? (UINT64_C(0) - (uint64_t)sv) : (uint64_t)sv;
                         }
                         uint64_t off = k * stride;
-                        if (off == 0u && copy.operands[0].kind == PIR_OPER_VAL) {
+                        if (target->ptr_bytes == 4u) {
+                            uint32_t u32 = neg ? (0u - (uint32_t)off) : (uint32_t)off;
+                            off = (uint64_t)u32;
+                            neg = false;
+                        }
+                        if (off == 0u && copy.operands[0].kind == PIR_OPER_VAL &&
+                            copy.results[0] != copy.operands[0].u.val) {
                             pir_fn_replace_val_uses(fn, copy.results[0], copy.operands[0].u.val);
                         } else {
                             PirInst *slot = &fn->insts.data[iid];
@@ -631,12 +711,25 @@ bool pir_lower_aggregates(PirModule *mod, const PirTargetSpec *target, PirDiag *
                             sx.results[0]    = pir_fn_new_val(mod, fn, "eidx", ptr_int_ty, b, PIR_INVALID_ID, 0u);
                             pir_fn_append_inst(fn, &new_insts, sx);
                             wide_idx = pir_op_val(sx.results[0], ptr_int_ty);
+                        } else if (idx.type.kind == PIR_TYPE_SCALAR && idx.type.u.scalar == PIR_SCALAR_I64 &&
+                                   ptr_int_ty.u.scalar == PIR_SCALAR_I32) {
+                            PirInst tr = pir_make_inst(PIR_OP_TRUNC, ptr_int_ty, copy.src_line, copy.loc_idx);
+                            tr.operand_count = 1u;
+                            tr.operands      = pir_alloc_ops(mod, 1u);
+                            tr.operands[0]   = idx;
+                            tr.results[0]    = pir_fn_new_val(mod, fn, "eidx", ptr_int_ty, b, PIR_INVALID_ID, 0u);
+                            pir_fn_append_inst(fn, &new_insts, tr);
+                            wide_idx = pir_op_val(tr.results[0], ptr_int_ty);
                         }
                         PirOperand byte_off = wide_idx;
                         uint32_t sh = 0u;
-                        if (stride == 1u) {
+                        uint64_t eff_stride = (target->ptr_bytes == 4u) ? (stride & UINT32_MAX) : stride;
+                        uint32_t max_sh = (target->ptr_bytes == 4u) ? 32u : 64u;
+                        if (eff_stride == 0u) {
+                            byte_off = pir_op_imm_i(0u, false, idx_ty);
+                        } else if (eff_stride == 1u) {
                             /* byte_off is already wide_idx */
-                        } else if (is_pow2_u64(stride, &sh)) {
+                        } else if (is_pow2_u64(eff_stride, &sh) && sh < max_sh) {
                             PirInst s = pir_make_inst(PIR_OP_SHL, idx_ty, copy.src_line, copy.loc_idx);
                             s.operand_count = 2u;
                             s.operands      = pir_alloc_ops(mod, 2u);
@@ -650,7 +743,7 @@ bool pir_lower_aggregates(PirModule *mod, const PirTargetSpec *target, PirDiag *
                             m.operand_count = 2u;
                             m.operands      = pir_alloc_ops(mod, 2u);
                             m.operands[0]   = wide_idx;
-                            m.operands[1]   = pir_op_imm_i(stride, false, idx_ty);
+                            m.operands[1]   = pir_op_imm_i(eff_stride, false, idx_ty);
                             m.results[0]    = pir_fn_new_val(mod, fn, "eoff", idx_ty, b, PIR_INVALID_ID, 0u);
                             pir_fn_append_inst(fn, &new_insts, m);
                             byte_off = pir_op_val(m.results[0], idx_ty);
@@ -668,7 +761,10 @@ bool pir_lower_aggregates(PirModule *mod, const PirTargetSpec *target, PirDiag *
                     }
                 } else if (copy.op == PIR_OP_MEMCPY || copy.op == PIR_OP_MEMMOVE ||
                            copy.op == PIR_OP_MEMSET) {
-                    lower_mem_intrinsic(mod, target, fi, b, &new_insts, &copy);
+                    if (!lower_mem_intrinsic(mod, target, fi, b, &new_insts, &copy, diag)) {
+                        PIR_VEC_FREE(&new_insts);
+                        return false;
+                    }
                 } else {
                     PIR_VEC_PUSH(&new_insts, iid);
                 }

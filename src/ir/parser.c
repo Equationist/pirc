@@ -492,6 +492,32 @@ static bool token_has_nul(const PirToken *t) {
     return t->len > 0u && memchr(t->text, '\0', t->len) != NULL;
 }
 
+static bool token_has_newline(const PirToken *t) {
+    return t->len > 0u &&
+           (memchr(t->text, '\n', t->len) != NULL || memchr(t->text, '\r', t->len) != NULL);
+}
+
+static bool parse_u64_positive(Parser *p, uint64_t *out, const char *what) {
+    if (p->cur.kind != TOK_INT || p->cur.int_neg || p->cur.int_hi != 0u || p->cur.int_lo == 0u) {
+        pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected positive integer for %s", what);
+        return false;
+    }
+    *out = p->cur.int_lo;
+    advance_tok(p);
+    return true;
+}
+
+static bool parse_u32_positive(Parser *p, uint32_t *out, const char *what) {
+    uint64_t v = 0u;
+    if (!parse_u64_positive(p, &v, what)) return false;
+    if (v > UINT32_MAX) {
+        pir_diag_error(p->diag, p->cur.line, p->cur.col, "integer out of 32-bit range for %s", what);
+        return false;
+    }
+    *out = (uint32_t)v;
+    return true;
+}
+
 static bool parse_operand(Parser *p, PirFuncId func_idx, PirBlockId blk_idx,
                           PirInstId inst_idx, int which_target, uint32_t op_idx,
                           bool allow_invoke_kw, bool allow_type_tag,
@@ -540,7 +566,7 @@ static bool parse_operand(Parser *p, PirFuncId func_idx, PirBlockId blk_idx,
             advance_tok(p);
         }
     } else if (p->cur.kind == TOK_IDENT && strcmp(p->cur.text, "nan") == 0) {
-        double nv = 0.0 / 0.0;
+        double nv = (double)NAN;
         out->kind                = PIR_OPER_IMM_FLOAT;
         out->u.imm_float.raw_val = nv;
         out->u.imm_float.bits    = encode_float_bits(nv, pir_type_scalar(PIR_SCALAR_F64));
@@ -576,6 +602,28 @@ static bool parse_operand(Parser *p, PirFuncId func_idx, PirBlockId blk_idx,
             if (!parse_type(p, &out->type)) return false;
             if (out->kind == PIR_OPER_IMM_FLOAT) {
                 out->u.imm_float.bits = encode_float_bits(out->u.imm_float.raw_val, out->type);
+            }
+        }
+    }
+    if (allow_type_tag) {
+        while (p->cur.kind == TOK_IDENT) {
+            if (strcmp(p->cur.text, "byval_size") == 0) {
+                advance_tok(p);
+                if (!parse_u64_positive(p, &out->call_byval_size, "byval_size")) return false;
+            } else if (strcmp(p->cur.text, "byval_align") == 0) {
+                advance_tok(p);
+                if (!parse_u32_positive(p, &out->call_byval_align, "byval_align")) return false;
+            } else if (strcmp(p->cur.text, "stack_align") == 0) {
+                advance_tok(p);
+                if (!parse_u32_positive(p, &out->call_stack_align, "stack_align")) return false;
+            } else if (strcmp(p->cur.text, "force_stack") == 0) {
+                out->call_force_stack = true;
+                advance_tok(p);
+            } else if (strcmp(p->cur.text, "no_f32_promote") == 0) {
+                out->call_no_f32_promote = true;
+                advance_tok(p);
+            } else {
+                break;
             }
         }
     }
@@ -732,6 +780,9 @@ static PirValueId define_value(Parser *p, PirFunction *fn, const char *name, Pir
 }
 
 static void assign_literal_type(PirOperand *op, PirType ty) {
+    if (op->has_explicit_type) {
+        return;
+    }
     if (op->kind == PIR_OPER_IMM_INT) {
         if (op->type.kind == PIR_TYPE_SCALAR && op->type.u.scalar == PIR_SCALAR_VOID) {
             op->type = ty;
@@ -941,11 +992,13 @@ static bool parse_instruction(Parser *p, PirFuncId func_idx, PirBlockId blk_idx,
             case PIR_OP_ATOMIC_RMW:
             case PIR_OP_ATOMIC_CMPXCHG:
             case PIR_OP_VA_ARG:
+            case PIR_OP_SWITCH:
+                break;
             case PIR_OP_CALL:
             case PIR_OP_CALL_INDIRECT:
-            case PIR_OP_SWITCH:
             case PIR_OP_INVOKE:
             case PIR_OP_INVOKE_INDIRECT:
+                forbids_suffix = true;
                 break;
         }
         if (forbids_suffix) {
@@ -1571,6 +1624,27 @@ static bool parse_param_list(Parser *p, bool require_names,
                 } else if (strcmp(p->cur.text, "zeroext") == 0) {
                     pd.attrs |= PIR_PATTR_ZEROEXT;
                     advance_tok(p);
+                } else if (strcmp(p->cur.text, "byval_size") == 0) {
+                    advance_tok(p);
+                    if (!parse_u64_positive(p, &pd.abi_byval_size, "byval_size")) {
+                        PIR_VEC_FREE(&params);
+                        return false;
+                    }
+                } else if (strcmp(p->cur.text, "byval_align") == 0) {
+                    advance_tok(p);
+                    if (!parse_u32_positive(p, &pd.abi_byval_align, "byval_align")) {
+                        PIR_VEC_FREE(&params);
+                        return false;
+                    }
+                } else if (strcmp(p->cur.text, "stack_align") == 0) {
+                    advance_tok(p);
+                    if (!parse_u32_positive(p, &pd.abi_stack_align, "stack_align")) {
+                        PIR_VEC_FREE(&params);
+                        return false;
+                    }
+                } else if (strcmp(p->cur.text, "force_stack") == 0) {
+                    pd.abi_force_stack = true;
+                    advance_tok(p);
                 } else {
                     break;
                 }
@@ -1593,10 +1667,12 @@ static bool parse_param_list(Parser *p, bool require_names,
 }
 
 static bool parse_fn_cc_and_attrs(Parser *p, PirCallingConv *cc_out,
-                                  uint32_t *attrs_out, const char **sec_out) {
+                                  uint32_t *attrs_out, const char **sec_out,
+                                  PirCabiRetInfo *cabi_ret_out) {
     *cc_out    = PIR_CC_INTERNAL;
     *attrs_out = PIR_FATTR_NONE;
     if (sec_out) *sec_out = NULL;
+    if (cabi_ret_out) memset(cabi_ret_out, 0, sizeof(*cabi_ret_out));
 
     for (;;) {
         if (is_ident(p, "cc")) {
@@ -1616,8 +1692,8 @@ static bool parse_fn_cc_and_attrs(Parser *p, PirCallingConv *cc_out,
             advance_tok(p);
         } else if (is_ident(p, "section") && sec_out) {
             advance_tok(p);
-            if (p->cur.kind != TOK_STRING || token_has_nul(&p->cur)) {
-                pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected section name string");
+            if (p->cur.kind != TOK_STRING || token_has_nul(&p->cur) || token_has_newline(&p->cur)) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected valid section name string");
                 return false;
             }
             *sec_out = p->cur.text;
@@ -1637,6 +1713,44 @@ static bool parse_fn_cc_and_attrs(Parser *p, PirCallingConv *cc_out,
         } else if (is_ident(p, "zeroext")) {
             *attrs_out |= PIR_FATTR_RET_ZEROEXT;
             advance_tok(p);
+        } else if (cabi_ret_out && is_ident(p, "sret_x8")) {
+            cabi_ret_out->kind = PIR_CABI_RET_SRET_X8;
+            advance_tok(p);
+        } else if (cabi_ret_out && is_ident(p, "sret_rax")) {
+            cabi_ret_out->kind = PIR_CABI_RET_SRET_RAX;
+            advance_tok(p);
+        } else if (cabi_ret_out && is_ident(p, "multi_ret")) {
+            advance_tok(p);
+            if (!expect_tok(p, TOK_LPAREN, "'('")) return false;
+            cabi_ret_out->kind = PIR_CABI_RET_MULTI_REG;
+            cabi_ret_out->reg_count = 0u;
+            for (;;) {
+                if (cabi_ret_out->reg_count >= 4u) {
+                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "too many registers in multi_ret");
+                    return false;
+                }
+                if (!parse_type(p, &cabi_ret_out->regs[cabi_ret_out->reg_count++])) return false;
+                if (!expect_tok(p, TOK_COMMA, "','")) return false;
+                if (is_ident(p, "size")) break;
+            }
+            if (cabi_ret_out->reg_count < 2u) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "multi_ret requires at least 2 register types");
+                return false;
+            }
+            if (!is_ident(p, "size")) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected 'size' in multi_ret");
+                return false;
+            }
+            advance_tok(p);
+            if (!parse_u64_positive(p, &cabi_ret_out->agg_size, "multi_ret size")) return false;
+            if (!expect_tok(p, TOK_COMMA, "','")) return false;
+            if (!is_ident(p, "align")) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected 'align' in multi_ret");
+                return false;
+            }
+            advance_tok(p);
+            if (!parse_u32_positive(p, &cabi_ret_out->agg_align, "multi_ret align")) return false;
+            if (!expect_tok(p, TOK_RPAREN, "')'")) return false;
         } else if (p->cur.kind == TOK_LBRACKET) {
             advance_tok(p);
             do {
@@ -1769,7 +1883,7 @@ static bool parse_sig_decl(Parser *p) {
     if (!parse_param_list(p, false, &sig.params, &sig.param_count, &sig.is_variadic)) return false;
     if (!expect_tok(p, TOK_ARROW, "'->'")) return false;
     if (!parse_type(p, &sig.ret_type)) return false;
-    if (!parse_fn_cc_and_attrs(p, &sig.cc, &sig.attrs, NULL)) return false;
+    if (!parse_fn_cc_and_attrs(p, &sig.cc, &sig.attrs, NULL, &sig.cabi_ret)) return false;
     PIR_VEC_PUSH(&p->mod->sigs, sig);
     return true;
 }
@@ -1794,7 +1908,7 @@ static bool parse_global_item(Parser *p, PirType hint_ty, PirGlobalItem *out) {
     if (p->cur.kind == TOK_FLOAT || is_ident(p, "nan") || is_ident(p, "inf")) {
         double v = 0.0;
         if (p->cur.kind == TOK_FLOAT) v = p->cur.float_val;
-        else if (strcmp(p->cur.text, "nan") == 0) v = 0.0 / 0.0;
+        else if (strcmp(p->cur.text, "nan") == 0) v = (double)NAN;
         else v = HUGE_VAL;
         out->kind       = PIR_GITEM_FLOAT;
         out->float_bits = encode_float_bits(v, hint_ty);
@@ -1847,14 +1961,15 @@ static bool parse_global_item(Parser *p, PirType hint_ty, PirGlobalItem *out) {
     return false;
 }
 
-static bool parse_global_decl(Parser *p, PirLinkage linkage) {
+static bool parse_global_decl(Parser *p, PirLinkage linkage, bool is_weak_extern) {
     uint32_t line = p->cur.line;
     PirGlobal g;
     memset(&g, 0, sizeof(g));
-    g.name     = p->cur.text;
-    g.src_line = line;
-    g.linkage  = linkage;
-    g.type     = pir_type_scalar(PIR_SCALAR_VOID);
+    g.name           = p->cur.text;
+    g.src_line       = line;
+    g.linkage        = linkage;
+    g.is_weak_extern = is_weak_extern;
+    g.type           = pir_type_scalar(PIR_SCALAR_VOID);
     advance_tok(p); /* @name */
     if (!expect_tok(p, TOK_EQ, "'='")) return false;
 
@@ -1872,8 +1987,8 @@ static bool parse_global_decl(Parser *p, PirLinkage linkage) {
             if (!parse_align_clause(p, &g.align)) return false;
         } else if (is_ident(p, "section")) {
             advance_tok(p);
-            if (p->cur.kind != TOK_STRING || token_has_nul(&p->cur)) {
-                pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected section string");
+            if (p->cur.kind != TOK_STRING || token_has_nul(&p->cur) || token_has_newline(&p->cur)) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected valid section string");
                 return false;
             }
             g.section = p->cur.text;
@@ -1970,19 +2085,24 @@ static bool parse_global_decl(Parser *p, PirLinkage linkage) {
             }
         }
         for (;;) {
-            match_tok(p, TOK_COMMA);
+            bool had_comma = match_tok(p, TOK_COMMA);
             if (is_ident(p, "align")) {
                 if (!parse_align_clause(p, &g.align)) { PIR_VEC_FREE(&items); return false; }
             } else if (is_ident(p, "section")) {
                 advance_tok(p);
-                if (p->cur.kind != TOK_STRING) {
+                if (p->cur.kind != TOK_STRING || token_has_nul(&p->cur) || token_has_newline(&p->cur)) {
                     PIR_VEC_FREE(&items);
-                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected section string");
+                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected valid section string");
                     return false;
                 }
                 g.section = p->cur.text;
                 advance_tok(p);
             } else {
+                if (had_comma) {
+                    PIR_VEC_FREE(&items);
+                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected 'align' or 'section' after ','");
+                    return false;
+                }
                 break;
             }
         }
@@ -2012,19 +2132,24 @@ static bool parse_global_decl(Parser *p, PirLinkage linkage) {
             }
         }
         for (;;) {
-            match_tok(p, TOK_COMMA);
+            bool had_comma = match_tok(p, TOK_COMMA);
             if (is_ident(p, "align")) {
                 if (!parse_align_clause(p, &g.align)) { PIR_VEC_FREE(&items); return false; }
             } else if (is_ident(p, "section")) {
                 advance_tok(p);
-                if (p->cur.kind != TOK_STRING) {
+                if (p->cur.kind != TOK_STRING || token_has_nul(&p->cur) || token_has_newline(&p->cur)) {
                     PIR_VEC_FREE(&items);
-                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected section string");
+                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected valid section string");
                     return false;
                 }
                 g.section = p->cur.text;
                 advance_tok(p);
             } else {
+                if (had_comma) {
+                    PIR_VEC_FREE(&items);
+                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected 'align' or 'section' after ','");
+                    return false;
+                }
                 break;
             }
         }
@@ -2040,7 +2165,7 @@ static bool parse_global_decl(Parser *p, PirLinkage linkage) {
     return true;
 }
 
-static bool parse_func_decl(Parser *p, PirLinkage linkage) {
+static bool parse_func_decl(Parser *p, PirLinkage linkage, bool is_weak_extern) {
     uint32_t line = p->cur.line;
     advance_tok(p); /* consume 'func' */
     if (p->cur.kind != TOK_GLOBAL) {
@@ -2050,9 +2175,10 @@ static bool parse_func_decl(Parser *p, PirLinkage linkage) {
 
     PirFunction fn;
     memset(&fn, 0, sizeof(fn));
-    fn.name     = p->cur.text;
-    fn.src_line = line;
-    fn.linkage  = linkage;
+    fn.name           = p->cur.text;
+    fn.src_line       = line;
+    fn.linkage        = linkage;
+    fn.is_weak_extern = is_weak_extern;
     advance_tok(p);
 
     bool is_extern = (linkage == PIR_LINK_EXTERN);
@@ -2061,7 +2187,7 @@ static bool parse_func_decl(Parser *p, PirLinkage linkage) {
     }
     if (!expect_tok(p, TOK_ARROW, "'->'")) return false;
     if (!parse_type(p, &fn.ret_type)) return false;
-    if (!parse_fn_cc_and_attrs(p, &fn.cc, &fn.attrs, &fn.section)) return false;
+    if (!parse_fn_cc_and_attrs(p, &fn.cc, &fn.attrs, &fn.section, &fn.cabi_ret)) return false;
 
     PirFuncId func_idx = p->mod->funcs.len;
     PIR_VEC_PUSH(&p->mod->funcs, fn);
@@ -2155,6 +2281,11 @@ static bool parse_func_decl(Parser *p, PirLinkage linkage) {
                     }
                     loc.col = (uint32_t)p->cur.int_lo;
                     advance_tok(p);
+                    if (p->cur.kind != TOK_NEWLINE && p->cur.kind != TOK_EOF) {
+                        pir_diag_error(p->diag, p->cur.line, p->cur.col,
+                                       "expected newline after loc directive");
+                        return false;
+                    }
                     cur_loc = f->locs.len;
                     PIR_VEC_PUSH(&f->locs, loc);
                     skip_newlines(p);
@@ -2449,14 +2580,27 @@ bool pir_parse_module(const char *src, size_t len, const char *filename,
             if (!parse_sig_decl(&p)) break;
         } else {
             PirLinkage linkage = PIR_LINK_INTERNAL;
-            if (is_ident(&p, "export"))      { linkage = PIR_LINK_EXPORT; advance_tok(&p); }
-            else if (is_ident(&p, "weak"))   { linkage = PIR_LINK_WEAK;   advance_tok(&p); }
-            else if (is_ident(&p, "extern")) { linkage = PIR_LINK_EXTERN; advance_tok(&p); }
+            bool is_weak_extern = false;
+            if (is_ident(&p, "export")) {
+                linkage = PIR_LINK_EXPORT;
+                advance_tok(&p);
+            } else if (is_ident(&p, "weak")) {
+                linkage = PIR_LINK_WEAK;
+                advance_tok(&p);
+                if (is_ident(&p, "extern")) {
+                    linkage = PIR_LINK_EXTERN;
+                    is_weak_extern = true;
+                    advance_tok(&p);
+                }
+            } else if (is_ident(&p, "extern")) {
+                linkage = PIR_LINK_EXTERN;
+                advance_tok(&p);
+            }
 
             if (is_ident(&p, "func")) {
-                if (!parse_func_decl(&p, linkage)) break;
+                if (!parse_func_decl(&p, linkage, is_weak_extern)) break;
             } else if (p.cur.kind == TOK_GLOBAL) {
-                if (!parse_global_decl(&p, linkage)) break;
+                if (!parse_global_decl(&p, linkage, is_weak_extern)) break;
             } else {
                 pir_diag_error(diag, p.cur.line, p.cur.col, "unexpected top-level token");
                 break;

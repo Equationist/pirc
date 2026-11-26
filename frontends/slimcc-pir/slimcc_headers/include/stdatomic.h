@@ -26,14 +26,14 @@ typedef enum {
 #endif
 
 #define ATOMIC_FLAG_INIT { 0 }
-#define atomic_init(addr, val) (*(addr) = (val))
+#define atomic_init(addr, val) ((void)(*(addr) = (val)))
 #define kill_dependency(x) (x)
 #define atomic_thread_fence(order) ((void)(order), __builtin_atomic_thread_fence())
 #define atomic_signal_fence(order) ((void)(order))
-#define atomic_is_lock_free(x) ((void)(x), 1)
+#define atomic_is_lock_free(x) ((void)(x), (sizeof(*(x)) <= 8))
 
-#define atomic_load(addr) (*__builtin_atomic_chk(addr))
-#define atomic_store(addr, val) (*__builtin_atomic_chk(addr) = (val))
+#define atomic_load(addr) (0 ? *__builtin_atomic_chk(addr) : *__builtin_atomic_chk(addr))
+#define atomic_store(addr, val) ((void)(*__builtin_atomic_chk(addr) = (val)))
 
 #define atomic_load_explicit(addr, order) ((void)(order), atomic_load(addr))
 #define atomic_store_explicit(addr, val, order) ((void)(order), atomic_store(addr, val))
@@ -67,7 +67,7 @@ typedef enum {
 
 #define atomic_flag_test_and_set(obj) atomic_exchange((obj), 1)
 #define atomic_flag_test_and_set_explicit(obj, order) ((void)(order), atomic_flag_test_and_set(obj))
-#define atomic_flag_clear(obj) (*__builtin_atomic_chk(obj) = 0)
+#define atomic_flag_clear(obj) ((void)(*__builtin_atomic_chk(obj) = 0))
 #define atomic_flag_clear_explicit(obj, order) ((void)(order), atomic_flag_clear(obj))
 
 typedef _Atomic _Bool atomic_flag;

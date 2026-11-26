@@ -27,8 +27,20 @@
     }
 
 static inline void *pir_vec_grow_impl(void *ptr, uint32_t *cap, size_t elem_size) {
-    uint32_t next_cap = (*cap == 0u) ? 8u : (*cap * 2u);
-    void    *next     = realloc(ptr, (size_t)next_cap * elem_size);
+    uint32_t next_cap;
+    if (*cap == 0u) {
+        next_cap = 8u;
+    } else if (*cap > UINT32_MAX / 2u) {
+        fprintf(stderr, "pirc: vector capacity overflow (%u elems)\n", *cap);
+        abort();
+    } else {
+        next_cap = *cap * 2u;
+    }
+    if (elem_size != 0u && (size_t)next_cap > SIZE_MAX / elem_size) {
+        fprintf(stderr, "pirc: vector allocation overflow (%u * %zu)\n", next_cap, elem_size);
+        abort();
+    }
+    void *next = realloc(ptr, (size_t)next_cap * elem_size);
     if (!next) {
         fprintf(stderr, "pirc: out of memory growing vector (%u elems)\n", next_cap);
         abort();

@@ -11,6 +11,8 @@
 
 #include "ir/ir.h"
 
+#define PIR_ABI_MAX_REGS 4u
+
 typedef enum {
     PIR_ABI_DIRECT = 0,     /* Passed/returned in 1..4 machine scalar/vec regs */
     PIR_ABI_INDIRECT        /* Passed/returned via pointer (caller copy or sret) */
@@ -18,8 +20,8 @@ typedef enum {
 
 typedef struct {
     PirAbiClassKind kind;
-    PirType         regs[4];
-    uint64_t        reg_offsets[4]; /* Explicit byte offset per reg when has_reg_offsets is true */
+    PirType         regs[PIR_ABI_MAX_REGS];
+    uint64_t        reg_offsets[PIR_ABI_MAX_REGS]; /* Explicit byte offset per reg when has_reg_offsets is true */
     bool            has_reg_offsets;
     uint32_t        reg_count;
     uint32_t        gp_used;
@@ -36,6 +38,12 @@ typedef struct {
     uint32_t gp_used;
     uint32_t fp_used;
 } PirAbiRegState;
+
+/* Shared aggregate/vector ABI helper queries */
+bool     pir_abi_is_pad_only_agg(const PirModule *mod, PirType ty);
+uint32_t pir_abi_natural_align(const PirModule *mod, const PirTargetSpec *target, PirType ty);
+void     pir_abi_vec_param_regs(const PirTargetSpec *target, PirVecType vt,
+                                uint32_t *out_gp, uint32_t *out_fp);
 
 /* Classify a C ABI parameter (normal, byval, or i128) and update reg state. */
 bool pir_abi_classify_param(const PirModule *mod, const PirTargetSpec *target,

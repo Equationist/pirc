@@ -36,9 +36,11 @@ PirTypeLayout pir_type_layout(const PirModule *mod, const PirTargetSpec *target,
 uint64_t      pir_field_offset(const PirModule *mod, const PirTargetSpec *target,
                                PirTypeId agg_id, uint32_t field_idx);
 
-/* Shared IR builder helpers for lowering passes */
+/* Shared IR builder helpers for lowering & optimization passes */
 PirValueId pir_fn_new_val(PirModule *mod, PirFunction *fn, const char *prefix,
                           PirType ty, PirBlockId def_block, PirInstId def_inst, uint32_t slot);
+PirBlockId pir_fn_new_block(PirModule *mod, PirFunction *fn, const char *prefix,
+                            uint32_t src_line);
 PirInstId  pir_fn_append_inst(PirFunction *fn, PirInstIdVec *out_list, PirInst inst);
 PirInst    pir_make_inst(PirOpcode op, PirType ty, uint32_t src_line, uint32_t loc_idx);
 PirOperand pir_op_val(PirValueId id, PirType ty);
@@ -50,5 +52,11 @@ PirFuncId  pir_ensure_extern_func(PirModule *mod, const char *name,
                                   const PirType *param_tys, uint32_t param_count,
                                   PirType ret_ty);
 void       pir_fn_replace_val_uses(PirFunction *fn, PirValueId old_v, PirValueId new_v);
+PirValueId pir_emit_ptr_add_const(PirModule *mod, PirFunction *fn, PirBlockId b,
+                                  PirInstIdVec *out, PirValueId base, uint64_t off,
+                                  const PirTargetSpec *target, uint32_t ln, uint32_t lc);
+PirValueId pir_emit_align_ptr(PirModule *mod, PirFunction *fn, PirBlockId b,
+                              PirInstIdVec *out, PirValueId ptr_val, uint64_t align,
+                              const PirTargetSpec *target, uint32_t ln, uint32_t lc);
 
 #endif /* PIR_LOWER_LOWER_H */

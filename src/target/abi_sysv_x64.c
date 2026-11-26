@@ -52,8 +52,10 @@ static void walk_sysv(const PirModule *mod, const PirTargetSpec *target,
             if (eb < 2u) { w->cls[eb] = merge_cls(w->cls[eb], EB_SSE); w->f64_cnt[eb]++; }
         } else {
             if (eb < 2u) w->cls[eb] = merge_cls(w->cls[eb], EB_INT);
-            uint64_t end_eb = (base_off + ly.size - 1u) / 8u;
-            if (end_eb != eb && end_eb < 2u) w->cls[end_eb] = merge_cls(w->cls[end_eb], EB_INT);
+            if (ly.size > 0u) {
+                uint64_t end_eb = (base_off + ly.size - 1u) / 8u;
+                if (end_eb != eb && end_eb < 2u) w->cls[end_eb] = merge_cls(w->cls[end_eb], EB_INT);
+            }
         }
         return;
     }
@@ -75,6 +77,10 @@ static void walk_sysv(const PirModule *mod, const PirTargetSpec *target,
         }
         return;
     }
+    if (ty.u.agg_id >= mod->agg_types.len) {
+        w->unaligned = true;
+        return;
+    }
     const PirAggDef *agg = &mod->agg_types.data[ty.u.agg_id];
     if (agg->kind == PIR_AGG_PAD) {
         return; /* Explicit padding is NO_CLASS (EB_NONE) */
@@ -86,6 +92,7 @@ static void walk_sysv(const PirModule *mod, const PirTargetSpec *target,
     }
     if (agg->kind == PIR_AGG_ARRAY) {
         PirTypeLayout el = pir_type_layout(mod, target, agg->elem_type);
+        if (el.size == 0u || agg->array_len == 0u) return;
         uint64_t stride = el.size;
         for (uint64_t i = 0u; i < agg->array_len; ++i) {
             walk_sysv(mod, target, agg->elem_type, base_off + i * stride, w);
@@ -102,7 +109,14 @@ static void classify_sysv_agg(const PirModule *mod, const PirTargetSpec *target,
                               PirType agg_ty, PirAbiArgInfo *out) {
     memset(out, 0, sizeof(*out));
     PirTypeLayout ly = pir_type_layout(mod, target, agg_ty);
-    if (ly.size == 0u || ly.size > 16u) {
+    if (ly.size == 0u) {
+        out->kind      = PIR_ABI_DIRECT;
+        out->reg_count = 0u;
+        out->gp_used   = 0u;
+        out->fp_used   = 0u;
+        return;
+    }
+    if (ly.size > 16u) {
         out->kind              = PIR_ABI_INDIRECT;
         out->gp_used           = 0u;
         out->stack_byval_size  = ly.size;
@@ -187,7 +201,14 @@ bool pir_abi_sysv_x64_param(const PirModule *mod, const PirTargetSpec *target,
             out->stack_align = 16u;
             out->force_stack = true;
         }
-    } else if (pir_type_is_float(pd->type) || pd->type.kind == PIR_TYPE_VECTOR) {
+    } else if (pd->type.kind == PIR_TYPE_VECTOR) {
+        uint32_t vgp = 0u, vfp = 0u;
+        pir_abi_vec_param_regs(target, pd->type.u.vec, &vgp, &vfp);
+        out->gp_used = vgp;
+        out->fp_used = vfp;
+        if (vgp > 0u) st->gp_used = (st->gp_used + vgp < 6u) ? (st->gp_used + vgp) : 6u;
+        if (vfp > 0u) st->fp_used = (st->fp_used + vfp < 8u) ? (st->fp_used + vfp) : 8u;
+    } else if (pir_type_is_float(pd->type)) {
         out->fp_used = 1u;
         if (st->fp_used < 8u) st->fp_used++;
     } else {

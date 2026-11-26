@@ -1505,6 +1505,11 @@ static void emit_call_inst(X64ISelCtx *c, const PirInst *inst, uint32_t loc) {
             if ((pa & (PIR_PATTR_SIGNEXT | PIR_PATTR_ZEROEXT)) != 0u) {
                 v = normalize_int(c, v, arg_tys[i], (pa & PIR_PATTR_SIGNEXT) != 0u, loc);
             }
+        } else if (is_variadic && i >= pass_fixed && alocs[i].is_reg &&
+                   arg_tys[i].kind == PIR_TYPE_SCALAR &&
+                   (arg_tys[i].u.scalar == PIR_SCALAR_I8 || arg_tys[i].u.scalar == PIR_SCALAR_I16)) {
+            /* Zero-extend sub-32b variadic GP register args so upper register bits hold 0. */
+            v = normalize_int(c, v, arg_tys[i], false, loc);
         }
         avregs[i] = v;
     }
@@ -1546,6 +1551,14 @@ static void emit_call_inst(X64ISelCtx *c, const PirInst *inst, uint32_t loc) {
     for (uint32_t i = 0u; i < pass_nargs; ++i) {
         if (alocs[i].is_reg) {
             uint8_t w = alocs[i].promote_f32_to_f64 ? 8u : pir_type_vreg_bytes(arg_tys[i]);
+            if (pir_type_rclass(arg_tys[i]) == MREG_CLASS_GP && w < 4u) {
+                bool norm_fixed = (cal_params && (i + arg_skip) < cal_param_count &&
+                                   (cal_params[i + arg_skip].attrs &
+                                    (PIR_PATTR_SIGNEXT | PIR_PATTR_ZEROEXT)) != 0u);
+                if (norm_fixed || (is_variadic && i >= pass_fixed)) {
+                    w = 4u;
+                }
+            }
             MInst mv = minst_make(MI_COPY, w, loc);
             mv.op_count = 2u;
             mv.ops[0]   = mop_preg_def(alocs[i].preg);
@@ -1756,16 +1769,6 @@ static bool try_match_ror(const PirFunction *fn, const uint32_t *val_uses,
             }
         }
     }
-    return false;
-}
-
-static bool try_match_vec_fminmax(const PirFunction *fn, const uint32_t *val_uses,
-                                  PirBlockId bid, const PirInst *sel,
-                                  PirInstId *out_fcmp_id, MOpcode *out_mop,
-                                  PirOperand *out_a, PirOperand *out_b) {
-    /* PIR fcmp/select carry exact IEEE-754 NaN and signed-zero semantics (no [fast] flag). */
-    (void)fn; (void)val_uses; (void)bid; (void)sel;
-    (void)out_fcmp_id; (void)out_mop; (void)out_a; (void)out_b;
     return false;
 }
 
@@ -2607,20 +2610,7 @@ static bool isel_inst(X64ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
 
         case PIR_OP_SELECT: {
             if (inst->ty.kind == PIR_TYPE_VECTOR) {
-                PirInstId fcid = PIR_INVALID_ID;
-                MOpcode fmop = MI_NOP;
-                PirOperand fa, fb;
-                if (try_match_vec_fminmax(c->fn, c->val_uses, cur_pir_blk, inst, &fcid, &fmop, &fa, &fb) &&
-                    c->inst_fused[fcid]) {
-                    uint8_t vb = pir_type_vreg_bytes(inst->ty);
-                    MVReg va = mat_op(c, &fa, loc);
-                    MVReg vb_r = mat_op(c, &fb, loc);
-                    emit_copy(c, dst0, va, vb, loc);
-                    MInst v = minst_make(fmop, vb, loc);
-                    v.op_count = 2u; v.ops[0] = mop_vreg_defuse(dst0); v.ops[1] = mop_vreg_use(vb_r);
-                    emit(c, v);
-                    return true;
-                }
+                c->last_flags_cmp_id = PIR_INVALID_ID;
                 MVReg cond = mat_op(c, &inst->operands[0], loc);
                 MVReg tv   = mat_op(c, &inst->operands[1], loc);
                 MVReg fv   = mat_op(c, &inst->operands[2], loc);
@@ -3401,10 +3391,6 @@ static bool isel_inst(X64ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
                                : (inst->ty.u.scalar == PIR_SCALAR_I16) ? UINT64_C(0xFFFF)
                                : (inst->ty.u.scalar == PIR_SCALAR_I32) ? UINT64_C(0xFFFFFFFF)
                                                                        : ~UINT64_C(0);
-            int64_t signed_max = (inst->ty.u.scalar == PIR_SCALAR_I8)  ? INT64_C(127)
-                               : (inst->ty.u.scalar == PIR_SCALAR_I16) ? INT64_C(32767)
-                               : (inst->ty.u.scalar == PIR_SCALAR_I32) ? INT64_C(2147483647)
-                                                                       : INT64_MAX;
             uint32_t def_mblk = prepare_branch_edge(c, &inst->targets[0], loc);
             uint32_t nc = inst->switch_case_count;
 
@@ -3451,7 +3437,6 @@ static bool isel_inst(X64ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
                     jt_span    = s_span;
                 }
             }
-            (void)signed_max;
 
             MVReg val = normalize_int(c, mat_op(c, &inst->operands[0], loc),
                                       inst->ty, use_jtable && jt_signed, loc);
@@ -3733,15 +3718,9 @@ static void analyze_fusion(X64ISelCtx *c, const PirCfg *cfg) {
                 }
             }
 
-            if (ins->op == PIR_OP_SELECT && ins->operands[0].kind == PIR_OPER_VAL) {
-                if (ins->ty.kind == PIR_TYPE_VECTOR) {
-                    PirInstId fcid = PIR_INVALID_ID;
-                    MOpcode fmop = MI_NOP;
-                    PirOperand fa, fb;
-                    if (try_match_vec_fminmax(fn, c->val_uses, bid, ins, &fcid, &fmop, &fa, &fb)) {
-                        c->inst_fused[fcid] = true;
-                    }
-                } else {
+            if (ins->op == PIR_OP_SELECT && ins->ty.kind == PIR_TYPE_SCALAR &&
+                ins->operands[0].kind == PIR_OPER_VAL) {
+                {
                     PirValueId cv = ins->operands[0].u.val;
                     const PirValueDef *vd = &fn->values.data[cv];
                     if (vd->def_inst != PIR_INVALID_ID && vd->def_block == bid &&
@@ -3944,6 +3923,7 @@ bool pir_x64_isel_func(const PirModule *mod, const PirFunction *fn, uint32_t fn_
                 if (mb > reg_align) reg_align = mb;
             }
             uint64_t slot_sz = fn->cabi_ret.agg_size > reg_bytes ? fn->cabi_ret.agg_size : reg_bytes;
+            slot_sz = align_up_u64(slot_sz, 8u);
             uint32_t slot_al = fn->cabi_ret.agg_align > reg_align ? fn->cabi_ret.agg_align : reg_align;
             ctx.multi_ret_align = slot_al;
             if (slot_al > 16u) {

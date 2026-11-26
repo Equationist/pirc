@@ -32,11 +32,13 @@ typedef struct {
     int64_t        offset;     /* Constant byte offset (sum of constant ptr_add steps) */
     uint64_t       stride;     /* GCD of variable step multipliers when !has_offset (0/1 = unknown) */
     bool           has_offset; /* True if offset is statically known */
+    bool           all_inbounds;
 } PirPtrInfo;
 
-PirPtrInfo     pir_alias_decompose(const PirFunction *fn, PirOperand op);
+PirPtrInfo     pir_alias_decompose(const PirFunction *fn, PirOperand op, uint8_t ptr_bytes);
 PirAliasResult pir_alias_query(const PirFunction *fn,
                                PirOperand p1, uint32_t sz1,
-                               PirOperand p2, uint32_t sz2);
+                               PirOperand p2, uint32_t sz2,
+                               uint8_t ptr_bytes);
 
 #endif /* PIR_ANALYSIS_ALIAS_H */

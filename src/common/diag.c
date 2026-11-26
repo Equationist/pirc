@@ -26,5 +26,7 @@ void pir_diag_error(PirDiag *diag, uint32_t line, uint32_t col, const char *fmt,
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
-    diag->error_count++;
+    if (diag->error_count < UINT32_MAX) {
+        diag->error_count++;
+    }
 }

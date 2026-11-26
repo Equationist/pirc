@@ -108,14 +108,7 @@ PirBlockId pir_loop_ensure_preheader(PirModule *mod, PirFunction *fn,
     }
 
     /* Insert a dedicated preheader block forwarding header's block parameters. */
-    char buf[48];
-    PirBlockId pre = fn->blocks.len;
-    snprintf(buf, sizeof(buf), "pre_%u", pre);
-    PirBlock blk;
-    memset(&blk, 0, sizeof(blk));
-    blk.label    = pir_arena_strdup(&mod->arena, buf);
-    blk.src_line = fn->blocks.data[h].src_line;
-    PIR_VEC_PUSH(&fn->blocks, blk);
+    PirBlockId pre = pir_fn_new_block(mod, fn, "pre", fn->blocks.data[h].src_line);
 
     uint32_t np = fn->blocks.data[h].params.len;
     PirInst jmp = pir_make_inst(PIR_OP_JMP, pir_type_scalar(PIR_SCALAR_VOID),
@@ -140,10 +133,19 @@ PirBlockId pir_loop_ensure_preheader(PirModule *mod, PirFunction *fn,
         PirBlock *pb = &fn->blocks.data[p];
         if (pb->insts.len == 0u) continue;
         PirInst *term = &fn->insts.data[pb->insts.data[pb->insts.len - 1u]];
-        redirect_target(&term->targets[0], h, pre);
-        redirect_target(&term->targets[1], h, pre);
-        for (uint32_t c = 0u; c < term->switch_case_count; ++c) {
-            redirect_target(&term->switch_cases[c].target, h, pre);
+        if (term->op == PIR_OP_JMP || term->op == PIR_OP_BR ||
+            term->op == PIR_OP_INVOKE || term->op == PIR_OP_INVOKE_INDIRECT ||
+            term->op == PIR_OP_SWITCH) {
+            redirect_target(&term->targets[0], h, pre);
+            if (term->op == PIR_OP_BR || term->op == PIR_OP_INVOKE ||
+                term->op == PIR_OP_INVOKE_INDIRECT) {
+                redirect_target(&term->targets[1], h, pre);
+            }
+            if (term->op == PIR_OP_SWITCH) {
+                for (uint32_t c = 0u; c < term->switch_case_count; ++c) {
+                    redirect_target(&term->switch_cases[c].target, h, pre);
+                }
+            }
         }
     }
 

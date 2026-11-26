@@ -22,7 +22,7 @@ PirValueId pir_fn_new_val(PirModule *mod, PirFunction *fn, const char *prefix,
     const char *pfx = prefix ? prefix : "t";
     uint32_t suffix = id;
     for (;;) {
-        snprintf(buf, sizeof(buf), "%s_%u", pfx, suffix);
+        snprintf(buf, sizeof(buf), "%.48s_%u", pfx, suffix);
         bool dup = false;
         for (uint32_t k = 0u; k < fn->values.len; ++k) {
             if (fn->values.data[k].name && strcmp(fn->values.data[k].name, buf) == 0) {
@@ -41,6 +41,32 @@ PirValueId pir_fn_new_val(PirModule *mod, PirFunction *fn, const char *prefix,
     vd.param_index = slot;
     PIR_VEC_PUSH(&fn->values, vd);
     return id;
+}
+
+PirBlockId pir_fn_new_block(PirModule *mod, PirFunction *fn, const char *prefix,
+                            uint32_t src_line) {
+    char buf[64];
+    PirBlockId bid = fn->blocks.len;
+    const char *pfx = prefix ? prefix : "bb";
+    uint32_t suffix = bid;
+    for (;;) {
+        snprintf(buf, sizeof(buf), "%.48s_%u", pfx, suffix);
+        bool dup = false;
+        for (uint32_t k = 0u; k < fn->blocks.len; ++k) {
+            if (fn->blocks.data[k].label && strcmp(fn->blocks.data[k].label, buf) == 0) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) break;
+        suffix++;
+    }
+    PirBlock blk;
+    memset(&blk, 0, sizeof(blk));
+    blk.label    = pir_arena_strdup(&mod->arena, buf);
+    blk.src_line = src_line;
+    PIR_VEC_PUSH(&fn->blocks, blk);
+    return bid;
 }
 
 PirInstId pir_fn_append_inst(PirFunction *fn, PirInstIdVec *out_list, PirInst inst) {
@@ -171,6 +197,58 @@ void pir_fn_replace_val_uses(PirFunction *fn, PirValueId old_v, PirValueId new_v
     }
 }
 
+PirValueId pir_emit_ptr_add_const(PirModule *mod, PirFunction *fn, PirBlockId b,
+                                  PirInstIdVec *out, PirValueId base, uint64_t off,
+                                  const PirTargetSpec *target, uint32_t ln, uint32_t lc) {
+    if (off == 0u) return base;
+    PirType tptr   = pir_type_scalar(PIR_SCALAR_PTR);
+    PirType idx_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
+    PirInst pa = pir_make_inst(PIR_OP_PTR_ADD, idx_ty, ln, lc);
+    pa.operand_count = 2u;
+    pa.operands      = pir_alloc_ops(mod, 2u);
+    pa.operands[0]   = pir_op_val(base, tptr);
+    pa.operands[1]   = pir_op_imm_i(off, false, idx_ty);
+    pa.results[0]    = pir_fn_new_val(mod, fn, "poff", tptr, b, PIR_INVALID_ID, 0u);
+    pir_fn_append_inst(fn, out, pa);
+    return pa.results[0];
+}
+
+PirValueId pir_emit_align_ptr(PirModule *mod, PirFunction *fn, PirBlockId b,
+                              PirInstIdVec *out, PirValueId ptr_val, uint64_t align,
+                              const PirTargetSpec *target, uint32_t ln, uint32_t lc) {
+    if (align <= 1u) return ptr_val;
+    PirType tptr   = pir_type_scalar(PIR_SCALAR_PTR);
+    PirType idx_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
+    uint64_t idx_mask = (target->ptr_bytes == 4u) ? UINT32_MAX : UINT64_MAX;
+
+    PirInst p2i = pir_make_inst(PIR_OP_PTRTOINT, idx_ty, ln, lc);
+    p2i.operand_count = 1u; p2i.operands = pir_alloc_ops(mod, 1u);
+    p2i.operands[0] = pir_op_val(ptr_val, tptr);
+    p2i.results[0]  = pir_fn_new_val(mod, fn, "al_i", idx_ty, b, PIR_INVALID_ID, 0u);
+    pir_fn_append_inst(fn, out, p2i);
+
+    PirInst ad = pir_make_inst(PIR_OP_ADD, idx_ty, ln, lc);
+    ad.operand_count = 2u; ad.operands = pir_alloc_ops(mod, 2u);
+    ad.operands[0] = pir_op_val(p2i.results[0], idx_ty);
+    ad.operands[1] = pir_op_imm_i(align - 1u, false, idx_ty);
+    ad.results[0]  = pir_fn_new_val(mod, fn, "al_a", idx_ty, b, PIR_INVALID_ID, 0u);
+    pir_fn_append_inst(fn, out, ad);
+
+    PirInst an = pir_make_inst(PIR_OP_AND, idx_ty, ln, lc);
+    an.operand_count = 2u; an.operands = pir_alloc_ops(mod, 2u);
+    an.operands[0] = pir_op_val(ad.results[0], idx_ty);
+    an.operands[1] = pir_op_imm_i((~(align - 1u)) & idx_mask, false, idx_ty);
+    an.results[0]  = pir_fn_new_val(mod, fn, "al_m", idx_ty, b, PIR_INVALID_ID, 0u);
+    pir_fn_append_inst(fn, out, an);
+
+    PirInst i2p = pir_make_inst(PIR_OP_INTTOPTR, tptr, ln, lc);
+    i2p.operand_count = 1u; i2p.operands = pir_alloc_ops(mod, 1u);
+    i2p.operands[0] = pir_op_val(an.results[0], idx_ty);
+    i2p.results[0]  = pir_fn_new_val(mod, fn, "al_p", tptr, b, PIR_INVALID_ID, 0u);
+    pir_fn_append_inst(fn, out, i2p);
+    return i2p.results[0];
+}
+
 /* =========================================================================
  * Master Lowering Orchestrator (Strict Order per PIR.md §6.2)
  * ========================================================================= */
@@ -186,7 +264,8 @@ static bool maybe_verify_hir(const PirModule *mod, const PirTargetSpec *target, 
 
 /* Rewrite any PIR_OP_ALLOCA_PTR with align > 16 into an over-allocated 16B-aligned
  * frame slot + dynamic pointer alignment (x29/rbp are guaranteed 16B aligned). */
-static void pir_legalize_overaligned_allocas(PirModule *mod, const PirTargetSpec *target) {
+static bool pir_legalize_overaligned_allocas(PirModule *mod, const PirTargetSpec *target,
+                                             PirDiag *diag) {
     PirType tptr   = pir_type_scalar(PIR_SCALAR_PTR);
     PirType idx_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
     uint64_t idx_mask = (target->ptr_bytes == 4u) ? UINT32_MAX : UINT64_MAX;
@@ -213,6 +292,12 @@ static void pir_legalize_overaligned_allocas(PirModule *mod, const PirTargetSpec
                 if (copy.op == PIR_OP_ALLOCA_PTR && copy.align > 16u &&
                     copy.results[0] != PIR_INVALID_ID) {
                     uint64_t al = (uint64_t)copy.align;
+                    if (copy.imm_u64 > UINT64_MAX - (al - 16u)) {
+                        pir_diag_error(diag, copy.src_line, 0u,
+                                       "overaligned alloca.ptr size overflow");
+                        PIR_VEC_FREE(&out);
+                        return false;
+                    }
                     uint32_t ln = copy.src_line, lc = copy.loc_idx;
                     PirValueId orig_res = copy.results[0];
 
@@ -255,9 +340,20 @@ static void pir_legalize_overaligned_allocas(PirModule *mod, const PirTargetSpec
             fn->blocks.data[b].insts = out;
         }
     }
+    return true;
 }
 
 bool pir_lower_module(PirModule *mod, const PirTargetSpec *target, PirDiag *diag) {
+    /* Validate all aggregate layouts for 64-bit size overflow before any lowering pass. */
+    for (uint32_t ti = 0u; ti < mod->agg_types.len; ++ti) {
+        PirTypeLayout ly = pir_type_layout(mod, target, pir_type_agg(ti));
+        if (ly.overflow) {
+            pir_diag_error(diag, mod->agg_types.data[ti].src_line, 0u,
+                           "aggregate type layout size overflow");
+            return false;
+        }
+    }
+
     if (!pir_lower_exceptions(mod, target, diag)) return false;
     if (!maybe_verify_hir(mod, target, diag))     return false;
 
@@ -277,8 +373,11 @@ bool pir_lower_module(PirModule *mod, const PirTargetSpec *target, PirDiag *diag
     if (!maybe_verify_hir(mod, target, diag))     return false;
 
     if (!pir_legalize_optional_ops(mod, target, diag)) return false;
+#ifdef PIR_VERIFY_ALL
+    if (!pir_verify_module(mod, PIR_VERIFY_LIR, target, diag)) return false;
+#endif
 
-    pir_legalize_overaligned_allocas(mod, target);
+    if (!pir_legalize_overaligned_allocas(mod, target, diag)) return false;
 
     /* Final LIR Verification Gate (always runs). */
     return pir_verify_module(mod, PIR_VERIFY_LIR, target, diag);

@@ -25,6 +25,18 @@ typedef struct {
 } PirPtr;
 
 typedef struct {
+    uint64_t byval_size;
+    uint32_t byval_align;
+    uint32_t stack_align;
+    bool     force_stack;
+    bool     no_f32_promote;
+} PirCallArgMeta;
+
+static inline bool pir_ptr_is_null(PirPtr p) {
+    return p.alloc_id == 0u && p.offset == 0;
+}
+
+typedef struct {
     PirType ty;
     uint8_t bytes[32]; /* Up to 256-bit scalar or vector value (little-endian) */
     PirPtr  ptr;       /* Provenance pointer when ty == PIR_SCALAR_PTR */
@@ -85,6 +97,8 @@ bool     pir_interp_mem_write(PirInterp *it, PirPtr p, const void *src, size_t s
 bool     pir_interp_mem_read_ptr(PirInterp *it, PirPtr p, PirPtr *out, uint32_t align);
 bool     pir_interp_mem_write_ptr(PirInterp *it, PirPtr p, PirPtr val, uint32_t align);
 bool     pir_interp_mem_copy(PirInterp *it, PirPtr dst, PirPtr src, size_t len, bool overlap_ok);
+void     pir_interp_clear_ptr_tags(PirAlloc *a, size_t off, size_t size, uint8_t ptr_bytes);
+bool     pir_ptr_offset_checked(PirInterp *it, PirPtr base, int64_t delta, PirPtr *out);
 PirPtr   pir_interp_int_to_ptr(PirInterp *it, uint64_t addr);
 uint64_t pir_interp_ptr_to_int(const PirInterp *it, PirPtr p);
 uint64_t pir_val_get_u64(const PirVal *v);

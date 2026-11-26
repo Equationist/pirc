@@ -416,6 +416,7 @@ typedef struct {
     uint32_t        call_byval_align; /* SysV x64 variadic inline stack byval alignment */
     uint32_t        call_stack_align; /* Call-site outgoing stack alignment override (0 = default) */
     bool            call_force_stack; /* Force variadic arg onto stack (e.g. SysV i128 at gp==5) */
+    bool            call_no_f32_promote; /* Suppress variadic f32->f64 promotion (e.g. unpacked HFA) */
     union {
         PirValueId val;
         struct {
@@ -499,6 +500,7 @@ typedef struct {
     const char    *name;
     uint32_t       src_line;
     PirLinkage     linkage;
+    bool           is_weak_extern;
     const char    *section;   /* NULL if default */
     PirCallingConv cc;
     uint32_t       attrs;     /* PirFuncAttrs */
@@ -545,6 +547,7 @@ typedef struct {
     const char    *name;
     uint32_t       src_line;
     PirLinkage     linkage;
+    bool           is_weak_extern;
     PirGlobalSeg   seg;
     const char    *section;
     uint32_t       align;

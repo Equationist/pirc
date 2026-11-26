@@ -911,7 +911,20 @@ static void print_linemarker(FILE *out, Token *tok) {
   const char *name = display_files.data[tok->display_file_no];
   if (!strcmp(name, "-"))
     name = "<stdin>";
-  fprintf(out, "# %d \"%s\"\n", tok->display_line_no, name);
+  fprintf(out, "# %d \"", tok->display_line_no);
+  for (const char *p = name; *p; p++) {
+    if (*p == '\\' || *p == '"')
+      fputc('\\', out), fputc(*p, out);
+    else if (*p == '\n')
+      fputs("\\n", out);
+    else if (*p == '\r')
+      fputs("\\r", out);
+    else if (*p == '\t')
+      fputs("\\t", out);
+    else
+      fputc(*p, out);
+  }
+  fputs("\"\n", out);
 }
 
 static bool needs_space_between(Token *prev, Token *cur) {
@@ -962,7 +975,7 @@ static void print_tokens(Token *tok, FILE *out) {
     return;
   }
 
-  int line = 0;
+  int64_t line = 0;
   int file_no = -1;
   bool after_tok = false;
   Token *prev = NULL;
@@ -992,10 +1005,10 @@ static void print_tokens(Token *tok, FILE *out) {
         fputc('\n', out);
         line++;
       }
-      int diff = tok->display_line_no - line;
+      int64_t diff = (int64_t)tok->display_line_no - line;
       if (diff) {
         if (diff > 0 && diff <= 8)
-          fprintf(out, "%.*s", diff, "\n\n\n\n\n\n\n\n");
+          fprintf(out, "%.*s", (int)diff, "\n\n\n\n\n\n\n\n");
         else
           print_linemarker(out, tok);
 

@@ -87,8 +87,12 @@ uint32_t mfunc_add_jtable(MFunc *mf, int64_t min_val, uint32_t num_entries,
     jt.min_val     = min_val;
     jt.num_entries = num_entries;
     jt.default_blk = default_blk;
-    jt.targets     = PIR_ARENA_NEW_ARRAY(&mf->arena, uint32_t, num_entries);
-    memcpy(jt.targets, targets, (size_t)num_entries * sizeof(uint32_t));
+    if (num_entries > 0u) {
+        jt.targets = PIR_ARENA_NEW_ARRAY(&mf->arena, uint32_t, num_entries);
+        memcpy(jt.targets, targets, (size_t)num_entries * sizeof(uint32_t));
+    } else {
+        jt.targets = NULL;
+    }
     PIR_VEC_PUSH(&mf->jtables, jt);
     return id;
 }

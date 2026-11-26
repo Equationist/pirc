@@ -306,13 +306,20 @@ static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
             op.val_id   = ret_out_val;
             PIR_VEC_PUSH(&nfp, op);
 
-            fn->ret_type           = tvoid;
-            fn->cabi_ret.kind      = PIR_CABI_RET_MULTI_REG;
-            fn->cabi_ret.reg_count = 2u;
-            fn->cabi_ret.regs[0]   = t64;
-            fn->cabi_ret.regs[1]   = t64;
-            fn->cabi_ret.agg_size  = 16u;
-            fn->cabi_ret.agg_align = 8u;
+            fn->ret_type = tvoid;
+            if (target->arch == PIR_ARCH_X86_64 && target->os == PIR_OS_WINDOWS) {
+                fn->cabi_ret.kind      = PIR_CABI_RET_SRET_RAX;
+                fn->cabi_ret.reg_count = 0u;
+                fn->cabi_ret.agg_size  = 0u;
+                fn->cabi_ret.agg_align = 0u;
+            } else {
+                fn->cabi_ret.kind      = PIR_CABI_RET_MULTI_REG;
+                fn->cabi_ret.reg_count = 2u;
+                fn->cabi_ret.regs[0]   = t64;
+                fn->cabi_ret.regs[1]   = t64;
+                fn->cabi_ret.agg_size  = 16u;
+                fn->cabi_ret.agg_align = 8u;
+            }
         }
         for (uint32_t i = 0u; i < fn->param_count; ++i) {
             if (is_i128(fn->params[i].type)) {
@@ -412,10 +419,12 @@ static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                         if (is_i128(copy.operands[k].type)) {
                             PirOperand lo, hi;
                             operand_to_pair(&copy.operands[k], map, &lo, &hi);
-                            lo.call_stack_align = copy.operands[k].call_stack_align;
-                            hi.call_stack_align = 0u;
-                            lo.call_force_stack = copy.operands[k].call_force_stack;
-                            hi.call_force_stack = copy.operands[k].call_force_stack;
+                            lo.call_stack_align  = copy.operands[k].call_stack_align;
+                            hi.call_stack_align  = 0u;
+                            lo.call_force_stack  = copy.operands[k].call_force_stack;
+                            hi.call_force_stack  = copy.operands[k].call_force_stack;
+                            lo.has_explicit_type = copy.operands[k].has_explicit_type;
+                            hi.has_explicit_type = copy.operands[k].has_explicit_type;
                             PIR_VEC_PUSH(&nargs, lo);
                             PIR_VEC_PUSH(&nargs, hi);
                         } else {
@@ -500,27 +509,7 @@ static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                                 br.operands[0] = pir_op_val(ceq, t8);
                                 br.targets[0]  = sw_copy.switch_cases[c].target;
                                 if (c + 1u < sw_copy.switch_case_count) {
-                                    PirBlockId next_b = fn->blocks.len;
-                                    PirBlock nb;
-                                    memset(&nb, 0, sizeof(nb));
-                                    char sbuf[48];
-                                    uint32_t u = next_b;
-                                    for (;;) {
-                                        snprintf(sbuf, sizeof(sbuf), "sw128_%u_%u", (unsigned)b, (unsigned)u);
-                                        bool dup = false;
-                                        for (uint32_t k = 0u; k < fn->blocks.len; ++k) {
-                                            if (fn->blocks.data[k].label &&
-                                                strcmp(fn->blocks.data[k].label, sbuf) == 0) {
-                                                dup = true;
-                                                break;
-                                            }
-                                        }
-                                        if (!dup) break;
-                                        u++;
-                                    }
-                                    nb.label    = pir_arena_strdup(&mod->arena, sbuf);
-                                    nb.src_line = ln;
-                                    PIR_VEC_PUSH(&fn->blocks, nb);
+                                    PirBlockId next_b = pir_fn_new_block(mod, fn, "sw128", ln);
                                     cur_out = (cur_blk == b) ? &new_insts : &fn->blocks.data[cur_blk].insts;
                                     br.targets[1].target = next_b;
                                     pir_fn_append_inst(fn, cur_out, br);
@@ -583,15 +572,15 @@ static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                                            pir_op_val(lz, t64), pir_op_imm_i(0u, false, t64), ln, lc, PIR_INVALID_ID);
                 PirValueId sh_r = emit_bin(mod, fn, b, &new_insts, PIR_OP_SUB, t64, 0u,
                                            pir_op_imm_i(64u, false, t64), pir_op_val(lz, t64), ln, lc, PIR_INVALID_ID);
-                PirValueId hi_shl = emit_bin(mod, fn, b, &new_insts, PIR_OP_SHL, t64, 0u,
+                PirValueId hi_shl = emit_bin(mod, fn, b, &new_insts, PIR_OP_SHL, t64, PIR_FLAG_MASK,
                                              uhi, pir_op_val(lz, t64), ln, lc, PIR_INVALID_ID);
-                PirValueId lo_shr = emit_bin(mod, fn, b, &new_insts, PIR_OP_SHR, t64, 0u,
+                PirValueId lo_shr = emit_bin(mod, fn, b, &new_insts, PIR_OP_SHR, t64, PIR_FLAG_MASK,
                                              ulo, pir_op_val(sh_r, t64), ln, lc, PIR_INVALID_ID);
                 PirValueId lo_top = emit_sel(mod, fn, b, &new_insts, t64, pir_op_val(lz_z, t8),
                                              pir_op_imm_i(0u, false, t64), pir_op_val(lo_shr, t64), ln, lc, PIR_INVALID_ID);
                 PirValueId top64 = emit_bin(mod, fn, b, &new_insts, PIR_OP_OR, t64, 0u,
                                             pir_op_val(hi_shl, t64), pir_op_val(lo_top, t64), ln, lc, PIR_INVALID_ID);
-                PirValueId lo_rem = emit_bin(mod, fn, b, &new_insts, PIR_OP_SHL, t64, 0u,
+                PirValueId lo_rem = emit_bin(mod, fn, b, &new_insts, PIR_OP_SHL, t64, PIR_FLAG_MASK,
                                              ulo, pir_op_val(lz, t64), ln, lc, PIR_INVALID_ID);
                 PirValueId rem64 = emit_sel(mod, fn, b, &new_insts, t64, pir_op_val(lz_z, t8),
                                             ulo, pir_op_val(lo_rem, t64), ln, lc, PIR_INVALID_ID);
@@ -1003,7 +992,7 @@ static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                 PirInst l0 = pir_make_inst(PIR_OP_LOAD, t64, ln, lc);
                 l0.align = 8u; l0.operand_count = 1u; l0.operands = pir_alloc_ops(mod, 1u);
                 l0.operands[0] = pir_op_val(al.results[0], tptr);
-                l0.results[0]  = rlo;
+                l0.results[0]  = target->is_big_endian ? rhi : rlo;
                 pir_fn_append_inst(fn, &new_insts, l0);
 
                 PirInst pa = pir_make_inst(PIR_OP_PTR_ADD, idx_ty, ln, lc);
@@ -1016,7 +1005,7 @@ static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                 PirInst l1 = pir_make_inst(PIR_OP_LOAD, t64, ln, lc);
                 l1.align = 8u; l1.operand_count = 1u; l1.operands = pir_alloc_ops(mod, 1u);
                 l1.operands[0] = pir_op_val(pa.results[0], tptr);
-                l1.results[0]  = rhi;
+                l1.results[0]  = target->is_big_endian ? rlo : rhi;
                 pir_fn_append_inst(fn, &new_insts, l1);
             } else if (copy.op >= PIR_OP_CMP_EQ && copy.op <= PIR_OP_CMP_GE_U) {
                 PirOperand alo, ahi, blo, bhi;
@@ -1202,23 +1191,31 @@ static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
     fn = &mod->funcs.data[fi];
     for (uint32_t i = 0u; i < aliases.len; ++i) {
         PirValueId root = aliases.data[i].to;
-        for (bool progress = true; progress; ) {
+        uint32_t steps = 0u;
+        for (bool progress = true; progress && steps <= aliases.len; ++steps) {
             progress = false;
             for (uint32_t k = 0u; k < aliases.len; ++k) {
                 if (aliases.data[k].from == root) {
+                    if (aliases.data[k].to == aliases.data[i].from) {
+                        progress = false;
+                        break;
+                    }
                     root = aliases.data[k].to;
                     progress = true;
                     break;
                 }
             }
         }
-        pir_fn_replace_val_uses(fn, aliases.data[i].from, root);
+        if (root != aliases.data[i].from) {
+            pir_fn_replace_val_uses(fn, aliases.data[i].from, root);
+        }
     }
     PIR_VEC_FREE(&aliases);
     free(map);
 }
 
-static void split_i128_decl(PirModule *mod, PirParamDecl **params_io, uint32_t *count_io,
+static void split_i128_decl(PirModule *mod, const PirTargetSpec *target,
+                            PirParamDecl **params_io, uint32_t *count_io,
                             PirType *ret_ty_io, PirCabiRetInfo *cabi_ret_io) {
     PirParamDecl *old_p = *params_io;
     uint32_t old_n      = *count_io;
@@ -1239,13 +1236,20 @@ static void split_i128_decl(PirModule *mod, PirParamDecl **params_io, uint32_t *
         op.abi_type = tvoid;
         op.val_id   = PIR_INVALID_ID;
         PIR_VEC_PUSH(&np, op);
-        *ret_ty_io             = tvoid;
-        cabi_ret_io->kind      = PIR_CABI_RET_MULTI_REG;
-        cabi_ret_io->reg_count = 2u;
-        cabi_ret_io->regs[0]   = t64;
-        cabi_ret_io->regs[1]   = t64;
-        cabi_ret_io->agg_size  = 16u;
-        cabi_ret_io->agg_align = 8u;
+        *ret_ty_io = tvoid;
+        if (target->arch == PIR_ARCH_X86_64 && target->os == PIR_OS_WINDOWS) {
+            cabi_ret_io->kind      = PIR_CABI_RET_SRET_RAX;
+            cabi_ret_io->reg_count = 0u;
+            cabi_ret_io->agg_size  = 0u;
+            cabi_ret_io->agg_align = 0u;
+        } else {
+            cabi_ret_io->kind      = PIR_CABI_RET_MULTI_REG;
+            cabi_ret_io->reg_count = 2u;
+            cabi_ret_io->regs[0]   = t64;
+            cabi_ret_io->regs[1]   = t64;
+            cabi_ret_io->agg_size  = 16u;
+            cabi_ret_io->agg_align = 8u;
+        }
     }
     for (uint32_t i = 0u; i < old_n; ++i) {
         if (is_i128(old_p[i].type)) {
@@ -1285,12 +1289,12 @@ bool pir_legalize_i128(PirModule *mod, const PirTargetSpec *target, PirDiag *dia
         if (mod->funcs.data[fi].is_defined) {
             legalize_i128_func(mod, target, fi, fn_ret_i128, sig_ret_i128, orig_funcs);
         } else {
-            split_i128_decl(mod, &mod->funcs.data[fi].params, &mod->funcs.data[fi].param_count,
+            split_i128_decl(mod, target, &mod->funcs.data[fi].params, &mod->funcs.data[fi].param_count,
                             &mod->funcs.data[fi].ret_type, &mod->funcs.data[fi].cabi_ret);
         }
     }
     for (uint32_t si = 0u; si < orig_sigs; ++si) {
-        split_i128_decl(mod, &mod->sigs.data[si].params, &mod->sigs.data[si].param_count,
+        split_i128_decl(mod, target, &mod->sigs.data[si].params, &mod->sigs.data[si].param_count,
                         &mod->sigs.data[si].ret_type, &mod->sigs.data[si].cabi_ret);
     }
 
@@ -1299,6 +1303,15 @@ bool pir_legalize_i128(PirModule *mod, const PirTargetSpec *target, PirDiag *dia
         PirGlobal *g = &mod->globals.data[gi];
         if (!g->has_type || !is_i128(g->type)) continue;
         if (g->align < 16u) g->align = 16u;
+        if (g->linkage == PIR_LINK_EXTERN) {
+            g->has_type    = true;
+            g->type        = pir_type_scalar(PIR_SCALAR_I8);
+            g->is_zeroinit = false;
+            g->is_braced   = false;
+            g->item_count  = 0u;
+            g->items       = NULL;
+            continue;
+        }
         g->has_type = false;
         g->type     = pir_type_scalar(PIR_SCALAR_VOID);
         if (g->is_zeroinit || g->item_count == 0u || g->items[0].kind == PIR_GITEM_ZERO) {

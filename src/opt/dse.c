@@ -32,29 +32,23 @@ typedef struct {
 typedef PIR_VEC(ActiveStore) ActiveStoreVec;
 typedef PIR_VEC(ActiveLoad)  ActiveLoadVec;
 
-static bool is_pure_math_call(const PirModule *mod, const PirInst *ins) {
-    if (ins->op != PIR_OP_CALL || ins->operand_count < 1u ||
-        ins->operands[0].kind != PIR_OPER_SYM || !ins->operands[0].u.sym.name) {
-        return false;
+static PirValueId resolve_alias(PirValueId *alias, uint32_t nvals, PirValueId v) {
+    PirValueId root = v;
+    uint32_t steps = 0u;
+    while (root < nvals && alias[root] != PIR_INVALID_ID && steps < nvals) {
+        root = alias[root];
+        steps++;
     }
-    bool is_def = (ins->operands[0].u.sym.is_func &&
-                   ins->operands[0].u.sym.id < mod->funcs.len &&
-                   mod->funcs.data[ins->operands[0].u.sym.id].is_defined);
-    if (is_def) return false;
-    const char *cn = ins->operands[0].u.sym.name;
-    return strcmp(cn, "sqrt") == 0 || strcmp(cn, "sqrtf") == 0 ||
-           strcmp(cn, "fabs") == 0 || strcmp(cn, "fabsf") == 0;
+    PirValueId cur = v;
+    while (cur != root && cur < nvals && alias[cur] != PIR_INVALID_ID) {
+        PirValueId next = alias[cur];
+        alias[cur] = root;
+        cur = next;
+    }
+    return root;
 }
 
-static PirValueId resolve_alias(const PirValueId *alias, uint32_t nvals, PirValueId v) {
-    uint32_t guard = 0u;
-    while (v < nvals && alias[v] != PIR_INVALID_ID && guard++ < 1024u) {
-        v = alias[v];
-    }
-    return v;
-}
-
-static void resolve_ops(const PirValueId *alias, uint32_t nvals, PirOperand *ops, uint32_t n) {
+static void resolve_ops(PirValueId *alias, uint32_t nvals, PirOperand *ops, uint32_t n) {
     for (uint32_t i = 0u; i < n; ++i) {
         if (ops[i].kind == PIR_OPER_VAL) {
             ops[i].u.val = resolve_alias(alias, nvals, ops[i].u.val);
@@ -66,6 +60,9 @@ static bool is_mem_barrier(PirOpcode op) {
     switch (op) {
         case PIR_OP_CALL:
         case PIR_OP_CALL_INDIRECT:
+        case PIR_OP_INVOKE:
+        case PIR_OP_INVOKE_INDIRECT:
+        case PIR_OP_RESUME:
         case PIR_OP_ATOMIC_LOAD:
         case PIR_OP_ATOMIC_STORE:
         case PIR_OP_ATOMIC_RMW:
@@ -110,7 +107,6 @@ static bool is_mem_barrier(PirOpcode op) {
         case PIR_OP_STACKSAVE: case PIR_OP_FIELD_PTR: case PIR_OP_ELEM_PTR:
         case PIR_OP_PTR_ADD: case PIR_OP_LOAD: case PIR_OP_STORE:
         case PIR_OP_JMP: case PIR_OP_BR: case PIR_OP_SWITCH:
-        case PIR_OP_INVOKE: case PIR_OP_INVOKE_INDIRECT: case PIR_OP_RESUME:
         case PIR_OP_RET: case PIR_OP_TRAP: case PIR_OP_UNREACHABLE:
             return false;
     }
@@ -161,7 +157,7 @@ static void dse_walk_block(DseCtx *ctx, PirBlockId b, const ActiveLoadVec *paren
                 uint32_t dst = 0u;
                 for (uint32_t k = 0u; k < active.len; ++k) {
                     PirAliasResult ar = pir_alias_query(fn, active.data[k].ptr, active.data[k].size,
-                                                        ins->operands[1], ssz);
+                                                        ins->operands[1], ssz, ctx->target->ptr_bytes);
                     if (ar == PIR_ALIAS_MUST) {
                         if (!active.data[k].observed && active.data[k].size == ssz) {
                             dead[active.data[k].blk_inst_idx] = true;
@@ -177,7 +173,7 @@ static void dse_walk_block(DseCtx *ctx, PirBlockId b, const ActiveLoadVec *paren
                 uint32_t ldst = 0u;
                 for (uint32_t k = 0u; k < loads.len; ++k) {
                     PirAliasResult ar = pir_alias_query(fn, loads.data[k].ptr, loads.data[k].size,
-                                                        ins->operands[1], ssz);
+                                                        ins->operands[1], ssz, ctx->target->ptr_bytes);
                     if (ar == PIR_ALIAS_NO) {
                         loads.data[ldst++] = loads.data[k];
                     }
@@ -202,7 +198,8 @@ static void dse_walk_block(DseCtx *ctx, PirBlockId b, const ActiveLoadVec *paren
                 bool forwarded = false;
                 for (uint32_t k = active.len; k > 0u; --k) {
                     ActiveStore *as = &active.data[k - 1u];
-                    PirAliasResult ar = pir_alias_query(fn, as->ptr, as->size, ins->operands[0], lsz);
+                    PirAliasResult ar = pir_alias_query(fn, as->ptr, as->size, ins->operands[0], lsz,
+                                                        ctx->target->ptr_bytes);
                     if (ar == PIR_ALIAS_MUST && pir_type_eq(as->ty, ins->ty)) {
                         if (as->val.kind == PIR_OPER_VAL) {
                             ctx->alias[ins->results[0]] = resolve_alias(ctx->alias, ctx->nvals, as->val.u.val);
@@ -226,7 +223,8 @@ static void dse_walk_block(DseCtx *ctx, PirBlockId b, const ActiveLoadVec *paren
                 if (!forwarded) {
                     for (uint32_t k = loads.len; k > 0u; --k) {
                         ActiveLoad *al = &loads.data[k - 1u];
-                        PirAliasResult ar = pir_alias_query(fn, al->ptr, al->size, ins->operands[0], lsz);
+                        PirAliasResult ar = pir_alias_query(fn, al->ptr, al->size, ins->operands[0], lsz,
+                                                            ctx->target->ptr_bytes);
                         if (ar == PIR_ALIAS_MUST && pir_type_eq(al->ty, ins->ty)) {
                             ctx->alias[ins->results[0]] = resolve_alias(ctx->alias, ctx->nvals, al->val);
                             dead[j] = true;
@@ -238,7 +236,7 @@ static void dse_walk_block(DseCtx *ctx, PirBlockId b, const ActiveLoadVec *paren
                 if (!forwarded) {
                     for (uint32_t k = 0u; k < active.len; ++k) {
                         PirAliasResult ar = pir_alias_query(fn, active.data[k].ptr, active.data[k].size,
-                                                            ins->operands[0], lsz);
+                                                            ins->operands[0], lsz, ctx->target->ptr_bytes);
                         if (ar != PIR_ALIAS_NO) active.data[k].observed = true;
                     }
                     ActiveLoad al;
@@ -248,7 +246,7 @@ static void dse_walk_block(DseCtx *ctx, PirBlockId b, const ActiveLoadVec *paren
                     al.size = lsz;
                     PIR_VEC_PUSH(&loads, al);
                 }
-            } else if (is_mem_barrier(ins->op) && !is_pure_math_call(ctx->mod, ins)) {
+            } else if (is_mem_barrier(ins->op) && !pir_inst_is_pure_math_call(ctx->mod, fn, ins)) {
                 active.len = 0u;
                 loads.len  = 0u;
             } else if (ins->op == PIR_OP_TRAP ||

@@ -56,6 +56,7 @@ src/interp/interp.c
 src/interp/runtime_shims.c
 src/backend/mir.c
 src/backend/regalloc.c
+src/backend/asm_common.c
 src/backend/arm64/arm64_isel.c
 src/backend/arm64/arm64_frame.c
 src/backend/arm64/arm64_asm.c

@@ -123,9 +123,10 @@ static void mark_edge_arg(DceCtx *ctx, const PirBranchTarget *bt, PirBlockId des
 }
 
 static void compact_target_args(PirModule *mod, PirBranchTarget *bt,
-                                const bool *val_live, const PirValueIdVec *orig_params,
+                                const bool *val_live, const bool *reachable,
+                                const PirValueIdVec *orig_params,
                                 uint32_t nblks) {
-    if (bt->target >= nblks || bt->arg_count == 0u) return;
+    if (bt->target >= nblks || !reachable[bt->target] || bt->arg_count == 0u) return;
     const PirValueIdVec *op = &orig_params[bt->target];
     uint32_t keep_cnt = 0u;
     for (uint32_t k = 0u; k < op->len && k < bt->arg_count; ++k) {
@@ -162,10 +163,34 @@ void pir_opt_dce(PirModule *mod, PirFunction *fn) {
     ctx.val_wl.data = NULL; ctx.val_wl.len = 0u; ctx.val_wl.cap = 0u;
     if (!ctx.inst_live || !ctx.val_live) abort();
 
-    /* 1. Seed with side-effecting / trapping / terminator roots in reachable blocks. */
+    /* 1. Seed with side-effecting / trapping / terminator roots in reachable blocks.
+     * Also preserve any reachable definitions still referenced by unreachable blocks
+     * so the IR stays verifier-clean if unreachable blocks remain before simplify_cfg. */
     for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
-        if (!cfg.reachable[b]) continue;
         const PirBlock *blk = &fn->blocks.data[b];
+        if (!cfg.reachable[b]) {
+            for (uint32_t j = 0u; j < blk->insts.len; ++j) {
+                const PirInst *ins = &fn->insts.data[blk->insts.data[j]];
+                for (uint32_t k = 0u; k < ins->operand_count; ++k) {
+                    if (ins->operands[k].kind == PIR_OPER_VAL) mark_val(&ctx, ins->operands[k].u.val);
+                }
+                for (uint32_t t = 0u; t < 2u; ++t) {
+                    for (uint32_t k = 0u; k < ins->targets[t].arg_count; ++k) {
+                        if (ins->targets[t].args[k].kind == PIR_OPER_VAL) {
+                            mark_val(&ctx, ins->targets[t].args[k].u.val);
+                        }
+                    }
+                }
+                for (uint32_t c = 0u; c < ins->switch_case_count; ++c) {
+                    for (uint32_t k = 0u; k < ins->switch_cases[c].target.arg_count; ++k) {
+                        if (ins->switch_cases[c].target.args[k].kind == PIR_OPER_VAL) {
+                            mark_val(&ctx, ins->switch_cases[c].target.args[k].u.val);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         for (uint32_t j = 0u; j < blk->insts.len; ++j) {
             PirInstId iid = blk->insts.data[j];
             if (inst_is_live_root(&fn->insts.data[iid])) {
@@ -236,22 +261,22 @@ void pir_opt_dce(PirModule *mod, PirFunction *fn) {
         blk->insts.len = iout;
     }
 
-    /* 4. Compact terminator argument lists to match surviving block parameters. */
+    /* 4. Compact terminator argument lists (including from unreachable blocks targeting
+     * reachable blocks) to match surviving block parameters. */
     for (uint32_t b = 0u; b < nblks; ++b) {
-        if (!cfg.reachable[b]) continue;
         const PirBlock *blk = &fn->blocks.data[b];
         if (blk->insts.len == 0u) continue;
         PirInst *term = &fn->insts.data[blk->insts.data[blk->insts.len - 1u]];
         if (term->op == PIR_OP_JMP) {
-            compact_target_args(mod, &term->targets[0], ctx.val_live, orig_params, nblks);
+            compact_target_args(mod, &term->targets[0], ctx.val_live, cfg.reachable, orig_params, nblks);
         } else if (term->op == PIR_OP_BR) {
-            compact_target_args(mod, &term->targets[0], ctx.val_live, orig_params, nblks);
-            compact_target_args(mod, &term->targets[1], ctx.val_live, orig_params, nblks);
+            compact_target_args(mod, &term->targets[0], ctx.val_live, cfg.reachable, orig_params, nblks);
+            compact_target_args(mod, &term->targets[1], ctx.val_live, cfg.reachable, orig_params, nblks);
         } else if (term->op == PIR_OP_SWITCH) {
-            compact_target_args(mod, &term->targets[0], ctx.val_live, orig_params, nblks);
+            compact_target_args(mod, &term->targets[0], ctx.val_live, cfg.reachable, orig_params, nblks);
             for (uint32_t c = 0u; c < term->switch_case_count; ++c) {
                 compact_target_args(mod, &term->switch_cases[c].target,
-                                    ctx.val_live, orig_params, nblks);
+                                    ctx.val_live, cfg.reachable, orig_params, nblks);
             }
         }
     }

@@ -10,7 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-static bool read_cstr(PirInterp *it, PirPtr p, char **out_buf, size_t *out_len) {
+static bool read_cstr_n(PirInterp *it, PirPtr p, bool has_max, size_t max_n,
+                        char **out_buf, size_t *out_len) {
     if (p.alloc_id == 0u || p.alloc_id >= it->allocs.len) {
         pir_interp_fail(it, PIR_INTERP_UB, "null or invalid pointer passed to C string function");
         return false;
@@ -24,6 +25,18 @@ static bool read_cstr(PirInterp *it, PirPtr p, char **out_buf, size_t *out_len) 
         pir_interp_fail(it, PIR_INTERP_UB, "cannot read C string from function pointer");
         return false;
     }
+    if (has_max && max_n == 0u) {
+        if (p.offset < 0 || (uint64_t)p.offset > a->size) {
+            pir_interp_fail(it, PIR_INTERP_UB, "out-of-bounds C string read");
+            return false;
+        }
+        char *buf = (char *)malloc(1u);
+        if (!buf) abort();
+        buf[0] = '\0';
+        *out_buf = buf;
+        if (out_len) *out_len = 0u;
+        return true;
+    }
     if (p.offset < 0 || (uint64_t)p.offset >= a->size) {
         pir_interp_fail(it, PIR_INTERP_UB, "out-of-bounds C string read");
         return false;
@@ -31,6 +44,15 @@ static bool read_cstr(PirInterp *it, PirPtr p, char **out_buf, size_t *out_len) 
     size_t start = (size_t)p.offset;
     size_t len = 0u;
     while (start + len < a->size) {
+        if (has_max && len >= max_n) {
+            char *buf = (char *)malloc(len + 1u);
+            if (!buf) abort();
+            if (len > 0u) memcpy(buf, a->bytes + start, len);
+            buf[len] = '\0';
+            *out_buf = buf;
+            if (out_len) *out_len = len;
+            return true;
+        }
         if (a->init_bits[start + len] == 0u) {
             pir_interp_fail(it, PIR_INTERP_UB, "uninitialized byte in C string");
             return false;
@@ -46,8 +68,21 @@ static bool read_cstr(PirInterp *it, PirPtr p, char **out_buf, size_t *out_len) 
         }
         len++;
     }
+    if (has_max && len == max_n) {
+        char *buf = (char *)malloc(len + 1u);
+        if (!buf) abort();
+        if (len > 0u) memcpy(buf, a->bytes + start, len);
+        buf[len] = '\0';
+        *out_buf = buf;
+        if (out_len) *out_len = len;
+        return true;
+    }
     pir_interp_fail(it, PIR_INTERP_UB, "unterminated C string (out-of-bounds)");
     return false;
+}
+
+static bool read_cstr(PirInterp *it, PirPtr p, char **out_buf, size_t *out_len) {
+    return read_cstr_n(it, p, false, 0u, out_buf, out_len);
 }
 
 static bool shim_printf(PirInterp *it, const PirVal *args, uint32_t arg_count, int *out_written) {
@@ -86,15 +121,21 @@ static bool shim_printf(PirInterp *it, const PirVal *args, uint32_t arg_count, i
             }
             fbuf[fl++] = *s++;
         }
+        uint32_t width_val = 0u;
         while (*s >= '0' && *s <= '9') {
-            if (fl >= sizeof(fbuf) - 4u) {
+            width_val = width_val * 10u + (uint32_t)(*s - '0');
+            if (fl >= sizeof(fbuf) - 4u || width_val > 4096u) {
                 free(fmt);
-                pir_interp_fail(it, PIR_INTERP_UB, "printf format specifier too long");
+                pir_interp_fail(it, PIR_INTERP_UB, "printf format width too large");
                 return false;
             }
             fbuf[fl++] = *s++;
         }
+        bool has_prec = false;
+        uint32_t prec_val = 0u;
+        size_t prec_start = fl;
         if (*s == '.') {
+            has_prec = true;
             if (fl >= sizeof(fbuf) - 4u) {
                 free(fmt);
                 pir_interp_fail(it, PIR_INTERP_UB, "printf format specifier too long");
@@ -102,9 +143,10 @@ static bool shim_printf(PirInterp *it, const PirVal *args, uint32_t arg_count, i
             }
             fbuf[fl++] = *s++;
             while (*s >= '0' && *s <= '9') {
-                if (fl >= sizeof(fbuf) - 4u) {
+                prec_val = prec_val * 10u + (uint32_t)(*s - '0');
+                if (fl >= sizeof(fbuf) - 4u || prec_val > 4096u) {
                     free(fmt);
-                    pir_interp_fail(it, PIR_INTERP_UB, "printf format specifier too long");
+                    pir_interp_fail(it, PIR_INTERP_UB, "printf format precision too large");
                     return false;
                 }
                 fbuf[fl++] = *s++;
@@ -127,7 +169,8 @@ static bool shim_printf(PirInterp *it, const PirVal *args, uint32_t arg_count, i
             case 'd': case 'i': {
                 int64_t sv = 0;
                 uint64_t raw = pir_val_get_u64(av);
-                if (av->ty.kind == PIR_TYPE_SCALAR && av->ty.u.scalar == PIR_SCALAR_I64) {
+                if (long_cnt > 0 && av->ty.kind == PIR_TYPE_SCALAR &&
+                    av->ty.u.scalar == PIR_SCALAR_I64) {
                     sv = (int64_t)raw;
                 } else if (av->ty.kind == PIR_TYPE_SCALAR && av->ty.u.scalar == PIR_SCALAR_I16) {
                     sv = (int64_t)(int16_t)raw;
@@ -142,8 +185,7 @@ static bool shim_printf(PirInterp *it, const PirVal *args, uint32_t arg_count, i
             }
             case 'u': case 'x': case 'X': {
                 uint64_t uv = pir_val_get_u64(av);
-                if (long_cnt == 0 && av->ty.kind == PIR_TYPE_SCALAR &&
-                    av->ty.u.scalar == PIR_SCALAR_I32) {
+                if (long_cnt == 0) {
                     uv = (uint32_t)uv;
                 }
                 fbuf[fl++] = 'l'; fbuf[fl++] = 'l'; fbuf[fl++] = spec; fbuf[fl] = '\0';
@@ -151,14 +193,14 @@ static bool shim_printf(PirInterp *it, const PirVal *args, uint32_t arg_count, i
                 break;
             }
             case 'c': {
-                int ch = (int)(uint8_t)pir_val_get_u64(av);
-                putchar(ch);
-                total++;
+                int ch = (int)(unsigned char)pir_val_get_u64(av);
+                fbuf[fl++] = 'c'; fbuf[fl] = '\0';
+                total += printf(fbuf, ch);
                 break;
             }
             case 's': {
                 char *str = NULL;
-                if (!read_cstr(it, av->ptr, &str, NULL)) {
+                if (!read_cstr_n(it, av->ptr, has_prec, (size_t)prec_val, &str, NULL)) {
                     free(fmt);
                     return false;
                 }
@@ -169,7 +211,11 @@ static bool shim_printf(PirInterp *it, const PirVal *args, uint32_t arg_count, i
             }
             case 'p': {
                 uint64_t addr = pir_interp_ptr_to_int(it, av->ptr);
-                total += printf("0x%" PRIx64, addr);
+                char pbuf[32];
+                snprintf(pbuf, sizeof(pbuf), "0x%" PRIx64, addr);
+                if (has_prec) fl = prec_start;
+                fbuf[fl++] = 's'; fbuf[fl] = '\0';
+                total += printf(fbuf, pbuf);
                 break;
             }
             case 'f': case 'g': case 'e': {
@@ -300,8 +346,8 @@ bool pir_interp_try_shim(PirInterp *it, const char *name,
     if (strcmp(name, "free") == 0) {
         if (arg_count != 1u) { pir_interp_fail(it, PIR_INTERP_UB, "free arity"); return true; }
         PirPtr p = args[0].ptr;
-        if (p.alloc_id == 0u) return true; /* free(NULL) is a no-op */
-        if (p.alloc_id >= it->allocs.len) {
+        if (pir_ptr_is_null(p)) return true; /* free(NULL) is a no-op */
+        if (p.alloc_id == 0u || p.alloc_id >= it->allocs.len) {
             pir_interp_fail(it, PIR_INTERP_UB, "free of invalid pointer");
             return true;
         }
@@ -321,19 +367,18 @@ bool pir_interp_try_shim(PirInterp *it, const char *name,
         if (arg_count != 2u) { pir_interp_fail(it, PIR_INTERP_UB, "realloc arity"); return true; }
         PirPtr p = args[0].ptr;
         uint64_t new_sz_u64 = pir_val_get_u64(&args[1]);
-        if (new_sz_u64 > (UINT64_C(1) << 30)) {
-            out_ret->ptr.alloc_id = 0u;
-            out_ret->ptr.offset   = 0;
-            return true;
-        }
-        size_t new_sz = (size_t)new_sz_u64;
-        if (p.alloc_id == 0u) {
-            uint32_t id = pir_interp_alloc_new(it, new_sz, 16u, false, true, false, false);
+        if (pir_ptr_is_null(p)) {
+            if (new_sz_u64 > (UINT64_C(1) << 30)) {
+                out_ret->ptr.alloc_id = 0u;
+                out_ret->ptr.offset   = 0;
+                return true;
+            }
+            uint32_t id = pir_interp_alloc_new(it, (size_t)new_sz_u64, 16u, false, true, false, false);
             out_ret->ptr.alloc_id = id;
             out_ret->ptr.offset   = 0;
             return true;
         }
-        if (p.alloc_id >= it->allocs.len) {
+        if (p.alloc_id == 0u || p.alloc_id >= it->allocs.len) {
             pir_interp_fail(it, PIR_INTERP_UB, "realloc of invalid pointer");
             return true;
         }
@@ -342,6 +387,12 @@ bool pir_interp_try_shim(PirInterp *it, const char *name,
             pir_interp_fail(it, PIR_INTERP_UB, "realloc of dead/non-heap/interior pointer");
             return true;
         }
+        if (new_sz_u64 > (UINT64_C(1) << 30)) {
+            out_ret->ptr.alloc_id = 0u;
+            out_ret->ptr.offset   = 0;
+            return true;
+        }
+        size_t new_sz = (size_t)new_sz_u64;
         size_t old_sz = old_a->size;
         uint32_t new_id = pir_interp_alloc_new(it, new_sz, 16u, false, true, false, false);
         if (new_id == 0u) {
@@ -375,15 +426,7 @@ bool pir_interp_try_shim(PirInterp *it, const char *name,
             size_t off = (size_t)dst.offset;
             memset(a->bytes + off, byte, len);
             memset(a->init_bits + off, 1, len);
-            /* Invalidate overwritten ptr_tags. */
-            for (uint32_t i = 0u; i < a->ptr_tags.len; ) {
-                size_t to = a->ptr_tags.data[i].byte_off;
-                if (to + it->ptr_bytes > off && to < off + len) {
-                    a->ptr_tags.data[i] = a->ptr_tags.data[--a->ptr_tags.len];
-                } else {
-                    i++;
-                }
-            }
+            pir_interp_clear_ptr_tags(a, off, len, it->ptr_bytes);
         }
         out_ret->ptr = dst;
         return true;
@@ -481,14 +524,17 @@ bool pir_interp_try_shim(PirInterp *it, const char *name,
             return true;
         }
         /* Store exception payload at frame.exn (offset = ptr_bytes). */
-        PirPtr exn_slot = { frame_p.alloc_id, frame_p.offset + (int64_t)it->ptr_bytes };
+        PirPtr exn_slot, jb_slot;
+        if (!pir_ptr_offset_checked(it, frame_p, (int64_t)it->ptr_bytes, &exn_slot) ||
+            !pir_ptr_offset_checked(it, frame_p, (int64_t)(2u * it->ptr_bytes), &jb_slot)) {
+            return true;
+        }
         if (!pir_interp_mem_write_ptr(it, exn_slot, exn, it->ptr_bytes)) {
             return true;
         }
-        it->unwinding                 = true;
-        it->unwind_target_jb.alloc_id = frame_p.alloc_id;
-        it->unwind_target_jb.offset   = frame_p.offset + (int64_t)(2u * it->ptr_bytes);
-        it->unwind_exn                = exn;
+        it->unwinding        = true;
+        it->unwind_target_jb = jb_slot;
+        it->unwind_exn       = exn;
         return true;
     }
     if (strcmp(name, "__divti3") == 0 || strcmp(name, "__udivti3") == 0 ||

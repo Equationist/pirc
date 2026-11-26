@@ -4,8 +4,9 @@
 #define ARENA_POOL_SIZE 8160
 
 struct Pool {
-  char buf[ARENA_POOL_SIZE];
   Pool *next;
+  size_t oversized;
+  char buf[ARENA_POOL_SIZE];
 };
 
 Arena ast_arena;
@@ -28,25 +29,46 @@ static Pool *new_pool(void) {
     pool_freelist = p->next;
   } else {
     p = malloc(sizeof(Pool));
+    if (!p)
+      error("out of memory");
   }
 
 #if defined(USE_ASAN)
   __asan_poison_memory_region(&p->buf, ARENA_POOL_SIZE);
 #endif
   p->next = NULL;
+  p->oversized = false;
   return p;
+}
+
+static void *allocate_oversized(Arena *arena, size_t aligned_sz, bool clear) {
+  size_t hdr = (size_t)offsetof(Pool, buf);
+  if (aligned_sz > SIZE_MAX - hdr)
+    error("out of memory");
+  Pool *p = malloc(hdr + aligned_sz);
+  if (!p)
+    error("out of memory");
+  p->oversized = true;
+  /* Link behind arena->head so arena->cur remains a standard reusable pool. */
+  p->next = arena->head;
+  arena->head = p;
+  void *ptr = p->buf;
+  if (clear)
+    memset(ptr, 0, aligned_sz);
+  return ptr;
 }
 
 static void *allocate(Arena *arena, size_t sz, bool clear) {
   size_t aligned_sz = (sz + 15) & -16LL;
+
+  if (aligned_sz > ARENA_POOL_SIZE)
+    return allocate_oversized(arena, aligned_sz, clear);
 
   void *ptr;
   if ((arena->used + aligned_sz) <= ARENA_POOL_SIZE) {
     ptr = &arena->cur->buf[arena->used];
     arena->used += aligned_sz;
   } else {
-    if (aligned_sz > ARENA_POOL_SIZE)
-      internal_error();
     arena->cur = arena->cur->next = new_pool();
     ptr = &arena->cur->buf;
     arena->used = aligned_sz;
@@ -76,27 +98,35 @@ char *arena_format(Arena *arena, const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
 
-  size_t sz = 1 + (size_t)vsnprintf(ptr, n, fmt, ap);
+  int needed = vsnprintf(ptr, n, fmt, ap);
+  va_end(ap);
+  if (needed < 0)
+    internal_error();
+  size_t sz = 1 + (size_t)needed;
   size_t aligned_sz = (sz + 15) & -16LL;
 
   if (aligned_sz <= n) {
-    va_end(ap);
     arena->used += aligned_sz;
 #if defined(USE_ASAN)
-    __asan_poison_memory_region(ptr + aligned_sz, ARENA_POOL_SIZE - arena->used);
+    __asan_poison_memory_region((char *)ptr + aligned_sz, ARENA_POOL_SIZE - arena->used);
 #endif
     return ptr;
   }
-  if (aligned_sz > ARENA_POOL_SIZE)
-    internal_error();
-
-  arena->cur = arena->cur->next = new_pool();
-  ptr = &arena->cur->buf;
-  arena->used = aligned_sz;
 
 #if defined(USE_ASAN)
-  __asan_unpoison_memory_region(ptr, aligned_sz);
+  __asan_poison_memory_region(ptr, n);
 #endif
+
+  if (aligned_sz > ARENA_POOL_SIZE) {
+    ptr = allocate_oversized(arena, aligned_sz, false);
+  } else {
+    arena->cur = arena->cur->next = new_pool();
+    ptr = &arena->cur->buf;
+    arena->used = aligned_sz;
+#if defined(USE_ASAN)
+    __asan_unpoison_memory_region(ptr, aligned_sz);
+#endif
+  }
 
   va_start(ap, fmt);
   vsnprintf(ptr, aligned_sz, fmt, ap);
@@ -128,10 +158,18 @@ void arena_off(Arena *arena) {
       free(tmp);
     }
   } else {
-    arena->cur->next = pool_freelist;
-    pool_freelist = arena->head;
+    for (Pool *p = arena->head; p;) {
+      Pool *tmp = p;
+      p = p->next;
+      if (tmp->oversized) {
+        free(tmp);
+      } else {
+        tmp->next = pool_freelist;
+        pool_freelist = tmp;
+      }
+    }
   }
-  arena->cur = NULL;
+  arena->head = arena->cur = NULL;
 }
 
 void *arena_malloc(Arena *a, size_t sz) {

@@ -26,7 +26,7 @@ static void remove_backslash_newline(char *p, SlashDelta *dlt);
 #define Startswith2(p, x, y) ((*(p) == x) && ((p)[1] == y))
 #define Startswith3(p, x, y, z) ((*(p) == x) && ((p)[1] == y) && ((p)[2] == z))
 
-#define Is_c_ident(c) (Isalnum(c) || (c) == '_' || (c) == '$')
+#define Is_c_ident(c) (Isalnum(c) || (c) == '_' || ((c) == '$' && (!is_iso_std || (current_file && current_file->is_syshdr))))
 
 // Reports an error and exit.
 void error(const char *fmt, ...) {
@@ -79,7 +79,24 @@ void verror_at_tok(Token *tok, const char *fmt, va_list ap) {
   } else {
     if (!tok->origin)
       print_display_file(tok, tok);
-    verror_at(tok->file->name, tok->file->contents, tok->line_no, tok->loc, fmt, ap);
+    const char *contents = tok->file->contents;
+    bool loc_in_file = false;
+    if (contents && tok->loc >= contents) {
+      size_t clen = strlen(contents);
+      if ((size_t)(tok->loc - contents) <= clen)
+        loc_in_file = true;
+    }
+    if (loc_in_file) {
+      verror_at(tok->file->name, contents, tok->line_no, tok->loc, fmt, ap);
+    } else if (tok->origin && tok->origin->file && tok->origin->file->contents &&
+               tok->origin->loc >= tok->origin->file->contents &&
+               (size_t)(tok->origin->loc - tok->origin->file->contents) <= strlen(tok->origin->file->contents)) {
+      verror_at(tok->origin->file->name, tok->origin->file->contents,
+                tok->origin->line_no, tok->origin->loc, fmt, ap);
+      return;
+    } else {
+      verror_at(tok->file->name, tok->loc, tok->line_no, tok->loc, fmt, ap);
+    }
   }
 
   if (tok->origin) {
@@ -474,10 +491,11 @@ static bool read_ucn(const char **new_pos, const char *p, uint32_t *val, bool *i
   int len = (*p == 'u') ? 4 : 8;
 
   bool has_brace = p[1] == '{';
-  if (has_brace && is_iso_std && opt_std < STD_C23)
+  if (has_brace && (*p == 'U' || (is_iso_std && opt_std < STD_C23)))
     *invalid = true;
   p += 1 + has_brace;
 
+  const char *digits_start = p;
   const char *end = p + len;
   uint64_t c = 0;
   for (; has_brace || p != end; p++) {
@@ -488,12 +506,15 @@ static bool read_ucn(const char **new_pos, const char *p, uint32_t *val, bool *i
       *invalid = true;
   }
 
-  if (has_brace)
+  if (has_brace) {
+    if (p == digits_start)
+      *invalid = true;
     chk_delimit_end(&p, invalid);
-  else if (p != end)
+  } else if (p != end) {
     *invalid = true;
+  }
   if ((c >= 0xD800 && c <= 0xDFFF) || (c > 0x10FFFF) ||
-      (is_iso_std && c < 0xA0 && c != 0x24 && c != 0x40 && c != 0x60))
+      (is_iso_std && opt_std < STD_C23 && c < 0xA0 && c != 0x24 && c != 0x40 && c != 0x60))
     *invalid = true;
 
   *val = *invalid ? 0 : c;
@@ -744,6 +765,7 @@ static Token *read_char_literal(const char *start) {
       break;
     is_multi = true;
   }
+
   if (invalid)
     return new_token(TK_INVALID, start, p + 1);
 
@@ -782,6 +804,9 @@ static Token *read_unicode_char_literal(const char *start, const char *quote, Ty
     return new_token(TK_INVALID, start, p + 1);
   }
 
+  if (start[0] == 'u' && start[1] == '8' && c > 0x7F)
+    invalid = true;
+
   if (invalid)
     return new_token(TK_INVALID, start, p + 1);
 
@@ -806,7 +831,7 @@ static Token *new_pp_number(const char *start, const char *p) {
       p++;
       continue;
     }
-    if (*p == '\'' && Isalnum(p[1]) && opt_std >= STD_C23) {
+    if (*p == '\'' && (Isalnum(p[1]) || p[1] == '_') && opt_std >= STD_C23) {
       p += 2;
       continue;
     }
@@ -885,15 +910,20 @@ static bool convert_pp_bitint(const char *begin, const char *end, Node *node, in
     bit_width = (is_unsigned || opt_std > STD_C23) ? 1 : 2;
   }
 
+  node->ty = new_bitint(bit_width, node->tok);
+  node->ty->is_unsigned = is_unsigned;
+
   size_t cnt64 = (bit_width + 63) / 64;
-  if (cnt64 * 2 > cnt32) {
-    data = realloc(data, cnt64 * sizeof(uint64_t));
-    (&data->as32)[cnt32] = 0;
+  size_t need_bytes = (size_t)node->ty->size;
+  if (cnt64 * sizeof(uint64_t) > need_bytes)
+    need_bytes = cnt64 * sizeof(uint64_t);
+  size_t cur_bytes = cnt32 * sizeof(uint32_t);
+  if (need_bytes > cur_bytes) {
+    data = realloc(data, need_bytes);
+    memset((char *)data + cur_bytes, 0, need_bytes - cur_bytes);
   }
 
   node->num.bitint_data = data;
-  node->ty = new_bitint(bit_width, node->tok);
-  node->ty->is_unsigned = is_unsigned;
   return true;
 }
 
@@ -1045,7 +1075,7 @@ bool is_pp_token_int(Token *tok) {
 
 void convert_pp_number(Token *tok, Node *node) {
   if (tok->kind == TK_CHAR_LIT) {
-    if ((uint64_t)tok->ival >> tok->ty->size * 8)
+    if (tok->ty->size < 8 && ((uint64_t)tok->ival >> (tok->ty->size * 8)))
       error_tok(tok, "character too large for literal type");
     node->num.val = eval_sign_extend(tok->ty, tok->ival);
     node->ty = tok->ty;
@@ -1130,6 +1160,8 @@ void tokenize_string_literal(Token *tok, Type *basety) {
   else
     tok2 = read_utf32_string_literal(tok->loc, tok->loc, basety);
   current_file = saved_file;
+  if (tok2->kind == TK_INVALID)
+    error_tok(tok, "invalid string literal");
   tok->ty = tok2->ty;
   tok->str = tok2->str;
 }

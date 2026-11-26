@@ -1,8 +1,8 @@
 // MODE: HIR
-// EXPECT_SIG: @take_packed_unaligned (ptr) -> i64
-// EXPECT_SIG: @take_big_24b (ptr) -> i64
+// EXPECT_SIG: @take_packed_unaligned (ptr byval_size 9 byval_align 1) -> i64
+// EXPECT_SIG: @take_big_24b (ptr byval_size 24 byval_align 8) -> i64
 // EXPECT_SIG: @ret_big_24b (ptr, i64) -> void
-// EXPECT_SIG: @spill_all_or_nothing (i64, i64, i64, i64, i64, ptr) -> i64
+// EXPECT_SIG: @spill_all_or_nothing (i64, i64, i64, i64, i64, ptr byval_size 16 byval_align 8) -> i64
 // EXPECT_LIR_FORBIDS: byval
 // EXPECT_LIR_FORBIDS: retbuf
 target "x86_64-unknown-linux-gnu"

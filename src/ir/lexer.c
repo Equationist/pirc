@@ -198,6 +198,12 @@ static PirToken lex_number(PirLexer *lex, bool neg, uint32_t line, uint32_t col,
         }
     }
 
+    if (is_ident_cont((unsigned char)peek(lex, 0))) {
+        pir_diag_error(lex->diag, line, col, "invalid suffix on numeric literal");
+        tok.kind = TOK_ERR;
+        return tok;
+    }
+
     if (is_float) {
         size_t flen = lex->pos - num_start;
         char *buf = (char *)malloc(flen + 2u);
@@ -393,6 +399,11 @@ PirToken pir_lexer_next(PirLexer *lex) {
             }
             if (memchr(s, '\0', slen) != NULL) {
                 pir_diag_error(lex->diag, tok.line, tok.col, "symbol name cannot contain embedded NUL byte");
+                tok.kind = TOK_ERR;
+                return tok;
+            }
+            if (memchr(s, '\n', slen) != NULL || memchr(s, '\r', slen) != NULL) {
+                pir_diag_error(lex->diag, tok.line, tok.col, "symbol name cannot contain newline");
                 tok.kind = TOK_ERR;
                 return tok;
             }

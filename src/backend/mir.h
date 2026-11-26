@@ -98,6 +98,10 @@ static inline uint32_t x64_reg_num(MPReg r) {
     return (r >= 32u) ? (uint32_t)(r - 32u) : (uint32_t)r;
 }
 
+static inline uint32_t mreg_num(MPReg r) {
+    return (r >= 32u) ? (uint32_t)(r - 32u) : (uint32_t)r;
+}
+
 /* =========================================================================
  * 2. Condition Codes, NEON Arrangements & Machine Opcodes
  * ========================================================================= */

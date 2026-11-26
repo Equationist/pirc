@@ -345,8 +345,8 @@ static LoopVecAlias classify_loop_pair(const PirFunction *fn,
     if (op_same_base(a_base, b_base)) {
         return (a_delta == b_delta) ? LV_ALIAS_EXACT_SAME : LV_ALIAS_DIFF_OFF;
     }
-    PirPtrInfo pa = pir_alias_decompose(fn, a_base);
-    PirPtrInfo pb = pir_alias_decompose(fn, b_base);
+    PirPtrInfo pa = pir_alias_decompose(fn, a_base, 8u);
+    PirPtrInfo pb = pir_alias_decompose(fn, b_base, 8u);
     bool same_obj = (pa.kind != PIR_PTR_UNKNOWN && pa.kind == pb.kind) &&
                     ((pa.kind == PIR_PTR_GLOBAL)
                      ? (pa.global_name && pb.global_name && strcmp(pa.global_name, pb.global_name) == 0)
@@ -761,16 +761,23 @@ static bool try_vectorize_loop(PirModule *mod, PirFunction *fn, const PirTargetS
                 int64_t si = (iv_ty.u.scalar == PIR_SCALAR_I32) ? (int64_t)(int32_t)c_init : (int64_t)c_init;
                 int64_t sl = (iv_ty.u.scalar == PIR_SCALAR_I32) ? (int64_t)(int32_t)c_lim  : (int64_t)c_lim;
                 uint64_t trips = 0u;
+                bool overflow = false;
                 if (is_signed) {
                     if (sl > si || (is_inclusive && sl == si)) {
-                        trips = ((uint64_t)sl - (uint64_t)si) + (is_inclusive ? 1u : 0u);
+                        uint64_t diff = (uint64_t)sl - (uint64_t)si;
+                        if (is_inclusive && diff == UINT64_MAX) overflow = true;
+                        else trips = diff + (is_inclusive ? 1u : 0u);
                     }
                 } else {
-                    if (c_lim > c_init || (is_inclusive && c_lim == c_init)) {
-                        trips = (c_lim - c_init) + (is_inclusive ? 1u : 0u);
+                    uint64_t ui = (iv_ty.u.scalar == PIR_SCALAR_I32) ? (c_init & 0xFFFFFFFFULL) : c_init;
+                    uint64_t ul = (iv_ty.u.scalar == PIR_SCALAR_I32) ? (c_lim & 0xFFFFFFFFULL) : c_lim;
+                    if (ul > ui || (is_inclusive && ul == ui)) {
+                        uint64_t diff = ul - ui;
+                        if (is_inclusive && diff == UINT64_MAX) overflow = true;
+                        else trips = diff + (is_inclusive ? 1u : 0u);
                     }
                 }
-                if (trips < (uint64_t)step) goto cleanup;
+                if (!overflow && trips < (uint64_t)step) goto cleanup;
             }
         }
         const uint32_t shift_amt = (elem_bytes == 1u) ? 0u
@@ -779,21 +786,10 @@ static bool try_vectorize_loop(PirModule *mod, PirFunction *fn, const PirTargetS
         const uint32_t vec_bytes = vf * elem_bytes; /* 16 bytes */
         uint32_t sline = hdr->src_line;
 
-        PirBlockId guard_bid   = fn->blocks.len;
-        PirBlockId vpre_bid    = guard_bid + 1u;
-        PirBlockId vhdr_bid    = guard_bid + 2u;
-        PirBlockId vbody_bid   = guard_bid + 3u;
-
-        static const char *const sfx[4] = { "vguard", "vpre", "vhdr", "vbody" };
-        for (uint32_t k = 0u; k < 4u; ++k) {
-            char lbuf[64];
-            snprintf(lbuf, sizeof(lbuf), "%s_%u", sfx[k], guard_bid + k);
-            PirBlock nb_blk;
-            memset(&nb_blk, 0, sizeof(nb_blk));
-            nb_blk.label    = pir_arena_strdup(&mod->arena, lbuf);
-            nb_blk.src_line = sline;
-            PIR_VEC_PUSH(&fn->blocks, nb_blk);
-        }
+        PirBlockId guard_bid = pir_fn_new_block(mod, fn, "vguard", sline);
+        PirBlockId vpre_bid  = pir_fn_new_block(mod, fn, "vpre",   sline);
+        PirBlockId vhdr_bid  = pir_fn_new_block(mod, fn, "vhdr",   sline);
+        PirBlockId vbody_bid = pir_fn_new_block(mod, fn, "vbody",  sline);
 
         /* Redirect entry_pred's jump from hdr_bid -> guard_bid (0 args). */
         fn->insts.data[ep_term_id].targets[0].target    = guard_bid;
@@ -949,9 +945,10 @@ static bool try_vectorize_loop(PirModule *mod, PirFunction *fn, const PirTargetS
                 if (iv_init.kind == PIR_OPER_IMM_INT) {
                     if (is_signed) {
                         int64_t sv = iv_init.u.imm_int.is_negative
-                                     ? -(int64_t)(uint32_t)iv_init.u.imm_int.lo
+                                     ? (int64_t)(int32_t)(0u - (uint32_t)iv_init.u.imm_int.lo)
                                      : (int64_t)(int32_t)(uint32_t)iv_init.u.imm_int.lo;
-                        iv0_64 = pir_op_imm_i(sv < 0 ? (uint64_t)(-sv) : (uint64_t)sv, sv < 0, i64_ty);
+                        uint64_t mag = (sv < 0) ? (UINT64_C(0) - (uint64_t)sv) : (uint64_t)sv;
+                        iv0_64 = pir_op_imm_i(mag, sv < 0, i64_ty);
                     } else {
                         uint64_t uv = iv_init.u.imm_int.is_negative
                                       ? ((uint64_t)(0u - (uint32_t)iv_init.u.imm_int.lo))
@@ -972,9 +969,10 @@ static bool try_vectorize_loop(PirModule *mod, PirFunction *fn, const PirTargetS
                 if (excl_limit.kind == PIR_OPER_IMM_INT) {
                     if (is_signed) {
                         int64_t sv = excl_limit.u.imm_int.is_negative
-                                     ? -(int64_t)(uint32_t)excl_limit.u.imm_int.lo
+                                     ? (int64_t)(int32_t)(0u - (uint32_t)excl_limit.u.imm_int.lo)
                                      : (int64_t)(int32_t)(uint32_t)excl_limit.u.imm_int.lo;
-                        lim_64 = pir_op_imm_i(sv < 0 ? (uint64_t)(-sv) : (uint64_t)sv, sv < 0, i64_ty);
+                        uint64_t mag = (sv < 0) ? (UINT64_C(0) - (uint64_t)sv) : (uint64_t)sv;
+                        lim_64 = pir_op_imm_i(mag, sv < 0, i64_ty);
                     } else {
                         uint64_t uv = excl_limit.u.imm_int.is_negative
                                       ? ((uint64_t)(0u - (uint32_t)excl_limit.u.imm_int.lo))
@@ -991,6 +989,29 @@ static bool try_vectorize_loop(PirModule *mod, PirFunction *fn, const PirTargetS
                     pir_fn_append_inst(fn, &fn->blocks.data[guard_bid].insts, e1);
                     lim_64 = pir_op_val(v1, i64_ty);
                 }
+            }
+
+            if (iv_ty.u.scalar == PIR_SCALAR_I64 && shift_amt > 0u) {
+                /* Prevent 64-bit wraparound in `(excl_limit - iv_init) << shift_amt`. */
+                uint64_t max_elems = UINT64_C(1) << (64u - shift_amt);
+                PirValueId c_sw = pir_fn_new_val(mod, fn, "vg_sw", i8_ty, guard_bid, PIR_INVALID_ID, 0u);
+                PirInst i_sw = pir_make_inst(PIR_OP_CMP_LT_U, i64_ty, sline, 0u);
+                i_sw.operands = pir_alloc_ops(mod, 2u);
+                i_sw.operands[0] = pir_op_val(v_diff, i64_ty);
+                i_sw.operands[1] = pir_op_imm_i(max_elems, false, i64_ty);
+                i_sw.operand_count = 2u;
+                i_sw.results[0] = c_sw;
+                pir_fn_append_inst(fn, &fn->blocks.data[guard_bid].insts, i_sw);
+
+                PirValueId c_n = pir_fn_new_val(mod, fn, "vg_oksw", i8_ty, guard_bid, PIR_INVALID_ID, 0u);
+                PirInst i_n = pir_make_inst(PIR_OP_AND, i8_ty, sline, 0u);
+                i_n.operands = pir_alloc_ops(mod, 2u);
+                i_n.operands[0] = pir_op_val(c_ok, i8_ty);
+                i_n.operands[1] = pir_op_val(c_sw, i8_ty);
+                i_n.operand_count = 2u;
+                i_n.results[0] = c_n;
+                pir_fn_append_inst(fn, &fn->blocks.data[guard_bid].insts, i_n);
+                c_ok = c_n;
             }
 
             PirOperand iv0_by = iv0_64;
@@ -1415,7 +1436,7 @@ cleanup:
 
 void pir_opt_loop_vec(PirModule *mod, PirFunction *fn, const PirTargetSpec *target) {
     if (fn->blocks.len < 2u) return;
-    if (target->caps.max_simd_bits < 128u) return;
+    if (!target || target->ptr_bytes != 8u || target->caps.max_simd_bits < 128u) return;
 
     /* Vectorize at most 16 loops per function (rebuild CFG/loops cleanly after each). */
     for (uint32_t round = 0u; round < 16u; ++round) {

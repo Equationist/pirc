@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
+#include <errno.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -79,16 +80,20 @@ static bool assemble_to_obj(const char *asm_path, const char *obj_path,
     }
     if (pid == 0) {
         if (target && target->os == PIR_OS_MACOS && target->arch == PIR_ARCH_X86_64) {
-            execlp("cc", "cc", "-arch", "x86_64", "-c", asm_path, "-o", obj_path, (char *)NULL);
+            execlp("cc", "cc", "-arch", "x86_64", "-x", "assembler", "-c", asm_path, "-o", obj_path, (char *)NULL);
         } else if (target && target->os == PIR_OS_MACOS && target->arch == PIR_ARCH_ARM64) {
-            execlp("cc", "cc", "-arch", "arm64", "-c", asm_path, "-o", obj_path, (char *)NULL);
+            execlp("cc", "cc", "-arch", "arm64", "-x", "assembler", "-c", asm_path, "-o", obj_path, (char *)NULL);
         } else {
-            execlp("cc", "cc", "-c", asm_path, "-o", obj_path, (char *)NULL);
+            execlp("cc", "cc", "-x", "assembler", "-c", asm_path, "-o", obj_path, (char *)NULL);
         }
         _exit(127);
     }
     int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
+    pid_t wr;
+    do {
+        wr = waitpid(pid, &status, 0);
+    } while (wr < 0 && errno == EINTR);
+    if (wr < 0) {
         return false;
     }
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
@@ -198,6 +203,11 @@ int main(int argc, char **argv) {
             print_usage();
             return 1;
         } else {
+            if (input_path) {
+                fprintf(stderr, "pirc: multiple input files specified ('%s' and '%s')\n",
+                        input_path, arg);
+                return 1;
+            }
             input_path = arg;
         }
     }
@@ -297,16 +307,24 @@ int main(int argc, char **argv) {
                 rc = 1;
                 goto cleanup;
             }
-            char tmp_asm[256];
-            snprintf(tmp_asm, sizeof(tmp_asm), "/tmp/pirc_obj_%ld.s", (long)getpid());
-            FILE *af = fopen(tmp_asm, "wb");
+            char tmp_asm[] = "/tmp/pirc_obj_XXXXXX";
+            int tmp_fd = mkstemp(tmp_asm);
+            if (tmp_fd < 0) {
+                fprintf(stderr, "pirc: cannot create temporary assembly file\n");
+                rc = 1;
+                goto cleanup;
+            }
+            FILE *af = fdopen(tmp_fd, "wb");
             if (!af) {
-                fprintf(stderr, "pirc: cannot create temporary assembly '%s'\n", tmp_asm);
+                fprintf(stderr, "pirc: cannot open temporary assembly '%s'\n", tmp_asm);
+                close(tmp_fd);
+                remove(tmp_asm);
                 rc = 1;
                 goto cleanup;
             }
             bool ok = pir_backend_emit_asm(&mod, target_ptr, af, &diag);
-            fclose(af);
+            if (ferror(af)) ok = false;
+            if (fclose(af) != 0) ok = false;
             if (!ok || !assemble_to_obj(tmp_asm, output_path, target_ptr)) {
                 rc = 1;
             }
@@ -323,7 +341,8 @@ int main(int argc, char **argv) {
                 }
             }
             bool ok = pir_backend_emit_asm(&mod, target_ptr, out, &diag);
-            if (output_path) fclose(out);
+            if (ferror(out)) ok = false;
+            if (output_path && fclose(out) != 0) ok = false;
             if (!ok) {
                 rc = 1;
                 goto cleanup;

@@ -14,7 +14,6 @@
 
 typedef struct {
     bool       is_int;
-    bool       is_float;
     uint64_t   bits;
 } ConstVal;
 
@@ -41,15 +40,23 @@ typedef struct {
     GvnEntryVec          table;
 } GvnCtx;
 
-static PirValueId resolve_alias(const GvnCtx *ctx, PirValueId v) {
-    uint32_t guard = 0u;
-    while (v < ctx->nvals && ctx->alias[v] != PIR_INVALID_ID && guard++ < 1024u) {
-        v = ctx->alias[v];
+static PirValueId resolve_alias(GvnCtx *ctx, PirValueId v) {
+    PirValueId root = v;
+    uint32_t steps = 0u;
+    while (root < ctx->nvals && ctx->alias[root] != PIR_INVALID_ID && steps < ctx->nvals) {
+        root = ctx->alias[root];
+        steps++;
     }
-    return v;
+    PirValueId cur = v;
+    while (cur != root && cur < ctx->nvals && ctx->alias[cur] != PIR_INVALID_ID) {
+        PirValueId next = ctx->alias[cur];
+        ctx->alias[cur] = root;
+        cur = next;
+    }
+    return root;
 }
 
-static void resolve_ops(const GvnCtx *ctx, PirOperand *ops, uint32_t n) {
+static void resolve_ops(GvnCtx *ctx, PirOperand *ops, uint32_t n) {
     for (uint32_t i = 0u; i < n; ++i) {
         if (ops[i].kind == PIR_OPER_VAL) {
             ops[i].u.val = resolve_alias(ctx, ops[i].u.val);
@@ -88,29 +95,14 @@ static bool get_int_const(const GvnCtx *ctx, PirOperand op, uint32_t bits, uint6
     return true;
 }
 
-static bool op_exact_eq(PirOperand a, PirOperand b) {
-    if (a.kind != b.kind) return false;
-    switch (a.kind) {
-        case PIR_OPER_VAL:       return a.u.val == b.u.val;
-        case PIR_OPER_IMM_INT:
-            return pir_type_eq(a.type, b.type) &&
-                   a.u.imm_int.lo == b.u.imm_int.lo &&
-                   a.u.imm_int.hi == b.u.imm_int.hi &&
-                   a.u.imm_int.is_negative == b.u.imm_int.is_negative;
-        case PIR_OPER_IMM_FLOAT: return a.u.imm_float.bits == b.u.imm_float.bits;
-        case PIR_OPER_SYM:
-            return a.u.sym.offset == b.u.sym.offset && a.u.sym.name && b.u.sym.name &&
-                   strcmp(a.u.sym.name, b.u.sym.name) == 0;
-        case PIR_OPER_INVOKE_RET:
-        case PIR_OPER_INVOKE_EXN:
-            return true;
+static bool is_commutative(const PirInst *ins) {
+    PirOpcode op = ins->op;
+    if (op == PIR_OP_FADD || op == PIR_OP_FMUL) {
+        /* IEEE-754 NaN payload propagation is order-dependent unless [fast] is set. */
+        return (ins->flags & PIR_FLAG_FAST) != 0u;
     }
-    return false;
-}
-
-static bool is_commutative(PirOpcode op) {
     return op == PIR_OP_ADD || op == PIR_OP_MUL || op == PIR_OP_AND || op == PIR_OP_OR ||
-           op == PIR_OP_XOR || op == PIR_OP_FADD || op == PIR_OP_FMUL ||
+           op == PIR_OP_XOR ||
            op == PIR_OP_CMP_EQ || op == PIR_OP_CMP_NE ||
            op == PIR_OP_FCMP_OEQ || op == PIR_OP_FCMP_ONE ||
            op == PIR_OP_FCMP_UEQ || op == PIR_OP_FCMP_UNE;
@@ -120,9 +112,21 @@ static bool op_less(PirOperand a, PirOperand b) {
     if (a.kind != b.kind) return (int)a.kind < (int)b.kind;
     switch (a.kind) {
         case PIR_OPER_VAL:       return a.u.val < b.u.val;
-        case PIR_OPER_IMM_INT:   return a.u.imm_int.lo < b.u.imm_int.lo;
-        case PIR_OPER_IMM_FLOAT: return a.u.imm_float.bits < b.u.imm_float.bits;
-        case PIR_OPER_SYM:       return (a.u.sym.name && b.u.sym.name) ? (strcmp(a.u.sym.name, b.u.sym.name) < 0) : false;
+        case PIR_OPER_IMM_INT:
+            if (a.u.imm_int.is_negative != b.u.imm_int.is_negative) {
+                return a.u.imm_int.is_negative < b.u.imm_int.is_negative;
+            }
+            if (a.u.imm_int.hi != b.u.imm_int.hi) return a.u.imm_int.hi < b.u.imm_int.hi;
+            if (a.u.imm_int.lo != b.u.imm_int.lo) return a.u.imm_int.lo < b.u.imm_int.lo;
+            return (int)a.type.u.scalar < (int)b.type.u.scalar;
+        case PIR_OPER_IMM_FLOAT:
+            if (a.u.imm_float.bits != b.u.imm_float.bits) {
+                return a.u.imm_float.bits < b.u.imm_float.bits;
+            }
+            return (int)a.type.u.scalar < (int)b.type.u.scalar;
+        case PIR_OPER_SYM:
+            if (a.u.sym.offset != b.u.sym.offset) return a.u.sym.offset < b.u.sym.offset;
+            return (a.u.sym.name && b.u.sym.name) ? (strcmp(a.u.sym.name, b.u.sym.name) < 0) : false;
         case PIR_OPER_INVOKE_RET:
         case PIR_OPER_INVOKE_EXN: return false;
     }
@@ -134,7 +138,7 @@ static bool is_gvn_eligible(const PirInst *ins) {
     if (ins->operand_count > 3u) return false;
     uint32_t bad_flags = PIR_FLAG_TRAP | PIR_FLAG_TRAP_S | PIR_FLAG_TRAP_U |
                          PIR_FLAG_UNSAFE | PIR_FLAG_UNSAFE_S | PIR_FLAG_UNSAFE_U |
-                         PIR_FLAG_NONZERO | PIR_FLAG_VOLATILE;
+                         PIR_FLAG_NONZERO | PIR_FLAG_VOLATILE | PIR_FLAG_INBOUNDS;
     if (ins->flags & bad_flags) return false;
 
     switch (ins->op) {
@@ -154,9 +158,19 @@ static bool is_gvn_eligible(const PirInst *ins) {
         case PIR_OP_SELECT:
         case PIR_OP_ZEXT: case PIR_OP_SEXT: case PIR_OP_TRUNC:
         case PIR_OP_SITOFP: case PIR_OP_UITOFP: case PIR_OP_FPEXT: case PIR_OP_FPTRUNC:
-        case PIR_OP_BITCAST: case PIR_OP_PTRTOINT: case PIR_OP_INTTOPTR:
+        case PIR_OP_PTRTOINT:
         case PIR_OP_PTR_ADD: case PIR_OP_SPLAT: case PIR_OP_EXTRACT: case PIR_OP_INSERT:
             return true;
+        case PIR_OP_BITCAST:
+            if (ins->ty.kind == PIR_TYPE_SCALAR && ins->ty.u.scalar == PIR_SCALAR_PTR &&
+                (ins->operand_count < 1u ||
+                 !(ins->operands[0].type.kind == PIR_TYPE_SCALAR &&
+                   ins->operands[0].type.u.scalar == PIR_SCALAR_PTR))) {
+                return false;
+            }
+            return true;
+        case PIR_OP_INTTOPTR:
+            return false;
         case PIR_OP_FPTOSI: case PIR_OP_FPTOUI:
             return (ins->flags & PIR_FLAG_SAT) != 0u;
         case PIR_OP_DIV_S: case PIR_OP_DIV_U: case PIR_OP_REM_S: case PIR_OP_REM_U:
@@ -384,7 +398,8 @@ static void propagate_int_imms(GvnCtx *ctx, PirInst *ins) {
     if (ins->operand_count != 2u) return;
 
     if (ins->op == PIR_OP_PTR_ADD) {
-        uint32_t pbits = (uint32_t)ctx->target->ptr_bytes * 8u;
+        uint32_t pbits = scalar_int_bits(ins->ty);
+        if (pbits == 0u) pbits = (uint32_t)ctx->target->ptr_bytes * 8u;
         uint64_t off = 0u;
         if (ins->operands[1].kind == PIR_OPER_VAL &&
             get_int_const(ctx, ins->operands[1], pbits, &off)) {
@@ -558,10 +573,11 @@ static bool try_simplify_identity(GvnCtx *ctx, PirInst *ins) {
         uint64_t cv = 0u;
         PirOperand chosen;
         bool has_chosen = false;
-        if (get_int_const(ctx, ins->operands[0], 8u, &cv)) {
+        if (get_int_const(ctx, ins->operands[0], 8u, &cv) && cv <= 1u) {
             chosen = (cv != 0u) ? ins->operands[1] : ins->operands[2];
             has_chosen = true;
-        } else if (op_exact_eq(ins->operands[1], ins->operands[2])) {
+        } else if (pir_operand_eq_exact(ins->operands[1], ins->operands[2]) &&
+                   pir_operand_is_proven_bool_i8(ctx->fn, ins->operands[0])) {
             chosen = ins->operands[1];
             has_chosen = true;
         }
@@ -581,11 +597,14 @@ static bool try_simplify_identity(GvnCtx *ctx, PirInst *ins) {
         return false;
     }
 
-    /* ptr_add p, 0 -> p */
-    if (ins->op == PIR_OP_PTR_ADD && ins->operand_count == 2u) {
+    /* ptr_add p, 0 -> p (only without [inbounds], since ptr_add [inbounds] null, 0 is UB). */
+    if (ins->op == PIR_OP_PTR_ADD && ins->operand_count == 2u &&
+        (ins->flags & PIR_FLAG_INBOUNDS) == 0u) {
+        uint32_t pbits = scalar_int_bits(ins->ty);
+        if (pbits == 0u) pbits = (uint32_t)ctx->target->ptr_bytes * 8u;
         uint64_t off = 0u;
         if (ins->operands[0].kind == PIR_OPER_VAL &&
-            get_int_const(ctx, ins->operands[1], (uint32_t)ctx->target->ptr_bytes * 8u, &off) &&
+            get_int_const(ctx, ins->operands[1], pbits, &off) &&
             off == 0u) {
             ctx->alias[res] = ins->operands[0].u.val;
             return true;
@@ -603,7 +622,7 @@ static bool try_simplify_identity(GvnCtx *ctx, PirInst *ins) {
     bool has_b = get_int_const(ctx, b, bits, &cb);
 
     /* Same-operand identities */
-    if (op_exact_eq(a, b)) {
+    if (pir_operand_eq_exact(a, b)) {
         if (ins->op == PIR_OP_XOR || ins->op == PIR_OP_SUB) {
             rewrite_to_const_int(ctx, ins, 0u, ins->ty);
             return true;
@@ -687,7 +706,7 @@ static bool entry_matches(const GvnEntry *e, const PirInst *ins, const PirOperan
         return false;
     }
     for (uint32_t i = 0u; i < e->op_count; ++i) {
-        if (!op_exact_eq(e->ops[i], canon_ops[i])) return false;
+        if (!pir_operand_eq_exact(e->ops[i], canon_ops[i])) return false;
     }
     return true;
 }
@@ -707,9 +726,6 @@ static void gvn_walk_block(GvnCtx *ctx, PirBlockId b) {
                              : ins->operands[0].u.imm_int.lo;
                 ctx->consts[ins->results[0]].is_int = true;
                 ctx->consts[ins->results[0]].bits   = v;
-            } else if (ins->operands[0].kind == PIR_OPER_IMM_FLOAT) {
-                ctx->consts[ins->results[0]].is_float = true;
-                ctx->consts[ins->results[0]].bits     = ins->operands[0].u.imm_float.bits;
             }
         }
 
@@ -725,7 +741,7 @@ static void gvn_walk_block(GvnCtx *ctx, PirBlockId b) {
 
         PirOperand canon[3];
         for (uint32_t k = 0u; k < ins->operand_count; ++k) canon[k] = ins->operands[k];
-        if (ins->operand_count == 2u && is_commutative(ins->op) && op_less(canon[1], canon[0])) {
+        if (ins->operand_count == 2u && is_commutative(ins) && op_less(canon[1], canon[0])) {
             PirOperand tmp = canon[0];
             canon[0] = canon[1];
             canon[1] = tmp;

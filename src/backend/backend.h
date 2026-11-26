@@ -33,6 +33,12 @@ struct PirCodeEmitter {
 /* Register allocation (target-configured linear scan + parallel copy sequentializer) */
 bool pir_regalloc_run(MFunc *mf, PirDiag *diag);
 
+#ifdef PIR_VERIFY_ALL
+/* MIR structural verifiers (pre-regalloc and post-regalloc) */
+bool pir_mir_verify_pre_ra(const MFunc *mf, PirDiag *diag);
+bool pir_mir_verify_post_ra(const MFunc *mf, PirDiag *diag);
+#endif
+
 /* ARM64 backend passes (M6) */
 bool pir_arm64_isel_func(const PirModule *mod, const PirFunction *fn, uint32_t fn_index,
                          const PirTargetSpec *target, MFunc *out_mf, PirDiag *diag);

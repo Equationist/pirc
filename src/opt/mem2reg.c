@@ -22,9 +22,8 @@ typedef struct {
     PirValueId  zero_val;
 } Mem2RegSlot;
 
-static uint32_t min_type_bytes(PirType ty) {
-    if (ty.kind == PIR_TYPE_SCALAR && ty.u.scalar == PIR_SCALAR_PTR) return 4u;
-    uint32_t bits = pir_type_bits(ty, 8u);
+static uint32_t min_type_bytes(PirType ty, uint8_t ptr_bytes) {
+    uint32_t bits = pir_type_bits(ty, ptr_bytes);
     return bits / 8u;
 }
 
@@ -54,15 +53,24 @@ typedef struct {
     PirInstIdVec   entry_zeros; /* Deferred zero consts to prepend to entry block */
 } RenameCtx;
 
-static PirValueId resolve_val(const RenameCtx *ctx, PirValueId v) {
-    uint32_t guard = 0u;
-    while (v < ctx->orig_nvals && ctx->val_remap[v] != PIR_INVALID_ID && guard++ < 1024u) {
-        v = ctx->val_remap[v];
+static PirValueId resolve_val(RenameCtx *ctx, PirValueId v) {
+    PirValueId root = v;
+    uint32_t steps = 0u;
+    while (root < ctx->orig_nvals && ctx->val_remap[root] != PIR_INVALID_ID &&
+           steps < ctx->orig_nvals) {
+        root = ctx->val_remap[root];
+        steps++;
     }
-    return v;
+    PirValueId cur = v;
+    while (cur != root && cur < ctx->orig_nvals && ctx->val_remap[cur] != PIR_INVALID_ID) {
+        PirValueId next = ctx->val_remap[cur];
+        ctx->val_remap[cur] = root;
+        cur = next;
+    }
+    return root;
 }
 
-static void remap_ops(const RenameCtx *ctx, PirOperand *ops, uint32_t n) {
+static void remap_ops(RenameCtx *ctx, PirOperand *ops, uint32_t n) {
     for (uint32_t i = 0u; i < n; ++i) {
         if (ops[i].kind == PIR_OPER_VAL) {
             ops[i].u.val = resolve_val(ctx, ops[i].u.val);
@@ -264,25 +272,6 @@ static void rename_block(RenameCtx *ctx, PirBlockId b) {
     free(saved);
 }
 
-static bool fn_has_returns_twice(const PirFunction *fn) {
-    for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
-        const PirBlock *blk = &fn->blocks.data[b];
-        for (uint32_t j = 0u; j < blk->insts.len; ++j) {
-            const PirInst *ins = &fn->insts.data[blk->insts.data[j]];
-            if (ins->op == PIR_OP_CALL && ins->operand_count >= 1u &&
-                ins->operands[0].kind == PIR_OPER_SYM && ins->operands[0].u.sym.name) {
-                const char *cn = ins->operands[0].u.sym.name;
-                if (strcmp(cn, "__pir_setjmp") == 0 || strcmp(cn, "setjmp") == 0 ||
-                    strcmp(cn, "_setjmp") == 0 || strcmp(cn, "sigsetjmp") == 0 ||
-                    strcmp(cn, "vfork") == 0) {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
-
 /* =========================================================================
  * Constant-Offset SROA (Scalar Replacement of Aggregates)
  * =========================================================================
@@ -298,6 +287,7 @@ static bool fn_has_returns_twice(const PirFunction *fn) {
 typedef struct {
     int64_t    offset;
     uint32_t   size;
+    uint32_t   max_align;
     PirType    ty;
     PirValueId new_alloca_val;
 } SroaSlice;
@@ -339,9 +329,9 @@ static bool sroa_const_i64(const PirFunction *fn, PirOperand op, int64_t *out) {
     return false;
 }
 
-static uint32_t sroa_type_bytes(PirType ty) {
+static uint32_t sroa_type_bytes(PirType ty, uint8_t ptr_bytes) {
     if (!pir_type_is_ssa(ty)) return 0u;
-    uint32_t bits = pir_type_bits(ty, 8u);
+    uint32_t bits = pir_type_bits(ty, ptr_bytes);
     return bits / 8u;
 }
 
@@ -356,19 +346,22 @@ static void sroa_disqualify_ops(const PirOperand *ops, uint32_t n,
     }
 }
 
-static void sroa_record_access(SroaCand *cand, int64_t off, PirType ty, uint32_t flags) {
+static void sroa_record_access(SroaCand *cand, int64_t off, PirType ty, uint32_t flags,
+                               uint32_t align, uint8_t ptr_bytes) {
     if (!cand->ok) return;
     if ((flags & PIR_FLAG_VOLATILE) != 0u) { cand->ok = false; return; }
-    uint32_t sz = sroa_type_bytes(ty);
+    uint32_t sz = sroa_type_bytes(ty, ptr_bytes);
     if (sz == 0u || off < 0 || (uint64_t)off + (uint64_t)sz > cand->alloc_size) {
         cand->ok = false;
         return;
     }
+    uint32_t eff_al = (align > sz) ? align : sz;
     if (off != 0) cand->has_nonzero_off = true;
     for (uint32_t k = 0u; k < cand->nslices; ++k) {
         SroaSlice *sl = &cand->slices[k];
         if (sl->offset == off && sl->size == sz) {
             if (!pir_type_eq(sl->ty, ty)) cand->ok = false;
+            if (eff_al > sl->max_align) sl->max_align = eff_al;
             return;
         }
         if (!(off + (int64_t)sz <= sl->offset || sl->offset + (int64_t)sl->size <= off)) {
@@ -383,11 +376,12 @@ static void sroa_record_access(SroaCand *cand, int64_t off, PirType ty, uint32_t
     SroaSlice *ns = &cand->slices[cand->nslices++];
     ns->offset         = off;
     ns->size           = sz;
+    ns->max_align      = eff_al;
     ns->ty             = ty;
     ns->new_alloca_val = PIR_INVALID_ID;
 }
 
-static void run_sroa(PirModule *mod, PirFunction *fn) {
+static void run_sroa(PirModule *mod, PirFunction *fn, uint8_t ptr_bytes) {
     uint32_t nvals = fn->values.len;
     if (nvals == 0u || fn->blocks.len == 0u) return;
 
@@ -424,10 +418,14 @@ static void run_sroa(PirModule *mod, PirFunction *fn) {
         return;
     }
 
-    /* Propagate constant-offset ptr_add chains from candidate allocas. */
+    PirCfg scfg;
+    pir_cfg_build(&scfg, fn);
+
+    /* Propagate constant-offset ptr_add chains from candidate allocas in reachable blocks. */
     for (uint32_t pass = 0u; pass < 8u; ++pass) {
         bool changed = false;
         for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
+            if (!scfg.reachable[b]) continue;
             const PirBlock *blk = &fn->blocks.data[b];
             for (uint32_t j = 0u; j < blk->insts.len; ++j) {
                 const PirInst *ins = &fn->insts.data[blk->insts.data[j]];
@@ -458,7 +456,8 @@ static void run_sroa(PirModule *mod, PirFunction *fn) {
         if (!changed) break;
     }
 
-    /* Verify all uses of candidate allocas and derived pointers. */
+    /* Verify all uses of candidate allocas and derived pointers.
+     * Any reference in an unreachable block disqualifies the candidate. */
     for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
         const PirBlock *blk = &fn->blocks.data[b];
         for (uint32_t j = 0u; j < blk->insts.len; ++j) {
@@ -471,6 +470,12 @@ static void run_sroa(PirModule *mod, PirFunction *fn) {
                 sroa_disqualify_ops(ins->switch_cases[c].target.args,
                                     ins->switch_cases[c].target.arg_count,
                                     val_base, nvals, cands.data);
+            }
+
+            if (!scfg.reachable[b]) {
+                sroa_disqualify_ops(ins->operands, ins->operand_count,
+                                    val_base, nvals, cands.data);
+                continue;
             }
 
             if (ins->op == PIR_OP_PTR_ADD && ins->operand_count == 2u) {
@@ -486,7 +491,7 @@ static void run_sroa(PirModule *mod, PirFunction *fn) {
                     int32_t ci = val_base[ins->operands[0].u.val];
                     if (ci >= 0) {
                         sroa_record_access(&cands.data[ci], val_off[ins->operands[0].u.val],
-                                           ins->ty, ins->flags);
+                                           ins->ty, ins->flags, ins->align, ptr_bytes);
                     }
                 }
             } else if (ins->op == PIR_OP_STORE) {
@@ -495,7 +500,7 @@ static void run_sroa(PirModule *mod, PirFunction *fn) {
                     int32_t ci = val_base[ins->operands[1].u.val];
                     if (ci >= 0) {
                         sroa_record_access(&cands.data[ci], val_off[ins->operands[1].u.val],
-                                           ins->ty, ins->flags);
+                                           ins->ty, ins->flags, ins->align, ptr_bytes);
                     }
                 }
             } else {
@@ -504,6 +509,7 @@ static void run_sroa(PirModule *mod, PirFunction *fn) {
             }
         }
     }
+    pir_cfg_destroy(&scfg);
 
     /* Emit replacement scalar allocas for each qualifying aggregate candidate. */
     PirInstIdVec new_allocas = {NULL, 0u, 0u};
@@ -522,7 +528,7 @@ static void run_sroa(PirModule *mod, PirFunction *fn) {
             PirValueId nv = pir_fn_new_val(mod, fn, "sroa", ptr_ty, 0u, PIR_INVALID_ID, 0u);
             PirInst al = pir_make_inst(PIR_OP_ALLOCA_PTR, ptr_ty, sc->src_line, 0u);
             al.imm_u64    = (uint64_t)sl->size;
-            al.align      = sl->size;
+            al.align      = sl->max_align;
             al.results[0] = nv;
             PirInstId aid = pir_fn_append_inst(fn, NULL, al);
             PIR_VEC_PUSH(&new_allocas, aid);
@@ -590,62 +596,93 @@ static void run_sroa(PirModule *mod, PirFunction *fn) {
     free(val_base);
 }
 
-void pir_opt_mem2reg(PirModule *mod, PirFunction *fn) {
+void pir_opt_mem2reg(PirModule *mod, PirFunction *fn, const PirTargetSpec *target) {
     if (fn->blocks.len == 0u) return;
 
     /* Functions calling setjmp / __pir_setjmp (lowered PIR invoke) have implicit
      * abnormal CFG edges from unwinding calls/resume back to the setjmp landing pad.
      * Promoting stack slots to SSA across those invisible edges would drop stores
      * executed before an exception unwinds (or clobber callee-saved regs on longjmp). */
-    if (fn_has_returns_twice(fn)) return;
+    if (pir_fn_has_returns_twice(fn)) return;
 
-    run_sroa(mod, fn);
+    uint8_t ptr_bytes = target ? target->ptr_bytes : 8u;
+    run_sroa(mod, fn, ptr_bytes);
 
     uint32_t nvals = fn->values.len;
 
     /* Pre-canonicalize zero-offset ptr_add (%p = ptr_add %base, 0) so frontends that
-     * emit ptr_add %alloca, 0 do not falsely mark allocas as escaped before GVN runs. */
+     * emit ptr_add %alloca, 0 do not falsely mark allocas as escaped before GVN runs.
+     * Resolve chains of arbitrary depth with cycle detection so no kept use ever
+     * references a deleted instruction. */
+    PirCfg zcfg;
+    pir_cfg_build(&zcfg, fn);
     PirValueId *zero_alias = (PirValueId *)malloc(nvals * sizeof(PirValueId));
     if (!zero_alias) abort();
     for (uint32_t v = 0u; v < nvals; ++v) zero_alias[v] = PIR_INVALID_ID;
     bool has_zero_pa = false;
     for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
+        if (!zcfg.reachable[b]) continue;
         const PirBlock *blk = &fn->blocks.data[b];
         for (uint32_t j = 0u; j < blk->insts.len; ++j) {
             const PirInst *ins = &fn->insts.data[blk->insts.data[j]];
             if (ins->op == PIR_OP_PTR_ADD && ins->operand_count == 2u &&
+                (ins->flags & PIR_FLAG_INBOUNDS) == 0u &&
                 ins->results[0] < nvals && ins->operands[0].kind == PIR_OPER_VAL &&
                 ins->operands[1].kind == PIR_OPER_IMM_INT &&
                 ins->operands[1].u.imm_int.lo == 0u && ins->operands[1].u.imm_int.hi == 0u) {
                 PirValueId base = ins->operands[0].u.val;
-                uint32_t guard = 0u;
-                while (base < nvals && zero_alias[base] != PIR_INVALID_ID && guard++ < 64u) {
-                    base = zero_alias[base];
+                if (base != ins->results[0]) {
+                    zero_alias[ins->results[0]] = base;
+                    has_zero_pa = true;
                 }
-                zero_alias[ins->results[0]] = base;
-                has_zero_pa = true;
             }
         }
     }
     if (has_zero_pa) {
-        /* Resolve transitive zero-offset chains regardless of block order. */
+        uint8_t *state = (uint8_t *)calloc(nvals, sizeof(uint8_t));
+        PirValueId *path = (PirValueId *)malloc(nvals * sizeof(PirValueId));
+        if (!state || !path) abort();
         for (uint32_t v = 0u; v < nvals; ++v) {
-            if (zero_alias[v] != PIR_INVALID_ID) {
-                PirValueId base = zero_alias[v];
-                uint32_t guard = 0u;
-                while (base < nvals && zero_alias[base] != PIR_INVALID_ID && guard++ < 64u) {
-                    base = zero_alias[base];
+            if (zero_alias[v] == PIR_INVALID_ID || state[v] == 2u) continue;
+            uint32_t plen = 0u;
+            PirValueId cur = v;
+            bool cyclic = false;
+            while (cur < nvals && zero_alias[cur] != PIR_INVALID_ID) {
+                if (state[cur] == 2u) {
+                    cur = zero_alias[cur];
+                    break;
                 }
-                zero_alias[v] = base;
+                if (state[cur] == 1u) {
+                    cyclic = true;
+                    break;
+                }
+                state[cur] = 1u;
+                path[plen++] = cur;
+                cur = zero_alias[cur];
+            }
+            if (cyclic) {
+                /* Break cycles in unreachable code by keeping all cyclic nodes intact. */
+                for (uint32_t k = 0u; k < plen; ++k) {
+                    zero_alias[path[k]] = PIR_INVALID_ID;
+                    state[path[k]] = 2u;
+                }
+            } else {
+                for (uint32_t k = 0u; k < plen; ++k) {
+                    zero_alias[path[k]] = cur;
+                    state[path[k]] = 2u;
+                }
             }
         }
+        free(path);
+        free(state);
         for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
             PirBlock *blk = &fn->blocks.data[b];
             uint32_t out_j = 0u;
             for (uint32_t j = 0u; j < blk->insts.len; ++j) {
                 PirInstId iid = blk->insts.data[j];
                 PirInst *ins = &fn->insts.data[iid];
-                if (ins->results[0] < nvals && zero_alias[ins->results[0]] != PIR_INVALID_ID) {
+                if (zcfg.reachable[b] && ins->results[0] < nvals &&
+                    zero_alias[ins->results[0]] != PIR_INVALID_ID) {
                     continue;
                 }
                 for (uint32_t k = 0u; k < ins->operand_count; ++k) {
@@ -678,6 +715,7 @@ void pir_opt_mem2reg(PirModule *mod, PirFunction *fn) {
         }
     }
     free(zero_alias);
+    pir_cfg_destroy(&zcfg);
 
     int32_t *val_to_slot = (int32_t *)malloc(nvals * sizeof(int32_t));
     if (!val_to_slot) abort();
@@ -705,7 +743,12 @@ void pir_opt_mem2reg(PirModule *mod, PirFunction *fn) {
         return;
     }
 
-    /* Scan all uses across the function to check escape / volatile / type uniformity. */
+    PirCfg cfg;
+    pir_cfg_build(&cfg, fn);
+
+    /* Scan all uses across the function to check escape / volatile / type uniformity.
+     * Any reference inside an unreachable block disqualifies the alloca so rename_block
+     * (which only walks the reachable dom tree) never leaves a dangling use behind. */
     for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
         const PirBlock *blk = &fn->blocks.data[b];
         for (uint32_t j = 0u; j < blk->insts.len; ++j) {
@@ -720,12 +763,18 @@ void pir_opt_mem2reg(PirModule *mod, PirFunction *fn) {
                                   val_to_slot, nvals, cands.data);
             }
 
+            if (!cfg.reachable[b]) {
+                disqualify_in_ops(ins->operands, ins->operand_count,
+                                  val_to_slot, nvals, cands.data);
+                continue;
+            }
+
             if (ins->op == PIR_OP_LOAD) {
                 if (ins->operands[0].kind == PIR_OPER_VAL && ins->operands[0].u.val < nvals) {
                     int32_t si = val_to_slot[ins->operands[0].u.val];
                     if (si >= 0) {
                         Mem2RegSlot *s = &cands.data[si];
-                        uint32_t need = min_type_bytes(ins->ty);
+                        uint32_t need = min_type_bytes(ins->ty, ptr_bytes);
                         if ((ins->flags & PIR_FLAG_VOLATILE) || !pir_type_is_ssa(ins->ty) ||
                             need == 0u || s->alloc_size < (uint64_t)need) {
                             s->promotable = false;
@@ -744,7 +793,7 @@ void pir_opt_mem2reg(PirModule *mod, PirFunction *fn) {
                     int32_t si = val_to_slot[ins->operands[1].u.val];
                     if (si >= 0) {
                         Mem2RegSlot *s = &cands.data[si];
-                        uint32_t need = min_type_bytes(ins->ty);
+                        uint32_t need = min_type_bytes(ins->ty, ptr_bytes);
                         if ((ins->flags & PIR_FLAG_VOLATILE) || !pir_type_is_ssa(ins->ty) ||
                             need == 0u || s->alloc_size < (uint64_t)need) {
                             s->promotable = false;
@@ -774,14 +823,13 @@ void pir_opt_mem2reg(PirModule *mod, PirFunction *fn) {
         }
     }
     if (nslots == 0u) {
+        pir_cfg_destroy(&cfg);
         PIR_VEC_FREE(&cands);
         free(val_to_slot);
         return;
     }
 
-    PirCfg cfg;
     PirDom dom;
-    pir_cfg_build(&cfg, fn);
     pir_dom_build(&dom, &cfg);
     uint32_t nblks = fn->blocks.len;
     PirBlockIdVec *df = (PirBlockIdVec *)calloc(nblks, sizeof(PirBlockIdVec));
@@ -858,6 +906,28 @@ void pir_opt_mem2reg(PirModule *mod, PirFunction *fn) {
     rctx.entry_zeros.cap  = 0u;
 
     rename_block(&rctx, 0u);
+
+    /* Any unreachable block branching to a reachable merge block with newly inserted
+     * phi parameters must also receive matching zero arguments so IR stays valid. */
+    for (uint32_t b = 0u; b < nblks; ++b) {
+        if (cfg.reachable[b]) continue;
+        const PirBlock *blk = &fn->blocks.data[b];
+        if (blk->insts.len == 0u) continue;
+        PirInstId tid = blk->insts.data[blk->insts.len - 1u];
+        PirOpcode top = fn->insts.data[tid].op;
+        if (top == PIR_OP_JMP) {
+            append_phi_args_to_target(&rctx, tid, 0, 0u);
+        } else if (top == PIR_OP_BR) {
+            append_phi_args_to_target(&rctx, tid, 0, 0u);
+            append_phi_args_to_target(&rctx, tid, 0, 1u);
+        } else if (top == PIR_OP_SWITCH) {
+            append_phi_args_to_target(&rctx, tid, 0, 0u);
+            uint32_t ncases = fn->insts.data[tid].switch_case_count;
+            for (uint32_t c = 0u; c < ncases; ++c) {
+                append_phi_args_to_target(&rctx, tid, 1, c);
+            }
+        }
+    }
 
     /* Prepend any synthesized zero constants to the entry block now that renaming is done. */
     if (rctx.entry_zeros.len > 0u) {

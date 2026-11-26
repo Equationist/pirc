@@ -88,7 +88,7 @@ bool pir_dom_dominates(const PirDom *dom, PirBlockId a, PirBlockId b) {
     }
     PirBlockId cur = b;
     while (cur != a) {
-        if (cur == 0u) {
+        if (cur == 0u || cur == PIR_INVALID_ID) {
             return false;
         }
         cur = dom->idom[cur];

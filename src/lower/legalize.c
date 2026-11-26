@@ -266,28 +266,13 @@ static int cmp_sorted_case(const void *a, const void *b) {
     return (ka < kb) ? -1 : (ka > kb ? 1 : 0);
 }
 
-static PirBlockId new_switch_block(PirModule *mod, PirFunction *fn, uint32_t line) {
-    char buf[64];
-    PirBlockId bid = fn->blocks.len;
-    uint32_t suffix = bid;
-    for (;;) {
-        snprintf(buf, sizeof(buf), "sw_%u", suffix);
-        bool dup = false;
-        for (uint32_t k = 0u; k < fn->blocks.len; ++k) {
-            if (fn->blocks.data[k].label && strcmp(fn->blocks.data[k].label, buf) == 0) {
-                dup = true;
-                break;
-            }
-        }
-        if (!dup) break;
-        suffix++;
+static PirBranchTarget clone_branch_target(PirModule *mod, PirBranchTarget bt) {
+    if (bt.arg_count > 0u && bt.args) {
+        PirOperand *cp = pir_alloc_ops(mod, bt.arg_count);
+        memcpy(cp, bt.args, bt.arg_count * sizeof(PirOperand));
+        bt.args = cp;
     }
-    PirBlock blk;
-    memset(&blk, 0, sizeof(blk));
-    blk.label    = pir_arena_strdup(&mod->arena, buf);
-    blk.src_line = line;
-    PIR_VEC_PUSH(&fn->blocks, blk);
-    return bid;
+    return bt;
 }
 
 static void emit_switch_node(PirModule *mod, PirFunction *fn, PirBlockId blk_id,
@@ -297,7 +282,7 @@ static void emit_switch_node(PirModule *mod, PirFunction *fn, PirBlockId blk_id,
     PirInstIdVec *out = cur_out ? cur_out : &fn->blocks.data[blk_id].insts;
     if (lo > hi) {
         PirInst j = pir_make_inst(PIR_OP_JMP, pir_type_scalar(PIR_SCALAR_VOID), ln, lc);
-        j.targets[0] = def_bt;
+        j.targets[0] = clone_branch_target(mod, def_bt);
         pir_fn_append_inst(fn, out, j);
         return;
     }
@@ -309,13 +294,13 @@ static void emit_switch_node(PirModule *mod, PirFunction *fn, PirBlockId blk_id,
         br.operand_count = 1u; br.operands = pir_alloc_ops(mod, 1u);
         br.operands[0] = pir_op_val(eq, pir_type_scalar(PIR_SCALAR_I8));
         br.targets[0]  = cases[mid].sc.target;
-        br.targets[1]  = def_bt;
+        br.targets[1]  = clone_branch_target(mod, def_bt);
         pir_fn_append_inst(fn, out, br);
         return;
     }
 
-    PirBlockId ne_blk = new_switch_block(mod, fn, ln);
-    /* Re-fetch out if cur_out == NULL because new_switch_block may realloc fn->blocks.data! */
+    PirBlockId ne_blk = pir_fn_new_block(mod, fn, "sw", ln);
+    /* Re-fetch out if cur_out == NULL because pir_fn_new_block may realloc fn->blocks.data! */
     out = cur_out ? cur_out : &fn->blocks.data[blk_id].insts;
     PirInst br_eq = pir_make_inst(PIR_OP_BR, pir_type_scalar(PIR_SCALAR_VOID), ln, lc);
     br_eq.operand_count = 1u; br_eq.operands = pir_alloc_ops(mod, 1u);
@@ -324,8 +309,8 @@ static void emit_switch_node(PirModule *mod, PirFunction *fn, PirBlockId blk_id,
     br_eq.targets[1].target = ne_blk;
     pir_fn_append_inst(fn, out, br_eq);
 
-    PirBlockId lo_blk = new_switch_block(mod, fn, ln);
-    PirBlockId hi_blk = new_switch_block(mod, fn, ln);
+    PirBlockId lo_blk = pir_fn_new_block(mod, fn, "sw", ln);
+    PirBlockId hi_blk = pir_fn_new_block(mod, fn, "sw", ln);
     PirValueId lt = emit2(mod, fn, ne_blk, &fn->blocks.data[ne_blk].insts,
                           PIR_OP_CMP_LT_S, ty, 0u, val, key_op, ln, lc, PIR_INVALID_ID);
     PirInst br_lt = pir_make_inst(PIR_OP_BR, pir_type_scalar(PIR_SCALAR_VOID), ln, lc);

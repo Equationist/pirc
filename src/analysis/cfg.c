@@ -49,6 +49,9 @@ void pir_cfg_build(PirCfg *cfg, const PirFunction *fn) {
             continue;
         }
         PirInstId term_id = blk->insts.data[blk->insts.len - 1u];
+        if (term_id >= fn->insts.len) {
+            continue;
+        }
         const PirInst *inst = &fn->insts.data[term_id];
         switch (inst->op) {
             case PIR_OP_JMP:

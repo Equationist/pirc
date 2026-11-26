@@ -196,6 +196,7 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
                     pd.type   = sp->piece_ty;
                     pd.val_id = sp->ids[p];
                     pd.name   = fn->values.data[pd.val_id].name;
+                    if (p > 0u) pd.abi_stack_align = 0u;
                     PIR_VEC_PUSH(&nfp, pd);
                 }
             } else {
@@ -638,7 +639,7 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
                 }
             } else if (copy.op == PIR_OP_CALL || copy.op == PIR_OP_CALL_INDIRECT) {
                 /* Split oversized vector arguments at call sites (matching expanded callee params). */
-                if (rsp) {
+                if (rsp || needs_split(copy.ty, max_bits)) {
                     pir_diag_error(diag, ln, 0u,
                                    "oversized vector return exceeds target SIMD width (%u bits)",
                                    (unsigned)max_bits);
@@ -656,13 +657,10 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
                         const VecSplit *sp = &splits[a.u.val];
                         for (uint32_t p = 0u; p < sp->count; ++p) {
                             PirOperand po = pir_op_val(sp->ids[p], sp->piece_ty);
-                            if (a.call_stack_align > 0u) {
-                                if (p == 0u) {
-                                    po.call_stack_align = a.call_stack_align;
-                                } else if (sp->piece_ty.kind == PIR_TYPE_VECTOR &&
-                                           pir_vec_bits(sp->piece_ty.u.vec) >= 128u) {
-                                    po.call_stack_align = 16u;
-                                }
+                            if (a.call_stack_align > 0u &&
+                                sp->piece_ty.kind == PIR_TYPE_VECTOR &&
+                                pir_vec_bits(sp->piece_ty.u.vec) >= 128u) {
+                                po.call_stack_align = (p == 0u) ? a.call_stack_align : 16u;
                             }
                             PIR_VEC_PUSH(&nargs, po);
                         }
@@ -754,7 +752,7 @@ static void split_simd_decl(PirModule *mod, PirParamDecl **params_io, uint32_t *
             for (uint32_t p = 0u; p < cnt; ++p) {
                 PirParamDecl pd = old_p[i];
                 pd.type = pty;
-                if (p > 0u) { pd.name = NULL; pd.val_id = PIR_INVALID_ID; }
+                if (p > 0u) { pd.name = NULL; pd.val_id = PIR_INVALID_ID; pd.abi_stack_align = 0u; }
                 PIR_VEC_PUSH(&np, pd);
             }
         } else {

@@ -14,8 +14,15 @@ typedef struct {
     uint32_t    error_count;
 } PirDiag;
 
+#if defined(__GNUC__) || defined(__clang__)
+#define PIR_PRINTF_LIKE(fmt_idx, arg_idx) __attribute__((format(printf, fmt_idx, arg_idx)))
+#else
+#define PIR_PRINTF_LIKE(fmt_idx, arg_idx)
+#endif
+
 void pir_diag_init(PirDiag *diag, const char *filename);
-void pir_diag_error(PirDiag *diag, uint32_t line, uint32_t col, const char *fmt, ...);
+void pir_diag_error(PirDiag *diag, uint32_t line, uint32_t col, const char *fmt, ...)
+    PIR_PRINTF_LIKE(4, 5);
 
 static inline bool pir_diag_has_errors(const PirDiag *diag) {
     return diag->error_count > 0u;

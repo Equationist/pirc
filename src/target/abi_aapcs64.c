@@ -16,36 +16,6 @@ typedef struct {
     uint32_t count;
 } HfaWalk;
 
-static bool is_pad_only_agg(const PirModule *mod, PirType ty) {
-    if (ty.kind != PIR_TYPE_NAMED_AGG || ty.u.agg_id >= mod->agg_types.len) return false;
-    const PirAggDef *agg = &mod->agg_types.data[ty.u.agg_id];
-    if (agg->kind == PIR_AGG_PAD) return true;
-    if (agg->kind == PIR_AGG_ARRAY) {
-        return agg->array_len == 0u || is_pad_only_agg(mod, agg->elem_type);
-    }
-    for (uint32_t i = 0u; i < agg->field_count; ++i) {
-        if (!is_pad_only_agg(mod, agg->fields[i])) return false;
-    }
-    return true;
-}
-
-static uint32_t natural_agg_align(const PirModule *mod, const PirTargetSpec *target, PirType ty) {
-    if (ty.kind != PIR_TYPE_NAMED_AGG || ty.u.agg_id >= mod->agg_types.len) {
-        return pir_type_layout(mod, target, ty).align;
-    }
-    const PirAggDef *agg = &mod->agg_types.data[ty.u.agg_id];
-    if (agg->kind == PIR_AGG_PACKED_STRUCT || agg->kind == PIR_AGG_PAD) return 1u;
-    if (agg->kind == PIR_AGG_ARRAY) {
-        return natural_agg_align(mod, target, agg->elem_type);
-    }
-    uint32_t max_al = 1u;
-    for (uint32_t i = 0u; i < agg->field_count; ++i) {
-        uint32_t fa = natural_agg_align(mod, target, agg->fields[i]);
-        if (fa > max_al) max_al = fa;
-    }
-    return max_al;
-}
-
 static bool is_hfa_leaf(const PirTargetSpec *target, PirType ty) {
     if (ty.kind == PIR_TYPE_SCALAR) {
         return ty.u.scalar == PIR_SCALAR_F32 || ty.u.scalar == PIR_SCALAR_F64;
@@ -84,6 +54,10 @@ static void walk_hfa(const PirModule *mod, const PirTargetSpec *target,
         if (w->count > 4u) w->valid = false;
         return;
     }
+    if (ty.u.agg_id >= mod->agg_types.len) {
+        w->valid = false;
+        return;
+    }
     const PirAggDef *agg = &mod->agg_types.data[ty.u.agg_id];
     if (agg->kind == PIR_AGG_PAD) {
         w->valid = false;
@@ -91,6 +65,7 @@ static void walk_hfa(const PirModule *mod, const PirTargetSpec *target,
     }
     if (agg->kind == PIR_AGG_ARRAY) {
         PirTypeLayout el = pir_type_layout(mod, target, agg->elem_type);
+        if (el.size == 0u || agg->array_len == 0u) { w->valid = false; return; }
         for (uint64_t i = 0u; i < agg->array_len && w->valid; ++i) {
             walk_hfa(mod, target, agg->elem_type, base_off + i * el.size, w);
         }
@@ -102,7 +77,7 @@ static void walk_hfa(const PirModule *mod, const PirTargetSpec *target,
         uint32_t max_cnt = 0u;
         bool has_any = false;
         for (uint32_t i = 0u; i < agg->field_count && w->valid; ++i) {
-            if (is_pad_only_agg(mod, agg->fields[i])) continue;
+            if (pir_abi_is_pad_only_agg(mod, agg->fields[i])) continue;
             has_any = true;
             HfaWalk mw = { true, false, pir_type_scalar(PIR_SCALAR_VOID), 0u };
             walk_hfa(mod, target, agg->fields[i], base_off, &mw);
@@ -149,7 +124,7 @@ static void classify_aapcs64_agg(const PirModule *mod, const PirTargetSpec *targ
                                  PirType agg_ty, PirAbiArgInfo *out) {
     memset(out, 0, sizeof(*out));
     PirTypeLayout ly = pir_type_layout(mod, target, agg_ty);
-    if (ly.size == 0u || is_pad_only_agg(mod, agg_ty)) {
+    if (ly.size == 0u || pir_abi_is_pad_only_agg(mod, agg_ty)) {
         out->kind      = PIR_ABI_DIRECT;
         out->reg_count = 0u;
         out->gp_used   = 0u;
@@ -192,8 +167,10 @@ bool pir_abi_aapcs64_param(const PirModule *mod, const PirTargetSpec *target,
     memset(out, 0, sizeof(*out));
     if (pd->abi_kind == PIR_PARAM_BYVAL) {
         classify_aapcs64_agg(mod, target, pd->abi_type, out);
-        uint32_t nat_al = natural_agg_align(mod, target, pd->abi_type);
+        PirTypeLayout agg_ly = pir_type_layout(mod, target, pd->abi_type);
+        uint32_t nat_al  = pir_abi_natural_align(mod, target, pd->abi_type);
         uint32_t nsaa_al = (nat_al > 16u) ? 16u : ((nat_al > 8u) ? nat_al : 8u);
+        uint32_t dar_al  = (agg_ly.align > 16u) ? 16u : ((agg_ly.align > 8u) ? agg_ly.align : 8u);
         if (out->kind == PIR_ABI_DIRECT) {
             if (out->fp_used > 0u) {
                 if (st->fp_used + out->fp_used > 8u) {
@@ -204,7 +181,7 @@ bool pir_abi_aapcs64_param(const PirModule *mod, const PirTargetSpec *target,
                     PirTypeLayout bl = pir_type_layout(mod, target, out->regs[0]);
                     out->pad_fp_before = (st->fp_used < 8u) ? (8u - st->fp_used) : 0u;
                     st->fp_used = 8u;
-                    out->stack_align = (target->os == PIR_OS_MACOS) ? bl.align : nsaa_al;
+                    out->stack_align = (target->os == PIR_OS_MACOS) ? bl.align : dar_al;
                     if (target->os != PIR_OS_MACOS &&
                         out->regs[0].kind == PIR_TYPE_SCALAR &&
                         out->regs[0].u.scalar == PIR_SCALAR_F32 &&
@@ -232,12 +209,13 @@ bool pir_abi_aapcs64_param(const PirModule *mod, const PirTargetSpec *target,
                     st->gp_used++;
                 }
                 if (st->gp_used + out->gp_used > 8u) {
-                    /* AAPCS64 all-or-nothing spill: consume remaining GP regs and pass by value on stack. */
+                    /* AAPCS64 all-or-nothing spill: consume remaining GP regs and pass by value on stack.
+                     * Darwin ARM64 aligns spilled non-HFA composites to effective align (clamped [8, 16]). */
                     if (st->gp_used < 8u) {
                         out->pad_gp_before += 8u - st->gp_used;
                     }
                     st->gp_used = 8u;
-                    out->stack_align = nsaa_al;
+                    out->stack_align = (target->os == PIR_OS_MACOS) ? dar_al : nsaa_al;
                 } else {
                     st->gp_used += out->gp_used;
                 }
@@ -268,7 +246,14 @@ bool pir_abi_aapcs64_param(const PirModule *mod, const PirTargetSpec *target,
             }
             out->stack_align = 16u;
         }
-    } else if (pir_type_is_float(pd->type) || pd->type.kind == PIR_TYPE_VECTOR) {
+    } else if (pd->type.kind == PIR_TYPE_VECTOR) {
+        uint32_t vgp = 0u, vfp = 0u;
+        pir_abi_vec_param_regs(target, pd->type.u.vec, &vgp, &vfp);
+        out->gp_used = vgp;
+        out->fp_used = vfp;
+        if (vgp > 0u) st->gp_used = (st->gp_used + vgp < 8u) ? (st->gp_used + vgp) : 8u;
+        if (vfp > 0u) st->fp_used = (st->fp_used + vfp < 8u) ? (st->fp_used + vfp) : 8u;
+    } else if (pir_type_is_float(pd->type)) {
         out->fp_used = 1u;
         if (st->fp_used < 8u) st->fp_used++;
     } else {

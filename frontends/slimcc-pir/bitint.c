@@ -143,13 +143,21 @@ void eval_bitint_shr(int32_t bits, BitBuf *src, BitBuf *dst, int32_t amount,
 
 void *eval_bitint_bitfield_load(int32_t bits, BitBuf *src, BitBuf *dst, int32_t width,
                                 int32_t ofs, bool is_unsigned) {
-  int32_t sz = (bits + 7) / 8;
+  int32_t need_bits = bits > (width + ofs) ? bits : (width + ofs);
+  int32_t cnt = (need_bits + 63) / 64;
+  int32_t full_bits = cnt * 64;
+  int32_t fp_bytes = (width + ofs + 7) / 8;
+  int32_t dst_cnt = (bits + 63) / 64;
 
-  for (int32_t i = 0; i < sz; i++)
-    (&dst->as8)[i] = (&src->as8)[i];
+  BitBuf *tmp = calloc((size_t)cnt, sizeof(BitBuf));
+  for (int32_t i = 0; i < fp_bytes; i++)
+    (&tmp->as8)[i] = (&src->as8)[i];
 
-  eval_bitint_shl(bits, dst, dst, bits - width - ofs);
-  eval_bitint_shr(bits, dst, dst, bits - width, is_unsigned);
+  eval_bitint_shl(full_bits, tmp, tmp, full_bits - width - ofs);
+  eval_bitint_shr(full_bits, tmp, tmp, full_bits - width, is_unsigned);
+  for (int32_t i = 0; i < dst_cnt; i++)
+    (&dst->as64)[i] = (&tmp->as64)[i];
+  free(tmp);
   return src;
 }
 

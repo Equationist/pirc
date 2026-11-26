@@ -33,9 +33,16 @@ bool pir_abi_win64_param(const PirModule *mod, const PirTargetSpec *target,
     if (pd->abi_kind == PIR_PARAM_BYVAL) {
         classify_win64_agg(mod, target, pd->abi_type, out);
     } else {
-        out->kind      = PIR_ABI_DIRECT;
-        out->reg_count = 1u;
-        out->regs[0]   = pd->type;
+        PirTypeLayout ly = pir_type_layout(mod, target, pd->type);
+        if (ly.size > 8u) {
+            /* Win64 passes values > 8 bytes (i128, v128, v256) indirectly via hidden pointer. */
+            out->kind    = PIR_ABI_INDIRECT;
+            out->gp_used = 1u;
+        } else {
+            out->kind      = PIR_ABI_DIRECT;
+            out->reg_count = 1u;
+            out->regs[0]   = pd->type;
+        }
     }
     /* Win64 consumes 1 unified slot per argument (rcx/xmm0, rdx/xmm1, r8/xmm2, r9/xmm3). */
     if (st->gp_used < 4u) st->gp_used++;

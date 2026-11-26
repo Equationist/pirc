@@ -184,6 +184,20 @@ Type *tyof_unqual(Type *ty) {
   return ty;
 }
 
+static void apply_atomic_size_align(Type *ret) {
+  if ((ret->qual & Q_ATOMIC) && ret->size > 0) {
+    if (ret->size == 3)
+      ret->size = 4;
+    else if (ret->size >= 5 && ret->size <= 7)
+      ret->size = 8;
+    else if (ret->size >= 9 && ret->size <= 15)
+      ret->size = 16;
+    if ((ret->size == 2 || ret->size == 4 || ret->size == 8 || ret->size == 16) &&
+        ret->align < ret->size)
+      ret->align = (int32_t)ret->size;
+  }
+}
+
 Type *new_derived_type(Type *newty, QualMask qual, Type *ty) {
   if (is_array(ty))
     return copy_array_ty(new_derived_type(NULL, qual, get_elem(ty)), ty);
@@ -197,6 +211,7 @@ Type *new_derived_type(Type *newty, QualMask qual, Type *ty) {
   newty->origin = ty;
   newty->qual = qual;
   newty->align = align;
+  apply_atomic_size_align(newty);
   return newty;
 }
 
@@ -223,12 +238,7 @@ static Type *add_qual2(QualMask msk, Type *ty, Token *tok) {
   if (tok && chk_qual_type(msk, ty))
     error_tok(tok, "invalid qualifier for type");
 
-  Type *ret = new_derived_type(NULL, msk | ty->qual, ty);
-  if ((msk & Q_ATOMIC) &&
-      (ret->size == 2 || ret->size == 4 || ret->size == 8 || ret->size == 16) &&
-      ret->align < ret->size)
-    ret->align = (int32_t)ret->size;
-  return ret;
+  return new_derived_type(NULL, msk | ty->qual, ty);
 }
 
 Type *add_qual(QualMask msk, Type *ty, Token *tok) {
@@ -452,13 +462,38 @@ static bool is_qual_compat(Type *t1, Type *t2) {
   return get_elem(t1)->qual == get_elem(t2)->qual;
 }
 
+typedef struct {
+  Type *a;
+  Type *b;
+} CompatPair;
+
+static CompatPair compat_vis[256];
+static int compat_vis_cnt;
+
 bool is_record_compat(Type *t1, Type *t2, bool is_redecl) {
+  if (t1->origin)
+    t1 = t1->origin;
+  if (t2->origin)
+    t2 = t2->origin;
+  if (t1 == t2)
+    return true;
   if (t1->size < 0 ||
       t2->size < 0 ||
       t1->align != t2->align ||
       t1->is_flexible != t2->is_flexible)
     return false;
 
+  for (int i = 0; i < compat_vis_cnt; i++) {
+    if ((compat_vis[i].a == t1 && compat_vis[i].b == t2) ||
+        (compat_vis[i].a == t2 && compat_vis[i].b == t1))
+      return true;
+  }
+  if (compat_vis_cnt >= 256)
+    return false;
+  int saved_cnt = compat_vis_cnt;
+  compat_vis[compat_vis_cnt++] = (CompatPair){t1, t2};
+
+  bool ok = true;
   Member *mem1 = t1->members;
   Member *mem2 = t2->members;
   while (mem1 && mem2) {
@@ -466,38 +501,54 @@ bool is_record_compat(Type *t1, Type *t2, bool is_redecl) {
         mem1->alt_align != mem2->alt_align ||
         mem1->is_bitfield != mem2->is_bitfield ||
         mem1->bit_offset != mem2->bit_offset ||
-        mem1->bit_width != mem2->bit_width)
-      return false;
+        mem1->bit_width != mem2->bit_width) {
+      ok = false;
+      break;
+    }
 
-    if (!mem1->name != !mem2->name)
-      return false;
-    if (mem1->name && !equal_tok(mem1->name, mem2->name))
-      return false;
+    if (!mem1->name != !mem2->name) {
+      ok = false;
+      break;
+    }
+    if (mem1->name && !equal_tok(mem1->name, mem2->name)) {
+      ok = false;
+      break;
+    }
 
-    Type *t1 = mem1->ty;
-    Type *t2 = mem2->ty;
-    if (t1->kind != t2->kind)
-      return false;
+    Type *m1 = mem1->ty;
+    Type *m2 = mem2->ty;
+    if (m1->kind != m2->kind) {
+      ok = false;
+      break;
+    }
 
-    if (t1->kind == TY_STRUCT || t1->kind == TY_UNION) {
-      if (!mem1->name != !t1->tag ||
-          !mem2->name != !t2->tag ||
-          (t1->tag && !equal_tok(t1->tag, t2->tag)))
-        return false;
-      if (!is_qual_compat(t1, t2) || !is_record_compat(t1, t2, is_redecl))
-        return false;
+    if (m1->kind == TY_STRUCT || m1->kind == TY_UNION) {
+      if (!mem1->name != !m1->tag ||
+          !mem2->name != !m2->tag ||
+          (m1->tag && !equal_tok(m1->tag, m2->tag))) {
+        ok = false;
+        break;
+      }
+      if (!is_qual_compat(m1, m2) || !is_record_compat(m1, m2, is_redecl)) {
+        ok = false;
+        break;
+      }
     } else {
-      if (is_redecl)
-        if (t1->is_enum != t2->is_enum)
-          return false;
+      if (is_redecl && m1->is_enum != m2->is_enum) {
+        ok = false;
+        break;
+      }
 
-      if (!is_compatible2(t1, t2))
-        return false;
+      if (!is_compatible2(m1, m2)) {
+        ok = false;
+        break;
+      }
     }
     mem1 = mem1->next;
     mem2 = mem2->next;
   }
-  return !mem1 == !mem2;
+  compat_vis_cnt = saved_cnt;
+  return ok && (!mem1 == !mem2);
 }
 
 bool is_compatible2(Type *t1, Type *t2) {
@@ -550,9 +601,27 @@ bool is_compatible(Type *t1, Type *t2) {
     if (t1->is_oldstyle || t2->is_oldstyle) {
       if (t1->is_oldstyle && t2->is_oldstyle)
         return true;
+      Type *old = t1->is_oldstyle ? t1 : t2;
       Type *proto = t1->is_oldstyle ? t2 : t1;
       if (proto->is_variadic)
         return false;
+      if (old->is_oldstyle_def) {
+        Obj *po = old->param_list;
+        Obj *pp = proto->param_list;
+        for (; po && pp; po = po->param_next, pp = pp->param_next) {
+          Type *ot = unqual(po->ty);
+          Type *pt = unqual(pp->ty);
+          if ((is_integer(pt) && pt->size < ty_int->size) || pt->kind == TY_FLOAT)
+            return false;
+          if (is_integer(ot) && ot->size < ty_int->size)
+            ot = ty_int;
+          else if (ot->kind == TY_FLOAT)
+            ot = ty_double;
+          if (!is_compatible(ot, pt))
+            return false;
+        }
+        return !po && !pp;
+      }
       for (Obj *p = proto->param_list; p; p = p->param_next) {
         Type *pt = p->ty;
         if ((is_integer(pt) && pt->size < ty_int->size) || pt->kind == TY_FLOAT)
@@ -564,9 +633,12 @@ bool is_compatible(Type *t1, Type *t2) {
       return false;
     Obj *p1 = t1->param_list;
     Obj *p2 = t2->param_list;
-    for (; p1 && p2; p1 = p1->param_next, p2 = p2->param_next)
+    for (; p1 && p2; p1 = p1->param_next, p2 = p2->param_next) {
+      if (!!(p1->ty->qual & Q_ATOMIC) != !!(p2->ty->qual & Q_ATOMIC))
+        return false;
       if (!is_compatible(p1->ty, p2->ty))
         return false;
+    }
     return p1 == NULL && p2 == NULL;
   }
   case TY_STRUCT:
@@ -623,10 +695,14 @@ Type *composite_type(Type *t1, Type *t2) {
       return array_of(base, t1->array_len);
     if (t2->kind == TY_ARRAY && t2->size >= 0)
       return array_of(base, t2->array_len);
-    if (t1->kind == TY_VLA)
-      return vla_of(base, t1->vla_len_expr, t1->array_len);
-    if (t2->kind == TY_VLA)
-      return vla_of(base, t2->vla_len_expr, t2->array_len);
+    if (t1->kind == TY_VLA || t2->kind == TY_VLA) {
+      Type *src = (t2->kind == TY_VLA && (t2->vla_len_val || t2->vla_len_expr)) ? t2
+                : (t1->kind == TY_VLA && (t1->vla_len_val || t1->vla_len_expr)) ? t1
+                : (t1->kind == TY_VLA ? t1 : t2);
+      Type *v = vla_of(base, src->vla_len_expr, src->array_len);
+      v->vla_len_val = src->vla_len_val;
+      return v;
+    }
     return array_of(base, -1);
   }
   if (t1->kind == TY_PTR && t2->kind == TY_PTR) {
@@ -1219,22 +1295,27 @@ void _add_type(Node *node) {
     add_type(node->m.lhs);
     node->ty = pointer_to(ty_void);
     return;
-  case ND_CAS:
+  case ND_CAS: {
     add_type(node->cas.addr);
     add_type(node->cas.old_val);
     add_type(node->cas.new_val);
-    node->cas.new_val = assign_cast(node->cas.addr->ty->base, node->cas.new_val);
+    Type *u_addr = unqual(node->cas.addr->ty->base);
+    Type *u_old = unqual(node->cas.old_val->ty->base);
+    node->cas.new_val = assign_cast(u_addr, node->cas.new_val);
 
-    if (node->cas.addr->ty->base->size != node->cas.old_val->ty->base->size)
+    if (u_addr->size != u_old->size)
       error_tok(node->tok, "argument size match");
     node->ty = ty_bool;
     return;
-  case ND_EXCH:
+  }
+  case ND_EXCH: {
     add_type(node->m.lhs);
     add_type(node->m.rhs);
-    node->m.rhs = assign_cast(node->m.lhs->ty->base, node->m.rhs);
-    node->ty = unqual(node->m.lhs->ty->base);
+    Type *u_lhs = unqual(node->m.lhs->ty->base);
+    node->m.rhs = assign_cast(u_lhs, node->m.rhs);
+    node->ty = u_lhs;
     return;
+  }
   case ND_VA_START:
     add_type(node->m.lhs);
     node->ty = ty_void;

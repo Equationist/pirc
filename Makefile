@@ -22,7 +22,7 @@ LOWER_SRCS    := src/lower/lower.c src/lower/exceptions.c src/lower/varargs.c sr
 OPT_SRCS      := src/opt/opt.c src/opt/inline.c src/opt/simplify_cfg.c src/opt/mem2reg.c src/opt/gvn.c \
                  src/opt/licm.c src/opt/dse.c src/opt/dce.c src/opt/loop_vec.c
 INTERP_SRCS   := src/interp/interp.c src/interp/runtime_shims.c
-BACKEND_SRCS  := src/backend/mir.c src/backend/regalloc.c \
+BACKEND_SRCS  := src/backend/mir.c src/backend/regalloc.c src/backend/asm_common.c \
                  src/backend/arm64/arm64_isel.c src/backend/arm64/arm64_frame.c \
                  src/backend/arm64/arm64_asm.c \
                  src/backend/x64/x64_isel.c src/backend/x64/x64_frame.c \
@@ -33,7 +33,7 @@ HEADERS       := src/common/arena.h src/common/vec.h src/common/diag.h \
                  src/analysis/cfg.h src/analysis/dom.h src/analysis/loops.h src/analysis/alias.h \
                  src/ir/ir.h src/ir/lexer.h src/ir/parser.h src/ir/printer.h src/ir/verify.h \
                  src/lower/lower.h src/opt/opt.h src/interp/interp.h \
-                 src/backend/mir.h src/backend/backend.h
+                 src/backend/mir.h src/backend/backend.h src/backend/asm_common.h
 
 BUILD_DIR   := build
 BIN         := $(BUILD_DIR)/pirc

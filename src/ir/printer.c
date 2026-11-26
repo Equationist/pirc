@@ -151,6 +151,10 @@ void pir_print_type(const PirModule *mod, PirType ty, FILE *out) {
             fputs(vec_name(ty.u.vec), out);
             break;
         case PIR_TYPE_NAMED_AGG: {
+            if (ty.u.agg_id >= mod->agg_types.len) {
+                fputs("@<invalid>", out);
+                break;
+            }
             const PirAggDef *agg = &mod->agg_types.data[ty.u.agg_id];
             if (agg->name) {
                 print_global_sym(agg->name, out);
@@ -338,7 +342,11 @@ static void print_operand(const PirModule *mod, const PirFunction *fn,
                           const PirOperand *op, FILE *out) {
     switch (op->kind) {
         case PIR_OPER_VAL:
-            fprintf(out, "%%%s", fn->values.data[op->u.val].name);
+            if (op->u.val < fn->values.len) {
+                fprintf(out, "%%%s", fn->values.data[op->u.val].name);
+            } else {
+                fprintf(out, "%%<invalid:%u>", op->u.val);
+            }
             break;
         case PIR_OPER_IMM_INT:
             print_u128(op->u.imm_int.hi, op->u.imm_int.lo, op->u.imm_int.is_negative, out);
@@ -368,11 +376,30 @@ static void print_operand(const PirModule *mod, const PirFunction *fn,
             pir_print_type(mod, op->type, out);
         }
     }
+    if (op->call_byval_size > 0u) {
+        fprintf(out, " byval_size %" PRIu64, op->call_byval_size);
+    }
+    if (op->call_byval_align > 0u) {
+        fprintf(out, " byval_align %u", op->call_byval_align);
+    }
+    if (op->call_stack_align > 0u) {
+        fprintf(out, " stack_align %u", op->call_stack_align);
+    }
+    if (op->call_force_stack) {
+        fputs(" force_stack", out);
+    }
+    if (op->call_no_f32_promote) {
+        fputs(" no_f32_promote", out);
+    }
 }
 
 static void print_branch_target(const PirModule *mod, const PirFunction *fn,
                                 const PirBranchTarget *bt, FILE *out) {
-    fprintf(out, ".%s", fn->blocks.data[bt->target].label);
+    if (bt->target < fn->blocks.len) {
+        fprintf(out, ".%s", fn->blocks.data[bt->target].label);
+    } else {
+        fprintf(out, ".<invalid:%u>", bt->target);
+    }
     if (bt->arg_count > 0u) {
         fputc('(', out);
         for (uint32_t i = 0u; i < bt->arg_count; ++i) {
@@ -410,6 +437,18 @@ static void print_param_list(const PirModule *mod, const PirParamDecl *params,
         if (params[i].attrs & PIR_PATTR_READONLY) fputs(" readonly", out);
         if (params[i].attrs & PIR_PATTR_SIGNEXT)  fputs(" signext", out);
         if (params[i].attrs & PIR_PATTR_ZEROEXT)  fputs(" zeroext", out);
+        if (params[i].abi_byval_size > 0u) {
+            fprintf(out, " byval_size %" PRIu64, params[i].abi_byval_size);
+        }
+        if (params[i].abi_byval_align > 0u) {
+            fprintf(out, " byval_align %u", params[i].abi_byval_align);
+        }
+        if (params[i].abi_stack_align > 0u) {
+            fprintf(out, " stack_align %u", params[i].abi_stack_align);
+        }
+        if (params[i].abi_force_stack) {
+            fputs(" force_stack", out);
+        }
     }
     if (is_variadic) {
         if (count > 0u) fputs(", ", out);
@@ -418,16 +457,19 @@ static void print_param_list(const PirModule *mod, const PirParamDecl *params,
     fputc(')', out);
 }
 
-static void print_linkage(PirLinkage l, FILE *out) {
+static void print_linkage(PirLinkage l, bool is_weak_extern, FILE *out) {
     switch (l) {
         case PIR_LINK_INTERNAL: break;
         case PIR_LINK_EXPORT:   fputs("export ", out); break;
-        case PIR_LINK_EXTERN:   fputs("extern ", out); break;
+        case PIR_LINK_EXTERN:
+            fputs(is_weak_extern ? "weak extern " : "extern ", out);
+            break;
         case PIR_LINK_WEAK:     fputs("weak ", out);   break;
     }
 }
 
-static void print_fn_cc_attrs(PirCallingConv cc, uint32_t attrs, const char *sec, FILE *out) {
+static void print_fn_cc_attrs(const PirModule *mod, PirCallingConv cc, uint32_t attrs,
+                              const char *sec, const PirCabiRetInfo *cabi_ret, FILE *out) {
     switch (cc) {
         case PIR_CC_INTERNAL: break;
         case PIR_CC_C:        fputs(" cc \"c\"", out); break;
@@ -441,6 +483,27 @@ static void print_fn_cc_attrs(PirCallingConv cc, uint32_t attrs, const char *sec
     if (attrs & PIR_FATTR_READONLY)    fputs(" readonly", out);
     if (attrs & PIR_FATTR_RET_SIGNEXT) fputs(" signext", out);
     if (attrs & PIR_FATTR_RET_ZEROEXT) fputs(" zeroext", out);
+    if (cabi_ret) {
+        switch (cabi_ret->kind) {
+            case PIR_CABI_RET_NONE:
+                break;
+            case PIR_CABI_RET_SRET_X8:
+                fputs(" sret_x8", out);
+                break;
+            case PIR_CABI_RET_SRET_RAX:
+                fputs(" sret_rax", out);
+                break;
+            case PIR_CABI_RET_MULTI_REG:
+                fputs(" multi_ret(", out);
+                for (uint32_t r = 0u; r < cabi_ret->reg_count && r < 4u; ++r) {
+                    if (r > 0u) fputs(", ", out);
+                    pir_print_type(mod, cabi_ret->regs[r], out);
+                }
+                fprintf(out, ", size %" PRIu64 ", align %u)",
+                        cabi_ret->agg_size, cabi_ret->agg_align);
+                break;
+        }
+    }
 }
 
 static void print_global_item(const PirGlobalItem *it, PirType hint_ty, FILE *out) {
@@ -449,7 +512,7 @@ static void print_global_item(const PirGlobalItem *it, PirType hint_ty, FILE *ou
             print_escaped_string(it->bytes, (size_t)it->len, out);
             break;
         case PIR_GITEM_ZERO:
-            if (it->len > 1u) {
+            if (it->len > 0u) {
                 fprintf(out, "zeroinit %" PRIu64, it->len);
             } else {
                 fputs("zeroinit", out);
@@ -834,14 +897,14 @@ void pir_print_module(const PirModule *mod, FILE *out) {
         print_param_list(mod, s->params, s->param_count, s->is_variadic, out);
         fputs(" -> ", out);
         pir_print_type(mod, s->ret_type, out);
-        print_fn_cc_attrs(s->cc, s->attrs, NULL, out);
+        print_fn_cc_attrs(mod, s->cc, s->attrs, NULL, &s->cabi_ret, out);
         fputc('\n', out);
     }
 
     if (mod->globals.len > 0u) fputc('\n', out);
     for (uint32_t i = 0u; i < mod->globals.len; ++i) {
         const PirGlobal *g = &mod->globals.data[i];
-        print_linkage(g->linkage, out);
+        print_linkage(g->linkage, g->is_weak_extern, out);
         print_global_sym(g->name, out);
         fputs(" = ", out);
         switch (g->seg) {
@@ -888,13 +951,13 @@ void pir_print_module(const PirModule *mod, FILE *out) {
     for (uint32_t i = 0u; i < mod->funcs.len; ++i) {
         const PirFunction *fn = &mod->funcs.data[i];
         fputc('\n', out);
-        print_linkage(fn->linkage, out);
+        print_linkage(fn->linkage, fn->is_weak_extern, out);
         fputs("func ", out);
         print_global_sym(fn->name, out);
         print_param_list(mod, fn->params, fn->param_count, fn->is_variadic, out);
         fputs(" -> ", out);
         pir_print_type(mod, fn->ret_type, out);
-        print_fn_cc_attrs(fn->cc, fn->attrs, fn->section, out);
+        print_fn_cc_attrs(mod, fn->cc, fn->attrs, fn->section, &fn->cabi_ret, out);
         if (!fn->is_defined) {
             fputc('\n', out);
             continue;
