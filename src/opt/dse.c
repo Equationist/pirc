@@ -180,6 +180,8 @@ static void inline_small_mem_calls(PirModule *mod, PirFunction *fn, const PirTar
             uint64_t total = 0u;
             bool is_mem = (copy.op == PIR_OP_CALL && copy.operand_count == 4u &&
                            copy.results[1] == PIR_INVALID_ID &&
+                           (copy.results[0] == PIR_INVALID_ID ||
+                            pir_type_eq(fn->values.data[copy.results[0]].type, ptr_ty)) &&
                            copy.operands[0].kind == PIR_OPER_SYM && copy.operands[0].u.sym.name &&
                            (strcmp(copy.operands[0].u.sym.name, "memcpy") == 0 ||
                             strcmp(copy.operands[0].u.sym.name, "memmove") == 0) &&
@@ -386,6 +388,16 @@ static void dse_walk_block(DseCtx *ctx, PirBlockId b, const ActiveLoadVec *paren
             } else if (is_mem_barrier(ins->op) && !is_pure_math_call(ctx->mod, ins)) {
                 active.len = 0u;
                 loads.len  = 0u;
+            } else if (ins->op == PIR_OP_TRAP ||
+                       (ins->flags & (PIR_FLAG_TRAP | PIR_FLAG_TRAP_S | PIR_FLAG_TRAP_U)) != 0u ||
+                       ((ins->op == PIR_OP_DIV_S || ins->op == PIR_OP_DIV_U ||
+                         ins->op == PIR_OP_REM_S || ins->op == PIR_OP_REM_U) &&
+                        (ins->flags & PIR_FLAG_UNSAFE) == 0u)) {
+                /* Deterministic traps may be observed by signal/trap handlers; do not delete
+                 * preceding stores that must be visible before the trap fires. */
+                for (uint32_t k = 0u; k < active.len; ++k) {
+                    active.data[k].observed = true;
+                }
             }
         }
 

@@ -457,7 +457,8 @@ static bool eval_fpto_int_lane(PirInterp *it, PirOpcode op, uint32_t flags,
     double hi_lim = is_signed ?  (double)((uint64_t)1u << (dst_bits - 1u))
                               : (dst_bits == 64u ? 18446744073709551616.0
                                                  : (double)((uint64_t)1u << dst_bits));
-    bool bad = isnan(d) || isinf(d) || d < lo_lim || d >= hi_lim;
+    double td = trunc(d);
+    bool bad = isnan(d) || isinf(d) || td < lo_lim || td >= hi_lim;
     if (bad) {
         if (flags & PIR_FLAG_TRAP) {
             pir_interp_fail(it, PIR_INTERP_TRAP, "float-to-int out of range or NaN");
@@ -990,8 +991,13 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                     PirScalarType ds = is_vec ? pir_vec_elem_scalar(inst->ty.u.vec) : inst->ty.u.scalar;
                     for (uint32_t l = 0u; l < lanes; ++l) {
                         uint64_t uv = read_lane_u64(&src, l, sb);
-                        double dv = (inst->op == PIR_OP_SITOFP) ? (double)sext_u64(uv, sb) : (double)uv;
-                        write_lane_f64(&r0, l, ds, dv);
+                        if (ds == PIR_SCALAR_F32) {
+                            float fv = (inst->op == PIR_OP_SITOFP) ? (float)sext_u64(uv, sb) : (float)uv;
+                            memcpy(r0.bytes + l * 4u, &fv, 4u);
+                        } else {
+                            double dv = (inst->op == PIR_OP_SITOFP) ? (double)sext_u64(uv, sb) : (double)uv;
+                            write_lane_f64(&r0, l, ds, dv);
+                        }
                     }
                     break;
                 }
@@ -1306,7 +1312,7 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                     const PirBranchTarget *chosen = &inst->targets[0];
                     for (uint32_t c = 0u; c < inst->switch_case_count; ++c) {
                         uint64_t cv = inst->switch_cases[c].is_negative
-                                      ? (uint64_t)(-(int64_t)inst->switch_cases[c].case_lo)
+                                      ? (UINT64_C(0) - inst->switch_cases[c].case_lo)
                                       : inst->switch_cases[c].case_lo;
                         if ((cv & width_mask(bits)) == val) {
                             chosen = &inst->switch_cases[c].target;
@@ -1435,7 +1441,7 @@ static bool init_globals(PirInterp *it) {
             const PirGlobalItem *gi = &g->items[0];
             size_t sz = type_byte_size(g->type, it->ptr_bytes);
             if (gi->kind == PIR_GITEM_INT) {
-                uint64_t x = gi->int_neg ? (uint64_t)(-(int64_t)gi->int_lo) : gi->int_lo;
+                uint64_t x = gi->int_neg ? (UINT64_C(0) - gi->int_lo) : gi->int_lo;
                 if (g->type.kind == PIR_TYPE_SCALAR && g->type.u.scalar == PIR_SCALAR_PTR) {
                     pir_interp_mem_write_ptr(it, base, pir_interp_int_to_ptr(it, x), 1u);
                 } else {
@@ -1471,7 +1477,7 @@ static bool init_globals(PirInterp *it) {
                         off += (size_t)(gi->len ? gi->len : 1u);
                         break;
                     case PIR_GITEM_INT: {
-                        uint8_t b = (uint8_t)(gi->int_neg ? (uint64_t)(-(int64_t)gi->int_lo) : gi->int_lo);
+                        uint8_t b = (uint8_t)(gi->int_neg ? (UINT64_C(0) - gi->int_lo) : gi->int_lo);
                         pir_interp_mem_write(it, dst, &b, 1u, 1u);
                         off += 1u;
                         break;

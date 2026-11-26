@@ -155,14 +155,18 @@ typedef enum {
 typedef enum {
     PIR_PATTR_NONE     = 0u,
     PIR_PATTR_NOALIAS  = 1u << 0,
-    PIR_PATTR_READONLY = 1u << 1
+    PIR_PATTR_READONLY = 1u << 1,
+    PIR_PATTR_SIGNEXT  = 1u << 2,
+    PIR_PATTR_ZEROEXT  = 1u << 3
 } PirParamAttrs;
 
 typedef enum {
-    PIR_FATTR_NONE     = 0u,
-    PIR_FATTR_NOUNWIND = 1u << 0,
-    PIR_FATTR_NORETURN = 1u << 1,
-    PIR_FATTR_READONLY = 1u << 2
+    PIR_FATTR_NONE        = 0u,
+    PIR_FATTR_NOUNWIND    = 1u << 0,
+    PIR_FATTR_NORETURN    = 1u << 1,
+    PIR_FATTR_READONLY    = 1u << 2,
+    PIR_FATTR_RET_SIGNEXT = 1u << 3,
+    PIR_FATTR_RET_ZEROEXT = 1u << 4
 } PirFuncAttrs;
 
 typedef struct {

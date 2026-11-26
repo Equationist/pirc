@@ -334,10 +334,16 @@ static Token *new_num_token(int64_t val, Token *orig, Token *nxt) {
 
 static char *quote_string(const char *str) {
   size_t len = strlen(str);
-  char *buf = arena_malloc(&cc1_arena, len + 3);
-  memcpy(buf + 1, str, len);
-  buf[0] = buf[len + 1] = '"';
-  buf[len + 2] = '\0';
+  char *buf = arena_malloc(&cc1_arena, len * 2 + 3);
+  char *q = buf;
+  *q++ = '"';
+  for (size_t i = 0; i < len; i++) {
+    if (str[i] == '\\' || str[i] == '"')
+      *q++ = '\\';
+    *q++ = str[i];
+  }
+  *q++ = '"';
+  *q = '\0';
   return buf;
 }
 
@@ -355,6 +361,12 @@ static Token *read_pp_const_expr(Token *tok) {
   for (; tok->kind != TK_EOF; pop_macro_lock(tok)) {
     if (tok->kind == TK_IDENT && !tok->dont_expand) {
       Macro *m = hashmap_get2(&macros, tok->loc, tok->len);
+      if (m && m->handler == &pragma_macro) {
+        tok = m->handler(tok)->next;
+        while (!tok->at_bol)
+          tok = tok->next;
+        continue;
+      }
       if (m && expand_macro(&tok, tok, m, false))
         continue;
     }
@@ -371,6 +383,7 @@ static Token *read_pp_const_expr(Token *tok) {
         tok = tok->next;
         if (has_paren)
           tok = skip_tk(tok, TK_RPAREN);
+        pop_macro_lock_until(start->next, tok);
         continue;
       }
       to_pp_eval_int(tok, equal(tok, "true") && opt_std >= STD_C23);
@@ -452,17 +465,31 @@ void add_macro_param(Token **cur, Token *params, Token *tok) {
   (*cur) = (*cur)->next = tok;
 }
 
+static bool is_predefined_macro_name(Token *tok) {
+  return equal(tok, "__LINE__") || equal(tok, "__FILE__") ||
+         equal(tok, "__DATE__") || equal(tok, "__TIME__") ||
+         equal(tok, "__STDC__") || equal(tok, "__STDC_VERSION__") ||
+         equal(tok, "__STDC_HOSTED__");
+}
+
 static Macro *new_funclike_macro(char *name, Token **rest, Token *tok) {
   Token head = {0};
   Token *cur = &head;
   Macro *m = new_macro(name, false);
 
   while (!consume_tk(rest, tok, TK_RPAREN)) {
-    if (m->arg_cnt++)
+    if (tok->at_bol || tok->kind == TK_EOF)
+      error_tok(tok, "unterminated macro parameter list");
+    if (m->arg_cnt++) {
       tok = skip_tk(tok, TK_COMMA);
+      if (tok->at_bol || tok->kind == TK_EOF)
+        error_tok(tok, "unterminated macro parameter list");
+    }
 
     if (tok->kind != TK_IDENT) {
       tok = skip_tk(tok, TK_DOT3);
+      if (tok->at_bol)
+        error_tok(tok, "unterminated macro parameter list");
       *rest = skip_tk(tok, TK_RPAREN);
       static Token va_args = {.loc = "__VA_ARGS__", .len = 11};
       add_macro_param(&cur, head.next, &va_args);
@@ -470,6 +497,10 @@ static Macro *new_funclike_macro(char *name, Token **rest, Token *tok) {
       break;
     }
     if (tok->next->kind == TK_DOT3) {
+      if (is_iso_std && !tok->file->is_syshdr)
+        error_tok(tok, "named variadic macros are a GNU extension");
+      if (tok->next->next->at_bol)
+        error_tok(tok->next->next, "unterminated macro parameter list");
       *rest = skip_tk(tok->next->next, TK_RPAREN);
       add_macro_param(&cur, head.next, tok);
       m->has_va_arg = true;
@@ -486,13 +517,17 @@ static Macro *new_funclike_macro(char *name, Token **rest, Token *tok) {
 static Macro *read_macro_name(Token **rest, Token *tok) {
   if (tok->kind != TK_IDENT)
     error_tok(tok, "macro name must be an identifier");
-  if (is_iso_std && equal(tok, "defined") && !tok->file->is_syshdr)
-    error_tok(tok, "'defined' cannot be used as a macro name");
+  if (is_iso_std && !tok->file->is_syshdr) {
+    if (equal(tok, "defined"))
+      error_tok(tok, "'defined' cannot be used as a macro name");
+    if (is_predefined_macro_name(tok))
+      error_tok(tok, "redefining predefined macro '%.*s'", tok->len, tok->loc);
+  }
   char *name = arena_copy_string(&pp_arena, tok->loc, tok->len);
   tok = tok->next;
 
   Macro *m;
-  if (!tok->has_space && tok->kind == TK_LPAREN)
+  if (!tok->at_bol && !tok->has_space && tok->kind == TK_LPAREN)
     m = new_funclike_macro(name, &tok, tok->next);
   else
     m = new_macro(name, true);
@@ -555,6 +590,8 @@ static void chk_macro_hash(Macro *m) {
 }
 
 static void read_macro_definition(Token **rest, Token *tok) {
+  if (tok->at_bol)
+    error_tok(tok, "macro name must be an identifier");
   Token *name_tok = tok;
   Macro *old = (name_tok->kind == TK_IDENT)
                    ? hashmap_get2(&macros, name_tok->loc, name_tok->len)
@@ -565,10 +602,20 @@ static void read_macro_definition(Token **rest, Token *tok) {
 
   chk_macro_startend(m->body, last);
   chk_macro_hash(m);
-  if (is_iso_std && old && !old->handler && !name_tok->file->is_syshdr &&
-      !(old->body && old->body->file && old->body->file->is_placeholder) &&
-      !macros_identical(old, m))
-    error_tok(name_tok, "macro '%.*s' redefined", name_tok->len, name_tok->loc);
+  if (is_iso_std && !name_tok->file->is_syshdr) {
+    if (m->is_objlike && m->body->kind != TK_EOF && !m->body->has_space)
+      error_tok(m->body, "ISO C requires whitespace after the macro name");
+    if (!m->has_va_arg) {
+      for (Token *t = m->body; t && t->kind != TK_EOF; t = t->next) {
+        if (t->kind == TK_IDENT && equal(t, "__VA_ARGS__"))
+          error_tok(t, "'__VA_ARGS__' can only appear in the expansion of a variadic macro");
+      }
+    }
+    if (old && !old->handler &&
+        !(old->body && old->body->file && !strcmp(old->body->file->name, "<built-in>")) &&
+        !macros_identical(old, m))
+      error_tok(name_tok, "macro '%.*s' redefined", name_tok->len, name_tok->loc);
+  }
 }
 
 static void read_macro_definition2(Token **rest, Token *tok) {
@@ -834,6 +881,8 @@ static Token *subst(Token *tok, MacroContext *ctx) {
     if (tok->kind == TK_COMMA && tok->next->kind == TK_HASH2 && ctx->m->has_va_arg) {
       MacroArg *arg = find_arg(NULL, tok->next->next, ctx);
       if (arg && (arg == &ctx->args[ctx->m->arg_cnt - 1])) {
+        if (is_iso_std && !tok->file->is_syshdr)
+          error_tok(tok, "GNU ', ## __VA_ARGS__' extension is not allowed in ISO C");
         if (ctx->omit_comma) {
           tok = tok->next->next->next;
           continue;
@@ -846,19 +895,28 @@ static Token *subst(Token *tok, MacroContext *ctx) {
 
     if (consume_tk(&tok, tok, TK_HASH2)) {
       if (cur->kind == TK_PMARK) {
+        bool sp = cur->has_space;
         if (tok->kind == TK_HASH) {
           cur = cur->next = stringize(&tok, tok, ctx);
+          cur->has_space |= sp;
           continue;
         }
         MacroArg *arg = find_arg(&tok, tok, ctx);
         if (arg) {
           if (arg->tok->kind == TK_EOF)
             continue;
-          for (Token *t = arg->tok; t->kind != TK_EOF; t = t->next)
+          bool first_t = true;
+          for (Token *t = arg->tok; t->kind != TK_EOF; t = t->next) {
             cur = cur->next = copy_token(t);
+            if (first_t) {
+              cur->has_space |= sp;
+              first_t = false;
+            }
+          }
           continue;
         }
         cur = cur->next = copy_token(tok);
+        cur->has_space |= sp;
         tok = tok->next;
         continue;
       }
@@ -1353,6 +1411,8 @@ static void read_line_marker(Token **rest, Token *tok, bool is_line_dir) {
 
   if (tok->kind != TK_STR)
     error_tok(tok, "filename expected");
+  if (is_iso_std && is_line_dir && tok->loc[0] != '"' && !start->file->is_syshdr)
+    error_tok(tok, "invalid filename in #line directive");
 
   if (is_iso_std && is_line_dir && tok->next->kind != TK_EOF && !start->file->is_syshdr)
     error_tok(tok->next, "extra tokens at end of #line directive");
@@ -1422,6 +1482,8 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
   Token *tok = start->next;
 
   if (equal(tok, "embed")) {
+    if (is_iso_std && opt_std < STD_C23 && !start->file->is_syshdr)
+      error_tok(tok, "'#embed' is a C23 extension");
     Token *file_tok = tok->next;
     Token *cont;
     const char *dir = NULL;
@@ -1462,16 +1524,22 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
   }
 
   if (equal(tok, "def")) {
+    if (is_iso_std && !start->file->is_syshdr)
+      error_tok(tok, "'#def' is not a standard preprocessor directive");
     read_macro_definition2(&tok, tok->next);
     return tok;
   }
 
   if (equal(tok, "undef")) {
     tok = tok->next;
-    if (tok->kind != TK_IDENT)
+    if (tok->at_bol || tok->kind != TK_IDENT)
       error_tok(tok, "macro name must be an identifier");
-    if (is_iso_std && equal(tok, "defined") && !tok->file->is_syshdr)
-      error_tok(tok, "'defined' cannot be used as a macro name");
+    if (is_iso_std && !tok->file->is_syshdr) {
+      if (equal(tok, "defined"))
+        error_tok(tok, "'defined' cannot be used as a macro name");
+      if (is_predefined_macro_name(tok))
+        error_tok(tok, "undefining predefined macro '%.*s'", tok->len, tok->loc);
+    }
     undef_macro2(tok);
     return skip_line(tok->next);
   }
@@ -1485,6 +1553,8 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
   }
 
   if (equal(tok, "ifdef")) {
+    if (tok->next->at_bol)
+      error_tok(tok, "expected an identifier");
     bool active = has_macro(tok->next);
     push_cond_incl(tok, active);
     tok = skip_line(tok->next->next);
@@ -1494,6 +1564,8 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
   }
 
   if (equal(tok, "ifndef")) {
+    if (tok->next->at_bol)
+      error_tok(tok, "expected an identifier");
     bool active = !has_macro(tok->next);
     push_cond_incl(tok, active);
     tok = skip_line(tok->next->next);
@@ -1516,6 +1588,8 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
   }
 
   if (equal(tok, "elifdef")) {
+    if (is_iso_std && opt_std < STD_C23 && !start->file->is_syshdr)
+      error_tok(tok, "'#elifdef' is a C23 extension");
     CondIncl *cond;
     if (!get_cond_incl(&cond) || cond->is_else)
       error_tok(start, "stray #elifdef");
@@ -1529,6 +1603,8 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
   }
 
   if (equal(tok, "elifndef")) {
+    if (is_iso_std && opt_std < STD_C23 && !start->file->is_syshdr)
+      error_tok(tok, "'#elifndef' is a C23 extension");
     CondIncl *cond;
     if (!get_cond_incl(&cond) || cond->is_else)
       error_tok(start, "stray #elifndef");
@@ -1584,6 +1660,8 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
     error_tok(tok, "error");
 
   if (equal(tok, "warning")) {
+    if (is_iso_std && opt_std < STD_C23 && !start->file->is_syshdr)
+      error_tok(tok, "'#warning' is a C23 extension");
     warn_tok(tok, "warning");
     do {
       tok = tok->next;
@@ -1615,7 +1693,6 @@ void define_macro_cli(const char *str) {
   static File file = {.name = "<command-line>", .is_placeholder = true};
   file.contents = str;
   Token *tok = tokenize(&file, NULL, NULL);
-  file.contents = NULL;
 
   Macro *m = read_macro_name(&tok, tok);
 
@@ -1637,6 +1714,9 @@ void define_macro_cli(const char *str) {
   }
   cur->next = tok;
   m->body = head.next;
+  chk_macro_startend(m->body, cur);
+  chk_macro_hash(m);
+  file.contents = NULL;
 }
 
 void define_macro(const char *name, const char *buf) {
@@ -1778,7 +1858,10 @@ static Token *pragma_macro(Token *start) {
   }
   const char *s = str_tok->loc;
   const char *e = s + str_tok->len;
-  if (s < e && *s == 'L') s++;
+  if (s + 1 < e && s[0] == 'u' && s[1] == '8')
+    s += 2;
+  else if (s < e && (*s == 'L' || *s == 'u' || *s == 'U'))
+    s++;
   if (s < e && *s == '"') s++;
   if (e > s && e[-1] == '"') e--;
   char *buf = arena_malloc(&cc1_arena, (size_t)(e - s) + 16);
@@ -2198,10 +2281,27 @@ static Token *preprocess3(Token *tok) {
 
     if (Is_hash(tok) && consume(&tok, tok->next, "pragma")) {
       if (equal(tok, "pack")) {
+        Token *lp = tok->next;
+        Token *end = NULL;
+        if (!lp->at_bol && lp->kind == TK_LPAREN) {
+          int lvl = 1;
+          for (Token *t = lp->next; !t->at_bol && t->kind != TK_EOF; t = t->next) {
+            if (t->kind == TK_LPAREN)
+              lvl++;
+            else if (t->kind == TK_RPAREN && --lvl == 0) {
+              end = t->next;
+              break;
+            }
+          }
+        }
+        if (!end) {
+          warn_tok(tok, "malformed #pragma pack");
+          tok = free_line(start, tok);
+          continue;
+        }
         tok->kind = TK_PRAGMA;
         tok->at_bol = true;
 
-        Token *end = skip_paren(skip_tk(tok->next, TK_LPAREN));
         for (Token *t = tok; t != end; t = t->next) {
           t->attr_next = NULL;
           cur = cur->next = t;

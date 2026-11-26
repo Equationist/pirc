@@ -689,6 +689,8 @@ Type *array_type(Type *base) {
 
 void array_setty(Type *ty, Type *base, int64_t len) {
   ty->kind = TY_ARRAY;
+  if (base->size > 0 && len > INT64_MAX / base->size)
+    error("array size is too large");
   ty->size = base->size * len;
   ty->align = base->align;
   ty->array_len = len;
@@ -884,7 +886,8 @@ static Type *cond_ptr_conv(Node **lhs, Node **rhs, Node **cond) {
       return pointer_to(add_qual(ty1->base->qual | ty2->base->qual, ty_void, NULL));
     }
 
-    if (is_compatible(ty1->base, ty2->base))
+    if (is_compatible(ty1->base, ty2->base) &&
+        (!is_iso_std || (ty1->base->qual & Q_ATOMIC) == (ty2->base->qual & Q_ATOMIC)))
       return pointer_to(cond_ptr_conv2(ty1->base, ty2->base, cond, &(Obj *){0}));
 
     if (is_iso_std)
@@ -1041,12 +1044,14 @@ void _add_type(Node *node) {
         bool lfn = (lb->kind == TY_FUNC || lb->kind == TY_FUNC_INCMP);
         bool rfn = (rb->kind == TY_FUNC || rb->kind == TY_FUNC_INCMP);
         if (is_rel) {
-          if (lfn || rfn || !is_compatible(lb, rb))
+          if (lfn || rfn || !is_compatible(lb, rb) ||
+              (lb->qual & Q_ATOMIC) != (rb->qual & Q_ATOMIC))
             error_tok(node->tok, "invalid relational pointer comparison");
         } else if (!is_null_ptr_constant(node->m.lhs) &&
                    !is_null_ptr_constant(node->m.rhs)) {
           bool void_obj = (lb->kind == TY_VOID && !rfn) || (rb->kind == TY_VOID && !lfn);
-          if (!void_obj && !is_compatible(lb, rb))
+          if (!void_obj && (!is_compatible(lb, rb) ||
+                            (lb->qual & Q_ATOMIC) != (rb->qual & Q_ATOMIC)))
             error_tok(node->tok, "comparison of distinct pointer types");
         }
       }
@@ -1124,8 +1129,13 @@ void _add_type(Node *node) {
     return;
   case ND_COMMA:
     add_type(node->m.lhs);
-    add_type(node->m.rhs);
-    node->ty = unqual(ptr_decay(node->m.rhs->ty));
+    if (is_iso_std) {
+      ptr_convert(&node->m.rhs);
+      node->ty = unqual(node->m.rhs->ty);
+    } else {
+      add_type(node->m.rhs);
+      node->ty = unqual(ptr_decay(node->m.rhs->ty));
+    }
     return;
   case ND_MEMBER:
     add_type(node->m.lhs);
@@ -1217,6 +1227,8 @@ void _add_type(Node *node) {
   }
   case ND_POST_INCDEC:
   case ND_ARITH_ASSIGN: {
+    add_type(node->m.lhs);
+    add_type(node->m.rhs);
     node->ty = unqual(node->m.lhs->ty);
     return;
   }

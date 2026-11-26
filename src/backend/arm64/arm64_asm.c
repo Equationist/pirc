@@ -21,6 +21,7 @@ typedef struct {
     const PirTargetSpec *target;
     uint32_t             local_seq; /* Unique counter for LL/SC loop labels */
     const uint32_t      *blk_redir; /* Empty jump-only trampoline redirection */
+    bool                 need_branch_relax; /* Relax 19-bit b.cond/cbz/cbnz when fn > 512 KiB */
 } A64AsmCtx;
 
 static uint32_t redir_blk(const A64AsmCtx *ctx, uint32_t bid) {
@@ -825,17 +826,32 @@ static void emit_inst(A64AsmCtx *ctx, const MFunc *mf, const MInst *ins) {
             fprintf(out, "\tb %sBB%u_%u\n", lp, mf->fn_index, redir_blk(ctx, ins->ops[0].u.block_id));
             return;
 
-        case MI_A64_BCOND:
-            fprintf(out, "\tb.%s %sBB%u_%u\n", cond_str(ins->ops[0].u.cond),
-                    lp, mf->fn_index, redir_blk(ctx, ins->ops[1].u.block_id));
+        case MI_A64_BCOND: {
+            uint32_t dst_b = redir_blk(ctx, ins->ops[1].u.block_id);
+            if (ctx->need_branch_relax) {
+                fprintf(out, "\tb.%s .+8\n\tb %sBB%u_%u\n",
+                        cond_str(invert_cond(ins->ops[0].u.cond)), lp, mf->fn_index, dst_b);
+            } else {
+                fprintf(out, "\tb.%s %sBB%u_%u\n", cond_str(ins->ops[0].u.cond),
+                        lp, mf->fn_index, dst_b);
+            }
             return;
+        }
 
         case MI_A64_CBZ:
-        case MI_A64_CBNZ:
+        case MI_A64_CBNZ: {
+            uint32_t dst_b = redir_blk(ctx, ins->ops[1].u.block_id);
             fmt_gp(r0, sizeof(r0), ins->ops[0].u.preg, ins->width);
-            fprintf(out, "\t%s %s, %sBB%u_%u\n", ins->op == MI_A64_CBZ ? "cbz" : "cbnz",
-                    r0, lp, mf->fn_index, redir_blk(ctx, ins->ops[1].u.block_id));
+            if (ctx->need_branch_relax) {
+                fprintf(out, "\t%s %s, .+8\n\tb %sBB%u_%u\n",
+                        ins->op == MI_A64_CBZ ? "cbnz" : "cbz",
+                        r0, lp, mf->fn_index, dst_b);
+            } else {
+                fprintf(out, "\t%s %s, %sBB%u_%u\n", ins->op == MI_A64_CBZ ? "cbz" : "cbnz",
+                        r0, lp, mf->fn_index, dst_b);
+            }
             return;
+        }
 
         case MI_A64_BL: {
             char sbuf[512];
@@ -979,7 +995,8 @@ static bool a64_emit_function(PirCodeEmitter *em, const PirModule *mod, const MF
     uint32_t nblks = mf->blocks.len;
     uint32_t *blk_redir = nblks ? (uint32_t *)malloc((size_t)nblks * sizeof(uint32_t)) : NULL;
     bool     *blk_skip  = nblks ? (bool *)calloc((size_t)nblks, sizeof(bool)) : NULL;
-    if (nblks && (!blk_redir || !blk_skip)) abort();
+    uint32_t *vis_mark  = nblks ? (uint32_t *)calloc((size_t)nblks, sizeof(uint32_t)) : NULL;
+    if (nblks && (!blk_redir || !blk_skip || !vis_mark)) abort();
     for (uint32_t b = 0u; b < nblks; ++b) blk_redir[b] = b;
     for (uint32_t b = 1u; b < nblks; ++b) {
         const MBlock *blk = &mf->blocks.data[b];
@@ -988,15 +1005,35 @@ static bool a64_emit_function(PirCodeEmitter *em, const PirModule *mod, const MF
             if (dst < nblks && dst != b) blk_redir[b] = dst;
         }
     }
+    /* Break any empty-block cycles by pinning one canonical representative per cycle. */
     for (uint32_t b = 1u; b < nblks; ++b) {
-        uint32_t cur = blk_redir[b];
-        for (uint32_t hop = 0u; hop < nblks && blk_redir[cur] != cur; ++hop) {
+        uint32_t cur = b;
+        while (blk_redir[cur] != cur) {
+            if (vis_mark[cur] == b) {
+                blk_redir[cur] = cur;
+                break;
+            }
+            if (vis_mark[cur] != 0u) break;
+            vis_mark[cur] = b;
             cur = blk_redir[cur];
         }
+    }
+    free(vis_mark);
+    /* Path-compress every block to its live root (guaranteed blk_redir[root] == root). */
+    for (uint32_t b = 1u; b < nblks; ++b) {
+        uint32_t cur = blk_redir[b];
+        while (blk_redir[cur] != cur) cur = blk_redir[cur];
         blk_redir[b] = cur;
         if (cur != b) blk_skip[b] = true;
     }
     ctx->blk_redir = blk_redir;
+
+    /* Relax 19-bit conditional branches (b.cond/cbz/cbnz, +-1 MiB) when function exceeds ~512 KiB. */
+    uint64_t est_insts = 0u;
+    for (uint32_t b = 0u; b < nblks; ++b) {
+        if (!blk_skip[b]) est_insts += (uint64_t)mf->blocks.data[b].insts.len + 1u;
+    }
+    ctx->need_branch_relax = (est_insts * 4u > 524288u);
 
     uint32_t last_loc = 0u;
     for (uint32_t b = 0u; b < nblks; ++b) {
@@ -1021,16 +1058,26 @@ static bool a64_emit_function(PirCodeEmitter *em, const PirModule *mod, const MF
                 uint32_t fdst = redir_blk(ctx, blk->insts.data[j + 1u].ops[0].u.block_id);
                 if (tdst == next_live) {
                     if (fdst != next_live) {
-                        fprintf(out, "\tb.%s %sBB%u_%u\n",
-                                cond_str(invert_cond(ins->ops[0].u.cond)),
-                                lp, mf->fn_index, fdst);
+                        if (ctx->need_branch_relax) {
+                            fprintf(out, "\tb.%s .+8\n\tb %sBB%u_%u\n",
+                                    cond_str(ins->ops[0].u.cond), lp, mf->fn_index, fdst);
+                        } else {
+                            fprintf(out, "\tb.%s %sBB%u_%u\n",
+                                    cond_str(invert_cond(ins->ops[0].u.cond)),
+                                    lp, mf->fn_index, fdst);
+                        }
                     }
                     break;
                 }
                 if (fdst == b && tdst != b) {
-                    fprintf(out, "\tb.%s %sBB%u_%u\n",
-                            cond_str(invert_cond(ins->ops[0].u.cond)),
-                            lp, mf->fn_index, b);
+                    if (ctx->need_branch_relax) {
+                        fprintf(out, "\tb.%s .+8\n\tb %sBB%u_%u\n",
+                                cond_str(ins->ops[0].u.cond), lp, mf->fn_index, b);
+                    } else {
+                        fprintf(out, "\tb.%s %sBB%u_%u\n",
+                                cond_str(invert_cond(ins->ops[0].u.cond)),
+                                lp, mf->fn_index, b);
+                    }
                     fprintf(out, "\tb %sBB%u_%u\n", lp, mf->fn_index, tdst);
                     break;
                 }
@@ -1069,7 +1116,7 @@ static bool a64_emit_function(PirCodeEmitter *em, const PirModule *mod, const MF
     }
     fprintf(out, "\t.cfi_endproc\n");
     if (!is_macho(target)) {
-        fprintf(out, "\t.size %s, .-%s\n", fn->name, fn->name);
+        fprintf(out, "\t.size %s, .-%s\n", fn_asym, fn_asym);
     }
     fprintf(out, "\n");
     return true;
@@ -1129,7 +1176,7 @@ static void emit_global_data_items(FILE *out, const PirModule *mod, const PirTar
         const PirGlobalItem *gi = &g->items[0];
         PirTypeLayout ly = pir_type_layout(mod, target, g->type);
         if (gi->kind == PIR_GITEM_INT) {
-            uint64_t x = gi->int_neg ? (uint64_t)(-(int64_t)gi->int_lo) : gi->int_lo;
+            uint64_t x = gi->int_neg ? (UINT64_C(0) - gi->int_lo) : gi->int_lo;
             if (ly.size == 1u)      fprintf(out, "\t.byte %" PRIu64 "\n", x & 0xFFu);
             else if (ly.size == 2u) fprintf(out, "\t.short %" PRIu64 "\n", x & 0xFFFFu);
             else if (ly.size == 4u) fprintf(out, "\t.long %" PRIu64 "\n", x & 0xFFFFFFFFu);
@@ -1162,7 +1209,7 @@ static void emit_global_data_items(FILE *out, const PirModule *mod, const PirTar
                 fprintf(out, "\t.zero %" PRIu64 "\n", gi->len > 0u ? gi->len : 1u);
                 break;
             case PIR_GITEM_INT: {
-                uint8_t b = (uint8_t)(gi->int_neg ? (uint64_t)(-(int64_t)gi->int_lo) : gi->int_lo);
+                uint8_t b = (uint8_t)(gi->int_neg ? (UINT64_C(0) - gi->int_lo) : gi->int_lo);
                 fprintf(out, "\t.byte %u\n", (unsigned)b);
                 break;
             }

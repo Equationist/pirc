@@ -288,13 +288,15 @@ bool pir_x64_frame_lower(MFunc *mf, PirDiag *diag) {
                 int64_t dst_off = ins.ops[1].u.imm;
                 uint64_t rem = (uint64_t)ins.aux_id;
                 MPReg tmp = (src_ptr == X64_SCRATCH_GP0) ? X64_SCRATCH_GP1 : X64_SCRATCH_GP0;
+                MPReg addr_scr = (tmp == X64_SCRATCH_GP0) ? X64_SCRATCH_GP1 : X64_SCRATCH_GP0;
                 int64_t cur_off = 0;
                 static const uint8_t CHUNKS[4] = { 8u, 4u, 2u, 1u };
                 for (uint32_t ci = 0u; ci < 4u && rem > 0u; ++ci) {
                     uint8_t cw = CHUNKS[ci];
                     while (rem >= cw) {
                         emit_x64_mem(&out, true, tmp, src_ptr, cur_off, cw, false, tmp, loc);
-                        emit_x64_mem(&out, false, tmp, X64_RSP, dst_off + cur_off, cw, false, tmp, loc);
+                        emit_x64_mem(&out, false, tmp, X64_RSP, dst_off + cur_off, cw, false,
+                                     (addr_scr == src_ptr) ? tmp : addr_scr, loc);
                         cur_off += cw;
                         rem     -= cw;
                     }

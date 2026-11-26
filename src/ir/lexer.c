@@ -311,6 +311,13 @@ PirToken pir_lexer_next(PirLexer *lex) {
             tok.float_val = -HUGE_VAL;
             return tok;
         }
+        if (peek(lex, 1) == 'n' && peek(lex, 2) == 'a' && peek(lex, 3) == 'n' &&
+            !is_ident_cont((unsigned char)peek(lex, 4))) {
+            advance(lex); advance(lex); advance(lex); advance(lex);
+            tok.kind      = TOK_FLOAT;
+            tok.float_val = -(double)NAN;
+            return tok;
+        }
         advance(lex);
         tok.kind = TOK_MINUS;
         return tok;

@@ -378,7 +378,9 @@ uint32_t decode_utf8(const char **new_pos, const char *p) {
   int len;
   uint32_t c;
 
-  if ((unsigned char)*p >= MASK2(4, 4)) {
+  if ((unsigned char)*p >= 0xF8) {
+    error_at(start, "invalid UTF-8 sequence");
+  } else if ((unsigned char)*p >= MASK2(4, 4)) {
     len = 4;
     c = *p & MASK(3);
   } else if ((unsigned char)*p >= MASK2(3, 5)) {
@@ -396,6 +398,10 @@ uint32_t decode_utf8(const char **new_pos, const char *p) {
       error_at(start, "invalid UTF-8 sequence");
     c = (c << 6) | (p[i] & MASK(6));
   }
+
+  if ((len == 2 && c < 0x80) || (len == 3 && c < 0x800) || (len == 4 && c < 0x10000) ||
+      (c >= 0xD800 && c <= 0xDFFF) || c > 0x10FFFF)
+    error_at(start, "invalid UTF-8 sequence");
 
   *new_pos = p + len;
   return c;
@@ -420,13 +426,13 @@ static bool in_range(uint32_t c, const UTF32Range *range, size_t len) {
 
 bool is_ident1(uint32_t c) {
   return in_range(c, xid_start, sizeof(xid_start) / sizeof(UTF32Range)) ||
-         in_range(c, math_start, sizeof(math_start) / sizeof(UTF32Range));
+         (!is_iso_std && in_range(c, math_start, sizeof(math_start) / sizeof(UTF32Range)));
 }
 
 bool is_ident2(uint32_t c) {
   return is_ident1(c) ||
          in_range(c, xid_cont, sizeof(xid_cont) / sizeof(UTF32Range)) ||
-         in_range(c, math_cont, sizeof(math_cont) / sizeof(UTF32Range));
+         (!is_iso_std && in_range(c, math_cont, sizeof(math_cont) / sizeof(UTF32Range)));
 }
 
 // Returns the number of columns needed to display a given
@@ -448,17 +454,41 @@ int display_width(const char *p, int len) {
   const char *start = p;
   int w = 0;
   while (p - start < len) {
-    if (*p >= 0x20 && *p < 0x7F) {
+    unsigned char b0 = (unsigned char)*p;
+    if (b0 >= 0x20 && b0 < 0x7F) {
       w++;
       p++;
       continue;
     }
-    if (*p == '\t') {
+    if (b0 == '\t') {
       w += 8;
       p++;
       continue;
     }
-    uint32_t c = decode_utf8(&p, p);
+    if (b0 < 0x80) {
+      p++;
+      continue;
+    }
+    // Lenient UTF-8 decoding for diagnostics (never call error_at here to avoid recursion/OOB)
+    size_t rem = (size_t)(len - (p - start));
+    uint32_t c = 0xFFFD;
+    if ((b0 & 0xE0) == 0xC0 && rem >= 2 && ((unsigned char)p[1] & 0xC0) == 0x80) {
+      c = ((uint32_t)(b0 & 0x1F) << 6) | ((unsigned char)p[1] & 0x3F);
+      p += 2;
+    } else if ((b0 & 0xF0) == 0xE0 && rem >= 3 &&
+               ((unsigned char)p[1] & 0xC0) == 0x80 && ((unsigned char)p[2] & 0xC0) == 0x80) {
+      c = ((uint32_t)(b0 & 0x0F) << 12) | ((uint32_t)((unsigned char)p[1] & 0x3F) << 6) |
+          ((unsigned char)p[2] & 0x3F);
+      p += 3;
+    } else if ((b0 & 0xF8) == 0xF0 && rem >= 4 &&
+               ((unsigned char)p[1] & 0xC0) == 0x80 && ((unsigned char)p[2] & 0xC0) == 0x80 &&
+               ((unsigned char)p[3] & 0xC0) == 0x80) {
+      c = ((uint32_t)(b0 & 0x07) << 18) | ((uint32_t)((unsigned char)p[1] & 0x3F) << 12) |
+          ((uint32_t)((unsigned char)p[2] & 0x3F) << 6) | ((unsigned char)p[3] & 0x3F);
+      p += 4;
+    } else {
+      p++;
+    }
     w += char_width(c);
   }
   return w;

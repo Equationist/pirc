@@ -87,12 +87,53 @@ static bool is_pure_hoistable_op(const PirInst *ins) {
     return false;
 }
 
+static bool inst_may_trap_or_exit(const PirModule *mod, const PirInst *ins) {
+    if (ins->op == PIR_OP_TRAP || ins->op == PIR_OP_UNREACHABLE ||
+        ins->op == PIR_OP_CALL_INDIRECT || ins->op == PIR_OP_INVOKE ||
+        ins->op == PIR_OP_INVOKE_INDIRECT || ins->op == PIR_OP_RESUME ||
+        ins->op == PIR_OP_FENCE || ins->op == PIR_OP_STACKRESTORE ||
+        ins->op == PIR_OP_ATOMIC_LOAD || ins->op == PIR_OP_ATOMIC_STORE ||
+        ins->op == PIR_OP_ATOMIC_RMW || ins->op == PIR_OP_ATOMIC_CMPXCHG) {
+        return true;
+    }
+    if ((ins->op == PIR_OP_LOAD || ins->op == PIR_OP_STORE) &&
+        (ins->flags & PIR_FLAG_VOLATILE) != 0u) {
+        return true;
+    }
+    if ((ins->flags & (PIR_FLAG_TRAP | PIR_FLAG_TRAP_S | PIR_FLAG_TRAP_U)) != 0u) {
+        return true;
+    }
+    if ((ins->op == PIR_OP_DIV_S || ins->op == PIR_OP_DIV_U ||
+         ins->op == PIR_OP_REM_S || ins->op == PIR_OP_REM_U) &&
+        (ins->flags & PIR_FLAG_UNSAFE) == 0u) {
+        return true;
+    }
+    if (ins->op == PIR_OP_CALL) {
+        /* Only total, non-exiting pure math intrinsics are guaranteed to return normally. */
+        if (ins->operands[0].kind == PIR_OPER_SYM && ins->operands[0].u.sym.name) {
+            bool is_def = (ins->operands[0].u.sym.is_func &&
+                           ins->operands[0].u.sym.id < mod->funcs.len &&
+                           mod->funcs.data[ins->operands[0].u.sym.id].is_defined);
+            const char *cn = ins->operands[0].u.sym.name;
+            if (!is_def &&
+                (strcmp(cn, "sqrt") == 0 || strcmp(cn, "sqrtf") == 0 ||
+                 strcmp(cn, "fabs") == 0 || strcmp(cn, "fabsf") == 0)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
 static bool loop_has_mem_barrier(const PirModule *mod, const PirFunction *fn, const PirLoop *lp) {
     for (uint32_t bi = 0u; bi < lp->blocks.len; ++bi) {
         const PirBlock *blk = &fn->blocks.data[lp->blocks.data[bi]];
         for (uint32_t j = 0u; j < blk->insts.len; ++j) {
             const PirInst *ins = &fn->insts.data[blk->insts.data[j]];
-            if (ins->op == PIR_OP_CALL_INDIRECT || ins->op == PIR_OP_FENCE ||
+            if (((ins->op == PIR_OP_LOAD || ins->op == PIR_OP_STORE) &&
+                 (ins->flags & PIR_FLAG_VOLATILE) != 0u) ||
+                ins->op == PIR_OP_CALL_INDIRECT || ins->op == PIR_OP_FENCE ||
                 ins->op == PIR_OP_ATOMIC_LOAD || ins->op == PIR_OP_ATOMIC_STORE ||
                 ins->op == PIR_OP_ATOMIC_RMW || ins->op == PIR_OP_ATOMIC_CMPXCHG ||
                 ins->op == PIR_OP_MEMCPY || ins->op == PIR_OP_MEMMOVE || ins->op == PIR_OP_MEMSET ||
@@ -146,7 +187,8 @@ static bool loop_has_real_call(const PirFunction *fn, const PirLoop *lp) {
 
 static bool load_is_safe_to_hoist(const PirModule *mod, const PirFunction *fn,
                                   const PirTargetSpec *target, const PirLoop *lp,
-                                  PirBlockId b, const PirInst *ins, bool has_barrier) {
+                                  PirBlockId b, uint32_t inst_idx, const PirInst *ins,
+                                  bool has_barrier) {
     if (ins->op != PIR_OP_LOAD || (ins->flags & PIR_FLAG_VOLATILE) || has_barrier) return false;
     if (!op_is_invariant(fn, lp, ins->operands[0])) return false;
 
@@ -167,11 +209,21 @@ static bool load_is_safe_to_hoist(const PirModule *mod, const PirFunction *fn,
         }
     }
 
-    /* Dereference safety: header executes unconditionally (including post-rotation loop
-     * headers guarded against 0 trips). Otherwise, only provably in-bounds loads from
-     * known stack allocas or defined globals are safe to speculate; `restrict` (noalias)
-     * pointer parameters may be NULL or out-of-bounds on untaken branches! */
-    if (b == lp->header) return true;
+    /* Dereference safety: a header load is guaranteed to execute on loop entry only if
+     * no preceding instruction in the header can trap, diverge, or exit. Otherwise, only
+     * provably in-bounds loads from known stack allocas or defined globals are safe to
+     * speculate; `restrict` (noalias) pointer parameters may be NULL or out-of-bounds. */
+    if (b == lp->header) {
+        const PirBlock *hblk = &fn->blocks.data[b];
+        bool preceded_by_hazard = false;
+        for (uint32_t k = 0u; k < inst_idx; ++k) {
+            if (inst_may_trap_or_exit(mod, &fn->insts.data[hblk->insts.data[k]])) {
+                preceded_by_hazard = true;
+                break;
+            }
+        }
+        if (!preceded_by_hazard) return true;
+    }
     PirPtrInfo pi = pir_alias_decompose(fn, ins->operands[0]);
     if (pi.kind == PIR_PTR_GLOBAL && pi.has_offset && pi.offset >= 0 && pi.global_name) {
         for (uint32_t gi = 0u; gi < mod->globals.len; ++gi) {
@@ -273,7 +325,7 @@ void pir_opt_licm(PirModule *mod, PirFunction *fn, const PirTargetSpec *target) 
                             if (!(has_call && (ins->ty.kind == PIR_TYPE_VECTOR || ins->op == PIR_OP_CONST))) {
                                 can_hoist = true;
                             }
-                        } else if (load_is_safe_to_hoist(mod, fn, target, lp, b, ins, has_barrier)) {
+                        } else if (load_is_safe_to_hoist(mod, fn, target, lp, b, j, ins, has_barrier)) {
                             can_hoist = true;
                         }
 

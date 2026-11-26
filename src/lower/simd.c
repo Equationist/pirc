@@ -628,10 +628,40 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
                         }
                     }
                 }
+            } else if (copy.op == PIR_OP_CALL || copy.op == PIR_OP_CALL_INDIRECT) {
+                /* Split oversized vector arguments at call sites (matching expanded callee params). */
+                if (rsp) {
+                    pir_diag_error(diag, ln, 0u,
+                                   "oversized vector return exceeds target SIMD width (%u bits)",
+                                   (unsigned)max_bits);
+                    PIR_VEC_FREE(&new_insts);
+                    PIR_VEC_FREE(&aliases);
+                    free(splits);
+                    return false;
+                }
+                PIR_VEC(PirOperand) nargs = {0};
+                PIR_VEC_PUSH(&nargs, copy.operands[0]);
+                for (uint32_t k = 1u; k < copy.operand_count; ++k) {
+                    PirOperand a = copy.operands[k];
+                    if (a.kind == PIR_OPER_VAL && a.u.val < orig_vals &&
+                        splits[a.u.val].count > 0u) {
+                        const VecSplit *sp = &splits[a.u.val];
+                        for (uint32_t p = 0u; p < sp->count; ++p) {
+                            PIR_VEC_PUSH(&nargs, pir_op_val(sp->ids[p], sp->piece_ty));
+                        }
+                    } else {
+                        PIR_VEC_PUSH(&nargs, a);
+                    }
+                }
+                PirInst *slot = &fn->insts.data[iid];
+                slot->operand_count = nargs.len;
+                slot->operands      = pir_alloc_ops(mod, nargs.len);
+                memcpy(slot->operands, nargs.data, nargs.len * sizeof(PirOperand));
+                PIR_VEC_FREE(&nargs);
+                PIR_VEC_PUSH(&new_insts, iid);
             } else {
                 /* Generic lane-wise unary or binary op (arith, bitwise, shift, float). */
-                if (!rsp || copy.op == PIR_OP_RET || copy.op == PIR_OP_CALL ||
-                    copy.op == PIR_OP_CALL_INDIRECT || copy.op == PIR_OP_INVOKE) {
+                if (!rsp || copy.op == PIR_OP_RET || copy.op == PIR_OP_INVOKE) {
                     pir_diag_error(diag, ln, 0u,
                                    "oversized vector exceeds target SIMD width (%u bits) in unsupported op",
                                    (unsigned)max_bits);
@@ -689,14 +719,53 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
     return true;
 }
 
+static void split_simd_decl(PirModule *mod, PirParamDecl **params_io, uint32_t *count_io,
+                            uint16_t max_bits) {
+    PirParamDecl *old_p = *params_io;
+    uint32_t old_n      = *count_io;
+    bool has_any = false;
+    for (uint32_t i = 0u; i < old_n; ++i) {
+        if (needs_split(old_p[i].type, max_bits)) { has_any = true; break; }
+    }
+    if (!has_any) return;
+    PIR_VEC(PirParamDecl) np = {0};
+    for (uint32_t i = 0u; i < old_n; ++i) {
+        if (needs_split(old_p[i].type, max_bits)) {
+            PirType pty;
+            uint32_t cnt = 0u;
+            split_spec(old_p[i].type.u.vec, max_bits, &pty, &cnt);
+            for (uint32_t p = 0u; p < cnt; ++p) {
+                PirParamDecl pd = old_p[i];
+                pd.type = pty;
+                if (p > 0u) { pd.name = NULL; pd.val_id = PIR_INVALID_ID; }
+                PIR_VEC_PUSH(&np, pd);
+            }
+        } else {
+            PIR_VEC_PUSH(&np, old_p[i]);
+        }
+    }
+    *count_io  = np.len;
+    *params_io = PIR_ARENA_NEW_ARRAY(&mod->arena, PirParamDecl, np.len);
+    memcpy(*params_io, np.data, np.len * sizeof(PirParamDecl));
+    PIR_VEC_FREE(&np);
+}
+
 bool pir_legalize_simd(PirModule *mod, const PirTargetSpec *target, PirDiag *diag) {
     if (target->caps.max_simd_bits >= 256u) {
         return true;
     }
+    uint16_t max_bits = target->caps.max_simd_bits;
     for (uint32_t fi = 0u; fi < mod->funcs.len; ++fi) {
-        if (!legalize_simd_func(mod, target, fi, diag)) {
-            return false;
+        if (mod->funcs.data[fi].is_defined) {
+            if (!legalize_simd_func(mod, target, fi, diag)) {
+                return false;
+            }
+        } else {
+            split_simd_decl(mod, &mod->funcs.data[fi].params, &mod->funcs.data[fi].param_count, max_bits);
         }
+    }
+    for (uint32_t si = 0u; si < mod->sigs.len; ++si) {
+        split_simd_decl(mod, &mod->sigs.data[si].params, &mod->sigs.data[si].param_count, max_bits);
     }
     return true;
 }

@@ -184,9 +184,18 @@ static void verify_params_and_ret(Verifier *v, const char *owner, uint32_t line,
         } else {
             check_ssa_type(v, pd->type, line, "parameter");
         }
-        if (pd->attrs != PIR_PATTR_NONE &&
+        if ((pd->attrs & (PIR_PATTR_NOALIAS | PIR_PATTR_READONLY)) != 0u &&
             !(pd->type.kind == PIR_TYPE_SCALAR && pd->type.u.scalar == PIR_SCALAR_PTR)) {
             pir_diag_error(v->diag, line, 0u, "'%s': noalias/readonly only valid on ptr parameter", owner);
+        }
+        if ((pd->attrs & (PIR_PATTR_SIGNEXT | PIR_PATTR_ZEROEXT)) != 0u) {
+            if (pd->type.kind != PIR_TYPE_SCALAR ||
+                (pd->type.u.scalar != PIR_SCALAR_I8 && pd->type.u.scalar != PIR_SCALAR_I16)) {
+                pir_diag_error(v->diag, line, 0u, "'%s': signext/zeroext only valid on i8/i16 parameter", owner);
+            }
+            if ((pd->attrs & PIR_PATTR_SIGNEXT) != 0u && (pd->attrs & PIR_PATTR_ZEROEXT) != 0u) {
+                pir_diag_error(v->diag, line, 0u, "'%s': parameter cannot have both signext and zeroext", owner);
+            }
         }
     }
 }
@@ -454,6 +463,34 @@ static bool fail_order_valid(PirMemOrder succ, PirMemOrder fail) {
     return false;
 }
 
+static void check_operand_kind_and_type(Verifier *v, const PirFunction *fn,
+                                        const PirOperand *op, PirType expected,
+                                        uint32_t line, const char *ctx) {
+    if (op->kind == PIR_OPER_VAL) {
+        if (op->u.val >= fn->values.len) {
+            pir_diag_error(v->diag, line, 0u, "invalid value id in %s", ctx);
+            return;
+        }
+        PirType actual = fn->values.data[op->u.val].type;
+        if (!pir_type_eq(actual, expected) || !pir_type_eq(op->type, expected)) {
+            pir_diag_error(v->diag, line, 0u, "operand type mismatch on %s", ctx);
+        }
+    } else if (op->kind == PIR_OPER_IMM_INT) {
+        if (!(expected.kind == PIR_TYPE_SCALAR &&
+              (pir_scalar_is_int(expected.u.scalar) || expected.u.scalar == PIR_SCALAR_PTR))) {
+            pir_diag_error(v->diag, line, 0u, "integer immediate invalid for type in %s", ctx);
+        }
+    } else if (op->kind == PIR_OPER_IMM_FLOAT) {
+        if (!(expected.kind == PIR_TYPE_SCALAR && pir_scalar_is_float(expected.u.scalar))) {
+            pir_diag_error(v->diag, line, 0u, "float immediate invalid for type in %s", ctx);
+        }
+    } else if (op->kind == PIR_OPER_SYM) {
+        if (!is_ptr_type(expected)) {
+            pir_diag_error(v->diag, line, 0u, "symbol operand requires ptr type in %s", ctx);
+        }
+    }
+}
+
 static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst) {
     check_flags(v, inst);
     uint8_t ptr_bytes = v->target ? v->target->ptr_bytes : 8u;
@@ -471,13 +508,22 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
             check_result_count(v, inst, 1u);
             check_op_count(v, inst, 1u);
             check_ssa_type(v, inst->ty, inst->src_line, "const");
-            if (inst->operand_count == 1u && inst->operands[0].kind == PIR_OPER_SYM) {
-                if (!is_ptr_type(inst->ty)) {
-                    pir_diag_error(v->diag, inst->src_line, 0u, "symbol const requires ptr type");
-                }
-                if (!has_symbol(v->mod, inst->operands[0].u.sym.name)) {
-                    pir_diag_error(v->diag, inst->src_line, 0u,
-                                   "undefined symbol '@%s'", inst->operands[0].u.sym.name);
+            if (inst->ty.kind == PIR_TYPE_VECTOR) {
+                pir_diag_error(v->diag, inst->src_line, 0u, "const requires scalar type (use splat for vectors)");
+            }
+            if (inst->operand_count == 1u) {
+                if (inst->operands[0].kind == PIR_OPER_VAL) {
+                    pir_diag_error(v->diag, inst->src_line, 0u, "const operand must be an immediate or @symbol");
+                } else if (inst->operands[0].kind == PIR_OPER_SYM) {
+                    if (!is_ptr_type(inst->ty)) {
+                        pir_diag_error(v->diag, inst->src_line, 0u, "symbol const requires ptr type");
+                    }
+                    if (!has_symbol(v->mod, inst->operands[0].u.sym.name)) {
+                        pir_diag_error(v->diag, inst->src_line, 0u,
+                                       "undefined symbol '@%s'", inst->operands[0].u.sym.name);
+                    }
+                } else {
+                    check_operand_kind_and_type(v, fn, &inst->operands[0], inst->ty, inst->src_line, "const");
                 }
             }
             break;
@@ -501,10 +547,9 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
                 pir_diag_error(v->diag, inst->src_line, 0u, "integer opcode requires integer type");
             }
             check_lir_type(v, inst->ty, inst->src_line, "integer op");
-            if (inst->operand_count == 2u &&
-                (!pir_type_eq(inst->operands[0].type, inst->ty) ||
-                 !pir_type_eq(inst->operands[1].type, inst->ty))) {
-                pir_diag_error(v->diag, inst->src_line, 0u, "operand type mismatch on integer op");
+            if (inst->operand_count == 2u) {
+                check_operand_kind_and_type(v, fn, &inst->operands[0], inst->ty, inst->src_line, "integer op");
+                check_operand_kind_and_type(v, fn, &inst->operands[1], inst->ty, inst->src_line, "integer op");
             }
             break;
 
@@ -587,10 +632,9 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
                 pir_diag_error(v->diag, inst->src_line, 0u, "float op requires float type");
             }
             check_lir_type(v, inst->ty, inst->src_line, "float op");
-            if (inst->operand_count == 2u &&
-                (!pir_type_eq(inst->operands[0].type, inst->ty) ||
-                 !pir_type_eq(inst->operands[1].type, inst->ty))) {
-                pir_diag_error(v->diag, inst->src_line, 0u, "operand type mismatch on float op");
+            if (inst->operand_count == 2u) {
+                check_operand_kind_and_type(v, fn, &inst->operands[0], inst->ty, inst->src_line, "float op");
+                check_operand_kind_and_type(v, fn, &inst->operands[1], inst->ty, inst->src_line, "float op");
             }
             break;
 
@@ -601,8 +645,8 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
                 pir_diag_error(v->diag, inst->src_line, 0u, "fneg requires float type");
             }
             check_lir_type(v, inst->ty, inst->src_line, "fneg");
-            if (inst->operand_count == 1u && !pir_type_eq(inst->operands[0].type, inst->ty)) {
-                pir_diag_error(v->diag, inst->src_line, 0u, "operand type mismatch on fneg");
+            if (inst->operand_count == 1u) {
+                check_operand_kind_and_type(v, fn, &inst->operands[0], inst->ty, inst->src_line, "fneg");
             }
             break;
 
@@ -754,7 +798,10 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
             }
             check_lir_type(v, inst->ty, inst->src_line, "*tofp");
             if (inst->operand_count == 1u) {
-                PirType src = inst->operands[0].type;
+                PirType src = (inst->operands[0].kind == PIR_OPER_VAL && inst->operands[0].u.val < fn->values.len)
+                              ? fn->values.data[inst->operands[0].u.val].type
+                              : inst->operands[0].type;
+                check_lir_type(v, src, inst->src_line, "*tofp src");
                 if (!pir_type_is_int(src) || src.kind != inst->ty.kind ||
                     (src.kind == PIR_TYPE_VECTOR &&
                      pir_vec_lanes(src.u.vec) != pir_vec_lanes(inst->ty.u.vec))) {
@@ -790,7 +837,11 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
             check_op_count(v, inst, 1u);
             check_ssa_type(v, inst->ty, inst->src_line, "bitcast");
             if (inst->operand_count == 1u) {
-                uint32_t sb = pir_type_bits(inst->operands[0].type, ptr_bytes);
+                PirType src = (inst->operands[0].kind == PIR_OPER_VAL && inst->operands[0].u.val < fn->values.len)
+                              ? fn->values.data[inst->operands[0].u.val].type
+                              : inst->operands[0].type;
+                check_lir_type(v, src, inst->src_line, "bitcast src");
+                uint32_t sb = pir_type_bits(src, ptr_bytes);
                 uint32_t db = pir_type_bits(inst->ty, ptr_bytes);
                 if (sb == 0u || sb != db) {
                     pir_diag_error(v->diag, inst->src_line, 0u,
@@ -1177,6 +1228,9 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
                                inst->operand_count >= 1u ? inst->operands[0].u.sym.name : "?");
                 break;
             }
+            if (inst->operands[0].u.sym.offset != 0) {
+                pir_diag_error(v->diag, inst->src_line, 0u, "call target cannot have non-zero offset");
+            }
             const PirFunction *callee = &v->mod->funcs.data[inst->operands[0].u.sym.id];
             if (inst->results[0] != PIR_INVALID_ID &&
                 callee->ret_type.kind == PIR_TYPE_SCALAR &&
@@ -1251,10 +1305,29 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
             for (uint32_t c = 0u; c < inst->switch_case_count; ++c) {
                 check_branch_target(v, fn, inst, &inst->switch_cases[c].target, false, false,
                                     pir_type_scalar(PIR_SCALAR_VOID));
+                uint32_t sw_bits = (inst->ty.kind == PIR_TYPE_SCALAR)
+                                   ? pir_scalar_bits(inst->ty.u.scalar, ptr_bytes) : 64u;
+                uint64_t mask = (sw_bits >= 64u) ? UINT64_MAX : ((UINT64_C(1) << sw_bits) - 1u);
+                uint64_t clo = inst->switch_cases[c].case_lo;
+                uint64_t chi = inst->switch_cases[c].case_hi;
+                if (inst->switch_cases[c].is_negative) {
+                    uint64_t nlo = ~clo + 1u;
+                    uint64_t cy = (nlo == 0u) ? 1u : 0u;
+                    clo = nlo; chi = ~chi + cy;
+                }
+                clo &= mask;
+                if (sw_bits <= 64u) chi = 0u;
                 for (uint32_t d = 0u; d < c; ++d) {
-                    if (inst->switch_cases[c].case_lo == inst->switch_cases[d].case_lo &&
-                        inst->switch_cases[c].case_hi == inst->switch_cases[d].case_hi &&
-                        inst->switch_cases[c].is_negative == inst->switch_cases[d].is_negative) {
+                    uint64_t dlo = inst->switch_cases[d].case_lo;
+                    uint64_t dhi = inst->switch_cases[d].case_hi;
+                    if (inst->switch_cases[d].is_negative) {
+                        uint64_t nlo = ~dlo + 1u;
+                        uint64_t cy = (nlo == 0u) ? 1u : 0u;
+                        dlo = nlo; dhi = ~dhi + cy;
+                    }
+                    dlo &= mask;
+                    if (sw_bits <= 64u) dhi = 0u;
+                    if (clo == dlo && chi == dhi) {
                         pir_diag_error(v->diag, inst->src_line, 0u, "duplicate switch case constant");
                         break;
                     }
@@ -1415,8 +1488,26 @@ static void verify_function(Verifier *v, const PirFunction *fn) {
     }
 
     for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
-        if (!cfg.reachable[b]) continue;
         const PirBlock *blk = &fn->blocks.data[b];
+        if (!cfg.reachable[b]) {
+            /* Even in unreachable blocks, verify same-block def-before-use. */
+            for (uint32_t j = 0u; j < blk->insts.len; ++j) {
+                const PirInst *inst = &fn->insts.data[blk->insts.data[j]];
+                for (uint32_t k = 0u; k < inst->operand_count; ++k) {
+                    const PirOperand *op = &inst->operands[k];
+                    if (op->kind == PIR_OPER_VAL && op->u.val < fn->values.len) {
+                        const PirValueDef *vd = &fn->values.data[op->u.val];
+                        if (vd->def_block == b && vd->def_inst != PIR_INVALID_ID &&
+                            inst_pos[vd->def_inst] >= j) {
+                            pir_diag_error(v->diag, inst->src_line, 0u,
+                                           "use of '%%%s' in '.%s' precedes its definition",
+                                           vd->name, blk->label);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         for (uint32_t j = 0u; j < blk->insts.len; ++j) {
             const PirInst *inst = &fn->insts.data[blk->insts.data[j]];
             for (uint32_t k = 0u; k < inst->operand_count; ++k) {

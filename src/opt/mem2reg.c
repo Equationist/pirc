@@ -75,21 +75,48 @@ static PirValueId get_or_make_zero(RenameCtx *ctx, uint32_t s) {
         return ctx->slots[s].zero_val;
     }
     PirType ty = ctx->slots[s].slot_type;
-    PirValueId zv = pir_fn_new_val(ctx->mod, ctx->fn, "m2r_z", ty, 0u, PIR_INVALID_ID, 0u);
-    PirInst ci = pir_make_inst(PIR_OP_CONST, ty, ctx->fn->blocks.data[0].src_line, 0u);
-    ci.operands = pir_alloc_ops(ctx->mod, 1u);
-    ci.operand_count = 1u;
-    if (pir_type_is_float(ty)) {
-        ci.operands[0] = pir_op_imm_f(0u, ty);
-    } else {
-        ci.operands[0] = pir_op_imm_i(0u, false, ty);
-    }
-    ci.results[0] = zv;
-    PirInstId cid = pir_fn_append_inst(ctx->fn, NULL, ci);
+    uint32_t ln = ctx->fn->blocks.data[0].src_line;
+    PirValueId zv;
+    if (ty.kind == PIR_TYPE_VECTOR) {
+        PirType ety = pir_type_scalar(pir_vec_elem_scalar(ty.u.vec));
+        PirValueId sv = pir_fn_new_val(ctx->mod, ctx->fn, "m2r_ez", ety, 0u, PIR_INVALID_ID, 0u);
+        PirInst ci = pir_make_inst(PIR_OP_CONST, ety, ln, 0u);
+        ci.operands = pir_alloc_ops(ctx->mod, 1u);
+        ci.operand_count = 1u;
+        if (pir_type_is_float(ety)) {
+            ci.operands[0] = pir_op_imm_f(0u, ety);
+        } else {
+            ci.operands[0] = pir_op_imm_i(0u, false, ety);
+        }
+        ci.results[0] = sv;
+        PirInstId cid0 = pir_fn_append_inst(ctx->fn, NULL, ci);
+        PIR_VEC_PUSH(&ctx->entry_zeros, cid0);
 
-    /* Record to prepend to blocks[0].insts after rename_block finishes so we never
-     * mutate blocks[0].insts while rename_block(ctx, 0) is iterating over it. */
-    PIR_VEC_PUSH(&ctx->entry_zeros, cid);
+        zv = pir_fn_new_val(ctx->mod, ctx->fn, "m2r_z", ty, 0u, PIR_INVALID_ID, 0u);
+        PirInst sp = pir_make_inst(PIR_OP_SPLAT, ty, ln, 0u);
+        sp.operands = pir_alloc_ops(ctx->mod, 1u);
+        sp.operand_count = 1u;
+        sp.operands[0] = pir_op_val(sv, ety);
+        sp.results[0] = zv;
+        PirInstId cid1 = pir_fn_append_inst(ctx->fn, NULL, sp);
+        PIR_VEC_PUSH(&ctx->entry_zeros, cid1);
+    } else {
+        zv = pir_fn_new_val(ctx->mod, ctx->fn, "m2r_z", ty, 0u, PIR_INVALID_ID, 0u);
+        PirInst ci = pir_make_inst(PIR_OP_CONST, ty, ln, 0u);
+        ci.operands = pir_alloc_ops(ctx->mod, 1u);
+        ci.operand_count = 1u;
+        if (pir_type_is_float(ty)) {
+            ci.operands[0] = pir_op_imm_f(0u, ty);
+        } else {
+            ci.operands[0] = pir_op_imm_i(0u, false, ty);
+        }
+        ci.results[0] = zv;
+        PirInstId cid = pir_fn_append_inst(ctx->fn, NULL, ci);
+
+        /* Record to prepend to blocks[0].insts after rename_block finishes so we never
+         * mutate blocks[0].insts while rename_block(ctx, 0) is iterating over it. */
+        PIR_VEC_PUSH(&ctx->entry_zeros, cid);
+    }
 
     ctx->slots[s].zero_val = zv;
     return zv;

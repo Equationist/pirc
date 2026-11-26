@@ -152,7 +152,7 @@ bool pir_abi_aapcs64_param(const PirModule *mod, const PirTargetSpec *target,
                      * On Darwin ARM64, fixed HFA stack alignment is the HFA base element alignment
                      * (4 for float, 8 for double), ignoring user _Alignas overrides. */
                     PirTypeLayout bl = pir_type_layout(mod, target, out->regs[0]);
-                    out->pad_fp_before = 8u - st->fp_used;
+                    out->pad_fp_before = (st->fp_used < 8u) ? (8u - st->fp_used) : 0u;
                     st->fp_used = 8u;
                     out->stack_align = (target->os == PIR_OS_MACOS)
                                        ? bl.align : (ly.align > 8u ? ly.align : 8u);
@@ -160,9 +160,17 @@ bool pir_abi_aapcs64_param(const PirModule *mod, const PirTargetSpec *target,
                     st->fp_used += out->fp_used;
                 }
             } else {
+                /* Linux AAPCS64 §6.8.2: 16B-aligned composite passed in GP regs starts at an even reg. */
+                if (target->os != PIR_OS_MACOS && ly.align >= 16u &&
+                    (st->gp_used & 1u) != 0u && st->gp_used < 8u) {
+                    out->pad_gp_before++;
+                    st->gp_used++;
+                }
                 if (st->gp_used + out->gp_used > 8u) {
                     /* AAPCS64 all-or-nothing spill: consume remaining GP regs and pass by value on stack. */
-                    out->pad_gp_before = 8u - st->gp_used;
+                    if (st->gp_used < 8u) {
+                        out->pad_gp_before += 8u - st->gp_used;
+                    }
                     st->gp_used = 8u;
                     out->stack_align = (ly.align > 8u) ? ly.align : 8u;
                 } else {

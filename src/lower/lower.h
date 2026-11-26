@@ -15,7 +15,8 @@
 typedef struct {
     uint64_t size;
     uint32_t align;
-    uint64_t stride; /* For arrays: element stride */
+    uint64_t stride;   /* For arrays: element stride */
+    bool     overflow; /* True if size/offset calculation overflowed 64 bits */
 } PirTypeLayout;
 
 /* Master HIR -> LIR lowering pipeline (verify-after-every-pass in PIR_VERIFY_ALL) */

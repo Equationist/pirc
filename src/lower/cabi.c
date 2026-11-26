@@ -10,12 +10,13 @@
 #include <string.h>
 
 typedef struct {
-    bool          has_retbuf;
-    PirType       retbuf_agg_ty;
-    PirAbiArgInfo ret_info;
+    bool           has_retbuf;
+    PirType        retbuf_agg_ty;
+    PirAbiArgInfo  ret_info;
     PirAbiArgInfo *param_infos;
-    uint32_t      orig_param_count;
-    bool          needs_rewrite;
+    uint32_t       orig_param_count;
+    PirAbiRegState end_reg_state;
+    bool           needs_rewrite;
 } CabiPlan;
 
 static bool build_plan(const PirModule *mod, const PirTargetSpec *target,
@@ -60,6 +61,7 @@ static bool build_plan(const PirModule *mod, const PirTargetSpec *target,
             plan->needs_rewrite = true;
         }
     }
+    plan->end_reg_state = st;
     return true;
 }
 
@@ -137,6 +139,7 @@ static void pack_byval_arg(PirModule *mod, const PirTargetSpec *target,
     }
 
     /* DIRECT: unpack into 1..4 scalar/vector registers. Use staging buffer if size < reg_bytes or under-aligned. */
+    if (info->reg_count == 0u) return;
     uint64_t reg_bytes = 0u;
     uint32_t max_al    = 1u;
     reg_bundle_info(mod, target, info, &reg_bytes, &max_al);
@@ -149,20 +152,25 @@ static void pack_byval_arg(PirModule *mod, const PirTargetSpec *target,
         stg.results[0] = pir_fn_new_val(mod, fn, "byv_st", tptr, blk, PIR_INVALID_ID, 0u);
         pir_fn_append_inst(fn, out, stg);
 
-        PirInst ms = pir_make_inst(PIR_OP_MEMSET, pir_type_scalar(PIR_SCALAR_VOID), ln, lc);
-        ms.align = max_al; ms.operand_count = 3u; ms.operands = pir_alloc_ops(mod, 3u);
-        ms.operands[0] = pir_op_val(stg.results[0], tptr);
-        ms.operands[1] = pir_op_imm_i(0u, false, ti8);
-        ms.operands[2] = pir_op_imm_i(reg_bytes, false, idx_ty);
-        pir_fn_append_inst(fn, out, ms);
+        if (ly.size < reg_bytes) {
+            PirInst ms = pir_make_inst(PIR_OP_MEMSET, pir_type_scalar(PIR_SCALAR_VOID), ln, lc);
+            ms.align = max_al; ms.operand_count = 3u; ms.operands = pir_alloc_ops(mod, 3u);
+            ms.operands[0] = pir_op_val(stg.results[0], tptr);
+            ms.operands[1] = pir_op_imm_i(0u, false, ti8);
+            ms.operands[2] = pir_op_imm_i(reg_bytes, false, idx_ty);
+            pir_fn_append_inst(fn, out, ms);
+        }
 
-        PirInst mc = pir_make_inst(PIR_OP_MEMCPY, pir_type_scalar(PIR_SCALAR_VOID), ln, lc);
-        mc.align = ly.align > 0u ? ly.align : 1u;
-        mc.operand_count = 3u; mc.operands = pir_alloc_ops(mod, 3u);
-        mc.operands[0] = pir_op_val(stg.results[0], tptr);
-        mc.operands[1] = src_ptr;
-        mc.operands[2] = pir_op_imm_i(ly.size, false, idx_ty);
-        pir_fn_append_inst(fn, out, mc);
+        uint64_t copy_sz = (ly.size < reg_bytes) ? ly.size : reg_bytes;
+        if (copy_sz > 0u) {
+            PirInst mc = pir_make_inst(PIR_OP_MEMCPY, pir_type_scalar(PIR_SCALAR_VOID), ln, lc);
+            mc.align = ly.align > 0u ? ly.align : 1u;
+            mc.operand_count = 3u; mc.operands = pir_alloc_ops(mod, 3u);
+            mc.operands[0] = pir_op_val(stg.results[0], tptr);
+            mc.operands[1] = src_ptr;
+            mc.operands[2] = pir_op_imm_i(copy_sz, false, idx_ty);
+            pir_fn_append_inst(fn, out, mc);
+        }
 
         load_base = pir_op_val(stg.results[0], tptr);
     }
@@ -211,17 +219,12 @@ static void rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
         arg_start = 2u;
     }
 
-    PirAbiRegState va_st = { 0u, 0u };
-    if (plan->has_retbuf && plan->ret_info.kind == PIR_ABI_INDIRECT) {
-        va_st.gp_used += plan->ret_info.gp_used;
-    }
+    PirAbiRegState va_st = plan->end_reg_state;
     for (uint32_t i = arg_start; i < inst->operand_count; ++i) {
         uint32_t pi = i - 1u;
         PirOperand arg = inst->operands[i];
         if (pi < plan->orig_param_count) {
             const PirAbiArgInfo *info = &plan->param_infos[pi];
-            va_st.gp_used += info->gp_used + info->pad_gp_before;
-            va_st.fp_used += info->fp_used + info->pad_fp_before;
             for (uint32_t p = 0u; p < info->pad_gp_before; ++p) {
                 PIR_VEC_PUSH(&new_ops, pir_op_imm_i(0u, false, ti64));
             }
@@ -373,10 +376,10 @@ static void populate_cabi_ret(const PirModule *mod, const PirTargetSpec *target,
         return;
     }
     /* PIR_ABI_INDIRECT: on ARM64, hidden sret pointer is passed in x8;
-     * on SysV x86-64, hidden sret pointer is passed in rdi and returned in rax. */
+     * on x86-64 (SysV and Win64), hidden sret pointer is returned in rax. */
     if (target->arch == PIR_ARCH_ARM64) {
         out->kind = PIR_CABI_RET_SRET_X8;
-    } else if (target->arch == PIR_ARCH_X86_64 && target->os != PIR_OS_WINDOWS) {
+    } else if (target->arch == PIR_ARCH_X86_64) {
         out->kind = PIR_CABI_RET_SRET_RAX;
     }
 }
@@ -636,27 +639,29 @@ bool pir_lower_cabi(PirModule *mod, const PirTargetSpec *target, PirDiag *diag) 
             for (uint32_t j = 0u; j < fn->blocks.data[b].insts.len; ++j) {
                 PirInstId iid = fn->blocks.data[b].insts.data[j];
                 PirInst copy  = fn->insts.data[iid];
-                bool has_va_byval = false;
+                bool has_va_special = false;
                 if (copy.op == PIR_OP_CALL || copy.op == PIR_OP_CALL_INDIRECT) {
                     for (uint32_t k = 1u; k < copy.operand_count; ++k) {
-                        if (copy.operands[k].call_abi == PIR_PARAM_BYVAL) {
-                            has_va_byval = true;
+                        if (copy.operands[k].call_abi == PIR_PARAM_BYVAL ||
+                            (copy.operands[k].type.kind == PIR_TYPE_SCALAR &&
+                             copy.operands[k].type.u.scalar == PIR_SCALAR_I128)) {
+                            has_va_special = true;
                             break;
                         }
                     }
                 }
                 if (copy.op == PIR_OP_CALL && copy.operands[0].u.sym.is_func) {
                     PirFuncId cid = copy.operands[0].u.sym.id;
-                    if (fn_plans[cid].needs_rewrite || has_va_byval) {
-                        const PirFunction *cal = &mod->funcs.data[cid];
+                    const PirFunction *cal = &mod->funcs.data[cid];
+                    if (fn_plans[cid].needs_rewrite || (cal->is_variadic && has_va_special)) {
                         rewrite_call_site(mod, target, fn, b, &out, &copy, &fn_plans[cid],
                                           cal->params, cal->is_variadic);
                         continue;
                     }
                 } else if (copy.op == PIR_OP_CALL_INDIRECT && copy.sig_id < mod->sigs.len) {
                     PirSigId sid = copy.sig_id;
-                    if (sig_plans[sid].needs_rewrite || has_va_byval) {
-                        const PirSigDef *sig = &mod->sigs.data[sid];
+                    const PirSigDef *sig = &mod->sigs.data[sid];
+                    if (sig_plans[sid].needs_rewrite || (sig->is_variadic && has_va_special)) {
                         rewrite_call_site(mod, target, fn, b, &out, &copy, &sig_plans[sid],
                                           sig->params, sig->is_variadic);
                         continue;

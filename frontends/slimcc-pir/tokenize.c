@@ -375,7 +375,8 @@ TokenKind ident_keyword(Token *tok) {
 
     if (opt_fdefer_ts)
       hashmap_put(&map, "defer", (void *)TK_defer);
-    hashmap_put(&map, "_Defer", (void *)TK_defer);
+    if (!is_iso_std || opt_std >= STD_C23)
+      hashmap_put(&map, "_Defer", (void *)TK_defer);
 
     hashmap_put(&map, "void", (void *)TK_void);
     hashmap_put(&map, "char", (void *)TK_char);
@@ -467,6 +468,8 @@ static bool read_ucn(const char **new_pos, const char *p, uint32_t *val, bool *i
   int len = (*p == 'u') ? 4 : 8;
 
   bool has_brace = p[1] == '{';
+  if (has_brace && is_iso_std && opt_std < STD_C23)
+    *invalid = true;
   p += 1 + has_brace;
 
   const char *end = p + len;
@@ -505,6 +508,8 @@ static uint32_t read_escape_seq(const char **new_pos, const char *p, bool *inval
   }
 
   if (*p == 'o' && p[1] == '{') {
+    if (is_iso_std && opt_std < STD_C23)
+      *invalid = true;
     p += 2;
     if (!Inrange(*p, '0', '7'))
       *invalid = true;
@@ -523,6 +528,8 @@ static uint32_t read_escape_seq(const char **new_pos, const char *p, bool *inval
 
   if (*p == 'x') {
     bool has_brace = p[1] == '{';
+    if (has_brace && is_iso_std && opt_std < STD_C23)
+      *invalid = true;
     p += 1 + has_brace;
 
     if (!Isxdigit(*p))
@@ -544,6 +551,12 @@ static uint32_t read_escape_seq(const char **new_pos, const char *p, bool *inval
   uint32_t c;
   if (read_ucn(new_pos, p, &c, invalid))
     return c;
+
+  if (*p == '\0' || *p == '\n') {
+    *new_pos = p;
+    *invalid = true;
+    return 0;
+  }
 
   *new_pos = p + 1;
 
@@ -578,8 +591,11 @@ static const char *string_literal_end(const char *p) {
   for (; *p != '"'; p++) {
     if (*p == '\n' || *p == '\0')
       error_at(start, "unclosed string literal");
-    if (*p == '\\')
+    if (*p == '\\') {
+      if (p[1] == '\n' || p[1] == '\0')
+        error_at(start, "unclosed string literal");
       p++;
+    }
   }
   return p;
 }
@@ -630,17 +646,22 @@ static Token *read_utf16_string_literal(const char *start, const char *quote) {
 
   for (const char *p = quote + 1; p < end;) {
     uint32_t c;
-    if (*p == '\\')
-      c = read_escape_seq(&p, p + 1, &invalid);
-    else
+    bool is_non_ucn_esc = false;
+    if (*p == '\\') {
+      if (!read_ucn(&p, p + 1, &c, &invalid)) {
+        c = read_escape_seq(&p, p + 1, &invalid);
+        is_non_ucn_esc = true;
+      }
+    } else {
       c = decode_utf8(&p, p);
+    }
 
     if (c < 0x10000) {
       // Encode a code point in 2 bytes.
       buf[len++] = c;
       continue;
     }
-    if (c <= 0x10ffff) {
+    if (!is_non_ucn_esc && c <= 0x10ffff) {
       // Encode a code point in 4 bytes.
       c -= 0x10000;
       buf[len++] = 0xd800 + (c >> 10);
@@ -699,8 +720,12 @@ static Token *read_char_literal(const char *start) {
 
     uint32_t c, lim;
     if (*p == '\\') {
-      c = read_escape_seq(&p, p + 1, &invalid);
-      lim = 256;
+      if (read_ucn(&p, p + 1, &c, &invalid)) {
+        lim = is_iso_std ? 128 : 256;
+      } else {
+        c = read_escape_seq(&p, p + 1, &invalid);
+        lim = 256;
+      }
     } else {
       c = decode_utf8(&p, p);
       lim = 128;
@@ -728,6 +753,8 @@ static Token *read_char_literal(const char *start) {
 static Token *read_unicode_char_literal(const char *start, const char *quote, Type *ty) {
   bool invalid = false;
   const char *p = quote + 1;
+  if (*p == '\'')
+    error_at(p, "empty character literal");
   if (*p == '\0' || *p == '\n')
     error_at(start, "unclosed character literal");
 
@@ -768,9 +795,21 @@ static Token *new_pp_number(const char *start, const char *p) {
       p += 2;
       continue;
     }
-    if ((unsigned char)*p >= 128) {
-      if (is_ident2(decode_utf8(&p, p)))
+    if (*p == '\\' && (p[1] == 'u' || p[1] == 'U')) {
+      const char *q = p;
+      uint32_t c;
+      bool inv = false;
+      if (read_ucn(&q, p + 1, &c, &inv) && !inv && c >= 0xA0 && is_ident2(c)) {
+        p = q;
         continue;
+      }
+    }
+    if ((unsigned char)*p >= 128) {
+      const char *q = p;
+      if (is_ident2(decode_utf8(&q, p))) {
+        p = q;
+        continue;
+      }
     }
     break;
   }
@@ -896,11 +935,16 @@ static bool convert_pp_int(const char *loc, int len, Node *node) {
 
   if (p != p_end)
     return false;
+  if (wb && is_iso_std && opt_std < STD_C23)
+    return false;
   if (!node)
     return true;
   if (wb)
     return convert_pp_bitint(digit_begin, digit_end, node, base, u);
-  if (overflow && is_iso_std)
+  bool is_sys = node->tok && node->tok->file && node->tok->file->is_syshdr;
+  if (overflow && is_iso_std && !is_sys)
+    return false;
+  if (base == 10 && !u && val > INT64_MAX && is_iso_std && !is_sys)
     return false;
 
   Type *ty;
@@ -976,9 +1020,13 @@ void convert_pp_number(Token *tok, Node *node) {
     return;
 
   // If it's not an integer, it must be a floating point constant.
-  if (len >= 2 && p[0] == '0' && (p[1] == 'x' || p[1] == 'X') &&
-      !memchr(p, 'p', len) && !memchr(p, 'P', len))
-    error_tok(tok, "hexadecimal floating constant requires an exponent");
+  bool is_hex = (len >= 2 && p[0] == '0' && (p[1] == 'x' || p[1] == 'X'));
+  if (is_hex) {
+    if (!memchr(p, 'p', len) && !memchr(p, 'P', len))
+      error_tok(tok, "hexadecimal floating constant requires an exponent");
+  } else if (!memchr(p, '.', len) && !memchr(p, 'e', len) && !memchr(p, 'E', len)) {
+    error_tok(tok, "invalid integer constant");
+  }
 
   char *end;
   long_double_t val = strtod(p, &end);
@@ -1034,11 +1082,15 @@ static void add_line_numbers(Token *tok, File *file, SlashDelta *dlt) {
 }
 
 void tokenize_string_literal(Token *tok, Type *basety) {
+  File *saved_file = current_file;
+  if (tok->file)
+    current_file = tok->file;
   Token *tok2;
   if (basety->size == 2)
     tok2 = read_utf16_string_literal(tok->loc, tok->loc);
   else
     tok2 = read_utf32_string_literal(tok->loc, tok->loc, basety);
+  current_file = saved_file;
   tok->ty = tok2->ty;
   tok->str = tok2->str;
 }
@@ -1062,6 +1114,37 @@ void convert_ucn_ident(Token *tok) {
     if (!read_ucn(&p, p + 1, &c, &invalid) || invalid || c < 0xA0 ||
         !(q == buf ? is_ident1(c) : is_ident2(c)))
       error_tok(tok, "invalid universal character name");
+    q += encode_utf8(q, c);
+  }
+  Token *orig = tok->origin;
+  if (!orig) {
+    orig = malloc(sizeof(Token));
+    *orig = *tok;
+  }
+  tok->origin = orig;
+  tok->loc = buf;
+  tok->len = q - buf;
+  tok->has_ucn = false;
+}
+
+static void try_convert_ucn_ident(Token *tok) {
+  const char *p = tok->loc;
+  const char *end = p + tok->len;
+  char *buf = calloc(1, tok->len + 1);
+  char *q = buf;
+
+  while (p < end) {
+    if (*p != '\\') {
+      *q++ = *p++;
+      continue;
+    }
+    bool invalid = false;
+    uint32_t c;
+    if (!read_ucn(&p, p + 1, &c, &invalid) || invalid || c < 0xA0 ||
+        !(q == buf ? is_ident1(c) : is_ident2(c)) || p > end) {
+      free(buf);
+      return;
+    }
     q += encode_utf8(q, c);
   }
   Token *orig = tok->origin;
@@ -1240,7 +1323,7 @@ Token *tokenize(File *file, SlashDelta *delta, Token **end) {
   add_line_numbers(head.next, file, delta);
   for (Token *t = head.next; t->kind != TK_EOF; t = t->next) {
     if (t->kind == TK_IDENT && t->has_ucn)
-      convert_ucn_ident(t);
+      try_convert_ucn_ident(t);
   }
   return head.next;
 }

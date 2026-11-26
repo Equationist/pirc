@@ -861,7 +861,8 @@ static bool x64_emit_function(PirCodeEmitter *em, const PirModule *mod, const MF
     uint32_t nblks = mf->blocks.len;
     uint32_t *blk_redir = nblks ? (uint32_t *)malloc((size_t)nblks * sizeof(uint32_t)) : NULL;
     bool     *blk_skip  = nblks ? (bool *)calloc((size_t)nblks, sizeof(bool)) : NULL;
-    if (nblks && (!blk_redir || !blk_skip)) abort();
+    uint32_t *vis_mark  = nblks ? (uint32_t *)calloc((size_t)nblks, sizeof(uint32_t)) : NULL;
+    if (nblks && (!blk_redir || !blk_skip || !vis_mark)) abort();
     for (uint32_t b = 0u; b < nblks; ++b) blk_redir[b] = b;
     for (uint32_t b = 1u; b < nblks; ++b) {
         const MBlock *blk = &mf->blocks.data[b];
@@ -871,10 +872,21 @@ static bool x64_emit_function(PirCodeEmitter *em, const PirModule *mod, const MF
         }
     }
     for (uint32_t b = 1u; b < nblks; ++b) {
-        uint32_t cur = blk_redir[b];
-        for (uint32_t hop = 0u; hop < nblks && blk_redir[cur] != cur; ++hop) {
+        uint32_t cur = b;
+        while (blk_redir[cur] != cur) {
+            if (vis_mark[cur] == b) {
+                blk_redir[cur] = cur;
+                break;
+            }
+            if (vis_mark[cur] != 0u) break;
+            vis_mark[cur] = b;
             cur = blk_redir[cur];
         }
+    }
+    free(vis_mark);
+    for (uint32_t b = 1u; b < nblks; ++b) {
+        uint32_t cur = blk_redir[b];
+        while (blk_redir[cur] != cur) cur = blk_redir[cur];
         blk_redir[b] = cur;
         if (cur != b) blk_skip[b] = true;
     }
@@ -946,7 +958,7 @@ static bool x64_emit_function(PirCodeEmitter *em, const PirModule *mod, const MF
     }
     fprintf(out, "\t.cfi_endproc\n");
     if (!is_macho(target)) {
-        fprintf(out, "\t.size %s, .-%s\n", fn->name, fn->name);
+        fprintf(out, "\t.size %s, .-%s\n", fn_asym, fn_asym);
     }
     fprintf(out, "\n");
     return true;
@@ -1006,7 +1018,7 @@ static void emit_global_data_items(FILE *out, const PirModule *mod, const PirTar
         const PirGlobalItem *gi = &g->items[0];
         PirTypeLayout ly = pir_type_layout(mod, target, g->type);
         if (gi->kind == PIR_GITEM_INT) {
-            uint64_t x = gi->int_neg ? (uint64_t)(-(int64_t)gi->int_lo) : gi->int_lo;
+            uint64_t x = gi->int_neg ? (UINT64_C(0) - gi->int_lo) : gi->int_lo;
             if (ly.size == 1u)      fprintf(out, "\t.byte %" PRIu64 "\n", x & 0xFFu);
             else if (ly.size == 2u) fprintf(out, "\t.short %" PRIu64 "\n", x & 0xFFFFu);
             else if (ly.size == 4u) fprintf(out, "\t.long %" PRIu64 "\n", x & 0xFFFFFFFFu);
@@ -1039,7 +1051,7 @@ static void emit_global_data_items(FILE *out, const PirModule *mod, const PirTar
                 fprintf(out, "\t.zero %" PRIu64 "\n", gi->len > 0u ? gi->len : 1u);
                 break;
             case PIR_GITEM_INT: {
-                uint8_t b = (uint8_t)(gi->int_neg ? (uint64_t)(-(int64_t)gi->int_lo) : gi->int_lo);
+                uint8_t b = (uint8_t)(gi->int_neg ? (UINT64_C(0) - gi->int_lo) : gi->int_lo);
                 fprintf(out, "\t.byte %u\n", (unsigned)b);
                 break;
             }

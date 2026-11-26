@@ -371,6 +371,11 @@ static void compute_intervals(const MFunc *mf, LiveInterval *v_ivs,
                     if (v < nv) {
                         uint32_t def_pos = ins->ops[k].is_early_clobber ? (pos - 1u) : pos;
                         iv_trim_start(&v_ivs[v], def_pos);
+                        if (ins->ops[k].is_early_clobber) {
+                            /* Cover both [pos-1, pos) and [pos, pos+1) so even a dead
+                             * early-clobber def at j==0 (pos==bs) conflicts with uses [bs, bs+1). */
+                            iv_add_range(&v_ivs[v], def_pos, pos + 1u);
+                        }
                     }
                 } else if (ins->ops[k].kind == MOP_PREG && ins->ops[k].is_def) {
                     MPReg p = ins->ops[k].u.preg;

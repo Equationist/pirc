@@ -684,6 +684,14 @@ static const char *register_pir_sig(const char *def_str) {
 }
 
 /* Format parameter type list + return type for `sig` declaration. */
+static const char *pir_int_ext_attr(Type *ty) {
+  if (!ty || !is_integer(ty) || ty->size >= 4)
+    return "";
+  if (ty->kind == TY_BOOL || ty->is_unsigned)
+    return " zeroext";
+  return " signext";
+}
+
 static const char *get_pir_sig_for_call(Type *fnty, Obj *call_args) {
   SBuf sb;
   sb_init(&sb);
@@ -708,7 +716,7 @@ static const char *get_pir_sig_for_call(Type *fnty, Obj *call_args) {
       if (is_mem_val_ty(a->ty))
         sb_printf(&sb, "byval(@%s)", get_pir_agg_type_name(a->ty));
       else
-        sb_printf(&sb, "%s", pir_scalar_ty_name(a->ty));
+        sb_printf(&sb, "%s%s", pir_scalar_ty_name(a->ty), pir_int_ext_attr(a->ty));
     }
   } else {
     for (Obj *p = fnty->param_list; p; p = p->param_next) {
@@ -720,7 +728,7 @@ static const char *get_pir_sig_for_call(Type *fnty, Obj *call_args) {
       if (is_mem_val_ty(p->ty))
         sb_printf(&sb, "byval(@%s)", get_pir_agg_type_name(p->ty));
       else
-        sb_printf(&sb, "%s", pir_scalar_ty_name(p->ty));
+        sb_printf(&sb, "%s%s", pir_scalar_ty_name(p->ty), pir_int_ext_attr(p->ty));
     }
     if (fnty->is_variadic) {
       if (!first)
@@ -729,11 +737,12 @@ static const char *get_pir_sig_for_call(Type *fnty, Obj *call_args) {
     }
   }
 
-  sb_printf(&sb, ") -> %s cc \"c\"",
+  sb_printf(&sb, ") -> %s cc \"c\"%s",
             has_retbuf ? "void"
             : (rty->kind == TY_VOID || (is_agg_ty(rty) && rty->size == 0))
                 ? "void"
-                : pir_scalar_ty_name(rty));
+                : pir_scalar_ty_name(rty),
+            has_retbuf ? "" : pir_int_ext_attr(rty));
   const char *res = register_pir_sig(sb.buf);
   sb_free(&sb);
   return res;
@@ -750,7 +759,8 @@ typedef struct {
 
 typedef struct {
   Obj *obj;
-  int slot_id;     /* %loc_<slot_id> or %p_<slot_id> */
+  int slot_id;       /* %loc_<slot_id> or %p_<slot_id> */
+  int vla_save_slot; /* %loc_<vla_save_slot> for stacksave before VLA alloca_dyn, or -1 */
   bool is_byval_param;
   const char *pir_ty;
   int64_t size;
@@ -935,6 +945,7 @@ static LocalInfo *register_local(Obj *var, bool is_param) {
   LocalInfo *li = &fc->locals[fc->local_cnt++];
   memset(li, 0, sizeof(*li));
   li->obj = var;
+  li->vla_save_slot = -1;
   int32_t al = var->alt_align ? var->alt_align : (var->ty->align > 0 ? var->ty->align : 1);
   li->align = al;
   li->size = var->ty->size > 0 ? var->ty->size : 1;
@@ -1560,13 +1571,16 @@ static PirVal gen_addr(Node *node) {
     gen_expr(node->m.lhs);
     return gen_addr(node->m.rhs);
   case ND_MEMBER: {
-    PirVal base = gen_addr(node->m.lhs);
+    PirVal base = (is_mem_val_ty(node->m.lhs->ty) && (node->m.lhs->ty->qual & Q_ATOMIC))
+                      ? gen_expr(node->m.lhs)
+                      : gen_addr(node->m.lhs);
     return emit_ptr_add_imm(base, node->m.member->offset);
   }
   case ND_ASSIGN:
   case ND_COND:
   case ND_CAST:
   case ND_FUNCALL:
+  case ND_EXCH:
   case ND_STMT_EXPR:
     if (is_mem_val_ty(node->ty))
       return gen_expr(node);
@@ -1727,13 +1741,26 @@ static PirVal gen_funcall(Node *node) {
   return pir_void_val();
 }
 
-static PirVal gen_expr_with_null_lhs(NodeKind kind, Type *ty, Node *rhs, PirVal lhs_val) {
+static PirVal gen_expr_with_null_lhs(NodeKind kind, Node *orig_lhs, Type *ty, Node *rhs, PirVal lhs_val) {
+  Type *null_ty = ty;
+  PirVal promoted_val = lhs_val;
+  if (orig_lhs && is_bitfield(orig_lhs) && ty->kind != TY_BITINT) {
+    int bw = orig_lhs->m.member->bit_width;
+    if (bw < 32) {
+      null_ty = ty_int;
+    } else if (bw == 32) {
+      null_ty = ty->is_unsigned ? ty_uint : ty_int;
+    }
+    if (null_ty != ty && strcmp(lhs_val.ty, pir_scalar_ty_name(null_ty)) != 0)
+      promoted_val = emit_cast_val(lhs_val, ty, null_ty);
+  }
+
   PirVal saved = fc->null_expr_val;
   bool saved_has = fc->has_null_expr_val;
-  fc->null_expr_val = lhs_val;
+  fc->null_expr_val = promoted_val;
   fc->has_null_expr_val = true;
 
-  Node null = {.kind = ND_NULL_EXPR, .ty = ty, .tok = rhs->tok};
+  Node null = {.kind = ND_NULL_EXPR, .ty = null_ty, .tok = rhs->tok};
   Node expr = {.kind = kind, .m.lhs = &null, .m.rhs = rhs, .tok = rhs->tok};
   add_type(&expr);
   Node *casted = new_cast(&expr, ty);
@@ -1981,13 +2008,13 @@ static PirVal gen_expr(Node *node) {
     LocalInfo *li = NULL;
     if (is_direct_scalar_local(node->m.lhs, &li)) {
       PirVal old = emit_load_local_slot(li, node->m.lhs->ty);
-      PirVal nv = gen_expr_with_null_lhs(node->arith_kind, node->m.lhs->ty, node->m.rhs, old);
+      PirVal nv = gen_expr_with_null_lhs(node->arith_kind, node->m.lhs, node->m.lhs->ty, node->m.rhs, old);
       emit_store_local_slot(nv, li, node->m.lhs->ty);
       return nv;
     }
     PirVal addr = gen_addr(node->m.lhs);
     PirVal old = emit_load_node(node->m.lhs, addr);
-    PirVal nv = gen_expr_with_null_lhs(node->arith_kind, node->m.lhs->ty, node->m.rhs, old);
+    PirVal nv = gen_expr_with_null_lhs(node->arith_kind, node->m.lhs, node->m.lhs->ty, node->m.rhs, old);
     return emit_store_node(node->m.lhs, nv, addr);
   }
 
@@ -1995,13 +2022,13 @@ static PirVal gen_expr(Node *node) {
     LocalInfo *li = NULL;
     if (is_direct_scalar_local(node->m.lhs, &li)) {
       PirVal old = emit_load_local_slot(li, node->m.lhs->ty);
-      PirVal nv = gen_expr_with_null_lhs(ND_ADD, node->m.lhs->ty, node->m.rhs, old);
+      PirVal nv = gen_expr_with_null_lhs(ND_ADD, node->m.lhs, node->m.lhs->ty, node->m.rhs, old);
       emit_store_local_slot(nv, li, node->m.lhs->ty);
       return old;
     }
     PirVal addr = gen_addr(node->m.lhs);
     PirVal old = emit_load_node(node->m.lhs, addr);
-    PirVal nv = gen_expr_with_null_lhs(ND_ADD, node->m.lhs->ty, node->m.rhs, old);
+    PirVal nv = gen_expr_with_null_lhs(ND_ADD, node->m.lhs, node->m.lhs->ty, node->m.rhs, old);
     emit_store_node(node->m.lhs, nv, addr);
     return old;
   }
@@ -2169,6 +2196,14 @@ static PirVal gen_expr(Node *node) {
     int32_t p2 = 16;
     while (p2 < al)
       p2 <<= 1;
+    if (fc->fn->dealloc_vla && node->m.var && node->m.var->vptr) {
+      LocalInfo *li = register_local(node->m.var->vptr, false);
+      if (li->vla_save_slot < 0)
+        li->vla_save_slot = emit_entry_scalar_alloca("ptr", 8, 8);
+      int sp = new_tid();
+      sb_printf(&fc->body_sb, "    %%t%d = stacksave\n", sp);
+      sb_printf(&fc->body_sb, "    store.ptr %%t%d, %%loc_%d, align 8\n", sp, li->vla_save_slot);
+    }
     int r = new_tid();
     if (p2 > 16) {
       int extra = new_tid();
@@ -2566,12 +2601,14 @@ static void gen_defr(Node *node) {
         defr = defr->next;
       if (fc->fn->dealloc_vla && !fc->terminated) {
         int sp = new_tid();
-        if (defr->next && defr->next->vla) {
-          LocalInfo *li = register_local(defr->next->vla, false);
-          sb_printf(&fc->body_sb, "    %%t%d = load.ptr %%loc_%d, align 8\n", sp, li->slot_id);
-        } else {
-          sb_printf(&fc->body_sb, "    %%t%d = load.ptr %%loc_%d, align 8\n", sp, fc->vla_sp_slot);
+        int save_slot = fc->vla_sp_slot;
+        if (defr->vla) {
+          LocalInfo *li = register_local(defr->vla, false);
+          if (li->vla_save_slot < 0)
+            li->vla_save_slot = emit_entry_scalar_alloca("ptr", 8, 8);
+          save_slot = li->vla_save_slot;
         }
+        sb_printf(&fc->body_sb, "    %%t%d = load.ptr %%loc_%d, align 8\n", sp, save_slot);
         sb_printf(&fc->body_sb, "    stackrestore %%t%d\n", sp);
       }
       defr = defr->next;
@@ -2906,7 +2943,7 @@ void emit_text(Obj *fn) {
     if (li->is_byval_param) {
       sb_printf(&hdr, "%%p_%d: byval(@%s)", li->slot_id, get_pir_agg_type_name(p->ty));
     } else {
-      sb_printf(&hdr, "%%p_%d: %s", li->slot_id, li->pir_ty);
+      sb_printf(&hdr, "%%p_%d: %s%s", li->slot_id, li->pir_ty, pir_int_ext_attr(p->ty));
       if (p->ty->kind == TY_PTR && (p->ty->qual & Q_RESTRICT))
         sb_printf(&hdr, " noalias");
       int32_t p2 = 1;
@@ -2923,7 +2960,8 @@ void emit_text(Obj *fn) {
     sb_printf(&hdr, "...");
   }
 
-  sb_printf(&hdr, ") -> %s cc \"c\"", ctx.ret_pir_ty);
+  sb_printf(&hdr, ") -> %s cc \"c\"%s", ctx.ret_pir_ty,
+            ctx.has_retbuf ? "" : pir_int_ext_attr(rty));
   if (fn->is_noreturn)
     sb_printf(&hdr, " noreturn");
   if (fn->section_name) {
@@ -3070,7 +3108,7 @@ static void emit_extern_decl(SBuf *sb, Obj *var) {
       if (is_mem_val_ty(p->ty))
         sb_printf(sb, "byval(@%s)", get_pir_agg_type_name(p->ty));
       else
-        sb_printf(sb, "%s", pir_scalar_ty_name(p->ty));
+        sb_printf(sb, "%s%s", pir_scalar_ty_name(p->ty), pir_int_ext_attr(p->ty));
     }
     if (var->ty->is_variadic) {
       if (!first)
@@ -3081,7 +3119,7 @@ static void emit_extern_decl(SBuf *sb, Obj *var) {
                    : (rty->kind == TY_VOID || (is_agg_ty(rty) && rty->size == 0))
                        ? "void"
                        : pir_scalar_ty_name(rty);
-    sb_printf(sb, ") -> %s cc \"c\"", rt);
+    sb_printf(sb, ") -> %s cc \"c\"%s", rt, has_rb ? "" : pir_int_ext_attr(rty));
     if (var->is_noreturn)
       sb_printf(sb, " noreturn");
     sb_printf(sb, "\n");

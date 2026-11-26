@@ -270,8 +270,9 @@ static bool match_unit_stride_ptr(const PirFunction *fn, const PirLoop *loop, Pi
     if (vd->def_inst == PIR_INVALID_ID || vd->def_block != body_bid) return false;
     const PirInst *pa = &fn->insts.data[vd->def_inst];
     if (pa->op != PIR_OP_PTR_ADD || pa->operand_count != 2u) return false;
-    /* ptr_add.i32 sign-extends its i32 offset; reject for unsigned IV loops. */
-    if (pa->ty.kind == PIR_TYPE_SCALAR && pa->ty.u.scalar == PIR_SCALAR_I32 && !is_signed) return false;
+    /* ptr_add.i32 truncates and sign-extends its i32 byte offset, whereas vectorized
+     * address generation widens the IV to i64 before scaling; reject ptr_add.i32. */
+    if (pa->ty.kind == PIR_TYPE_SCALAR && pa->ty.u.scalar == PIR_SCALAR_I32) return false;
     if (!operand_outside_loop(fn, loop, pa->operands[0])) return false;
     if (!match_unit_stride_offset(fn, body_bid, iv, is_signed, elem_bytes, pa->operands[1],
                                   out_delta, out_narrow_shift, out_off1, out_off2, out_off3)) {

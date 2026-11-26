@@ -914,13 +914,45 @@ static void print_linemarker(FILE *out, Token *tok) {
   fprintf(out, "# %d \"%s\"\n", tok->display_line_no, name);
 }
 
+static bool needs_space_between(Token *prev, Token *cur) {
+  if (!prev || cur->at_bol || cur->has_space || prev->len <= 0 || cur->len <= 0)
+    return false;
+  char a = prev->loc[prev->len - 1];
+  char b = cur->loc[0];
+  if (prev->kind == TK_PP_NUM && (b == '+' || b == '-') &&
+      (a == 'e' || a == 'E' || a == 'p' || a == 'P'))
+    return true;
+  if ((prev->kind == TK_IDENT || prev->kind == TK_PP_NUM) &&
+      (cur->kind == TK_IDENT || cur->kind == TK_PP_NUM || b == '.' || b == '"' || b == '\''))
+    return true;
+  if (prev->kind >= TK_PUNCT && prev->kind < TK_PUNCT_END &&
+      cur->kind >= TK_PUNCT && cur->kind < TK_PUNCT_END) {
+    if (a == b && (a == '+' || a == '-' || a == '&' || a == '|' || a == '<' ||
+                   a == '>' || a == '=' || a == '#' || a == ':' || a == '.'))
+      return true;
+    if (b == '=' && (a == '!' || a == '+' || a == '-' || a == '*' || a == '/' ||
+                     a == '%' || a == '^' || a == '&' || a == '|' || a == '<' || a == '>'))
+      return true;
+    if ((a == '-' && b == '>') || (a == '/' && (b == '*' || b == '/')) ||
+        (a == '<' && (b == ':' || b == '%')) || (a == '%' && (b == '>' || b == ':')) ||
+        (a == ':' && b == '>'))
+      return true;
+  }
+  if (prev->kind == TK_PUNCT && a == '.' && (cur->kind == TK_PP_NUM || b == '.'))
+    return true;
+  return false;
+}
+
 static void print_tokens(Token *tok, FILE *out) {
   if (opt_P) {
     tok->at_bol = false;
-    for (; tok->kind != TK_EOF; tok = tok->next) {
-      if (tok->at_bol)
+    Token *prev = NULL;
+    for (; tok->kind != TK_EOF; prev = tok, tok = tok->next) {
+      if (tok->at_bol) {
         fputc('\n', out);
-      if (tok->has_space)
+        prev = NULL;
+      }
+      if (tok->has_space || needs_space_between(prev, tok))
         fputc(' ', out);
       fprintf(out, "%.*s", tok->len, tok->loc);
     }
@@ -931,6 +963,7 @@ static void print_tokens(Token *tok, FILE *out) {
   int line = 0;
   int file_no = -1;
   bool after_tok = false;
+  Token *prev = NULL;
   for (; tok->kind != TK_EOF; tok = tok->next) {
     if (tok->kind == TK_FMARK) {
       if (tok->display_file_no == tok->next->display_file_no && tok->next->kind != TK_EOF)
@@ -940,6 +973,7 @@ static void print_tokens(Token *tok, FILE *out) {
       print_linemarker(out, tok);
       file_no = tok->display_file_no;
       after_tok = false;
+      prev = NULL;
       continue;
     }
 
@@ -949,6 +983,7 @@ static void print_tokens(Token *tok, FILE *out) {
       print_linemarker(out, tok);
       file_no = tok->display_file_no;
       line = tok->display_line_no;
+      prev = NULL;
 
     } else if (tok->at_bol) {
       if (after_tok) {
@@ -964,13 +999,15 @@ static void print_tokens(Token *tok, FILE *out) {
 
         line = tok->display_line_no;
       }
+      prev = NULL;
     }
 
-    if (tok->has_space)
+    if (tok->has_space || needs_space_between(prev, tok))
       fputc(' ', out);
 
     fprintf(out, "%.*s", tok->len, tok->loc);
     after_tok = true;
+    prev = tok;
   }
   fputc('\n', out);
 }

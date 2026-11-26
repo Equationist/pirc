@@ -112,7 +112,7 @@ static void classify_sysv_agg(const PirModule *mod, const PirTargetSpec *target,
         out->stack_byval_align = ly.align;
         return;
     }
-    if (w.single_v128 && ly.size == 16u) {
+    if (w.single_v128 && ly.size == 16u && w.cls[0] == EB_SSE && w.cls[1] == EB_SSE) {
         out->kind      = PIR_ABI_DIRECT;
         out->reg_count = 1u;
         out->regs[0]   = w.v128_ty;
@@ -151,7 +151,8 @@ bool pir_abi_sysv_x64_param(const PirModule *mod, const PirTargetSpec *target,
         PirTypeLayout ly = pir_type_layout(mod, target, pd->abi_type);
         if (out->kind == PIR_ABI_DIRECT) {
             /* All-or-nothing register availability rule (SysV AMD64 §3.2.3). */
-            if (st->gp_used + out->gp_used > 6u || st->fp_used + out->fp_used > 8u) {
+            if ((out->gp_used > 0u && st->gp_used + out->gp_used > 6u) ||
+                (out->fp_used > 0u && st->fp_used + out->fp_used > 8u)) {
                 memset(out, 0, sizeof(*out));
                 out->kind              = PIR_ABI_INDIRECT;
                 out->stack_byval_size  = ly.size;

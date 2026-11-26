@@ -44,11 +44,29 @@ typedef struct {
     PirToken   cur;
     PirModule *mod;
     PirDiag   *diag;
-    bool       agg_defined[4096]; /* Tracks named agg definitions */
+    bool      *agg_defined;     /* Dynamically sized bitmap of defined named aggregates */
+    uint32_t   agg_defined_cap;
     PIR_VEC(PendingTarget) pending_targets;
     PIR_VEC(PendingValRef) pending_vals;
     PIR_VEC(PendingSigRef) pending_sigs;
 } Parser;
+
+static bool is_agg_defined(const Parser *p, PirTypeId id) {
+    return id < p->agg_defined_cap && p->agg_defined[id];
+}
+
+static void mark_agg_defined(Parser *p, PirTypeId id) {
+    if (id >= p->agg_defined_cap) {
+        uint32_t ncap = p->agg_defined_cap ? p->agg_defined_cap : 64u;
+        while (ncap <= id) ncap *= 2u;
+        bool *nb = (bool *)realloc(p->agg_defined, (size_t)ncap * sizeof(bool));
+        if (!nb) abort();
+        memset(nb + p->agg_defined_cap, 0, (size_t)(ncap - p->agg_defined_cap) * sizeof(bool));
+        p->agg_defined = nb;
+        p->agg_defined_cap = ncap;
+    }
+    p->agg_defined[id] = true;
+}
 
 static void advance_tok(Parser *p) {
     p->cur = pir_lexer_next(&p->lex);
@@ -170,9 +188,7 @@ static PirTypeId intern_anon_array(Parser *p, uint64_t len, PirType elem, uint32
     def.array_len = len;
     PirTypeId id  = p->mod->agg_types.len;
     PIR_VEC_PUSH(&p->mod->agg_types, def);
-    if (id < 4096u) {
-        p->agg_defined[id] = true;
-    }
+    mark_agg_defined(p, id);
     return id;
 }
 
@@ -191,9 +207,7 @@ static PirTypeId intern_anon_pad(Parser *p, uint64_t len, uint32_t line) {
     def.array_len = len;
     PirTypeId id  = p->mod->agg_types.len;
     PIR_VEC_PUSH(&p->mod->agg_types, def);
-    if (id < 4096u) {
-        p->agg_defined[id] = true;
-    }
+    mark_agg_defined(p, id);
     return id;
 }
 
@@ -497,8 +511,9 @@ static bool parse_operand(Parser *p, PirFuncId func_idx, PirBlockId blk_idx,
                 pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected integer offset");
                 return false;
             }
-            int64_t off = (int64_t)p->cur.int_lo;
-            out->u.sym.offset = sub ? -off : off;
+            uint64_t mag = p->cur.int_lo;
+            bool neg = (sub != p->cur.int_neg);
+            out->u.sym.offset = neg ? (int64_t)(UINT64_C(0) - mag) : (int64_t)mag;
             advance_tok(p);
         }
     } else if (p->cur.kind == TOK_IDENT && strcmp(p->cur.text, "nan") == 0) {
@@ -1399,6 +1414,12 @@ static bool parse_param_list(Parser *p, bool require_names,
                 } else if (strcmp(p->cur.text, "readonly") == 0) {
                     pd.attrs |= PIR_PATTR_READONLY;
                     advance_tok(p);
+                } else if (strcmp(p->cur.text, "signext") == 0) {
+                    pd.attrs |= PIR_PATTR_SIGNEXT;
+                    advance_tok(p);
+                } else if (strcmp(p->cur.text, "zeroext") == 0) {
+                    pd.attrs |= PIR_PATTR_ZEROEXT;
+                    advance_tok(p);
                 } else {
                     break;
                 }
@@ -1459,12 +1480,20 @@ static bool parse_fn_cc_and_attrs(Parser *p, PirCallingConv *cc_out,
         } else if (is_ident(p, "readonly")) {
             *attrs_out |= PIR_FATTR_READONLY;
             advance_tok(p);
+        } else if (is_ident(p, "signext")) {
+            *attrs_out |= PIR_FATTR_RET_SIGNEXT;
+            advance_tok(p);
+        } else if (is_ident(p, "zeroext")) {
+            *attrs_out |= PIR_FATTR_RET_ZEROEXT;
+            advance_tok(p);
         } else if (p->cur.kind == TOK_LBRACKET) {
             advance_tok(p);
             do {
                 if (is_ident(p, "nounwind"))      *attrs_out |= PIR_FATTR_NOUNWIND;
                 else if (is_ident(p, "noreturn")) *attrs_out |= PIR_FATTR_NORETURN;
                 else if (is_ident(p, "readonly")) *attrs_out |= PIR_FATTR_READONLY;
+                else if (is_ident(p, "signext"))  *attrs_out |= PIR_FATTR_RET_SIGNEXT;
+                else if (is_ident(p, "zeroext"))  *attrs_out |= PIR_FATTR_RET_ZEROEXT;
                 else {
                     pir_diag_error(p->diag, p->cur.line, p->cur.col, "unknown function attribute '%s'",
                                    p->cur.text ? p->cur.text : "");
@@ -1492,7 +1521,7 @@ static bool parse_type_decl(Parser *p) {
     if (!expect_tok(p, TOK_EQ, "'='")) return false;
 
     PirTypeId id = intern_named_agg(p, name, line);
-    if (id < 4096u && p->agg_defined[id]) {
+    if (is_agg_defined(p, id)) {
         pir_diag_error(p->diag, line, 0u, "duplicate type definition '@%s'", name);
         return false;
     }
@@ -1569,9 +1598,7 @@ static bool parse_type_decl(Parser *p) {
         advance_tok(p);
     }
 
-    if (id < 4096u) {
-        p->agg_defined[id] = true;
-    }
+    mark_agg_defined(p, id);
     return true;
 }
 
@@ -1644,8 +1671,9 @@ static bool parse_global_item(Parser *p, PirType hint_ty, PirGlobalItem *out) {
                 pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected integer relocation offset");
                 return false;
             }
-            int64_t off = (int64_t)p->cur.int_lo;
-            out->sym_offset = sub ? -off : off;
+            uint64_t mag = p->cur.int_lo;
+            bool neg = (sub != p->cur.int_neg);
+            out->sym_offset = neg ? (int64_t)(UINT64_C(0) - mag) : (int64_t)mag;
             advance_tok(p);
         }
         return true;
@@ -2003,7 +2031,7 @@ static bool resolve_module(Parser *p) {
 
     /* 1. Check that all referenced named aggregates were defined. */
     for (uint32_t i = 0u; i < mod->agg_types.len; ++i) {
-        if (mod->agg_types.data[i].name && i < 4096u && !p->agg_defined[i]) {
+        if (mod->agg_types.data[i].name && !is_agg_defined(p, i)) {
             pir_diag_error(p->diag, mod->agg_types.data[i].src_line, 0u,
                            "undefined aggregate type '@%s'", mod->agg_types.data[i].name);
         }
@@ -2133,6 +2161,28 @@ static bool resolve_module(Parser *p) {
             }
         }
         if (found == PIR_INVALID_ID) {
+            /* Next prefer non-block-param defs (function params or instruction results). */
+            for (uint32_t v = 0u; v < fn->values.len; ++v) {
+                if ((fn->values.data[v].def_block == PIR_INVALID_ID ||
+                     fn->values.data[v].def_inst != PIR_INVALID_ID) &&
+                    strcmp(fn->values.data[v].name, vr->name) == 0) {
+                    found = v;
+                    break;
+                }
+            }
+        }
+        if (found == PIR_INVALID_ID) {
+            /* Finally pick the nearest preceding block parameter (or any matching block param). */
+            for (uint32_t v = fn->values.len; v > 0u; --v) {
+                uint32_t idx = v - 1u;
+                if (strcmp(fn->values.data[idx].name, vr->name) == 0 &&
+                    fn->values.data[idx].def_block < vr->use_block) {
+                    found = idx;
+                    break;
+                }
+            }
+        }
+        if (found == PIR_INVALID_ID) {
             for (uint32_t v = 0u; v < fn->values.len; ++v) {
                 if (strcmp(fn->values.data[v].name, vr->name) == 0) {
                     found = v;
@@ -2224,6 +2274,7 @@ bool pir_parse_module(const char *src, size_t len, const char *filename,
     }
 
 done:
+    free(p.agg_defined);
     PIR_VEC_FREE(&p.pending_targets);
     PIR_VEC_FREE(&p.pending_vals);
     PIR_VEC_FREE(&p.pending_sigs);

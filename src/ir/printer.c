@@ -346,7 +346,7 @@ static void print_operand(const PirModule *mod, const PirFunction *fn,
         case PIR_OPER_SYM:
             print_global_sym(op->u.sym.name, out);
             if (op->u.sym.offset > 0)      fprintf(out, " + %" PRId64, op->u.sym.offset);
-            else if (op->u.sym.offset < 0) fprintf(out, " - %" PRId64, -op->u.sym.offset);
+            else if (op->u.sym.offset < 0) fprintf(out, " - %" PRIu64, UINT64_C(0) - (uint64_t)op->u.sym.offset);
             break;
         case PIR_OPER_INVOKE_RET:
             fputs("ret", out);
@@ -405,6 +405,8 @@ static void print_param_list(const PirModule *mod, const PirParamDecl *params,
         }
         if (params[i].attrs & PIR_PATTR_NOALIAS)  fputs(" noalias", out);
         if (params[i].attrs & PIR_PATTR_READONLY) fputs(" readonly", out);
+        if (params[i].attrs & PIR_PATTR_SIGNEXT)  fputs(" signext", out);
+        if (params[i].attrs & PIR_PATTR_ZEROEXT)  fputs(" zeroext", out);
     }
     if (is_variadic) {
         if (count > 0u) fputs(", ", out);
@@ -431,9 +433,11 @@ static void print_fn_cc_attrs(PirCallingConv cc, uint32_t attrs, const char *sec
         fputs(" section ", out);
         print_escaped_string((const uint8_t *)sec, strlen(sec), out);
     }
-    if (attrs & PIR_FATTR_NOUNWIND) fputs(" nounwind", out);
-    if (attrs & PIR_FATTR_NORETURN) fputs(" noreturn", out);
-    if (attrs & PIR_FATTR_READONLY) fputs(" readonly", out);
+    if (attrs & PIR_FATTR_NOUNWIND)    fputs(" nounwind", out);
+    if (attrs & PIR_FATTR_NORETURN)    fputs(" noreturn", out);
+    if (attrs & PIR_FATTR_READONLY)    fputs(" readonly", out);
+    if (attrs & PIR_FATTR_RET_SIGNEXT) fputs(" signext", out);
+    if (attrs & PIR_FATTR_RET_ZEROEXT) fputs(" zeroext", out);
 }
 
 static void print_global_item(const PirGlobalItem *it, PirType hint_ty, FILE *out) {
@@ -454,7 +458,7 @@ static void print_global_item(const PirGlobalItem *it, PirType hint_ty, FILE *ou
             fputs("ptr ", out);
             print_global_sym(it->sym_name, out);
             if (it->sym_offset > 0)      fprintf(out, " + %" PRId64, it->sym_offset);
-            else if (it->sym_offset < 0) fprintf(out, " - %" PRId64, -it->sym_offset);
+            else if (it->sym_offset < 0) fprintf(out, " - %" PRIu64, UINT64_C(0) - (uint64_t)it->sym_offset);
             break;
     }
 }

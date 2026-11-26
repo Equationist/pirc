@@ -95,6 +95,99 @@ static PirValueId emit_un(PirModule *mod, PirFunction *fn, PirBlockId blk, PirIn
     return ins.results[0];
 }
 
+static void emit_trap_if(PirModule *mod, PirFunction *fn, PirBlockId blk, PirInstIdVec *out,
+                         PirValueId cond_i8, uint32_t ln, uint32_t lc) {
+    PirType t64 = pir_type_scalar(PIR_SCALAR_I64);
+    PirType t8  = pir_type_scalar(PIR_SCALAR_I8);
+    PirValueId c64 = emit_un(mod, fn, blk, out, PIR_OP_ZEXT, t64, pir_op_val(cond_i8, t8),
+                             ln, lc, PIR_INVALID_ID);
+    emit_bin(mod, fn, blk, out, PIR_OP_ADD, t64, PIR_FLAG_TRAP_U,
+             pir_op_val(c64, t64), pir_op_imm_i(UINT64_MAX, false, t64),
+             ln, lc, PIR_INVALID_ID);
+}
+
+static void emit_neg128(PirModule *mod, PirFunction *fn, PirBlockId blk, PirInstIdVec *out,
+                        PirOperand lo, PirOperand hi, uint32_t ln, uint32_t lc,
+                        PirValueId *out_lo, PirValueId *out_hi) {
+    PirType t64 = pir_type_scalar(PIR_SCALAR_I64);
+    PirType t8  = pir_type_scalar(PIR_SCALAR_I8);
+    PirInst s0 = pir_make_inst(PIR_OP_SUB_BORROW, t64, ln, lc);
+    s0.operand_count = 3u; s0.operands = pir_alloc_ops(mod, 3u);
+    s0.operands[0] = pir_op_imm_i(0u, false, t64);
+    s0.operands[1] = lo;
+    s0.operands[2] = pir_op_imm_i(0u, false, t8);
+    s0.results[0]  = pir_fn_new_val(mod, fn, "nlo", t64, blk, PIR_INVALID_ID, 0u);
+    s0.results[1]  = pir_fn_new_val(mod, fn, "nbw", t8,  blk, PIR_INVALID_ID, 1u);
+    pir_fn_append_inst(fn, out, s0);
+
+    PirInst s1 = pir_make_inst(PIR_OP_SUB_BORROW, t64, ln, lc);
+    s1.operand_count = 3u; s1.operands = pir_alloc_ops(mod, 3u);
+    s1.operands[0] = pir_op_imm_i(0u, false, t64);
+    s1.operands[1] = hi;
+    s1.operands[2] = pir_op_val(s0.results[1], t8);
+    s1.results[0]  = pir_fn_new_val(mod, fn, "nhi", t64, blk, PIR_INVALID_ID, 0u);
+    s1.results[1]  = pir_fn_new_val(mod, fn, "nbw2", t8, blk, PIR_INVALID_ID, 1u);
+    pir_fn_append_inst(fn, out, s1);
+
+    *out_lo = s0.results[0];
+    *out_hi = s1.results[0];
+}
+
+static PirValueId emit_mul_ovf_u128(PirModule *mod, PirFunction *fn, PirBlockId blk, PirInstIdVec *out,
+                                    PirOperand alo, PirOperand ahi, PirOperand blo, PirOperand bhi,
+                                    uint32_t ln, uint32_t lc, PirValueId rlo, PirValueId rhi) {
+    PirType t64 = pir_type_scalar(PIR_SCALAR_I64);
+    PirType t8  = pir_type_scalar(PIR_SCALAR_I8);
+
+    PirInst mw0 = pir_make_inst(PIR_OP_MUL_WIDE_U, t64, ln, lc);
+    mw0.operand_count = 2u; mw0.operands = pir_alloc_ops(mod, 2u);
+    mw0.operands[0] = alo; mw0.operands[1] = blo;
+    mw0.results[0]  = (rlo != PIR_INVALID_ID) ? rlo : pir_fn_new_val(mod, fn, "mlo", t64, blk, PIR_INVALID_ID, 0u);
+    mw0.results[1]  = pir_fn_new_val(mod, fn, "m0h", t64, blk, PIR_INVALID_ID, 1u);
+    pir_fn_append_inst(fn, out, mw0);
+
+    PirInst mw1 = pir_make_inst(PIR_OP_MUL_WIDE_U, t64, ln, lc);
+    mw1.operand_count = 2u; mw1.operands = pir_alloc_ops(mod, 2u);
+    mw1.operands[0] = alo; mw1.operands[1] = bhi;
+    mw1.results[0]  = pir_fn_new_val(mod, fn, "m1l", t64, blk, PIR_INVALID_ID, 0u);
+    mw1.results[1]  = pir_fn_new_val(mod, fn, "m1h", t64, blk, PIR_INVALID_ID, 1u);
+    pir_fn_append_inst(fn, out, mw1);
+
+    PirInst mw2 = pir_make_inst(PIR_OP_MUL_WIDE_U, t64, ln, lc);
+    mw2.operand_count = 2u; mw2.operands = pir_alloc_ops(mod, 2u);
+    mw2.operands[0] = ahi; mw2.operands[1] = blo;
+    mw2.results[0]  = pir_fn_new_val(mod, fn, "m2l", t64, blk, PIR_INVALID_ID, 0u);
+    mw2.results[1]  = pir_fn_new_val(mod, fn, "m2h", t64, blk, PIR_INVALID_ID, 1u);
+    pir_fn_append_inst(fn, out, mw2);
+
+    PirInst a1 = pir_make_inst(PIR_OP_ADD_CARRY, t64, ln, lc);
+    a1.operand_count = 3u; a1.operands = pir_alloc_ops(mod, 3u);
+    a1.operands[0] = pir_op_val(mw0.results[1], t64);
+    a1.operands[1] = pir_op_val(mw1.results[0], t64);
+    a1.operands[2] = pir_op_imm_i(0u, false, t8);
+    a1.results[0]  = pir_fn_new_val(mod, fn, "mt0", t64, blk, PIR_INVALID_ID, 0u);
+    a1.results[1]  = pir_fn_new_val(mod, fn, "mc1", t8,  blk, PIR_INVALID_ID, 1u);
+    pir_fn_append_inst(fn, out, a1);
+
+    PirInst a2 = pir_make_inst(PIR_OP_ADD_CARRY, t64, ln, lc);
+    a2.operand_count = 3u; a2.operands = pir_alloc_ops(mod, 3u);
+    a2.operands[0] = pir_op_val(a1.results[0], t64);
+    a2.operands[1] = pir_op_val(mw2.results[0], t64);
+    a2.operands[2] = pir_op_imm_i(0u, false, t8);
+    a2.results[0]  = (rhi != PIR_INVALID_ID) ? rhi : pir_fn_new_val(mod, fn, "mhi", t64, blk, PIR_INVALID_ID, 0u);
+    a2.results[1]  = pir_fn_new_val(mod, fn, "mc2", t8,  blk, PIR_INVALID_ID, 1u);
+    pir_fn_append_inst(fn, out, a2);
+
+    PirValueId ah_nz = emit_bin(mod, fn, blk, out, PIR_OP_CMP_NE, t64, 0u, ahi, pir_op_imm_i(0u, false, t64), ln, lc, PIR_INVALID_ID);
+    PirValueId bh_nz = emit_bin(mod, fn, blk, out, PIR_OP_CMP_NE, t64, 0u, bhi, pir_op_imm_i(0u, false, t64), ln, lc, PIR_INVALID_ID);
+    PirValueId both_hi = emit_bin(mod, fn, blk, out, PIR_OP_AND, t8, 0u, pir_op_val(ah_nz, t8), pir_op_val(bh_nz, t8), ln, lc, PIR_INVALID_ID);
+    PirValueId hi_or = emit_bin(mod, fn, blk, out, PIR_OP_OR, t64, 0u, pir_op_val(mw1.results[1], t64), pir_op_val(mw2.results[1], t64), ln, lc, PIR_INVALID_ID);
+    PirValueId hi_nz = emit_bin(mod, fn, blk, out, PIR_OP_CMP_NE, t64, 0u, pir_op_val(hi_or, t64), pir_op_imm_i(0u, false, t64), ln, lc, PIR_INVALID_ID);
+    PirValueId cy_or = emit_bin(mod, fn, blk, out, PIR_OP_OR, t8, 0u, pir_op_val(a1.results[1], t8), pir_op_val(a2.results[1], t8), ln, lc, PIR_INVALID_ID);
+    PirValueId o1 = emit_bin(mod, fn, blk, out, PIR_OP_OR, t8, 0u, pir_op_val(both_hi, t8), pir_op_val(hi_nz, t8), ln, lc, PIR_INVALID_ID);
+    return emit_bin(mod, fn, blk, out, PIR_OP_OR, t8, 0u, pir_op_val(o1, t8), pir_op_val(cy_or, t8), ln, lc, PIR_INVALID_ID);
+}
+
 static void expand_branch_target_i128(PirModule *mod, PirBranchTarget *bt, const I128Pair *map) {
     if (bt->arg_count == 0u) return;
     bool has_any = false;
@@ -133,9 +226,13 @@ static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
         }
     }
     if (!uses_i128) {
-        for (uint32_t i = 0u; i < fn->insts.len; ++i) {
+        for (uint32_t i = 0u; i < fn->insts.len && !uses_i128; ++i) {
             const PirInst *ins = &fn->insts.data[i];
             if (is_i128(ins->ty)) { uses_i128 = true; break; }
+            for (uint32_t k = 0u; k < ins->operand_count; ++k) {
+                if (is_i128(ins->operands[k].type)) { uses_i128 = true; break; }
+            }
+            if (uses_i128) break;
             if (ins->op == PIR_OP_CALL && ins->operands[0].u.sym.is_func &&
                 ins->operands[0].u.sym.id < orig_funcs &&
                 fn_ret_i128[ins->operands[0].u.sym.id]) {
@@ -314,6 +411,8 @@ static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                         if (is_i128(copy.operands[k].type)) {
                             PirOperand lo, hi;
                             operand_to_pair(&copy.operands[k], map, &lo, &hi);
+                            lo.call_stack_align = copy.operands[k].call_stack_align;
+                            hi.call_stack_align = 0u;
                             PIR_VEC_PUSH(&nargs, lo);
                             PIR_VEC_PUSH(&nargs, hi);
                         } else {
@@ -360,7 +459,7 @@ static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                 continue;
             }
 
-            /* Rewrite branch targets if any argument is i128. */
+            /* Rewrite branch targets if any argument is i128 (and lower switch.i128 to cmp+br chain). */
             if (copy.op == PIR_OP_JMP || copy.op == PIR_OP_BR || copy.op == PIR_OP_SWITCH) {
                 PirInst *slot = &fn->insts.data[iid];
                 expand_branch_target_i128(mod, &slot->targets[0], map);
@@ -369,6 +468,52 @@ static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                 } else if (copy.op == PIR_OP_SWITCH) {
                     for (uint32_t c = 0u; c < slot->switch_case_count; ++c) {
                         expand_branch_target_i128(mod, &slot->switch_cases[c].target, map);
+                    }
+                    if (is_i128(copy.ty)) {
+                        PirInst sw_copy = *slot;
+                        PirOperand vlo, vhi;
+                        operand_to_pair(&sw_copy.operands[0], map, &vlo, &vhi);
+                        if (sw_copy.switch_case_count == 0u) {
+                            PirInst jm = pir_make_inst(PIR_OP_JMP, tvoid, ln, lc);
+                            jm.targets[0] = sw_copy.targets[0];
+                            pir_fn_append_inst(fn, &new_insts, jm);
+                        } else {
+                            PirInstIdVec *cur_out = &new_insts;
+                            PirBlockId cur_blk = b;
+                            for (uint32_t c = 0u; c < sw_copy.switch_case_count; ++c) {
+                                PirOperand clo, chi;
+                                PirOperand cop = pir_op_imm_i(sw_copy.switch_cases[c].case_lo,
+                                                              sw_copy.switch_cases[c].is_negative,
+                                                              copy.ty);
+                                cop.u.imm_int.hi = sw_copy.switch_cases[c].case_hi;
+                                operand_to_pair(&cop, map, &clo, &chi);
+
+                                PirValueId c0 = emit_bin(mod, fn, cur_blk, cur_out, PIR_OP_CMP_EQ, t64, 0u, vlo, clo, ln, lc, PIR_INVALID_ID);
+                                PirValueId c1 = emit_bin(mod, fn, cur_blk, cur_out, PIR_OP_CMP_EQ, t64, 0u, vhi, chi, ln, lc, PIR_INVALID_ID);
+                                PirValueId ceq = emit_bin(mod, fn, cur_blk, cur_out, PIR_OP_AND, t8, 0u, pir_op_val(c0, t8), pir_op_val(c1, t8), ln, lc, PIR_INVALID_ID);
+
+                                PirInst br = pir_make_inst(PIR_OP_BR, tvoid, ln, lc);
+                                br.operand_count = 1u; br.operands = pir_alloc_ops(mod, 1u);
+                                br.operands[0] = pir_op_val(ceq, t8);
+                                br.targets[0]  = sw_copy.switch_cases[c].target;
+                                if (c + 1u < sw_copy.switch_case_count) {
+                                    PirBlockId next_b = fn->blocks.len;
+                                    PirBlock nb;
+                                    memset(&nb, 0, sizeof(nb));
+                                    nb.label    = pir_arena_strdup(&mod->arena, "sw128");
+                                    nb.src_line = ln;
+                                    PIR_VEC_PUSH(&fn->blocks, nb);
+                                    br.targets[1].target = next_b;
+                                    pir_fn_append_inst(fn, cur_out, br);
+                                    cur_blk = next_b;
+                                    cur_out = &fn->blocks.data[next_b].insts;
+                                } else {
+                                    br.targets[1] = sw_copy.targets[0];
+                                    pir_fn_append_inst(fn, cur_out, br);
+                                }
+                            }
+                        }
+                        continue;
                     }
                 }
                 PIR_VEC_PUSH(&new_insts, iid);
@@ -388,6 +533,87 @@ static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                 } else {
                     emit_un(mod, fn, b, &new_insts, PIR_OP_TRUNC, copy.ty, lo, ln, lc, copy.results[0]);
                 }
+                continue;
+            }
+
+            /* Check sitofp / uitofp from i128 -> f32/f64 */
+            if ((copy.op == PIR_OP_SITOFP || copy.op == PIR_OP_UITOFP) &&
+                copy.operand_count == 1u && is_i128(copy.operands[0].type)) {
+                PirType tf64 = pir_type_scalar(PIR_SCALAR_F64);
+                PirOperand alo, ahi;
+                operand_to_pair(&copy.operands[0], map, &alo, &ahi);
+                PirOperand ulo = alo, uhi = ahi;
+                PirValueId is_neg = PIR_INVALID_ID;
+                if (copy.op == PIR_OP_SITOFP) {
+                    is_neg = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_LT_S, t64, 0u,
+                                      ahi, pir_op_imm_i(0u, false, t64), ln, lc, PIR_INVALID_ID);
+                    PirValueId nlo = PIR_INVALID_ID, nhi = PIR_INVALID_ID;
+                    emit_neg128(mod, fn, b, &new_insts, alo, ahi, ln, lc, &nlo, &nhi);
+                    PirValueId slo = emit_sel(mod, fn, b, &new_insts, t64, pir_op_val(is_neg, t8),
+                                              pir_op_val(nlo, t64), alo, ln, lc, PIR_INVALID_ID);
+                    PirValueId shi = emit_sel(mod, fn, b, &new_insts, t64, pir_op_val(is_neg, t8),
+                                              pir_op_val(nhi, t64), ahi, ln, lc, PIR_INVALID_ID);
+                    ulo = pir_op_val(slo, t64);
+                    uhi = pir_op_val(shi, t64);
+                }
+                PirValueId hf = emit_un(mod, fn, b, &new_insts, PIR_OP_UITOFP, tf64, uhi, ln, lc, PIR_INVALID_ID);
+                PirValueId lf = emit_un(mod, fn, b, &new_insts, PIR_OP_UITOFP, tf64, ulo, ln, lc, PIR_INVALID_ID);
+                PirValueId hs = emit_bin(mod, fn, b, &new_insts, PIR_OP_FMUL, tf64, 0u,
+                                         pir_op_val(hf, tf64), pir_op_imm_f(0x43F0000000000000ULL, tf64),
+                                         ln, lc, PIR_INVALID_ID);
+                bool dst_f32 = (copy.ty.kind == PIR_TYPE_SCALAR && copy.ty.u.scalar == PIR_SCALAR_F32);
+                PirValueId sum_dst = (!dst_f32 && copy.op == PIR_OP_UITOFP) ? copy.results[0] : PIR_INVALID_ID;
+                PirValueId sum = emit_bin(mod, fn, b, &new_insts, PIR_OP_FADD, tf64, 0u,
+                                          pir_op_val(hs, tf64), pir_op_val(lf, tf64), ln, lc, sum_dst);
+                PirValueId res64 = sum;
+                if (copy.op == PIR_OP_SITOFP) {
+                    PirValueId nf = emit_un(mod, fn, b, &new_insts, PIR_OP_FNEG, tf64,
+                                            pir_op_val(sum, tf64), ln, lc, PIR_INVALID_ID);
+                    res64 = emit_sel(mod, fn, b, &new_insts, tf64, pir_op_val(is_neg, t8),
+                                     pir_op_val(nf, tf64), pir_op_val(sum, tf64), ln, lc,
+                                     dst_f32 ? PIR_INVALID_ID : copy.results[0]);
+                }
+                if (dst_f32) {
+                    emit_un(mod, fn, b, &new_insts, PIR_OP_FPTRUNC, copy.ty,
+                            pir_op_val(res64, tf64), ln, lc, copy.results[0]);
+                }
+                continue;
+            }
+
+            /* Check bitcast from i128 -> 128-bit vector */
+            if (copy.op == PIR_OP_BITCAST && copy.operand_count == 1u &&
+                is_i128(copy.operands[0].type) && !is_i128(copy.ty)) {
+                PirOperand vlo, vhi;
+                operand_to_pair(&copy.operands[0], map, &vlo, &vhi);
+                PirInst al = pir_make_inst(PIR_OP_ALLOCA_PTR, tptr, ln, lc);
+                al.imm_u64 = 16u; al.align = 16u;
+                al.results[0] = pir_fn_new_val(mod, fn, "bc128", tptr, b, PIR_INVALID_ID, 0u);
+                pir_fn_append_inst(fn, &new_insts, al);
+
+                PirInst s0 = pir_make_inst(PIR_OP_STORE, t64, ln, lc);
+                s0.align = 8u; s0.operand_count = 2u; s0.operands = pir_alloc_ops(mod, 2u);
+                s0.operands[0] = target->is_big_endian ? vhi : vlo;
+                s0.operands[1] = pir_op_val(al.results[0], tptr);
+                pir_fn_append_inst(fn, &new_insts, s0);
+
+                PirInst pa = pir_make_inst(PIR_OP_PTR_ADD, idx_ty, ln, lc);
+                pa.flags = PIR_FLAG_INBOUNDS; pa.operand_count = 2u; pa.operands = pir_alloc_ops(mod, 2u);
+                pa.operands[0] = pir_op_val(al.results[0], tptr);
+                pa.operands[1] = pir_op_imm_i(8u, false, idx_ty);
+                pa.results[0]  = pir_fn_new_val(mod, fn, "bc128p", tptr, b, PIR_INVALID_ID, 0u);
+                pir_fn_append_inst(fn, &new_insts, pa);
+
+                PirInst s1 = pir_make_inst(PIR_OP_STORE, t64, ln, lc);
+                s1.align = 8u; s1.operand_count = 2u; s1.operands = pir_alloc_ops(mod, 2u);
+                s1.operands[0] = target->is_big_endian ? vlo : vhi;
+                s1.operands[1] = pir_op_val(pa.results[0], tptr);
+                pir_fn_append_inst(fn, &new_insts, s1);
+
+                PirInst ld = pir_make_inst(PIR_OP_LOAD, copy.ty, ln, lc);
+                ld.align = 16u; ld.operand_count = 1u; ld.operands = pir_alloc_ops(mod, 1u);
+                ld.operands[0] = pir_op_val(al.results[0], tptr);
+                ld.results[0]  = copy.results[0];
+                pir_fn_append_inst(fn, &new_insts, ld);
                 continue;
             }
 
@@ -503,20 +729,134 @@ static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                 c1.results[0]  = rhi;
                 c1.results[1]  = pir_fn_new_val(mod, fn, "cyo", t8, b, PIR_INVALID_ID, 1u);
                 pir_fn_append_inst(fn, &new_insts, c1);
-            } else if (copy.op == PIR_OP_MUL) {
+
+                if (copy.flags & PIR_FLAG_TRAP_U) {
+                    emit_trap_if(mod, fn, b, &new_insts, c1.results[1], ln, lc);
+                } else if (copy.flags & PIR_FLAG_TRAP_S) {
+                    PirValueId x1 = emit_bin(mod, fn, b, &new_insts, PIR_OP_XOR, t64, 0u,
+                                             ahi, (copy.op == PIR_OP_ADD) ? pir_op_val(rhi, t64) : bhi,
+                                             ln, lc, PIR_INVALID_ID);
+                    PirValueId x2 = emit_bin(mod, fn, b, &new_insts, PIR_OP_XOR, t64, 0u,
+                                             (copy.op == PIR_OP_ADD) ? bhi : ahi, pir_op_val(rhi, t64),
+                                             ln, lc, PIR_INVALID_ID);
+                    PirValueId an = emit_bin(mod, fn, b, &new_insts, PIR_OP_AND, t64, 0u,
+                                             pir_op_val(x1, t64), pir_op_val(x2, t64), ln, lc, PIR_INVALID_ID);
+                    PirValueId ov = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_LT_S, t64, 0u,
+                                             pir_op_val(an, t64), pir_op_imm_i(0u, false, t64), ln, lc, PIR_INVALID_ID);
+                    emit_trap_if(mod, fn, b, &new_insts, ov, ln, lc);
+                }
+            } else if (copy.op == PIR_OP_ADD_CARRY || copy.op == PIR_OP_SUB_BORROW) {
                 PirOperand alo, ahi, blo, bhi;
                 operand_to_pair(&copy.operands[0], map, &alo, &ahi);
                 operand_to_pair(&copy.operands[1], map, &blo, &bhi);
-                PirInst mw = pir_make_inst(PIR_OP_MUL_WIDE_U, t64, ln, lc);
-                mw.operand_count = 2u; mw.operands = pir_alloc_ops(mod, 2u);
-                mw.operands[0] = alo; mw.operands[1] = blo;
-                mw.results[0]  = rlo;
-                mw.results[1]  = pir_fn_new_val(mod, fn, "mhi", t64, b, PIR_INVALID_ID, 1u);
-                pir_fn_append_inst(fn, &new_insts, mw);
-                PirValueId c1 = emit_bin(mod, fn, b, &new_insts, PIR_OP_MUL, t64, PIR_FLAG_WRAP, alo, bhi, ln, lc, PIR_INVALID_ID);
-                PirValueId c2 = emit_bin(mod, fn, b, &new_insts, PIR_OP_MUL, t64, PIR_FLAG_WRAP, ahi, blo, ln, lc, PIR_INVALID_ID);
-                PirValueId t0 = emit_bin(mod, fn, b, &new_insts, PIR_OP_ADD, t64, PIR_FLAG_WRAP, pir_op_val(mw.results[1], t64), pir_op_val(c1, t64), ln, lc, PIR_INVALID_ID);
-                emit_bin(mod, fn, b, &new_insts, PIR_OP_ADD, t64, PIR_FLAG_WRAP, pir_op_val(t0, t64), pir_op_val(c2, t64), ln, lc, rhi);
+                PirInst c0 = pir_make_inst(copy.op, t64, ln, lc);
+                c0.operand_count = 3u; c0.operands = pir_alloc_ops(mod, 3u);
+                c0.operands[0] = alo; c0.operands[1] = blo; c0.operands[2] = copy.operands[2];
+                c0.results[0]  = rlo;
+                c0.results[1]  = pir_fn_new_val(mod, fn, "cy", t8, b, PIR_INVALID_ID, 1u);
+                pir_fn_append_inst(fn, &new_insts, c0);
+
+                PirInst c1 = pir_make_inst(copy.op, t64, ln, lc);
+                c1.operand_count = 3u; c1.operands = pir_alloc_ops(mod, 3u);
+                c1.operands[0] = ahi; c1.operands[1] = bhi; c1.operands[2] = pir_op_val(c0.results[1], t8);
+                c1.results[0]  = rhi;
+                c1.results[1]  = copy.results[1];
+                pir_fn_append_inst(fn, &new_insts, c1);
+            } else if (copy.op == PIR_OP_ADD_OVF_U || copy.op == PIR_OP_SUB_OVF_U ||
+                       copy.op == PIR_OP_ADD_OVF_S || copy.op == PIR_OP_SUB_OVF_S) {
+                bool is_add = (copy.op == PIR_OP_ADD_OVF_U || copy.op == PIR_OP_ADD_OVF_S);
+                bool is_s   = (copy.op == PIR_OP_ADD_OVF_S || copy.op == PIR_OP_SUB_OVF_S);
+                PirOperand alo, ahi, blo, bhi;
+                operand_to_pair(&copy.operands[0], map, &alo, &ahi);
+                operand_to_pair(&copy.operands[1], map, &blo, &bhi);
+                PirOpcode cop = is_add ? PIR_OP_ADD_CARRY : PIR_OP_SUB_BORROW;
+                PirInst c0 = pir_make_inst(cop, t64, ln, lc);
+                c0.operand_count = 3u; c0.operands = pir_alloc_ops(mod, 3u);
+                c0.operands[0] = alo; c0.operands[1] = blo; c0.operands[2] = pir_op_imm_i(0u, false, t8);
+                c0.results[0]  = rlo;
+                c0.results[1]  = pir_fn_new_val(mod, fn, "cy", t8, b, PIR_INVALID_ID, 1u);
+                pir_fn_append_inst(fn, &new_insts, c0);
+
+                PirInst c1 = pir_make_inst(cop, t64, ln, lc);
+                c1.operand_count = 3u; c1.operands = pir_alloc_ops(mod, 3u);
+                c1.operands[0] = ahi; c1.operands[1] = bhi; c1.operands[2] = pir_op_val(c0.results[1], t8);
+                c1.results[0]  = rhi;
+                c1.results[1]  = is_s ? pir_fn_new_val(mod, fn, "cyo", t8, b, PIR_INVALID_ID, 1u)
+                                      : copy.results[1];
+                pir_fn_append_inst(fn, &new_insts, c1);
+                if (is_s) {
+                    PirValueId x1 = emit_bin(mod, fn, b, &new_insts, PIR_OP_XOR, t64, 0u,
+                                             ahi, is_add ? pir_op_val(rhi, t64) : bhi,
+                                             ln, lc, PIR_INVALID_ID);
+                    PirValueId x2 = emit_bin(mod, fn, b, &new_insts, PIR_OP_XOR, t64, 0u,
+                                             is_add ? bhi : ahi, pir_op_val(rhi, t64),
+                                             ln, lc, PIR_INVALID_ID);
+                    PirValueId an = emit_bin(mod, fn, b, &new_insts, PIR_OP_AND, t64, 0u,
+                                             pir_op_val(x1, t64), pir_op_val(x2, t64), ln, lc, PIR_INVALID_ID);
+                    emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_LT_S, t64, 0u,
+                             pir_op_val(an, t64), pir_op_imm_i(0u, false, t64), ln, lc, copy.results[1]);
+                }
+            } else if (copy.op == PIR_OP_MUL || copy.op == PIR_OP_MUL_OVF_U || copy.op == PIR_OP_MUL_OVF_S) {
+                PirOperand alo, ahi, blo, bhi;
+                operand_to_pair(&copy.operands[0], map, &alo, &ahi);
+                operand_to_pair(&copy.operands[1], map, &blo, &bhi);
+                bool need_ovf_u = (copy.op == PIR_OP_MUL_OVF_U) || (copy.op == PIR_OP_MUL && (copy.flags & PIR_FLAG_TRAP_U));
+                bool need_ovf_s = (copy.op == PIR_OP_MUL_OVF_S) || (copy.op == PIR_OP_MUL && (copy.flags & PIR_FLAG_TRAP_S));
+                if (need_ovf_u) {
+                    PirValueId ov = emit_mul_ovf_u128(mod, fn, b, &new_insts, alo, ahi, blo, bhi, ln, lc, rlo, rhi);
+                    if (copy.op == PIR_OP_MUL_OVF_U) {
+                        ValAlias al = { copy.results[1], ov };
+                        PIR_VEC_PUSH(&aliases, al);
+                    } else {
+                        emit_trap_if(mod, fn, b, &new_insts, ov, ln, lc);
+                    }
+                } else if (need_ovf_s) {
+                    PirValueId na = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_LT_S, t64, 0u, ahi, pir_op_imm_i(0u, false, t64), ln, lc, PIR_INVALID_ID);
+                    PirValueId nb = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_LT_S, t64, 0u, bhi, pir_op_imm_i(0u, false, t64), ln, lc, PIR_INVALID_ID);
+                    PirValueId nr = emit_bin(mod, fn, b, &new_insts, PIR_OP_XOR, t8, 0u, pir_op_val(na, t8), pir_op_val(nb, t8), ln, lc, PIR_INVALID_ID);
+                    PirValueId nalo = PIR_INVALID_ID, nahi = PIR_INVALID_ID;
+                    PirValueId nblo = PIR_INVALID_ID, nbhi = PIR_INVALID_ID;
+                    emit_neg128(mod, fn, b, &new_insts, alo, ahi, ln, lc, &nalo, &nahi);
+                    emit_neg128(mod, fn, b, &new_insts, blo, bhi, ln, lc, &nblo, &nbhi);
+                    PirValueId ualo = emit_sel(mod, fn, b, &new_insts, t64, pir_op_val(na, t8), pir_op_val(nalo, t64), alo, ln, lc, PIR_INVALID_ID);
+                    PirValueId uahi = emit_sel(mod, fn, b, &new_insts, t64, pir_op_val(na, t8), pir_op_val(nahi, t64), ahi, ln, lc, PIR_INVALID_ID);
+                    PirValueId ublo = emit_sel(mod, fn, b, &new_insts, t64, pir_op_val(nb, t8), pir_op_val(nblo, t64), blo, ln, lc, PIR_INVALID_ID);
+                    PirValueId ubhi = emit_sel(mod, fn, b, &new_insts, t64, pir_op_val(nb, t8), pir_op_val(nbhi, t64), bhi, ln, lc, PIR_INVALID_ID);
+                    PirValueId plo = pir_fn_new_val(mod, fn, "plo", t64, b, PIR_INVALID_ID, 0u);
+                    PirValueId phi = pir_fn_new_val(mod, fn, "phi", t64, b, PIR_INVALID_ID, 0u);
+                    PirValueId uov = emit_mul_ovf_u128(mod, fn, b, &new_insts,
+                                                       pir_op_val(ualo, t64), pir_op_val(uahi, t64),
+                                                       pir_op_val(ublo, t64), pir_op_val(ubhi, t64),
+                                                       ln, lc, plo, phi);
+                    PirValueId nplo = PIR_INVALID_ID, nphi = PIR_INVALID_ID;
+                    emit_neg128(mod, fn, b, &new_insts, pir_op_val(plo, t64), pir_op_val(phi, t64), ln, lc, &nplo, &nphi);
+                    emit_sel(mod, fn, b, &new_insts, t64, pir_op_val(nr, t8), pir_op_val(nplo, t64), pir_op_val(plo, t64), ln, lc, rlo);
+                    emit_sel(mod, fn, b, &new_insts, t64, pir_op_val(nr, t8), pir_op_val(nphi, t64), pir_op_val(phi, t64), ln, lc, rhi);
+                    /* Signed magnitude fit: if !nr, phi <= INT64_MAX; if nr, (phi < 2^63) || (phi == 2^63 && plo == 0). */
+                    PirValueId pos_bad = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_GT_U, t64, 0u, pir_op_val(phi, t64), pir_op_imm_i((uint64_t)INT64_MAX, false, t64), ln, lc, PIR_INVALID_ID);
+                    PirValueId neg_gt  = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_GT_U, t64, 0u, pir_op_val(phi, t64), UINT64_C(0x8000000000000000) ? pir_op_imm_i(UINT64_C(0x8000000000000000), false, t64) : pir_op_imm_i(0u, false, t64), ln, lc, PIR_INVALID_ID);
+                    PirValueId neg_eq  = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_EQ, t64, 0u, pir_op_val(phi, t64), pir_op_imm_i(UINT64_C(0x8000000000000000), false, t64), ln, lc, PIR_INVALID_ID);
+                    PirValueId plo_nz  = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_NE, t64, 0u, pir_op_val(plo, t64), pir_op_imm_i(0u, false, t64), ln, lc, PIR_INVALID_ID);
+                    PirValueId neg_e2  = emit_bin(mod, fn, b, &new_insts, PIR_OP_AND, t8, 0u, pir_op_val(neg_eq, t8), pir_op_val(plo_nz, t8), ln, lc, PIR_INVALID_ID);
+                    PirValueId neg_bad = emit_bin(mod, fn, b, &new_insts, PIR_OP_OR, t8, 0u, pir_op_val(neg_gt, t8), pir_op_val(neg_e2, t8), ln, lc, PIR_INVALID_ID);
+                    PirValueId mag_bad = emit_sel(mod, fn, b, &new_insts, t8, pir_op_val(nr, t8), pir_op_val(neg_bad, t8), pir_op_val(pos_bad, t8), ln, lc, PIR_INVALID_ID);
+                    PirValueId ov = emit_bin(mod, fn, b, &new_insts, PIR_OP_OR, t8, 0u, pir_op_val(uov, t8), pir_op_val(mag_bad, t8), ln, lc,
+                                             (copy.op == PIR_OP_MUL_OVF_S) ? copy.results[1] : PIR_INVALID_ID);
+                    if (copy.op == PIR_OP_MUL) {
+                        emit_trap_if(mod, fn, b, &new_insts, ov, ln, lc);
+                    }
+                } else {
+                    PirInst mw = pir_make_inst(PIR_OP_MUL_WIDE_U, t64, ln, lc);
+                    mw.operand_count = 2u; mw.operands = pir_alloc_ops(mod, 2u);
+                    mw.operands[0] = alo; mw.operands[1] = blo;
+                    mw.results[0]  = rlo;
+                    mw.results[1]  = pir_fn_new_val(mod, fn, "mhi", t64, b, PIR_INVALID_ID, 1u);
+                    pir_fn_append_inst(fn, &new_insts, mw);
+                    PirValueId c1 = emit_bin(mod, fn, b, &new_insts, PIR_OP_MUL, t64, PIR_FLAG_WRAP, alo, bhi, ln, lc, PIR_INVALID_ID);
+                    PirValueId c2 = emit_bin(mod, fn, b, &new_insts, PIR_OP_MUL, t64, PIR_FLAG_WRAP, ahi, blo, ln, lc, PIR_INVALID_ID);
+                    PirValueId t0 = emit_bin(mod, fn, b, &new_insts, PIR_OP_ADD, t64, PIR_FLAG_WRAP, pir_op_val(mw.results[1], t64), pir_op_val(c1, t64), ln, lc, PIR_INVALID_ID);
+                    emit_bin(mod, fn, b, &new_insts, PIR_OP_ADD, t64, PIR_FLAG_WRAP, pir_op_val(t0, t64), pir_op_val(c2, t64), ln, lc, rhi);
+                }
             } else if (copy.op == PIR_OP_AND || copy.op == PIR_OP_OR || copy.op == PIR_OP_XOR) {
                 PirOperand alo, ahi, blo, bhi;
                 operand_to_pair(&copy.operands[0], map, &alo, &ahi);
@@ -527,6 +867,12 @@ static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                 PirOperand alo, ahi, slo, shi;
                 operand_to_pair(&copy.operands[0], map, &alo, &ahi);
                 operand_to_pair(&copy.operands[1], map, &slo, &shi);
+                if (copy.flags & PIR_FLAG_TRAP) {
+                    PirValueId hi_nz = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_NE, t64, 0u, shi, pir_op_imm_i(0u, false, t64), ln, lc, PIR_INVALID_ID);
+                    PirValueId lo_ge = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_GE_U, t64, 0u, slo, pir_op_imm_i(128u, false, t64), ln, lc, PIR_INVALID_ID);
+                    PirValueId bad   = emit_bin(mod, fn, b, &new_insts, PIR_OP_OR, t8, 0u, pir_op_val(hi_nz, t8), pir_op_val(lo_ge, t8), ln, lc, PIR_INVALID_ID);
+                    emit_trap_if(mod, fn, b, &new_insts, bad, ln, lc);
+                }
                 PirValueId s   = emit_bin(mod, fn, b, &new_insts, PIR_OP_AND, t64, 0u, slo, pir_op_imm_i(127u, false, t64), ln, lc, PIR_INVALID_ID);
                 PirValueId s64 = emit_bin(mod, fn, b, &new_insts, PIR_OP_AND, t64, 0u, pir_op_val(s, t64), pir_op_imm_i(63u, false, t64), ln, lc, PIR_INVALID_ID);
                 PirValueId lt  = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_LT_U, t64, 0u, pir_op_val(s, t64), pir_op_imm_i(64u, false, t64), ln, lc, PIR_INVALID_ID);
@@ -560,6 +906,22 @@ static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                 PirOperand alo, ahi, blo, bhi;
                 operand_to_pair(&copy.operands[0], map, &alo, &ahi);
                 operand_to_pair(&copy.operands[1], map, &blo, &bhi);
+                bool is_s = (copy.op == PIR_OP_DIV_S || copy.op == PIR_OP_REM_S);
+                if ((copy.flags & PIR_FLAG_UNSAFE) == 0u) {
+                    PirValueId bor = emit_bin(mod, fn, b, &new_insts, PIR_OP_OR, t64, 0u, blo, bhi, ln, lc, PIR_INVALID_ID);
+                    PirValueId b0  = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_EQ, t64, 0u, pir_op_val(bor, t64), pir_op_imm_i(0u, false, t64), ln, lc, PIR_INVALID_ID);
+                    emit_trap_if(mod, fn, b, &new_insts, b0, ln, lc);
+                    if (is_s && (copy.flags & PIR_FLAG_WRAP) == 0u) {
+                        PirValueId al0 = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_EQ, t64, 0u, alo, pir_op_imm_i(0u, false, t64), ln, lc, PIR_INVALID_ID);
+                        PirValueId ahm = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_EQ, t64, 0u, ahi, pir_op_imm_i(UINT64_C(0x8000000000000000), false, t64), ln, lc, PIR_INVALID_ID);
+                        PirValueId blm = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_EQ, t64, 0u, blo, pir_op_imm_i(UINT64_MAX, false, t64), ln, lc, PIR_INVALID_ID);
+                        PirValueId bhm = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_EQ, t64, 0u, bhi, pir_op_imm_i(UINT64_MAX, false, t64), ln, lc, PIR_INVALID_ID);
+                        PirValueId t1  = emit_bin(mod, fn, b, &new_insts, PIR_OP_AND, t8, 0u, pir_op_val(al0, t8), pir_op_val(ahm, t8), ln, lc, PIR_INVALID_ID);
+                        PirValueId t2  = emit_bin(mod, fn, b, &new_insts, PIR_OP_AND, t8, 0u, pir_op_val(blm, t8), pir_op_val(bhm, t8), ln, lc, PIR_INVALID_ID);
+                        PirValueId ovf = emit_bin(mod, fn, b, &new_insts, PIR_OP_AND, t8, 0u, pir_op_val(t1, t8), pir_op_val(t2, t8), ln, lc, PIR_INVALID_ID);
+                        emit_trap_if(mod, fn, b, &new_insts, ovf, ln, lc);
+                    }
+                }
                 const char *cname = (copy.op == PIR_OP_DIV_S) ? "__divti3"
                                   : (copy.op == PIR_OP_DIV_U) ? "__udivti3"
                                   : (copy.op == PIR_OP_REM_S) ? "__modti3" : "__umodti3";
@@ -655,6 +1017,106 @@ static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                 PirValueId c2p = emit_bin(mod, fn, b, &new_insts, PIR_OP_ADD, t64, 0u, pir_op_val(c2, t64), pir_op_imm_i(64u, false, t64), ln, lc, PIR_INVALID_ID);
                 emit_sel(mod, fn, b, &new_insts, t64, pir_op_val(pz, t8), pir_op_val(c2p, t64), pir_op_val(c1, t64), ln, lc, rlo);
                 emit_un(mod, fn, b, &new_insts, PIR_OP_CONST, t64, pir_op_imm_i(0u, false, t64), ln, lc, rhi);
+            } else if (copy.op == PIR_OP_BITCAST) {
+                PirInst al = pir_make_inst(PIR_OP_ALLOCA_PTR, tptr, ln, lc);
+                al.imm_u64 = 16u; al.align = 16u;
+                al.results[0] = pir_fn_new_val(mod, fn, "bc128", tptr, b, PIR_INVALID_ID, 0u);
+                pir_fn_append_inst(fn, &new_insts, al);
+
+                PirInst st = pir_make_inst(PIR_OP_STORE, copy.operands[0].type, ln, lc);
+                st.align = 16u; st.operand_count = 2u; st.operands = pir_alloc_ops(mod, 2u);
+                st.operands[0] = copy.operands[0];
+                st.operands[1] = pir_op_val(al.results[0], tptr);
+                pir_fn_append_inst(fn, &new_insts, st);
+
+                PirInst l0 = pir_make_inst(PIR_OP_LOAD, t64, ln, lc);
+                l0.align = 8u; l0.operand_count = 1u; l0.operands = pir_alloc_ops(mod, 1u);
+                l0.operands[0] = pir_op_val(al.results[0], tptr);
+                l0.results[0]  = target->is_big_endian ? rhi : rlo;
+                pir_fn_append_inst(fn, &new_insts, l0);
+
+                PirInst pa = pir_make_inst(PIR_OP_PTR_ADD, idx_ty, ln, lc);
+                pa.flags = PIR_FLAG_INBOUNDS; pa.operand_count = 2u; pa.operands = pir_alloc_ops(mod, 2u);
+                pa.operands[0] = pir_op_val(al.results[0], tptr);
+                pa.operands[1] = pir_op_imm_i(8u, false, idx_ty);
+                pa.results[0]  = pir_fn_new_val(mod, fn, "bc128p", tptr, b, PIR_INVALID_ID, 0u);
+                pir_fn_append_inst(fn, &new_insts, pa);
+
+                PirInst l1 = pir_make_inst(PIR_OP_LOAD, t64, ln, lc);
+                l1.align = 8u; l1.operand_count = 1u; l1.operands = pir_alloc_ops(mod, 1u);
+                l1.operands[0] = pir_op_val(pa.results[0], tptr);
+                l1.results[0]  = target->is_big_endian ? rlo : rhi;
+                pir_fn_append_inst(fn, &new_insts, l1);
+            } else if (copy.op == PIR_OP_FPTOSI || copy.op == PIR_OP_FPTOUI) {
+                PirType tf64 = pir_type_scalar(PIR_SCALAR_F64);
+                PirOperand x = copy.operands[0];
+                if (x.type.kind == PIR_TYPE_SCALAR && x.type.u.scalar == PIR_SCALAR_F32) {
+                    PirValueId x64 = emit_un(mod, fn, b, &new_insts, PIR_OP_FPEXT, tf64, x, ln, lc, PIR_INVALID_ID);
+                    x = pir_op_val(x64, tf64);
+                }
+                PirValueId is_nan = emit_bin(mod, fn, b, &new_insts, PIR_OP_FCMP_UNE, tf64, 0u, x, x, ln, lc, PIR_INVALID_ID);
+                if (copy.op == PIR_OP_FPTOUI) {
+                    PirValueId lt0 = emit_bin(mod, fn, b, &new_insts, PIR_OP_FCMP_OLT, tf64, 0u, x, pir_op_imm_f(0u, tf64), ln, lc, PIR_INVALID_ID);
+                    PirValueId le_m1 = emit_bin(mod, fn, b, &new_insts, PIR_OP_FCMP_OLE, tf64, 0u, x, pir_op_imm_f(0xBFF0000000000000ULL, tf64), ln, lc, PIR_INVALID_ID);
+                    PirValueId ge_max = emit_bin(mod, fn, b, &new_insts, PIR_OP_FCMP_OGE, tf64, 0u, x, pir_op_imm_f(0x47F0000000000000ULL, tf64), ln, lc, PIR_INVALID_ID);
+                    if (copy.flags & PIR_FLAG_TRAP) {
+                        PirValueId b1 = emit_bin(mod, fn, b, &new_insts, PIR_OP_OR, t8, 0u, pir_op_val(is_nan, t8), pir_op_val(le_m1, t8), ln, lc, PIR_INVALID_ID);
+                        PirValueId bad = emit_bin(mod, fn, b, &new_insts, PIR_OP_OR, t8, 0u, pir_op_val(b1, t8), pir_op_val(ge_max, t8), ln, lc, PIR_INVALID_ID);
+                        emit_trap_if(mod, fn, b, &new_insts, bad, ln, lc);
+                    }
+                    PirValueId zero_c = emit_bin(mod, fn, b, &new_insts, PIR_OP_OR, t8, 0u, pir_op_val(is_nan, t8), pir_op_val(lt0, t8), ln, lc, PIR_INVALID_ID);
+                    PirValueId cx = emit_sel(mod, fn, b, &new_insts, tf64, pir_op_val(zero_c, t8), pir_op_imm_f(0u, tf64), x, ln, lc, PIR_INVALID_ID);
+                    PirValueId q = emit_bin(mod, fn, b, &new_insts, PIR_OP_FMUL, tf64, 0u, pir_op_val(cx, tf64), pir_op_imm_f(0x3BF0000000000000ULL, tf64), ln, lc, PIR_INVALID_ID);
+                    PirInst hi_i = pir_make_inst(PIR_OP_FPTOUI, t64, ln, lc);
+                    hi_i.flags = PIR_FLAG_SAT; hi_i.operand_count = 1u; hi_i.operands = pir_alloc_ops(mod, 1u);
+                    hi_i.operands[0] = pir_op_val(q, tf64);
+                    hi_i.results[0]  = pir_fn_new_val(mod, fn, "fhi", t64, b, PIR_INVALID_ID, 0u);
+                    pir_fn_append_inst(fn, &new_insts, hi_i);
+                    PirValueId hf  = emit_un(mod, fn, b, &new_insts, PIR_OP_UITOFP, tf64, pir_op_val(hi_i.results[0], t64), ln, lc, PIR_INVALID_ID);
+                    PirValueId hs  = emit_bin(mod, fn, b, &new_insts, PIR_OP_FMUL, tf64, 0u, pir_op_val(hf, tf64), pir_op_imm_f(0x43F0000000000000ULL, tf64), ln, lc, PIR_INVALID_ID);
+                    PirValueId rem = emit_bin(mod, fn, b, &new_insts, PIR_OP_FSUB, tf64, 0u, pir_op_val(cx, tf64), pir_op_val(hs, tf64), ln, lc, PIR_INVALID_ID);
+                    PirInst lo_i = pir_make_inst(PIR_OP_FPTOUI, t64, ln, lc);
+                    lo_i.flags = PIR_FLAG_SAT; lo_i.operand_count = 1u; lo_i.operands = pir_alloc_ops(mod, 1u);
+                    lo_i.operands[0] = pir_op_val(rem, tf64);
+                    lo_i.results[0]  = pir_fn_new_val(mod, fn, "flo", t64, b, PIR_INVALID_ID, 0u);
+                    pir_fn_append_inst(fn, &new_insts, lo_i);
+                    emit_sel(mod, fn, b, &new_insts, t64, pir_op_val(ge_max, t8), pir_op_imm_i(UINT64_MAX, false, t64), pir_op_val(lo_i.results[0], t64), ln, lc, rlo);
+                    emit_sel(mod, fn, b, &new_insts, t64, pir_op_val(ge_max, t8), pir_op_imm_i(UINT64_MAX, false, t64), pir_op_val(hi_i.results[0], t64), ln, lc, rhi);
+                } else {
+                    PirValueId too_lo = emit_bin(mod, fn, b, &new_insts, PIR_OP_FCMP_OLT, tf64, 0u, x, pir_op_imm_f(0xC7E0000000000000ULL, tf64), ln, lc, PIR_INVALID_ID);
+                    PirValueId too_hi = emit_bin(mod, fn, b, &new_insts, PIR_OP_FCMP_OGE, tf64, 0u, x, pir_op_imm_f(0x47E0000000000000ULL, tf64), ln, lc, PIR_INVALID_ID);
+                    if (copy.flags & PIR_FLAG_TRAP) {
+                        PirValueId b1 = emit_bin(mod, fn, b, &new_insts, PIR_OP_OR, t8, 0u, pir_op_val(is_nan, t8), pir_op_val(too_lo, t8), ln, lc, PIR_INVALID_ID);
+                        PirValueId bad = emit_bin(mod, fn, b, &new_insts, PIR_OP_OR, t8, 0u, pir_op_val(b1, t8), pir_op_val(too_hi, t8), ln, lc, PIR_INVALID_ID);
+                        emit_trap_if(mod, fn, b, &new_insts, bad, ln, lc);
+                    }
+                    PirValueId is_neg = emit_bin(mod, fn, b, &new_insts, PIR_OP_FCMP_OLT, tf64, 0u, x, pir_op_imm_f(0u, tf64), ln, lc, PIR_INVALID_ID);
+                    PirValueId nx = emit_un(mod, fn, b, &new_insts, PIR_OP_FNEG, tf64, x, ln, lc, PIR_INVALID_ID);
+                    PirValueId ax0 = emit_sel(mod, fn, b, &new_insts, tf64, pir_op_val(is_neg, t8), pir_op_val(nx, tf64), x, ln, lc, PIR_INVALID_ID);
+                    PirValueId ax  = emit_sel(mod, fn, b, &new_insts, tf64, pir_op_val(is_nan, t8), pir_op_imm_f(0u, tf64), pir_op_val(ax0, tf64), ln, lc, PIR_INVALID_ID);
+                    PirValueId q   = emit_bin(mod, fn, b, &new_insts, PIR_OP_FMUL, tf64, 0u, pir_op_val(ax, tf64), pir_op_imm_f(0x3BF0000000000000ULL, tf64), ln, lc, PIR_INVALID_ID);
+                    PirInst hi_i = pir_make_inst(PIR_OP_FPTOUI, t64, ln, lc);
+                    hi_i.flags = PIR_FLAG_SAT; hi_i.operand_count = 1u; hi_i.operands = pir_alloc_ops(mod, 1u);
+                    hi_i.operands[0] = pir_op_val(q, tf64);
+                    hi_i.results[0]  = pir_fn_new_val(mod, fn, "fhi", t64, b, PIR_INVALID_ID, 0u);
+                    pir_fn_append_inst(fn, &new_insts, hi_i);
+                    PirValueId hf  = emit_un(mod, fn, b, &new_insts, PIR_OP_UITOFP, tf64, pir_op_val(hi_i.results[0], t64), ln, lc, PIR_INVALID_ID);
+                    PirValueId hs  = emit_bin(mod, fn, b, &new_insts, PIR_OP_FMUL, tf64, 0u, pir_op_val(hf, tf64), pir_op_imm_f(0x43F0000000000000ULL, tf64), ln, lc, PIR_INVALID_ID);
+                    PirValueId rem = emit_bin(mod, fn, b, &new_insts, PIR_OP_FSUB, tf64, 0u, pir_op_val(ax, tf64), pir_op_val(hs, tf64), ln, lc, PIR_INVALID_ID);
+                    PirInst lo_i = pir_make_inst(PIR_OP_FPTOUI, t64, ln, lc);
+                    lo_i.flags = PIR_FLAG_SAT; lo_i.operand_count = 1u; lo_i.operands = pir_alloc_ops(mod, 1u);
+                    lo_i.operands[0] = pir_op_val(rem, tf64);
+                    lo_i.results[0]  = pir_fn_new_val(mod, fn, "flo", t64, b, PIR_INVALID_ID, 0u);
+                    pir_fn_append_inst(fn, &new_insts, lo_i);
+                    PirValueId nlo = PIR_INVALID_ID, nhi = PIR_INVALID_ID;
+                    emit_neg128(mod, fn, b, &new_insts, pir_op_val(lo_i.results[0], t64), pir_op_val(hi_i.results[0], t64), ln, lc, &nlo, &nhi);
+                    PirValueId s1l = emit_sel(mod, fn, b, &new_insts, t64, pir_op_val(is_neg, t8), pir_op_val(nlo, t64), pir_op_val(lo_i.results[0], t64), ln, lc, PIR_INVALID_ID);
+                    PirValueId s1h = emit_sel(mod, fn, b, &new_insts, t64, pir_op_val(is_neg, t8), pir_op_val(nhi, t64), pir_op_val(hi_i.results[0], t64), ln, lc, PIR_INVALID_ID);
+                    PirValueId s2l = emit_sel(mod, fn, b, &new_insts, t64, pir_op_val(too_lo, t8), pir_op_imm_i(0u, false, t64), pir_op_val(s1l, t64), ln, lc, PIR_INVALID_ID);
+                    PirValueId s2h = emit_sel(mod, fn, b, &new_insts, t64, pir_op_val(too_lo, t8), pir_op_imm_i(UINT64_C(0x8000000000000000), false, t64), pir_op_val(s1h, t64), ln, lc, PIR_INVALID_ID);
+                    emit_sel(mod, fn, b, &new_insts, t64, pir_op_val(too_hi, t8), pir_op_imm_i(UINT64_MAX, false, t64), pir_op_val(s2l, t64), ln, lc, rlo);
+                    emit_sel(mod, fn, b, &new_insts, t64, pir_op_val(too_hi, t8), pir_op_imm_i((uint64_t)INT64_MAX, false, t64), pir_op_val(s2h, t64), ln, lc, rhi);
+                }
             } else {
                 PIR_VEC_PUSH(&new_insts, iid);
             }
@@ -756,6 +1218,44 @@ bool pir_legalize_i128(PirModule *mod, const PirTargetSpec *target, PirDiag *dia
     for (uint32_t si = 0u; si < orig_sigs; ++si) {
         split_i128_decl(mod, &mod->sigs.data[si].params, &mod->sigs.data[si].param_count,
                         &mod->sigs.data[si].ret_type, &mod->sigs.data[si].cabi_ret);
+    }
+
+    /* Flatten typed i128 globals into raw 16-byte data items. */
+    for (uint32_t gi = 0u; gi < mod->globals.len; ++gi) {
+        PirGlobal *g = &mod->globals.data[gi];
+        if (!g->has_type || !is_i128(g->type)) continue;
+        if (g->align < 16u) g->align = 16u;
+        g->has_type = false;
+        g->type     = pir_type_scalar(PIR_SCALAR_VOID);
+        if (g->is_zeroinit || g->item_count == 0u) {
+            g->is_zeroinit = true;
+            g->is_braced   = false;
+            g->item_count  = 1u;
+            g->items       = PIR_ARENA_NEW_ARRAY(&mod->arena, PirGlobalItem, 1u);
+            g->items[0].kind = PIR_GITEM_ZERO;
+            g->items[0].len  = 16u;
+        } else if (g->items[0].kind == PIR_GITEM_INT) {
+            uint64_t lo = g->items[0].int_lo;
+            uint64_t hi = g->items[0].int_hi;
+            if (g->items[0].int_neg) {
+                uint64_t nlo = ~lo + 1u;
+                uint64_t cy  = (nlo == 0u) ? 1u : 0u;
+                lo = nlo;
+                hi = ~hi + cy;
+            }
+            uint8_t *buf = PIR_ARENA_NEW_ARRAY(&mod->arena, uint8_t, 16u);
+            for (uint32_t k = 0u; k < 8u; ++k) {
+                uint32_t sh = target->is_big_endian ? ((7u - k) * 8u) : (k * 8u);
+                buf[k]      = (uint8_t)(((target->is_big_endian ? hi : lo) >> sh) & 0xFFu);
+                buf[8u + k] = (uint8_t)(((target->is_big_endian ? lo : hi) >> sh) & 0xFFu);
+            }
+            g->is_braced = true;
+            g->item_count = 1u;
+            g->items = PIR_ARENA_NEW_ARRAY(&mod->arena, PirGlobalItem, 1u);
+            g->items[0].kind  = PIR_GITEM_BYTES;
+            g->items[0].bytes = buf;
+            g->items[0].len   = 16u;
+        }
     }
 
     free(fn_ret_i128);
