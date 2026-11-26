@@ -77,20 +77,24 @@ uint32_t pir_interp_alloc_new(PirInterp *it, size_t size, uint32_t align,
 }
 
 uint64_t pir_interp_ptr_to_int(const PirInterp *it, PirPtr p) {
+    uint64_t pmask = (it->ptr_bytes >= 8u) ? UINT64_MAX : (((uint64_t)1u << (it->ptr_bytes * 8u)) - 1u);
     if (p.alloc_id == 0u || p.alloc_id >= it->allocs.len) {
-        return (uint64_t)p.offset;
+        return (uint64_t)p.offset & pmask;
     }
-    return it->allocs.data[p.alloc_id].base_addr + (uint64_t)p.offset;
+    return (it->allocs.data[p.alloc_id].base_addr + (uint64_t)p.offset) & pmask;
 }
 
 PirPtr pir_interp_int_to_ptr(PirInterp *it, uint64_t addr) {
+    uint64_t pmask = (it->ptr_bytes >= 8u) ? UINT64_MAX : (((uint64_t)1u << (it->ptr_bytes * 8u)) - 1u);
+    addr &= pmask;
     PirPtr res = { 0u, 0 };
     if (addr == 0u) return res;
     for (uint32_t i = 1u; i < it->allocs.len; ++i) {
         const PirAlloc *a = &it->allocs.data[i];
-        if (addr >= a->base_addr && addr <= a->base_addr + (uint64_t)a->size) {
+        uint64_t base = a->base_addr & pmask;
+        if (addr >= base && addr <= base + (uint64_t)a->size) {
             res.alloc_id = i;
-            res.offset   = (int64_t)(addr - a->base_addr);
+            res.offset   = (int64_t)(addr - base);
             return res;
         }
     }
@@ -521,6 +525,7 @@ typedef struct {
     const PirFunction *fn;
     uint32_t           frame_id;
     PirVal            *vals;
+    uint32_t          *static_allocas;
     PIR_VEC(uint32_t)  stack_allocs;
     const PirVal      *varargs;
     uint32_t           vararg_count;
@@ -634,7 +639,8 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
     fr.fn = fn;
     fr.frame_id = ++it->next_frame_id;
     fr.vals = (PirVal *)calloc(fn->values.len + 1u, sizeof(PirVal));
-    if (!fr.vals) abort();
+    fr.static_allocas = (uint32_t *)calloc(fn->insts.len + 1u, sizeof(uint32_t));
+    if (!fr.vals || !fr.static_allocas) abort();
     for (uint32_t i = 0u; i < fn->param_count; ++i) {
         if (fn->params[i].val_id < fn->values.len) {
             if (i < arg_count) {
@@ -1094,10 +1100,15 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                 }
 
                 case PIR_OP_ALLOCA_PTR: {
-                    uint32_t aid = pir_interp_alloc_new(it, (size_t)inst->imm_u64, inst->align,
-                                                        false, false, false, false);
-                    if (aid == 0u) break;
-                    PIR_VEC_PUSH(&fr.stack_allocs, aid);
+                    PirInstId cur_iid = blk->insts.data[j];
+                    uint32_t aid = fr.static_allocas[cur_iid];
+                    if (aid == 0u) {
+                        aid = pir_interp_alloc_new(it, (size_t)inst->imm_u64, inst->align,
+                                                   false, false, false, false);
+                        if (aid == 0u) break;
+                        fr.static_allocas[cur_iid] = aid;
+                        PIR_VEC_PUSH(&fr.stack_allocs, aid);
+                    }
                     r0.ptr.alloc_id = aid;
                     r0.ptr.offset   = 0;
                     break;
@@ -1275,10 +1286,208 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                     break; /* Single-threaded sequential consistency */
 
                 case PIR_OP_VA_START: {
-                    /* Store synthetic vararg cursor into ap_ptr for LIR testing. */
                     PirVal ap = eval_operand(it, &fr, &inst->operands[0]);
-                    uint64_t zero = 0u;
-                    pir_interp_mem_write(it, ap.ptr, &zero, it->ptr_bytes, 1u);
+                    bool is_sysv_x64 = (it->target && it->target->arch == PIR_ARCH_X86_64 &&
+                                        it->target->os != PIR_OS_WINDOWS);
+                    bool is_aapcs64_lin = (it->target && it->target->arch == PIR_ARCH_ARM64 &&
+                                           it->target->os != PIR_OS_MACOS);
+                    bool is_darwin_arm64 = (it->target && it->target->arch == PIR_ARCH_ARM64 &&
+                                            it->target->os == PIR_OS_MACOS);
+
+                    if (is_sysv_x64) {
+                        uint32_t gp_used = 0u, fp_used = 0u;
+                        for (uint32_t k = 0u; k < fn->param_count; ++k) {
+                            PirType pt = fn->params[k].type;
+                            if (pir_type_is_float(pt) || pt.kind == PIR_TYPE_VECTOR) {
+                                if (fp_used < 8u) fp_used++;
+                            } else {
+                                if (gp_used < 6u) gp_used++;
+                            }
+                        }
+                        uint32_t init_gp_off = gp_used * 8u;
+                        uint32_t init_fp_off = 48u + fp_used * 16u;
+                        uint32_t rsa_aid = pir_interp_alloc_new(it, 176u, 16u, false, false, false, true);
+                        size_t oaa_cap = 16u + (size_t)fr.vararg_count * 64u;
+                        uint32_t oaa_aid = pir_interp_alloc_new(it, oaa_cap, 16u, false, false, false, true);
+                        if (rsa_aid == 0u || oaa_aid == 0u) break;
+                        PIR_VEC_PUSH(&fr.stack_allocs, rsa_aid);
+                        PIR_VEC_PUSH(&fr.stack_allocs, oaa_aid);
+
+                        uint32_t gp_off = init_gp_off;
+                        uint32_t fp_off = init_fp_off;
+                        size_t oaa_off = 0u;
+                        for (uint32_t k = 0u; k < fr.vararg_count; ++k) {
+                            const PirVal *va = &fr.varargs[k];
+                            bool is_fp = (pir_type_is_float(va->ty) || va->ty.kind == PIR_TYPE_VECTOR);
+                            bool is_f32 = (va->ty.kind == PIR_TYPE_SCALAR && va->ty.u.scalar == PIR_SCALAR_F32);
+                            size_t vsz = is_f32 ? 8u : type_byte_size(va->ty, it->ptr_bytes);
+                            if (vsz == 0u) vsz = 8u;
+                            if (is_fp) {
+                                uint32_t rstep = (vsz > 16u) ? (uint32_t)((vsz + 15u) & ~(size_t)15u) : 16u;
+                                PirPtr dst;
+                                if (fp_off + rstep <= 176u) {
+                                    dst.alloc_id = rsa_aid;
+                                    dst.offset   = (int64_t)fp_off;
+                                    fp_off += rstep;
+                                } else {
+                                    size_t al = (vsz > 8u) ? ((vsz > 32u) ? 32u : vsz) : 8u;
+                                    oaa_off = (oaa_off + al - 1u) & ~(al - 1u);
+                                    dst.alloc_id = oaa_aid;
+                                    dst.offset   = (int64_t)oaa_off;
+                                    oaa_off += (vsz + 7u) & ~(size_t)7u;
+                                }
+                                if (is_f32) {
+                                    float fv = 0.0f;
+                                    memcpy(&fv, va->bytes, 4u);
+                                    double dv = (double)fv;
+                                    pir_interp_mem_write(it, dst, &dv, 8u, 1u);
+                                } else {
+                                    pir_interp_mem_write(it, dst, va->bytes, vsz, 1u);
+                                }
+                            } else {
+                                PirPtr dst;
+                                if (gp_off + 8u <= 48u) {
+                                    dst.alloc_id = rsa_aid;
+                                    dst.offset   = (int64_t)gp_off;
+                                    gp_off += 8u;
+                                } else {
+                                    dst.alloc_id = oaa_aid;
+                                    dst.offset   = (int64_t)oaa_off;
+                                    oaa_off += 8u;
+                                }
+                                if (va->ty.kind == PIR_TYPE_SCALAR && va->ty.u.scalar == PIR_SCALAR_PTR) {
+                                    pir_interp_mem_write_ptr(it, dst, va->ptr, 1u);
+                                } else {
+                                    pir_interp_mem_write(it, dst, va->bytes, vsz <= 8u ? vsz : 8u, 1u);
+                                }
+                            }
+                        }
+                        PirPtr p0 = ap.ptr;
+                        PirPtr p4 = { ap.ptr.alloc_id, ap.ptr.offset + 4 };
+                        PirPtr p8 = { ap.ptr.alloc_id, ap.ptr.offset + 8 };
+                        PirPtr p16 = { ap.ptr.alloc_id, ap.ptr.offset + 16 };
+                        PirPtr oaa_ptr = { oaa_aid, 0 };
+                        PirPtr rsa_ptr = { rsa_aid, 0 };
+                        pir_interp_mem_write(it, p0, &init_gp_off, 4u, 1u);
+                        pir_interp_mem_write(it, p4, &init_fp_off, 4u, 1u);
+                        pir_interp_mem_write_ptr(it, p8, oaa_ptr, 1u);
+                        pir_interp_mem_write_ptr(it, p16, rsa_ptr, 1u);
+                    } else if (is_aapcs64_lin) {
+                        uint32_t gp_used = 0u, fp_used = 0u;
+                        for (uint32_t k = 0u; k < fn->param_count; ++k) {
+                            PirType pt = fn->params[k].type;
+                            if (pir_type_is_float(pt) || pt.kind == PIR_TYPE_VECTOR) {
+                                if (fp_used < 8u) fp_used++;
+                            } else {
+                                if (gp_used < 8u) gp_used++;
+                            }
+                        }
+                        int32_t init_gr = -(int32_t)((8u - gp_used) * 8u);
+                        int32_t init_vr = -(int32_t)((8u - fp_used) * 16u);
+                        uint32_t gr_aid = pir_interp_alloc_new(it, 64u, 16u, false, false, false, true);
+                        uint32_t vr_aid = pir_interp_alloc_new(it, 128u, 16u, false, false, false, true);
+                        size_t stk_cap = 16u + (size_t)fr.vararg_count * 64u;
+                        uint32_t stk_aid = pir_interp_alloc_new(it, stk_cap, 16u, false, false, false, true);
+                        if (gr_aid == 0u || vr_aid == 0u || stk_aid == 0u) break;
+                        PIR_VEC_PUSH(&fr.stack_allocs, gr_aid);
+                        PIR_VEC_PUSH(&fr.stack_allocs, vr_aid);
+                        PIR_VEC_PUSH(&fr.stack_allocs, stk_aid);
+
+                        int32_t cur_gr = init_gr;
+                        int32_t cur_vr = init_vr;
+                        size_t stk_off = 0u;
+                        for (uint32_t k = 0u; k < fr.vararg_count; ++k) {
+                            const PirVal *va = &fr.varargs[k];
+                            bool is_fp = (pir_type_is_float(va->ty) || va->ty.kind == PIR_TYPE_VECTOR);
+                            bool is_f32 = (va->ty.kind == PIR_TYPE_SCALAR && va->ty.u.scalar == PIR_SCALAR_F32);
+                            size_t vsz = is_f32 ? 8u : type_byte_size(va->ty, it->ptr_bytes);
+                            if (vsz == 0u) vsz = 8u;
+                            if (is_fp) {
+                                int32_t rstep = (vsz > 16u) ? (int32_t)((vsz + 15u) & ~(size_t)15u) : 16;
+                                PirPtr dst;
+                                if (cur_vr + rstep <= 0) {
+                                    dst.alloc_id = vr_aid;
+                                    dst.offset   = (int64_t)(128 + cur_vr);
+                                    cur_vr += rstep;
+                                } else {
+                                    cur_vr = 0;
+                                    size_t al = (vsz > 8u) ? 16u : 8u;
+                                    stk_off = (stk_off + al - 1u) & ~(al - 1u);
+                                    dst.alloc_id = stk_aid;
+                                    dst.offset   = (int64_t)stk_off;
+                                    stk_off += (vsz + 7u) & ~(size_t)7u;
+                                }
+                                if (is_f32) {
+                                    float fv = 0.0f;
+                                    memcpy(&fv, va->bytes, 4u);
+                                    double dv = (double)fv;
+                                    pir_interp_mem_write(it, dst, &dv, 8u, 1u);
+                                } else {
+                                    pir_interp_mem_write(it, dst, va->bytes, vsz, 1u);
+                                }
+                            } else {
+                                PirPtr dst;
+                                if (cur_gr + 8 <= 0) {
+                                    dst.alloc_id = gr_aid;
+                                    dst.offset   = (int64_t)(64 + cur_gr);
+                                    cur_gr += 8;
+                                } else {
+                                    cur_gr = 0;
+                                    dst.alloc_id = stk_aid;
+                                    dst.offset   = (int64_t)stk_off;
+                                    stk_off += 8u;
+                                }
+                                if (va->ty.kind == PIR_TYPE_SCALAR && va->ty.u.scalar == PIR_SCALAR_PTR) {
+                                    pir_interp_mem_write_ptr(it, dst, va->ptr, 1u);
+                                } else {
+                                    pir_interp_mem_write(it, dst, va->bytes, vsz <= 8u ? vsz : 8u, 1u);
+                                }
+                            }
+                        }
+                        PirPtr p0  = ap.ptr;
+                        PirPtr p8  = { ap.ptr.alloc_id, ap.ptr.offset + 8 };
+                        PirPtr p16 = { ap.ptr.alloc_id, ap.ptr.offset + 16 };
+                        PirPtr p24 = { ap.ptr.alloc_id, ap.ptr.offset + 24 };
+                        PirPtr p28 = { ap.ptr.alloc_id, ap.ptr.offset + 28 };
+                        PirPtr stk_ptr = { stk_aid, 0 };
+                        PirPtr gr_top  = { gr_aid, 64 };
+                        PirPtr vr_top  = { vr_aid, 128 };
+                        pir_interp_mem_write_ptr(it, p0, stk_ptr, 1u);
+                        pir_interp_mem_write_ptr(it, p8, gr_top, 1u);
+                        pir_interp_mem_write_ptr(it, p16, vr_top, 1u);
+                        pir_interp_mem_write(it, p24, &init_gr, 4u, 1u);
+                        pir_interp_mem_write(it, p28, &init_vr, 4u, 1u);
+                    } else {
+                        size_t slot_sz = (it->ptr_bytes == 4u) ? 4u : 8u;
+                        size_t cap = 16u + (size_t)fr.vararg_count * 64u;
+                        uint32_t va_aid = pir_interp_alloc_new(it, cap, 16u, false, false, false, true);
+                        if (va_aid == 0u) break;
+                        PIR_VEC_PUSH(&fr.stack_allocs, va_aid);
+                        size_t off = 0u;
+                        for (uint32_t k = 0u; k < fr.vararg_count; ++k) {
+                            const PirVal *va = &fr.varargs[k];
+                            bool is_f32 = (va->ty.kind == PIR_TYPE_SCALAR && va->ty.u.scalar == PIR_SCALAR_F32);
+                            size_t vsz = is_f32 ? 8u : type_byte_size(va->ty, it->ptr_bytes);
+                            if (vsz == 0u) vsz = slot_sz;
+                            if (is_darwin_arm64 && vsz > 8u) {
+                                off = (off + 15u) & ~(size_t)15u;
+                            }
+                            PirPtr dst = { va_aid, (int64_t)off };
+                            if (is_f32) {
+                                float fv = 0.0f;
+                                memcpy(&fv, va->bytes, 4u);
+                                double dv = (double)fv;
+                                pir_interp_mem_write(it, dst, &dv, 8u, 1u);
+                            } else if (va->ty.kind == PIR_TYPE_SCALAR && va->ty.u.scalar == PIR_SCALAR_PTR) {
+                                pir_interp_mem_write_ptr(it, dst, va->ptr, 1u);
+                            } else {
+                                pir_interp_mem_write(it, dst, va->bytes, vsz, 1u);
+                            }
+                            off += (vsz + slot_sz - 1u) & ~(slot_sz - 1u);
+                        }
+                        PirPtr va_ptr = { va_aid, 0 };
+                        pir_interp_mem_write_ptr(it, ap.ptr, va_ptr, 1u);
+                    }
                     break;
                 }
 
@@ -1417,6 +1626,7 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
         it->allocs.data[fr.stack_allocs.data[k]].alive = false;
     }
     PIR_VEC_FREE(&fr.stack_allocs);
+    free(fr.static_allocas);
     free(fr.vals);
     it->call_depth--;
     return it->status == PIR_INTERP_OK;
@@ -1427,7 +1637,7 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
  * ========================================================================= */
 
 static size_t compute_global_size(const PirGlobal *g, uint8_t ptr_bytes) {
-    if (g->has_type && (!g->is_braced || g->type.kind == PIR_TYPE_VECTOR)) {
+    if (g->has_type && (g->type.kind == PIR_TYPE_SCALAR || g->type.kind == PIR_TYPE_VECTOR)) {
         size_t sz = type_byte_size(g->type, ptr_bytes);
         return sz > 0u ? sz : 1u;
     }
@@ -1488,28 +1698,40 @@ static bool init_globals(PirInterp *it) {
                 const PirGlobalItem *gi = &g->items[k];
                 PirPtr dst = { aid, (int64_t)off };
                 if (gi->kind == PIR_GITEM_INT && esz <= 8u) {
-                    uint64_t x = gi->int_neg ? (UINT64_C(0) - gi->int_lo) : gi->int_lo;
-                    pir_interp_mem_write(it, dst, &x, esz, 1u);
-                } else if (gi->kind == PIR_GITEM_FLOAT && esz <= 8u) {
-                    uint64_t fb = gi->float_bits;
                     if (elem == PIR_SCALAR_F32) {
-                        double dv = 0.0;
-                        memcpy(&dv, &fb, sizeof(dv));
-                        float fv = (float)dv;
+                        float fv = gi->int_neg ? -(float)gi->int_lo : (float)gi->int_lo;
                         pir_interp_mem_write(it, dst, &fv, 4u, 1u);
+                    } else if (elem == PIR_SCALAR_F64) {
+                        double dv = gi->int_neg ? -(double)gi->int_lo : (double)gi->int_lo;
+                        pir_interp_mem_write(it, dst, &dv, 8u, 1u);
                     } else {
+                        uint64_t x = gi->int_neg ? (UINT64_C(0) - gi->int_lo) : gi->int_lo;
+                        pir_interp_mem_write(it, dst, &x, esz, 1u);
+                    }
+                } else if (gi->kind == PIR_GITEM_FLOAT && esz <= 8u) {
+                    if (elem == PIR_SCALAR_F32) {
+                        uint32_t fb32 = (uint32_t)gi->float_bits;
+                        pir_interp_mem_write(it, dst, &fb32, 4u, 1u);
+                    } else {
+                        uint64_t fb = gi->float_bits;
                         pir_interp_mem_write(it, dst, &fb, 8u, 1u);
                     }
                 }
                 off += esz;
             }
-        } else if (g->has_type && !g->is_braced && !g->is_zeroinit && g->item_count == 1u) {
+        } else if (g->has_type && g->type.kind == PIR_TYPE_SCALAR && !g->is_zeroinit && g->item_count == 1u) {
             const PirGlobalItem *gi = &g->items[0];
             size_t sz = type_byte_size(g->type, it->ptr_bytes);
             if (gi->kind == PIR_GITEM_INT) {
                 uint64_t x = gi->int_neg ? (UINT64_C(0) - gi->int_lo) : gi->int_lo;
-                if (g->type.kind == PIR_TYPE_SCALAR && g->type.u.scalar == PIR_SCALAR_PTR) {
+                if (g->type.u.scalar == PIR_SCALAR_PTR) {
                     pir_interp_mem_write_ptr(it, base, pir_interp_int_to_ptr(it, x), 1u);
+                } else if (g->type.u.scalar == PIR_SCALAR_F32) {
+                    float fv = gi->int_neg ? -(float)gi->int_lo : (float)gi->int_lo;
+                    pir_interp_mem_write(it, base, &fv, 4u, 1u);
+                } else if (g->type.u.scalar == PIR_SCALAR_F64) {
+                    double dv = gi->int_neg ? -(double)gi->int_lo : (double)gi->int_lo;
+                    pir_interp_mem_write(it, base, &dv, 8u, 1u);
                 } else if (sz <= sizeof(x)) {
                     pir_interp_mem_write(it, base, &x, sz, 1u);
                 } else {
@@ -1517,7 +1739,10 @@ static bool init_globals(PirInterp *it) {
                     return false;
                 }
             } else if (gi->kind == PIR_GITEM_FLOAT) {
-                if (sz <= sizeof(gi->float_bits)) {
+                if (sz == 4u) {
+                    uint32_t fb32 = (uint32_t)gi->float_bits;
+                    pir_interp_mem_write(it, base, &fb32, 4u, 1u);
+                } else if (sz <= sizeof(gi->float_bits)) {
                     pir_interp_mem_write(it, base, &gi->float_bits, sz, 1u);
                 } else {
                     pir_interp_fail(it, PIR_INTERP_ERR, "invalid scalar float global size %zu", sz);

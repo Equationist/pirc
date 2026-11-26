@@ -774,6 +774,7 @@ static bool match_direct_tail_block(const PirFunction *fn, const PirBlock *blk) 
 
 static bool eliminate_self_tail_calls(PirModule *mod, PirFunction *fn) {
     if (!fn->is_defined || fn->blocks.len == 0u || fn->is_variadic ||
+        fn->linkage == PIR_LINK_WEAK ||
         fn->cabi_ret.kind != PIR_CABI_RET_NONE || !fn->name || fn->param_count > 6u) {
         return false;
     }

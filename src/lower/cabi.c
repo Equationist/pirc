@@ -27,6 +27,19 @@ static bool build_plan(const PirModule *mod, const PirTargetSpec *target,
     plan->orig_param_count = param_count;
     if (cc != PIR_CC_C) return true;
 
+    if (target->arch == PIR_ARCH_CUSTOM) {
+        bool has_special = false;
+        for (uint32_t i = 0u; i < param_count; ++i) {
+            if (params[i].abi_kind != PIR_PARAM_NORMAL ||
+                (params[i].type.kind == PIR_TYPE_SCALAR &&
+                 params[i].type.u.scalar == PIR_SCALAR_I128)) {
+                has_special = true;
+                break;
+            }
+        }
+        if (!has_special) return true;
+    }
+
     PirAbiRegState st = { 0u, 0u };
     uint32_t start_p = 0u;
 
@@ -105,6 +118,91 @@ static uint32_t reg_bundle_info(const PirModule *mod, const PirTargetSpec *targe
 
 typedef PIR_VEC(PirOperand) PirOperandVec;
 
+static bool agg_has_implicit_gaps(const PirModule *mod, const PirTargetSpec *target, PirType ty) {
+    if (ty.kind != PIR_TYPE_NAMED_AGG || ty.u.agg_id >= mod->agg_types.len) return false;
+    const PirAggDef *agg = &mod->agg_types.data[ty.u.agg_id];
+    if (agg->kind == PIR_AGG_PAD || agg->kind == PIR_AGG_UNION || agg->kind == PIR_AGG_PACKED_STRUCT) {
+        return false;
+    }
+    if (agg->kind == PIR_AGG_ARRAY) {
+        if (agg->array_len == 0u) return false;
+        PirTypeLayout el = pir_type_layout(mod, target, agg->elem_type);
+        PirTypeLayout al = pir_type_layout(mod, target, ty);
+        if (al.size > el.size * agg->array_len) return true;
+        return agg_has_implicit_gaps(mod, target, agg->elem_type);
+    }
+    PirTypeLayout ly = pir_type_layout(mod, target, ty);
+    uint64_t pos = 0u;
+    for (uint32_t i = 0u; i < agg->field_count; ++i) {
+        uint64_t foff = pir_field_offset(mod, target, ty.u.agg_id, i);
+        if (foff > pos) return true;
+        PirTypeLayout fl = pir_type_layout(mod, target, agg->fields[i]);
+        if (agg_has_implicit_gaps(mod, target, agg->fields[i])) return true;
+        pos = foff + fl.size;
+    }
+    return pos < ly.size;
+}
+
+static bool agg_has_any_padding(const PirModule *mod, const PirTargetSpec *target, PirType ty) {
+    if (ty.kind != PIR_TYPE_NAMED_AGG || ty.u.agg_id >= mod->agg_types.len) return false;
+    const PirAggDef *agg = &mod->agg_types.data[ty.u.agg_id];
+    if (agg->kind == PIR_AGG_PAD || agg->kind == PIR_AGG_UNION) return true;
+    return agg_has_implicit_gaps(mod, target, ty);
+}
+
+static void emit_zero_range(PirModule *mod, PirFunction *fn, PirBlockId blk, PirInstIdVec *out,
+                            PirOperand base, uint64_t off, uint64_t len, PirType idx_ty,
+                            uint32_t ln, uint32_t lc) {
+    if (len == 0u) return;
+    PirValueId dp = cabi_padd(mod, fn, blk, out, base, off, idx_ty, ln, lc);
+    PirInst ms = pir_make_inst(PIR_OP_MEMSET, pir_type_scalar(PIR_SCALAR_VOID), ln, lc);
+    ms.align = 1u; ms.operand_count = 3u; ms.operands = pir_alloc_ops(mod, 3u);
+    ms.operands[0] = pir_op_val(dp, pir_type_scalar(PIR_SCALAR_PTR));
+    ms.operands[1] = pir_op_imm_i(0u, false, pir_type_scalar(PIR_SCALAR_I8));
+    ms.operands[2] = pir_op_imm_i(len, false, idx_ty);
+    pir_fn_append_inst(fn, out, ms);
+}
+
+static void emit_zero_implicit_gaps(PirModule *mod, const PirTargetSpec *target,
+                                    PirFunction *fn, PirBlockId blk, PirInstIdVec *out,
+                                    PirOperand base, PirType ty, uint64_t base_off,
+                                    PirType idx_ty, uint32_t ln, uint32_t lc) {
+    if (ty.kind != PIR_TYPE_NAMED_AGG || ty.u.agg_id >= mod->agg_types.len) return;
+    const PirAggDef *agg = &mod->agg_types.data[ty.u.agg_id];
+    if (agg->kind == PIR_AGG_PAD || agg->kind == PIR_AGG_UNION || agg->kind == PIR_AGG_PACKED_STRUCT) {
+        return;
+    }
+    PirTypeLayout ly = pir_type_layout(mod, target, ty);
+    if (agg->kind == PIR_AGG_ARRAY) {
+        PirTypeLayout el = pir_type_layout(mod, target, agg->elem_type);
+        if (agg_has_implicit_gaps(mod, target, agg->elem_type)) {
+            for (uint64_t i = 0u; i < agg->array_len; ++i) {
+                emit_zero_implicit_gaps(mod, target, fn, blk, out, base, agg->elem_type,
+                                        base_off + i * el.size, idx_ty, ln, lc);
+            }
+        }
+        uint64_t used = el.size * agg->array_len;
+        if (ly.size > used) {
+            emit_zero_range(mod, fn, blk, out, base, base_off + used, ly.size - used, idx_ty, ln, lc);
+        }
+        return;
+    }
+    uint64_t pos = 0u;
+    for (uint32_t i = 0u; i < agg->field_count; ++i) {
+        uint64_t foff = pir_field_offset(mod, target, ty.u.agg_id, i);
+        if (foff > pos) {
+            emit_zero_range(mod, fn, blk, out, base, base_off + pos, foff - pos, idx_ty, ln, lc);
+        }
+        emit_zero_implicit_gaps(mod, target, fn, blk, out, base, agg->fields[i],
+                                base_off + foff, idx_ty, ln, lc);
+        PirTypeLayout fl = pir_type_layout(mod, target, agg->fields[i]);
+        pos = foff + fl.size;
+    }
+    if (ly.size > pos) {
+        emit_zero_range(mod, fn, blk, out, base, base_off + pos, ly.size - pos, idx_ty, ln, lc);
+    }
+}
+
 /* Caller-side packing of a byval(@T) pointer into either DIRECT regs or INDIRECT stack copy. */
 static void pack_byval_arg(PirModule *mod, const PirTargetSpec *target,
                            PirFunction *fn, PirBlockId blk, PirInstIdVec *out,
@@ -138,14 +236,16 @@ static void pack_byval_arg(PirModule *mod, const PirTargetSpec *target,
         return;
     }
 
-    /* DIRECT: unpack into 1..4 scalar/vector registers. Use staging buffer if size < reg_bytes or under-aligned. */
+    /* DIRECT: unpack into 1..4 scalar/vector registers. Use staging buffer if size < reg_bytes,
+     * under-aligned, or aggregate contains padding bytes. */
     if (info->reg_count == 0u) return;
     uint64_t reg_bytes = 0u;
     uint32_t max_al    = 1u;
     reg_bundle_info(mod, target, info, &reg_bytes, &max_al);
 
+    bool has_gap = agg_has_implicit_gaps(mod, target, agg_ty);
     PirOperand load_base = src_ptr;
-    if (ly.size < reg_bytes || ly.align < max_al) {
+    if (ly.size < reg_bytes || ly.align < max_al || has_gap) {
         PirInst stg = pir_make_inst(PIR_OP_ALLOCA_PTR, tptr, ln, lc);
         stg.imm_u64 = reg_bytes;
         stg.align   = max_al;
@@ -170,6 +270,10 @@ static void pack_byval_arg(PirModule *mod, const PirTargetSpec *target,
             mc.operands[1] = src_ptr;
             mc.operands[2] = pir_op_imm_i(copy_sz, false, idx_ty);
             pir_fn_append_inst(fn, out, mc);
+        }
+        if (has_gap) {
+            emit_zero_implicit_gaps(mod, target, fn, blk, out, pir_op_val(stg.results[0], tptr),
+                                    agg_ty, 0u, idx_ty, ln, lc);
         }
 
         load_base = pir_op_val(stg.results[0], tptr);
@@ -271,12 +375,15 @@ static void rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
             } else if (target->arch == PIR_ARCH_X86_64 && target->os != PIR_OS_WINDOWS &&
                        vinfo.kind == PIR_ABI_DIRECT && vinfo.fp_used > 0u) {
                 /* SysV AMD64: variadic aggregate f32 eightbytes must NOT undergo C default
-                 * float->double promotion (cvtss2sd). Widen f32 pieces to v2f32 so the raw
-                 * 32-bit float bits land in the low lane of XMM (upper 32 bits zero-padded). */
+                 * float->double promotion (cvtss2sd). Widen f32 pieces to v2f32 (or f64 when
+                 * SIMD is disabled) so raw 32-bit float bits land in low XMM lane zero-padded. */
+                PirType widen_ty = (target->caps.max_simd_bits >= 64u)
+                                   ? pir_type_vec(PIR_VEC_V2F32)
+                                   : pir_type_scalar(PIR_SCALAR_F64);
                 for (uint32_t k = 0u; k < vinfo.reg_count; ++k) {
                     if (vinfo.regs[k].kind == PIR_TYPE_SCALAR &&
                         vinfo.regs[k].u.scalar == PIR_SCALAR_F32) {
-                        vinfo.regs[k] = pir_type_vec(PIR_VEC_V2F32);
+                        vinfo.regs[k] = widen_ty;
                     }
                 }
             } else if (target->arch == PIR_ARCH_ARM64 && target->os != PIR_OS_MACOS) {
@@ -300,7 +407,7 @@ static void rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
                 pir_abi_classify_param(mod, target, &vpd, &va_st, &vinfo);
                 if (target->arch == PIR_ARCH_ARM64 && target->os == PIR_OS_MACOS) {
                     if ((arg.type.kind == PIR_TYPE_SCALAR && arg.type.u.scalar == PIR_SCALAR_I128) ||
-                        (arg.type.kind == PIR_TYPE_VECTOR && pir_vec_bits(arg.type.u.vec) == 128u)) {
+                        (arg.type.kind == PIR_TYPE_VECTOR && pir_vec_bits(arg.type.u.vec) >= 128u)) {
                         arg.call_stack_align = 16u;
                     }
                 } else {
@@ -503,6 +610,14 @@ static void rewrite_param_decls(PirModule *mod, const PirTargetSpec *target, con
         }
     }
 
+    if (defined_fn) {
+        for (uint32_t k = 0u; k < np.len; ++k) {
+            if (np.data[k].val_id < defined_fn->values.len) {
+                defined_fn->values.data[np.data[k].val_id].param_index = k;
+            }
+        }
+    }
+
     *count_io = np.len;
     if (np.len > 0u) {
         *params_io = PIR_ARENA_NEW_ARRAY(&mod->arena, PirParamDecl, np.len);
@@ -551,7 +666,7 @@ static void rewrite_defined_callee(PirModule *mod, const PirTargetSpec *target,
         al_i.results[0] = retbuf_local;
         pir_fn_append_inst(fn, &prologue, al_i);
 
-        if (ly.size < sz) {
+        if (ly.size < sz || agg_has_any_padding(mod, target, plan->retbuf_agg_ty)) {
             PirInst ms = pir_make_inst(PIR_OP_MEMSET, pir_type_scalar(PIR_SCALAR_VOID), ln, 0u);
             ms.align = al; ms.operand_count = 3u; ms.operands = pir_alloc_ops(mod, 3u);
             ms.operands[0] = pir_op_val(retbuf_local, tptr);
@@ -668,7 +783,7 @@ bool pir_lower_cabi(PirModule *mod, const PirTargetSpec *target, PirDiag *diag) 
                             (copy.operands[k].type.kind == PIR_TYPE_SCALAR &&
                              copy.operands[k].type.u.scalar == PIR_SCALAR_I128) ||
                             (copy.operands[k].type.kind == PIR_TYPE_VECTOR &&
-                             pir_vec_bits(copy.operands[k].type.u.vec) == 128u)) {
+                             pir_vec_bits(copy.operands[k].type.u.vec) >= 128u)) {
                             has_va_special = true;
                             break;
                         }

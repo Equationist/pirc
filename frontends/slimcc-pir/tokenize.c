@@ -1002,10 +1002,34 @@ static const char *filter_digit_sep(Token *tok, int *len) {
     buf = realloc(buf, buflen);
   }
   int cnt = 0;
+  bool is_hex = (tok->len >= 2 && tok->loc[0] == '0' && (tok->loc[1] == 'x' || tok->loc[1] == 'X'));
+  bool is_bin = (tok->len >= 2 && tok->loc[0] == '0' && (tok->loc[1] == 'b' || tok->loc[1] == 'B'));
+  bool in_exp = false;
   for (int i = 0; i < tok->len; i++) {
-    if (tok->loc[i] == '\'')
+    char c = tok->loc[i];
+    if ((!is_hex && (c == 'e' || c == 'E')) || (is_hex && (c == 'p' || c == 'P')))
+      in_exp = true;
+    if (c == '\'') {
+      bool valid = (i > 0 && i + 1 < tok->len);
+      if (valid) {
+        char prev = tok->loc[i - 1];
+        char next = tok->loc[i + 1];
+        if (prev == '\'' || next == '\'')
+          valid = false;
+        else if (is_hex && !in_exp)
+          valid = (i > 2) &&
+                  ((prev >= '0' && prev <= '9') || (prev >= 'a' && prev <= 'f') || (prev >= 'A' && prev <= 'F')) &&
+                  ((next >= '0' && next <= '9') || (next >= 'a' && next <= 'f') || (next >= 'A' && next <= 'F'));
+        else if (is_bin && !in_exp)
+          valid = (i > 2) && (prev == '0' || prev == '1') && (next == '0' || next == '1');
+        else
+          valid = (prev >= '0' && prev <= '9') && (next >= '0' && next <= '9');
+      }
+      if (!valid)
+        error_tok(tok, "invalid digit separator in numeric literal");
       continue;
-    buf[cnt++] = tok->loc[i];
+    }
+    buf[cnt++] = c;
   }
   buf[cnt] = '\0';
   *len = cnt;

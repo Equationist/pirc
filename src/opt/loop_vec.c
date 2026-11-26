@@ -353,13 +353,24 @@ static LoopVecAlias classify_loop_pair(const PirFunction *fn,
                      : (pa.obj_id == pb.obj_id));
     if (same_obj) {
         if (pa.has_offset && pb.has_offset) {
-            int64_t oa = pa.offset + a_delta * (int64_t)elem_bytes;
-            int64_t ob = pb.offset + b_delta * (int64_t)elem_bytes;
+            int64_t eb = (int64_t)elem_bytes;
+            if (a_delta > INT64_MAX / eb || a_delta < INT64_MIN / eb ||
+                b_delta > INT64_MAX / eb || b_delta < INT64_MIN / eb) {
+                return LV_ALIAS_MAY;
+            }
+            int64_t da = a_delta * eb;
+            int64_t db = b_delta * eb;
+            if ((da > 0 && pa.offset > INT64_MAX - da) || (da < 0 && pa.offset < INT64_MIN - da) ||
+                (db > 0 && pb.offset > INT64_MAX - db) || (db < 0 && pb.offset < INT64_MIN - db)) {
+                return LV_ALIAS_MAY;
+            }
+            int64_t oa = pa.offset + da;
+            int64_t ob = pb.offset + db;
             if (oa == ob) return LV_ALIAS_EXACT_SAME;
-            int64_t dist = (oa > ob) ? (oa - ob) : (ob - oa);
+            uint64_t dist = (oa > ob) ? ((uint64_t)oa - (uint64_t)ob) : ((uint64_t)ob - (uint64_t)oa);
             /* Distance < 2 elements is guaranteed to overlap in any vectorized loop;
              * larger offsets (e.g. disjoint array fields in one struct) use runtime guard. */
-            if (dist < (int64_t)elem_bytes * 2) return LV_ALIAS_DIFF_OFF;
+            if (dist < (uint64_t)elem_bytes * 2u) return LV_ALIAS_DIFF_OFF;
             return LV_ALIAS_MAY;
         }
         return LV_ALIAS_MAY;
@@ -1269,9 +1280,9 @@ static bool try_vectorize_loop(PirModule *mod, PirFunction *fn, const PirTargetS
                     }
                     PirValueId bp = pir_fn_new_val(mod, fn, "vbp", ptr_ty, vbody_bid, PIR_INVALID_ID, 0u);
                     PirInst pa = pir_make_inst(PIR_OP_PTR_ADD, i64_ty, orig.src_line, 0u);
-                    /* When eff_base was pre-shifted by negative mem_delta, eff_base may sit
-                     * before object offset 0 until voff brings it back in-bounds, so omit [inbounds]. */
-                    pa.flags = (binfo[j].mem_delta == 0) ? PIR_FLAG_INBOUNDS : PIR_FLAG_NONE;
+                    /* Never fabricate [inbounds]: base may have been pre-shifted out of bounds
+                     * (e.g. negative mem_delta or caller-provided pre-shifted base + positive offset). */
+                    pa.flags = PIR_FLAG_NONE;
                     pa.operands = pir_alloc_ops(mod, 2u);
                     pa.operands[0] = eff_base;
                     pa.operands[1] = pir_op_val(voff, i64_ty);
@@ -1290,7 +1301,7 @@ static bool try_vectorize_loop(PirModule *mod, PirFunction *fn, const PirTargetS
                     if (u > 0u) {
                         PirValueId bp2 = pir_fn_new_val(mod, fn, "vbp", ptr_ty, vbody_bid, PIR_INVALID_ID, 0u);
                         PirInst pa2 = pir_make_inst(PIR_OP_PTR_ADD, i64_ty, orig.src_line, 0u);
-                        pa2.flags = PIR_FLAG_INBOUNDS;
+                        pa2.flags = PIR_FLAG_NONE;
                         pa2.operands = pir_alloc_ops(mod, 2u);
                         pa2.operands[0] = pir_op_val(mem_ptr, ptr_ty);
                         pa2.operands[1] = pir_op_imm_i((uint64_t)(u * vec_bytes), false, i64_ty);

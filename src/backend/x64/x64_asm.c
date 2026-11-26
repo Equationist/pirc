@@ -188,8 +188,18 @@ static void emit_section_directive(FILE *out, const PirTargetSpec *target,
                                    bool has_reloc, bool is_zero, bool is_func) {
     if (custom_sec && custom_sec[0] != '\0') {
         if (!is_macho(target)) {
-            if (is_func && strchr(custom_sec, ',') == NULL) {
-                fprintf(out, "\t.section %s,\"ax\",@progbits\n", custom_sec);
+            if (strchr(custom_sec, ',') == NULL) {
+                if (is_func) {
+                    fprintf(out, "\t.section %s,\"ax\",@progbits\n", custom_sec);
+                } else if (seg == PIR_GSEG_TLS) {
+                    fprintf(out, "\t.section %s,\"awT\",%s\n", custom_sec,
+                            is_zero ? "@nobits" : "@progbits");
+                } else if (seg == PIR_GSEG_RODATA && !has_reloc) {
+                    fprintf(out, "\t.section %s,\"a\",@progbits\n", custom_sec);
+                } else {
+                    fprintf(out, "\t.section %s,\"aw\",%s\n", custom_sec,
+                            is_zero ? "@nobits" : "@progbits");
+                }
             } else {
                 fprintf(out, "\t.section %s\n", custom_sec);
             }
@@ -229,7 +239,8 @@ static void emit_section_directive(FILE *out, const PirTargetSpec *target,
     } else {
         switch (seg) {
             case PIR_GSEG_RODATA:
-                fprintf(out, "\t.section .rodata\n");
+                fprintf(out, has_reloc ? "\t.section .data.rel.ro,\"aw\",@progbits\n"
+                                       : "\t.section .rodata\n");
                 break;
             case PIR_GSEG_DATA:
                 fprintf(out, is_zero ? "\t.bss\n" : "\t.data\n");
@@ -380,8 +391,43 @@ static void emit_inst(X64AsmCtx *ctx, const MFunc *mf, const MInst *ins) {
             return;
 
         case MI_X64_MOV_RSP:
-            if (ins->aux_id == 0u) fprintf(out, "\tmov %s, rsp\n", gp_name(ins->ops[0].u.preg, 8u));
-            else                   fprintf(out, "\tmov rsp, %s\n", gp_name(ins->ops[0].u.preg, 8u));
+            if (ins->aux_id == 3u) {
+                /* Linux/generic static frame stack probe: ops[0] = imm bytes. */
+                fprintf(out, "\tmov r11, %lld\n", (long long)ins->ops[0].u.imm);
+                fprintf(out, "1:\n");
+                fprintf(out, "\tcmp r11, 4096\n");
+                fprintf(out, "\tjbe 2f\n");
+                fprintf(out, "\tsub rsp, 4096\n");
+                fprintf(out, "\tmov r10, qword ptr [rsp]\n");
+                fprintf(out, "\tsub r11, 4096\n");
+                fprintf(out, "\tjmp 1b\n");
+                fprintf(out, "2:\n");
+                fprintf(out, "\tsub rsp, r11\n");
+                fprintf(out, "\tmov r10, qword ptr [rsp]\n");
+                return;
+            }
+            if (ins->aux_id == 0u) {
+                fprintf(out, "\tmov %s, rsp\n", gp_name(ins->ops[0].u.preg, 8u));
+            } else if (ins->aux_id == 2u) {
+                const char *r0 = gp_name(ins->ops[0].u.preg, 8u);
+                fprintf(out, "\tmov r11, rsp\n");
+                fprintf(out, "\tcmp r11, %s\n", r0);
+                fprintf(out, "\tjbe 3f\n");
+                fprintf(out, "1:\n");
+                fprintf(out, "\tsub r11, 4096\n");
+                fprintf(out, "\tcmp r11, %s\n", r0);
+                fprintf(out, "\tjbe 2f\n");
+                fprintf(out, "\tmov rsp, r11\n");
+                fprintf(out, "\tor qword ptr [rsp], 0\n");
+                fprintf(out, "\tjmp 1b\n");
+                fprintf(out, "2:\n");
+                fprintf(out, "\tmov rsp, %s\n", r0);
+                fprintf(out, "\tor qword ptr [rsp], 0\n");
+                fprintf(out, "3:\n");
+                fprintf(out, "\tmov rsp, %s\n", r0);
+            } else {
+                fprintf(out, "\tmov rsp, %s\n", gp_name(ins->ops[0].u.preg, 8u));
+            }
             return;
 
         case MI_X64_SYM_ADDR: {
@@ -408,7 +454,11 @@ static void emit_inst(X64AsmCtx *ctx, const MFunc *mf, const MInst *ins) {
             } else {
                 const char *dst = gp_name(ins->ops[0].u.preg, 8u);
                 fprintf(out, "\tmov %s, qword ptr fs:[0]\n", dst);
-                fprintf(out, "\tlea %s, [%s + %s@TPOFF]\n", dst, dst, asym);
+                if (ins->ops[1].u.sym.use_got) {
+                    fprintf(out, "\tadd %s, qword ptr [rip + %s@GOTTPOFF]\n", dst, asym);
+                } else {
+                    fprintf(out, "\tlea %s, [%s + %s@TPOFF]\n", dst, dst, asym);
+                }
             }
             return;
         }
@@ -981,7 +1031,7 @@ static bool global_has_reloc(const PirGlobal *g) {
 
 static uint64_t compute_global_bytes(const PirModule *mod, const PirTargetSpec *target,
                                      const PirGlobal *g) {
-    if (g->has_type && !g->is_braced) {
+    if (g->has_type && (g->type.kind == PIR_TYPE_SCALAR || g->type.kind == PIR_TYPE_VECTOR)) {
         PirTypeLayout ly = pir_type_layout(mod, target, g->type);
         return ly.size > 0u ? ly.size : 1u;
     }
@@ -1002,7 +1052,17 @@ static uint64_t compute_global_bytes(const PirModule *mod, const PirTargetSpec *
 static bool global_is_all_zero(const PirGlobal *g) {
     if (g->is_zeroinit) return true;
     if (g->item_count == 0u) return true;
-    if (g->has_type && !g->is_braced && g->item_count == 1u) {
+    if (g->has_type && g->type.kind == PIR_TYPE_VECTOR) {
+        for (uint32_t k = 0u; k < g->item_count; ++k) {
+            const PirGlobalItem *gi = &g->items[k];
+            if (gi->kind == PIR_GITEM_INT && gi->int_lo == 0u && gi->int_hi == 0u) continue;
+            if (gi->kind == PIR_GITEM_FLOAT && gi->float_bits == 0u) continue;
+            if (gi->kind == PIR_GITEM_ZERO) continue;
+            return false;
+        }
+        return true;
+    }
+    if (g->has_type && g->type.kind == PIR_TYPE_SCALAR && g->item_count == 1u) {
         const PirGlobalItem *gi = &g->items[0];
         if (gi->kind == PIR_GITEM_INT && gi->int_lo == 0u && gi->int_hi == 0u) return true;
         if (gi->kind == PIR_GITEM_FLOAT && gi->float_bits == 0u) return true;
@@ -1015,6 +1075,41 @@ static bool global_is_all_zero(const PirGlobal *g) {
     return true;
 }
 
+static void emit_scalar_gitem(FILE *out, const PirTargetSpec *target, PirScalarType sc,
+                              uint64_t sz, const PirGlobalItem *gi) {
+    if (gi->kind == PIR_GITEM_INT) {
+        if (sc == PIR_SCALAR_F32) {
+            float fv = gi->int_neg ? -(float)gi->int_lo : (float)gi->int_lo;
+            uint32_t fb = 0u;
+            memcpy(&fb, &fv, 4u);
+            fprintf(out, "\t.long %" PRIu32 "\n", fb);
+        } else if (sc == PIR_SCALAR_F64) {
+            double dv = gi->int_neg ? -(double)gi->int_lo : (double)gi->int_lo;
+            uint64_t db = 0u;
+            memcpy(&db, &dv, 8u);
+            fprintf(out, "\t.quad %" PRIu64 "\n", db);
+        } else {
+            uint64_t x = gi->int_neg ? (UINT64_C(0) - gi->int_lo) : gi->int_lo;
+            if (sz == 1u)      fprintf(out, "\t.byte %" PRIu64 "\n", x & 0xFFu);
+            else if (sz == 2u) fprintf(out, "\t.short %" PRIu64 "\n", x & 0xFFFFu);
+            else if (sz == 4u) fprintf(out, "\t.long %" PRIu64 "\n", x & 0xFFFFFFFFu);
+            else               fprintf(out, "\t.quad %" PRIu64 "\n", x);
+        }
+    } else if (gi->kind == PIR_GITEM_FLOAT) {
+        if (sz == 4u) fprintf(out, "\t.long %" PRIu64 "\n", gi->float_bits & 0xFFFFFFFFu);
+        else          fprintf(out, "\t.quad %" PRIu64 "\n", gi->float_bits);
+    } else if (gi->kind == PIR_GITEM_RELOC) {
+        char sbuf[512];
+        const char *asym = fmt_asm_sym(sbuf, sizeof(sbuf), target, gi->sym_name, NULL);
+        if (gi->sym_offset != 0)
+            fprintf(out, "\t.quad %s + %" PRId64 "\n", asym, gi->sym_offset);
+        else
+            fprintf(out, "\t.quad %s\n", asym);
+    } else if (gi->kind == PIR_GITEM_ZERO) {
+        fprintf(out, "\t.zero %" PRIu64 "\n", gi->len > 0u ? gi->len : sz);
+    }
+}
+
 static void emit_global_data_items(FILE *out, const PirModule *mod, const PirTargetSpec *target,
                                    const PirGlobal *g) {
     if (g->is_zeroinit) {
@@ -1022,28 +1117,22 @@ static void emit_global_data_items(FILE *out, const PirModule *mod, const PirTar
         fprintf(out, "\t.zero %" PRIu64 "\n", sz);
         return;
     }
-    if (g->has_type && !g->is_braced && g->item_count == 1u) {
-        const PirGlobalItem *gi = &g->items[0];
-        PirTypeLayout ly = pir_type_layout(mod, target, g->type);
-        if (gi->kind == PIR_GITEM_INT) {
-            uint64_t x = gi->int_neg ? (UINT64_C(0) - gi->int_lo) : gi->int_lo;
-            if (ly.size == 1u)      fprintf(out, "\t.byte %" PRIu64 "\n", x & 0xFFu);
-            else if (ly.size == 2u) fprintf(out, "\t.short %" PRIu64 "\n", x & 0xFFFFu);
-            else if (ly.size == 4u) fprintf(out, "\t.long %" PRIu64 "\n", x & 0xFFFFFFFFu);
-            else                    fprintf(out, "\t.quad %" PRIu64 "\n", x);
-        } else if (gi->kind == PIR_GITEM_FLOAT) {
-            if (ly.size == 4u) fprintf(out, "\t.long %" PRIu64 "\n", gi->float_bits & 0xFFFFFFFFu);
-            else               fprintf(out, "\t.quad %" PRIu64 "\n", gi->float_bits);
-        } else if (gi->kind == PIR_GITEM_RELOC) {
-            char sbuf[512];
-            const char *asym = fmt_asm_sym(sbuf, sizeof(sbuf), target, gi->sym_name, NULL);
-            if (gi->sym_offset != 0)
-                fprintf(out, "\t.quad %s + %" PRId64 "\n", asym, gi->sym_offset);
-            else
-                fprintf(out, "\t.quad %s\n", asym);
-        } else if (gi->kind == PIR_GITEM_ZERO) {
-            fprintf(out, "\t.zero %" PRIu64 "\n", gi->len > 0u ? gi->len : ly.size);
+    if (g->has_type && g->type.kind == PIR_TYPE_VECTOR) {
+        PirScalarType elem = pir_vec_elem_scalar(g->type.u.vec);
+        uint32_t lanes = pir_vec_lanes(g->type.u.vec);
+        uint64_t esz = pir_scalar_bits(elem, target->ptr_bytes) / 8u;
+        for (uint32_t l = 0u; l < lanes; ++l) {
+            if (l < g->item_count) {
+                emit_scalar_gitem(out, target, elem, esz, &g->items[l]);
+            } else {
+                fprintf(out, "\t.zero %" PRIu64 "\n", esz);
+            }
         }
+        return;
+    }
+    if (g->has_type && g->type.kind == PIR_TYPE_SCALAR && g->item_count == 1u) {
+        PirTypeLayout ly = pir_type_layout(mod, target, g->type);
+        emit_scalar_gitem(out, target, g->type.u.scalar, ly.size, &g->items[0]);
         return;
     }
 

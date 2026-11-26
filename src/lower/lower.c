@@ -17,9 +17,22 @@
 
 PirValueId pir_fn_new_val(PirModule *mod, PirFunction *fn, const char *prefix,
                           PirType ty, PirBlockId def_block, PirInstId def_inst, uint32_t slot) {
-    char buf[48];
+    char buf[64];
     PirValueId id = fn->values.len;
-    snprintf(buf, sizeof(buf), "%s_%u", prefix ? prefix : "t", id);
+    const char *pfx = prefix ? prefix : "t";
+    uint32_t suffix = id;
+    for (;;) {
+        snprintf(buf, sizeof(buf), "%s_%u", pfx, suffix);
+        bool dup = false;
+        for (uint32_t k = 0u; k < fn->values.len; ++k) {
+            if (fn->values.data[k].name && strcmp(fn->values.data[k].name, buf) == 0) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) break;
+        suffix++;
+    }
     PirValueDef vd;
     vd.name        = pir_arena_strdup(&mod->arena, buf);
     vd.type        = ty;

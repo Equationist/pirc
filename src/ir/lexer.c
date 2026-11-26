@@ -154,17 +154,32 @@ static PirToken lex_number(PirLexer *lex, bool neg, uint32_t line, uint32_t col,
 
     size_t digits_start = lex->pos;
     if (is_hex) {
+        bool has_dot = false;
+        bool has_exp = false;
         while (hex_val((unsigned char)peek(lex, 0)) >= 0) advance(lex);
         if (peek(lex, 0) == '.') {
+            has_dot = true;
             is_float = true;
             advance(lex);
             while (hex_val((unsigned char)peek(lex, 0)) >= 0) advance(lex);
         }
         if (peek(lex, 0) == 'p' || peek(lex, 0) == 'P') {
+            has_exp = true;
             is_float = true;
             advance(lex);
             if (peek(lex, 0) == '+' || peek(lex, 0) == '-') advance(lex);
+            size_t exp_start = lex->pos;
             while (isdigit((unsigned char)peek(lex, 0))) advance(lex);
+            if (lex->pos == exp_start) {
+                pir_diag_error(lex->diag, line, col, "hexadecimal float literal missing exponent digits");
+                tok.kind = TOK_ERR;
+                return tok;
+            }
+        }
+        if (has_dot && !has_exp) {
+            pir_diag_error(lex->diag, line, col, "hexadecimal float literal requires 'p'/'P' exponent");
+            tok.kind = TOK_ERR;
+            return tok;
         }
     } else if (is_bin) {
         while (peek(lex, 0) == '0' || peek(lex, 0) == '1') advance(lex);
@@ -368,6 +383,16 @@ PirToken pir_lexer_next(PirLexer *lex) {
             char *s = NULL;
             size_t slen = 0u;
             if (!lex_string_body(lex, tok.line, tok.col, &s, &slen)) {
+                tok.kind = TOK_ERR;
+                return tok;
+            }
+            if (slen == 0u) {
+                pir_diag_error(lex->diag, tok.line, tok.col, "symbol name cannot be empty");
+                tok.kind = TOK_ERR;
+                return tok;
+            }
+            if (memchr(s, '\0', slen) != NULL) {
+                pir_diag_error(lex->diag, tok.line, tok.col, "symbol name cannot contain embedded NUL byte");
                 tok.kind = TOK_ERR;
                 return tok;
             }

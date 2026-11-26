@@ -766,7 +766,7 @@ static MacroArg *find_arg(Token **rest, Token *tok, MacroContext *ctx) {
     idx++;
   }
 
-  if (equal(tok, "__VA_OPT__") && tok->next->kind == TK_LPAREN) {
+  if (opt_std >= STD_C23 && equal(tok, "__VA_OPT__") && tok->next->kind == TK_LPAREN) {
     MacroArg *arg = arena_malloc(&pp_arena, sizeof(MacroArg));
     arg->tok = read_macro_arg_one(&tok, tok->next->next, true);
 
@@ -983,7 +983,7 @@ static Token *subst(Token *tok, MacroContext *ctx) {
       continue;
     }
 
-    if (equal(tok, "__VA_TAIL__") && consume_tk(&tok, tok->next, TK_LPAREN)) {
+    if (!is_iso_std && equal(tok, "__VA_TAIL__") && consume_tk(&tok, tok->next, TK_LPAREN)) {
       Macro *tail_m = NULL;
       Token *rparen = NULL;
       if (tok->kind == TK_RPAREN) {
@@ -1455,7 +1455,8 @@ static void read_line_marker(Token **rest, Token *tok, bool is_line_dir) {
 
 static void finalize_tok2(Token *tok, Token *orig) {
   tok->display_file_no = orig->file->display_file_no;
-  tok->display_line_no = orig->file->line_delta + orig->line_no + orig->display_line_no;
+  int64_t lno = (int64_t)orig->file->line_delta + (int64_t)orig->line_no + (int64_t)orig->display_line_no;
+  tok->display_line_no = (int)lno;
   tok->is_root = true;
 }
 
@@ -1636,6 +1637,10 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
       error_tok(start, "stray #elifdef");
     cond->tok->is_incl_guard = false;
 
+    if (tok->next->kind != TK_IDENT)
+      error_tok(tok->next, "macro name must be an identifier");
+    if (is_iso_std && tok->next->next->kind != TK_EOF && !start->file->is_syshdr)
+      error_tok(tok->next->next, "extra tokens at end of #elifdef directive");
     if (!cond->been_active && has_macro(tok->next)) {
       cond->been_active = true;
       return skip_line(tok->next->next);
@@ -1651,6 +1656,10 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
       error_tok(start, "stray #elifndef");
     cond->tok->is_incl_guard = false;
 
+    if (tok->next->kind != TK_IDENT)
+      error_tok(tok->next, "macro name must be an identifier");
+    if (is_iso_std && tok->next->next->kind != TK_EOF && !start->file->is_syshdr)
+      error_tok(tok->next->next, "extra tokens at end of #elifndef directive");
     if (!cond->been_active && !has_macro(tok->next)) {
       cond->been_active = true;
       return skip_line(tok->next->next);

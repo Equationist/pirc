@@ -744,7 +744,7 @@ static const char *register_pir_sig(const char *def_str) {
 
 /* Format parameter type list + return type for `sig` declaration. */
 static const char *pir_int_ext_attr(Type *ty) {
-  if (!ty || !is_integer(ty) || ty->size >= 4)
+  if (!ty || !is_int_class(ty) || ty->size >= 4)
     return "";
   if (ty->kind == TY_BOOL || ty->is_unsigned)
     return " zeroext";
@@ -1278,7 +1278,7 @@ static PirVal emit_load_scalar(PirVal addr, Type *ty, int32_t align_hint) {
     sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", r, pt, addr.id, p2);
   }
   PirVal res = {r, pt};
-  return res;
+  return emit_bitint_norm(res, ty);
 }
 
 static void emit_store_scalar(PirVal val, PirVal addr, Type *ty, int32_t align_hint) {
@@ -1592,7 +1592,7 @@ static PirVal emit_store_node(Node *lhs, PirVal val, PirVal addr) {
       int raw = new_tid();
       sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", raw, it, val.id, p2);
       sb_printf(&fc->body_sb, "    atomic_store.%s %%t%d, %%t%d [seq_cst]\n", it, raw, addr.id);
-      return addr;
+      return val;
     }
     if (lhs->ty->size > 0) {
       need_atomic_lock_helpers = true;
@@ -1600,10 +1600,11 @@ static PirVal emit_store_node(Node *lhs, PirVal val, PirVal addr) {
       sb_printf(&fc->body_sb, "    %%t%d = const.i64 %" PRIi64 "\n", sz_id, lhs->ty->size);
       sb_printf(&fc->body_sb, "    call @__pir_atomic_store_n(%%t%d, %%t%d, %%t%d)\n",
                 addr.id, val.id, sz_id);
-      return addr;
+      return val;
     }
   }
   if (is_mem_val_ty(lhs->ty) || lhs->ty->kind == TY_ARRAY) {
+    bool is_vol = ((get_elem(lhs->ty)->qual & Q_VOLATILE) != 0);
     if (lhs->ty->size > 0) {
       int32_t al = lhs->ty->align > 0 ? lhs->ty->align : 1;
       if (lhs->kind == ND_MEMBER && lhs->m.member->is_packed)
@@ -1611,7 +1612,7 @@ static PirVal emit_store_node(Node *lhs, PirVal val, PirVal addr) {
       int32_t p2 = 1;
       while (p2 * 2 <= al)
         p2 *= 2;
-      if (lhs->ty->qual & Q_VOLATILE) {
+      if (is_vol) {
         int64_t off = 0;
         while (off < lhs->ty->size) {
           int64_t rem = lhs->ty->size - off;
@@ -1631,7 +1632,7 @@ static PirVal emit_store_node(Node *lhs, PirVal val, PirVal addr) {
                   addr.id, val.id, lhs->ty->size, p2);
       }
     }
-    return addr;
+    return is_vol ? val : addr;
   }
   int32_t al = lhs->ty->align;
   if (lhs->kind == ND_MEMBER && lhs->m.member->is_packed)
@@ -1643,6 +1644,26 @@ static PirVal emit_store_node(Node *lhs, PirVal val, PirVal addr) {
 /* =========================================================================
  * 9. Address Evaluation (`gen_addr`)
  * ========================================================================= */
+
+static bool is_under_init_seq_var(Node *n, Obj *target) {
+  if (!n || !target)
+    return false;
+  for (;;) {
+    if (n->kind == ND_VAR)
+      return n->m.var == target;
+    if (n->kind == ND_MEMBER || n->kind == ND_DEREF || n->kind == ND_CAST || n->kind == ND_ADDR) {
+      n = n->m.lhs;
+      continue;
+    }
+    if (n->kind == ND_ADD || n->kind == ND_SUB) {
+      if (is_under_init_seq_var(n->m.lhs, target))
+        return true;
+      n = n->m.rhs;
+      continue;
+    }
+    return false;
+  }
+}
 
 static PirVal gen_addr(Node *node) {
   ensure_open_block();
@@ -1686,9 +1707,7 @@ static PirVal gen_addr(Node *node) {
     gen_expr(node->m.lhs);
     return gen_addr(node->m.rhs);
   case ND_MEMBER: {
-    bool is_init_target = (node->m.lhs->kind == ND_VAR &&
-                           fc->init_seq_var != NULL &&
-                           node->m.lhs->m.var == fc->init_seq_var);
+    bool is_init_target = is_under_init_seq_var(node->m.lhs, fc->init_seq_var);
     PirVal base = (!is_init_target && is_mem_val_ty(node->m.lhs->ty) &&
                    (node->m.lhs->ty->qual & Q_ATOMIC))
                       ? gen_expr(node->m.lhs)
@@ -1745,11 +1764,48 @@ static PirVal gen_funcall(Node *node) {
         acnt++;
     if (direct->ty->is_variadic ? (acnt < pcnt) : (acnt != pcnt))
       use_direct = false;
-    /* Also verify return-type structness matches */
+    /* Also verify return-type & fixed parameter PIR types match (handles cast fnptrs) */
     bool d_retbuf = is_mem_val_ty(direct->ty->return_ty) && direct->ty->return_ty->size > 0;
     bool c_retbuf = is_mem_val_ty(fnty->return_ty) && fnty->return_ty->size > 0;
-    if (d_retbuf != c_retbuf)
+    if (d_retbuf != c_retbuf) {
       use_direct = false;
+    } else if (d_retbuf) {
+      if (strcmp(get_pir_agg_type_name(direct->ty->return_ty),
+                 get_pir_agg_type_name(fnty->return_ty)) != 0)
+        use_direct = false;
+    } else {
+      if (strcmp(pir_scalar_ty_name(direct->ty->return_ty),
+                 pir_scalar_ty_name(fnty->return_ty)) != 0)
+        use_direct = false;
+    }
+    if (use_direct) {
+      Obj *dp = direct->ty->param_list;
+      Obj *ca = node->call.args;
+      while (dp && ca) {
+        while (dp && dp->ty->size <= 0 && is_agg_ty(dp->ty)) dp = dp->param_next;
+        while (ca && ca->ty->size <= 0 && is_agg_ty(ca->ty)) ca = ca->param_next;
+        if (!dp || !ca) break;
+        bool d_mem = is_mem_val_ty(dp->ty);
+        bool c_mem = is_mem_val_ty(ca->ty);
+        if (d_mem != c_mem) {
+          use_direct = false;
+          break;
+        }
+        if (d_mem) {
+          if (strcmp(get_pir_agg_type_name(dp->ty), get_pir_agg_type_name(ca->ty)) != 0) {
+            use_direct = false;
+            break;
+          }
+        } else {
+          if (strcmp(pir_scalar_ty_name(dp->ty), pir_scalar_ty_name(ca->ty)) != 0) {
+            use_direct = false;
+            break;
+          }
+        }
+        dp = dp->param_next;
+        ca = ca->param_next;
+      }
+    }
   }
 
   PirVal fn_ptr = pir_void_val();
@@ -1966,7 +2022,7 @@ static PirVal emit_load_local_slot(LocalInfo *li, Type *ty) {
     sb_printf(&fc->body_sb, "    %%t%d = load.%s %%loc_%d, align %d\n", r, pt, li->slot_id, p2);
   }
   PirVal res = {r, pt};
-  return res;
+  return emit_bitint_norm(res, ty);
 }
 
 static void emit_store_local_slot(PirVal val, LocalInfo *li, Type *ty) {
@@ -2173,7 +2229,7 @@ static PirVal gen_expr(Node *node) {
     while (p2 * 2 <= al)
       p2 *= 2;
     if (node->m.var->ty->size > 0) {
-      if (node->m.var->ty->qual & Q_VOLATILE) {
+      if (get_elem(node->m.var->ty)->qual & Q_VOLATILE) {
         int base_p = new_tid();
         sb_printf(&fc->body_sb, "    %%t%d = ptr_add.i64 %%loc_%d, 0\n", base_p, li->slot_id);
         int64_t off = 0;
@@ -3495,7 +3551,7 @@ int codegen(Obj *prog, FILE *out) {
       "    %sh = shr.i64 %pi, 4 [mask]\n"
       "    %idx = and.i64 %sh, 63\n"
       "    %off = shl.i64 %idx, 2 [mask]\n"
-      "    %tbl = addr.ptr @__pir_atomic_locks\n"
+      "    %tbl = addr @__pir_atomic_locks\n"
       "    %lp = ptr_add.i64 %tbl, %off\n"
       "    %c1 = const.i32 1\n"
       "    jmp .spin\n"

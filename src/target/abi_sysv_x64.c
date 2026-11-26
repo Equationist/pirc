@@ -10,9 +10,10 @@
 #include "lower/lower.h"
 
 typedef enum {
-    EB_NONE = 0,
-    EB_SSE  = 1,
-    EB_INT  = 2
+    EB_NONE  = 0,
+    EB_SSEUP = 1,
+    EB_SSE   = 2,
+    EB_INT   = 3
 } SysvClass;
 
 typedef struct {
@@ -29,7 +30,8 @@ static SysvClass merge_cls(SysvClass a, SysvClass b) {
     if (a == EB_NONE) return b;
     if (b == EB_NONE) return a;
     if (a == EB_INT || b == EB_INT) return EB_INT;
-    return EB_SSE;
+    if (a == EB_SSE || b == EB_SSE) return EB_SSE;
+    return EB_SSEUP;
 }
 
 static void walk_sysv(const PirModule *mod, const PirTargetSpec *target,
@@ -66,7 +68,7 @@ static void walk_sysv(const PirModule *mod, const PirTargetSpec *target,
             w->single_v128 = true;
             w->v128_ty     = ty;
             w->cls[0] = merge_cls(w->cls[0], EB_SSE);
-            w->cls[1] = merge_cls(w->cls[1], EB_SSE);
+            w->cls[1] = merge_cls(w->cls[1], EB_SSEUP);
         } else {
             uint64_t eb = base_off / 8u;
             if (eb < 2u) w->cls[eb] = merge_cls(w->cls[eb], EB_SSE);
@@ -76,6 +78,11 @@ static void walk_sysv(const PirModule *mod, const PirTargetSpec *target,
     const PirAggDef *agg = &mod->agg_types.data[ty.u.agg_id];
     if (agg->kind == PIR_AGG_PAD) {
         return; /* Explicit padding is NO_CLASS (EB_NONE) */
+    }
+    PirTypeLayout aly = pir_type_layout(mod, target, ty);
+    if (aly.align > 1u && (base_off % aly.align) != 0u) {
+        w->unaligned = true;
+        return;
     }
     if (agg->kind == PIR_AGG_ARRAY) {
         PirTypeLayout el = pir_type_layout(mod, target, agg->elem_type);
@@ -112,7 +119,8 @@ static void classify_sysv_agg(const PirModule *mod, const PirTargetSpec *target,
         out->stack_byval_align = ly.align;
         return;
     }
-    if (w.single_v128 && ly.size == 16u && w.cls[0] == EB_SSE && w.cls[1] == EB_SSE) {
+    if (w.single_v128 && ly.size == 16u && w.cls[0] == EB_SSE && w.cls[1] == EB_SSEUP &&
+        target->caps.max_simd_bits >= 128u) {
         out->kind      = PIR_ABI_DIRECT;
         out->reg_count = 1u;
         out->regs[0]   = w.v128_ty;
@@ -127,7 +135,7 @@ static void classify_sysv_agg(const PirModule *mod, const PirTargetSpec *target,
             continue;
         }
         out->reg_offsets[out->reg_count] = (uint64_t)i * 8u;
-        if (w.cls[i] == EB_SSE) {
+        if (w.cls[i] == EB_SSE || w.cls[i] == EB_SSEUP) {
             PirType st = pir_type_scalar(PIR_SCALAR_F64);
             if (w.f64_cnt[i] == 0u && w.f32_cnt[i] >= 1u && ((uint64_t)i * 8u + 4u >= ly.size)) {
                 st = pir_type_scalar(PIR_SCALAR_F32);

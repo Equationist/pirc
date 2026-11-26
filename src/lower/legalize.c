@@ -267,9 +267,21 @@ static int cmp_sorted_case(const void *a, const void *b) {
 }
 
 static PirBlockId new_switch_block(PirModule *mod, PirFunction *fn, uint32_t line) {
-    char buf[48];
+    char buf[64];
     PirBlockId bid = fn->blocks.len;
-    snprintf(buf, sizeof(buf), "sw_%u", bid);
+    uint32_t suffix = bid;
+    for (;;) {
+        snprintf(buf, sizeof(buf), "sw_%u", suffix);
+        bool dup = false;
+        for (uint32_t k = 0u; k < fn->blocks.len; ++k) {
+            if (fn->blocks.data[k].label && strcmp(fn->blocks.data[k].label, buf) == 0) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) break;
+        suffix++;
+    }
     PirBlock blk;
     memset(&blk, 0, sizeof(blk));
     blk.label    = pir_arena_strdup(&mod->arena, buf);

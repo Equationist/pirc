@@ -20,6 +20,10 @@ static bool read_cstr(PirInterp *it, PirPtr p, char **out_buf, size_t *out_len) 
         pir_interp_fail(it, PIR_INTERP_UB, "use-after-free in C string read");
         return false;
     }
+    if (a->is_func) {
+        pir_interp_fail(it, PIR_INTERP_UB, "cannot read C string from function pointer");
+        return false;
+    }
     if (p.offset < 0 || (uint64_t)p.offset >= a->size) {
         pir_interp_fail(it, PIR_INTERP_UB, "out-of-bounds C string read");
         return false;

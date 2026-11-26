@@ -211,7 +211,7 @@ static void emit_sym_addr(X64ISelCtx *c, MVReg dst, const char *name, int64_t of
             MInst t = minst_make(MI_X64_TLS_ADDR, 8u, loc);
             t.op_count = 2u;
             t.ops[0]   = mop_vreg_def(base);
-            t.ops[1]   = mop_sym(name, 0, false, true, false);
+            t.ops[1]   = mop_sym(name, 0, false, true, use_got);
             emit(c, t);
         }
     } else {
@@ -1529,7 +1529,9 @@ static void emit_call_inst(X64ISelCtx *c, const PirInst *inst, uint32_t loc) {
             uint8_t sw = alocs[i].mem_bytes;
             MVReg sv = avregs[i];
             if (pir_type_rclass(arg_tys[i]) == MREG_CLASS_GP && sw < 4u) {
-                sv = normalize_int(c, sv, arg_tys[i], false, loc);
+                bool is_sext = (cal_params && (i + arg_skip) < cal_param_count &&
+                                (cal_params[i + arg_skip].attrs & PIR_PATTR_SIGNEXT) != 0u);
+                sv = normalize_int(c, sv, arg_tys[i], is_sext, loc);
                 sw = 4u;
             }
             MInst st = minst_make(MI_STORE_OUTARG, sw, loc);
@@ -1617,8 +1619,19 @@ static void emit_call_inst(X64ISelCtx *c, const PirInst *inst, uint32_t loc) {
                 off += mb;
                 rem -= mb;
             } else {
-                /* Partial trailing GP register (e.g. 9B/12B struct): store exact remaining bytes. */
+                /* Partial trailing register (e.g. 9B/12B struct): store exact remaining bytes.
+                 * If the return register is FP/XMM, move its raw bits to GP first so sub-word
+                 * shifts/stores never operate on an XMM register! */
                 MVReg cur = rvs[k];
+                if (is_fp) {
+                    MVReg gp_tmp = new_gp(c, 8u);
+                    MInst x2g = minst_make(MI_X64_MOV_X2G, (mb >= 8u) ? 8u : 4u, loc);
+                    x2g.op_count = 2u;
+                    x2g.ops[0] = mop_vreg_def(gp_tmp);
+                    x2g.ops[1] = mop_vreg_use(rvs[k]);
+                    emit(c, x2g);
+                    cur = gp_tmp;
+                }
                 uint64_t cur_shift = 0u;
                 static const uint8_t CHUNKS[3] = { 4u, 2u, 1u };
                 for (uint32_t ci = 0u; ci < 3u && rem > 0u; ++ci) {
@@ -3075,7 +3088,7 @@ static bool isel_inst(X64ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
                 emit(c, an2);
             }
             MInst ssp = minst_make(MI_X64_MOV_RSP, 8u, loc);
-            ssp.aux_id = 1u; ssp.op_count = 1u; ssp.ops[0] = mop_vreg_use(sp_v);
+            ssp.aux_id = 2u; ssp.op_count = 1u; ssp.ops[0] = mop_vreg_use(sp_v);
             emit(c, ssp);
             emit_copy(c, dst0, sp_v, 8u, loc);
             return true;

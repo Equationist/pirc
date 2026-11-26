@@ -331,7 +331,7 @@ static void compute_intervals(const MFunc *mf, LiveInterval *v_ivs,
                 for (uint32_t k = 0u; k < pc->count; ++k) {
                     if (!pc->entries[k].src_is_imm) {
                         MVReg sv = pc->entries[k].src;
-                        if (sv < nv) iv_add_range(&v_ivs[sv], bs, pos);
+                        if (sv < nv) iv_add_range(&v_ivs[sv], bs, pos > bs ? pos : pos + 1u);
                     }
                 }
                 continue;

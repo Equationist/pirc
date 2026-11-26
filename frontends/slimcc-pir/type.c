@@ -118,8 +118,10 @@ Type *new_bitint(int64_t width, Token *tok) {
     sz = align = 4;
   else if (width <= 64)
     sz = align = 8;
+  else if (is_x64_pir_target())
+    sz = align_to(width, 64) / 8, align = 8;
   else
-    sz = align_to(width, 64) / 8, align = 8; // ARM64 align to 16
+    sz = align_to(width, 128) / 8, align = 16;
 
   Type *ty = new_type(TY_BITINT, sz, align);
   ty->bit_cnt = width;
@@ -223,7 +225,7 @@ static Type *add_qual2(QualMask msk, Type *ty, Token *tok) {
 
   Type *ret = new_derived_type(NULL, msk | ty->qual, ty);
   if ((msk & Q_ATOMIC) &&
-      (ret->size == 2 || ret->size == 4 || ret->size == 8) &&
+      (ret->size == 2 || ret->size == 4 || ret->size == 8 || ret->size == 16) &&
       ret->align < ret->size)
     ret->align = (int32_t)ret->size;
   return ret;
@@ -629,8 +631,15 @@ Type *composite_type(Type *t1, Type *t2) {
   }
   if (t1->kind == TY_PTR && t2->kind == TY_PTR) {
     Type *res = copy_type(t1);
-    res->origin = NULL;
     res->base = composite_type(t1->base, t2->base);
+    if (res->qual) {
+      Type *u = copy_type(res);
+      u->qual = 0;
+      u->origin = NULL;
+      res->origin = u;
+    } else {
+      res->origin = NULL;
+    }
     return res;
   }
   if (t1->kind == TY_FUNC && t2->kind == TY_FUNC) {
@@ -756,7 +765,8 @@ Node *assign_cast(Type *to_ty, Node *expr) {
           Type *tb = to_ty->base, *eb = expr->ty->base;
           QualMask tq = (tb->kind == TY_VOID || !is_array(tb)) ? tb->qual : get_elem(tb)->qual;
           QualMask eq = (eb->kind == TY_VOID || !is_array(eb)) ? eb->qual : get_elem(eb)->qual;
-          if ((tq & Q_ATOMIC) != (eq & Q_ATOMIC))
+          bool either_void = (tb->kind == TY_VOID || eb->kind == TY_VOID);
+          if (!either_void && (tq & Q_ATOMIC) != (eq & Q_ATOMIC))
             error_tok(expr->tok, "incompatible pointer types");
           if (eq & ~tq & (Q_CONST | Q_VOLATILE | Q_RESTRICT))
             error_tok(expr->tok, "assignment discards qualifiers from pointer target type");
@@ -865,8 +875,15 @@ static Type *cond_ptr_conv2(Type *ty1, Type *ty2, Node **cond, Obj **cond_var) {
   }
   if (ty1->kind == TY_PTR) {
     Type *newty = copy_type(ty1);
-    newty->origin = NULL;
     newty->base = cond_ptr_conv2(ty1->base, ty2->base, cond, cond_var);
+    if (newty->qual) {
+      Type *u = copy_type(newty);
+      u->qual = 0;
+      u->origin = NULL;
+      newty->origin = u;
+    } else {
+      newty->origin = NULL;
+    }
     return add_qual(ty2->qual, newty, NULL);
   }
   if (ty1->kind == TY_FUNC) {
@@ -1149,10 +1166,12 @@ void _add_type(Node *node) {
       node->ty = unqual(ptr_decay(node->m.rhs->ty));
     }
     return;
-  case ND_MEMBER:
+  case ND_MEMBER: {
     add_type(node->m.lhs);
-    node->ty = node->m.member->ty;
+    QualMask mq = node->m.lhs->ty->qual & (Q_CONST | Q_VOLATILE);
+    node->ty = mq ? add_qual(mq, node->m.member->ty, NULL) : node->m.member->ty;
     return;
+  }
   case ND_ADDR:
     add_type(node->m.lhs);
     node->ty = pointer_to(node->m.lhs->ty);

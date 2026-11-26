@@ -145,6 +145,11 @@ static bool check_agg_cycles(Verifier *v, uint32_t id, uint8_t *color) {
     return true;
 }
 
+static bool is_pad_agg_type(const PirModule *mod, PirType t) {
+    return t.kind == PIR_TYPE_NAMED_AGG && t.u.agg_id < mod->agg_types.len &&
+           mod->agg_types.data[t.u.agg_id].kind == PIR_AGG_PAD;
+}
+
 static void verify_params_and_ret(Verifier *v, const char *owner, uint32_t line,
                                   PirCallingConv cc, uint32_t fn_attrs,
                                   const PirParamDecl *params,
@@ -180,11 +185,11 @@ static void verify_params_and_ret(Verifier *v, const char *owner, uint32_t line,
                 if (!(ret_type.kind == PIR_TYPE_SCALAR && ret_type.u.scalar == PIR_SCALAR_VOID)) {
                     pir_diag_error(v->diag, line, 0u, "'%s': retbuf function must return void", owner);
                 }
-                if (pd->abi_type.kind != PIR_TYPE_NAMED_AGG) {
+                if (pd->abi_type.kind != PIR_TYPE_NAMED_AGG || is_pad_agg_type(v->mod, pd->abi_type)) {
                     pir_diag_error(v->diag, line, 0u, "'%s': retbuf requires aggregate type", owner);
                 }
             } else { /* BYVAL */
-                bool ok = (pd->abi_type.kind == PIR_TYPE_NAMED_AGG) ||
+                bool ok = (pd->abi_type.kind == PIR_TYPE_NAMED_AGG && !is_pad_agg_type(v->mod, pd->abi_type)) ||
                           (pd->abi_type.kind == PIR_TYPE_SCALAR &&
                            pd->abi_type.u.scalar == PIR_SCALAR_VALIST);
                 if (!ok) {
@@ -414,6 +419,14 @@ static void check_call_args(Verifier *v, const PirFunction *fn, const PirInst *i
             pir_diag_error(v->diag, inst->src_line, 0u, "LIR forbids byval at call site");
         }
         if (i < param_count) {
+            if (arg->call_abi == PIR_PARAM_BYVAL) {
+                if (params[i].abi_kind != PIR_PARAM_BYVAL ||
+                    !pir_type_eq(arg->call_abi_type, params[i].abi_type)) {
+                    pir_diag_error(v->diag, inst->src_line, 0u,
+                                   "call to '%s': argument %u byval annotation mismatches callee parameter",
+                                   callee_name, i);
+                }
+            }
             if (!pir_type_eq(arg->type, params[i].type)) {
                 char b1[64], b2[64];
                 pir_diag_error(v->diag, inst->src_line, 0u,
@@ -426,8 +439,16 @@ static void check_call_args(Verifier *v, const PirFunction *fn, const PirInst *i
             }
         } else {
             if (arg->call_abi == PIR_PARAM_BYVAL) {
-                if (!is_ptr_type(arg->type)) {
-                    pir_diag_error(v->diag, inst->src_line, 0u, "byval call argument must be ptr");
+                bool ok_abi = (arg->call_abi_type.kind == PIR_TYPE_NAMED_AGG &&
+                               !is_pad_agg_type(v->mod, arg->call_abi_type)) ||
+                              (arg->call_abi_type.kind == PIR_TYPE_SCALAR &&
+                               arg->call_abi_type.u.scalar == PIR_SCALAR_VALIST);
+                if (!ok_abi) {
+                    pir_diag_error(v->diag, inst->src_line, 0u,
+                                   "byval call argument requires aggregate or va_list type");
+                }
+                if (!is_ptr_type(arg->type) || arg->kind == PIR_OPER_IMM_INT || arg->kind == PIR_OPER_IMM_FLOAT) {
+                    pir_diag_error(v->diag, inst->src_line, 0u, "byval call argument must be ptr value or symbol");
                 } else {
                     check_operand_kind_and_type(v, fn, arg, pir_type_scalar(PIR_SCALAR_PTR),
                                                 inst->src_line, "byval call argument");
@@ -511,6 +532,12 @@ static void check_operand_kind_and_type(Verifier *v, const PirFunction *fn,
         if (!(expected.kind == PIR_TYPE_SCALAR &&
               (pir_scalar_is_int(expected.u.scalar) || expected.u.scalar == PIR_SCALAR_PTR))) {
             pir_diag_error(v->diag, line, 0u, "integer immediate invalid for type in %s", ctx);
+        } else if (expected.u.scalar == PIR_SCALAR_PTR) {
+            if (op->u.imm_int.lo != 0u || op->u.imm_int.hi != 0u) {
+                pir_diag_error(v->diag, line, 0u, "only null literal '0' is valid for ptr in %s", ctx);
+            }
+        } else if (expected.u.scalar != PIR_SCALAR_I128 && op->u.imm_int.hi != 0u) {
+            pir_diag_error(v->diag, line, 0u, "128-bit integer immediate out of range for type in %s", ctx);
         }
     } else if (op->kind == PIR_OPER_IMM_FLOAT) {
         if (!(expected.kind == PIR_TYPE_SCALAR && pir_scalar_is_float(expected.u.scalar))) {
@@ -907,6 +934,13 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
                 } else if (op0->kind == PIR_OPER_SYM) {
                     check_operand_kind_and_type(v, fn, op0, pir_type_scalar(PIR_SCALAR_PTR),
                                                 inst->src_line, "bitcast");
+                } else if (op0->kind == PIR_OPER_IMM_INT) {
+                    if (inst->ty.kind == PIR_TYPE_VECTOR || src.kind == PIR_TYPE_VECTOR) {
+                        pir_diag_error(v->diag, inst->src_line, 0u, "integer immediate invalid for vector bitcast");
+                    } else if (!(inst->ty.kind == PIR_TYPE_SCALAR && inst->ty.u.scalar == PIR_SCALAR_I128) &&
+                               op0->u.imm_int.hi != 0u) {
+                        pir_diag_error(v->diag, inst->src_line, 0u, "128-bit integer immediate invalid for bitcast");
+                    }
                 } else if (op0->kind == PIR_OPER_IMM_FLOAT &&
                            !(src.kind == PIR_TYPE_SCALAR && pir_scalar_is_float(src.u.scalar))) {
                     pir_diag_error(v->diag, inst->src_line, 0u, "float immediate invalid for type in bitcast");
@@ -1004,6 +1038,9 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
             if (inst->aux_type.kind == PIR_TYPE_SCALAR && inst->aux_type.u.scalar == PIR_SCALAR_VOID) {
                 pir_diag_error(v->diag, inst->src_line, 0u, "cannot alloca void");
             }
+            if (is_pad_agg_type(v->mod, inst->aux_type)) {
+                pir_diag_error(v->diag, inst->src_line, 0u, "cannot alloca standalone pad type");
+            }
             if (inst->align != 0u && !pir_is_pow2_u32(inst->align)) {
                 pir_diag_error(v->diag, inst->src_line, 0u,
                                "alignment %u is not a non-zero power of two", inst->align);
@@ -1087,6 +1124,9 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
             check_op_count(v, inst, 2u);
             if (inst->aux_type.kind == PIR_TYPE_SCALAR && inst->aux_type.u.scalar == PIR_SCALAR_VOID) {
                 pir_diag_error(v->diag, inst->src_line, 0u, "elem_ptr element type cannot be void");
+            }
+            if (is_pad_agg_type(v->mod, inst->aux_type)) {
+                pir_diag_error(v->diag, inst->src_line, 0u, "elem_ptr element type cannot be standalone pad");
             }
             if (inst->operand_count == 2u) {
                 check_operand_kind_and_type(v, fn, &inst->operands[0], pir_type_scalar(PIR_SCALAR_PTR),
@@ -1415,6 +1455,19 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
                 uint64_t mask = (sw_bits >= 64u) ? UINT64_MAX : ((UINT64_C(1) << sw_bits) - 1u);
                 uint64_t clo = inst->switch_cases[c].case_lo;
                 uint64_t chi = inst->switch_cases[c].case_hi;
+                if (sw_bits < 64u) {
+                    bool oob = (chi != 0u) ||
+                               (inst->switch_cases[c].is_negative
+                                ? (clo > (UINT64_C(1) << (sw_bits - 1u)))
+                                : (clo > mask));
+                    if (oob) {
+                        pir_diag_error(v->diag, inst->src_line, 0u,
+                                       "switch case constant out of range for %u-bit switch", sw_bits);
+                    }
+                } else if (sw_bits == 64u && chi != 0u) {
+                    pir_diag_error(v->diag, inst->src_line, 0u,
+                                   "128-bit switch case constant out of range for 64-bit switch");
+                }
                 if (inst->switch_cases[c].is_negative) {
                     uint64_t nlo = ~clo + 1u;
                     uint64_t cy = (nlo == 0u) ? 1u : 0u;
@@ -1758,6 +1811,15 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
             pir_diag_error(diag, g->src_line, 0u,
                            "alignment %u is not a non-zero power of two", g->align);
         }
+        if (g->linkage == PIR_LINK_EXTERN) {
+            if (g->item_count > 0u || g->is_zeroinit || g->is_braced) {
+                pir_diag_error(diag, g->src_line, 0u, "extern global '@%s' cannot have an initializer", g->name);
+            }
+        } else {
+            if (!g->is_zeroinit && g->item_count == 0u && !g->is_braced) {
+                pir_diag_error(diag, g->src_line, 0u, "global '@%s' requires an initializer", g->name);
+            }
+        }
         if (g->has_type) {
             if (g->type.kind == PIR_TYPE_SCALAR && g->type.u.scalar == PIR_SCALAR_VOID) {
                 pir_diag_error(diag, g->src_line, 0u, "global '@%s' cannot have type void", g->name);
@@ -1765,12 +1827,61 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
             if (g->type.kind == PIR_TYPE_SCALAR && g->type.u.scalar == PIR_SCALAR_VALIST) {
                 pir_diag_error(diag, g->src_line, 0u, "global '@%s' cannot have type va_list", g->name);
             }
+            if (is_pad_agg_type(mod, g->type)) {
+                pir_diag_error(diag, g->src_line, 0u, "global '@%s' cannot have standalone pad type", g->name);
+            }
             if (g->type.kind == PIR_TYPE_VECTOR && !g->is_braced && !g->is_zeroinit &&
                 g->item_count > 0u) {
                 pir_diag_error(diag, g->src_line, 0u,
                                "vector global '@%s' requires braced or zeroinit initializer", g->name);
             }
+            if (g->type.kind == PIR_TYPE_SCALAR && g->item_count > 0u) {
+                if (g->item_count != 1u) {
+                    pir_diag_error(diag, g->src_line, 0u,
+                                   "scalar global '@%s' expects 1 initializer item, got %u",
+                                   g->name, g->item_count);
+                } else {
+                    PirGlobalItemKind ik = g->items[0].kind;
+                    PirScalarType sk = g->type.u.scalar;
+                    if (pir_scalar_is_int(sk) && ik == PIR_GITEM_FLOAT) {
+                        pir_diag_error(diag, g->src_line, 0u, "float initializer invalid for integer global '@%s'", g->name);
+                    } else if (ik == PIR_GITEM_BYTES) {
+                        pir_diag_error(diag, g->src_line, 0u, "string initializer invalid for scalar global '@%s'", g->name);
+                    } else if (ik == PIR_GITEM_RELOC && sk != PIR_SCALAR_PTR) {
+                        pir_diag_error(diag, g->src_line, 0u, "relocation initializer invalid for non-ptr global '@%s'", g->name);
+                    }
+                }
+            } else if (g->type.kind == PIR_TYPE_VECTOR && g->is_braced) {
+                uint32_t lanes = pir_vec_lanes(g->type.u.vec);
+                PirScalarType elem = pir_vec_elem_scalar(g->type.u.vec);
+                bool single_zero = (g->item_count == 1u && g->items[0].kind == PIR_GITEM_ZERO);
+                if (!single_zero && g->item_count != lanes) {
+                    pir_diag_error(diag, g->src_line, 0u,
+                                   "vector global '@%s' expects %u lane initializers, got %u",
+                                   g->name, lanes, g->item_count);
+                }
+                for (uint32_t k = 0u; k < g->item_count; ++k) {
+                    PirGlobalItemKind ik = g->items[k].kind;
+                    if (ik == PIR_GITEM_BYTES || ik == PIR_GITEM_RELOC ||
+                        (pir_scalar_is_int(elem) && ik == PIR_GITEM_FLOAT)) {
+                        pir_diag_error(diag, g->src_line, 0u,
+                                       "invalid lane initializer in vector global '@%s'", g->name);
+                    }
+                }
+            } else if (g->type.kind == PIR_TYPE_NAMED_AGG && g->type.u.agg_id < mod->agg_types.len && g->is_braced) {
+                const PirAggDef *ad = &mod->agg_types.data[g->type.u.agg_id];
+                if (ad->kind == PIR_AGG_ARRAY && ad->elem_type.kind == PIR_TYPE_SCALAR &&
+                    !(g->item_count == 1u && (g->items[0].kind == PIR_GITEM_ZERO || g->items[0].kind == PIR_GITEM_BYTES)) &&
+                    (uint64_t)g->item_count > ad->array_len) {
+                    pir_diag_error(diag, g->src_line, 0u,
+                                   "array global '@%s' has too many initializers (%u > %" PRIu64 ")",
+                                   g->name, g->item_count, ad->array_len);
+                }
+            }
             check_lir_type(&v, g->type, g->src_line, "global");
+        } else if (g->is_zeroinit && g->item_count == 1u &&
+                   g->items[0].kind == PIR_GITEM_ZERO && g->items[0].len == 0u) {
+            pir_diag_error(diag, g->src_line, 0u, "flattened zeroinit global '@%s' must have size > 0", g->name);
         }
         for (uint32_t k = 0u; k < g->item_count; ++k) {
             if (g->items[k].kind == PIR_GITEM_RELOC && !has_symbol(mod, g->items[k].sym_name)) {

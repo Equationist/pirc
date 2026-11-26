@@ -504,7 +504,20 @@ static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                                     PirBlock nb;
                                     memset(&nb, 0, sizeof(nb));
                                     char sbuf[48];
-                                    snprintf(sbuf, sizeof(sbuf), "sw128_%u_%u", (unsigned)b, (unsigned)next_b);
+                                    uint32_t u = next_b;
+                                    for (;;) {
+                                        snprintf(sbuf, sizeof(sbuf), "sw128_%u_%u", (unsigned)b, (unsigned)u);
+                                        bool dup = false;
+                                        for (uint32_t k = 0u; k < fn->blocks.len; ++k) {
+                                            if (fn->blocks.data[k].label &&
+                                                strcmp(fn->blocks.data[k].label, sbuf) == 0) {
+                                                dup = true;
+                                                break;
+                                            }
+                                        }
+                                        if (!dup) break;
+                                        u++;
+                                    }
                                     nb.label    = pir_arena_strdup(&mod->arena, sbuf);
                                     nb.src_line = ln;
                                     PIR_VEC_PUSH(&fn->blocks, nb);
@@ -1062,6 +1075,23 @@ static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                 emit_sel(mod, fn, b, &new_insts, t64, pir_op_val(pz, t8), pir_op_val(c2p, t64), pir_op_val(c1, t64), ln, lc, rlo);
                 emit_un(mod, fn, b, &new_insts, PIR_OP_CONST, t64, pir_op_imm_i(0u, false, t64), ln, lc, rhi);
             } else if (copy.op == PIR_OP_BITCAST) {
+                if (is_i128(copy.operands[0].type)) {
+                    PirOperand alo, ahi;
+                    operand_to_pair(&copy.operands[0], map, &alo, &ahi);
+                    if (alo.kind == PIR_OPER_VAL) {
+                        ValAlias a0 = { rlo, alo.u.val };
+                        PIR_VEC_PUSH(&aliases, a0);
+                    } else {
+                        emit_un(mod, fn, b, &new_insts, PIR_OP_CONST, t64, alo, ln, lc, rlo);
+                    }
+                    if (ahi.kind == PIR_OPER_VAL) {
+                        ValAlias a1 = { rhi, ahi.u.val };
+                        PIR_VEC_PUSH(&aliases, a1);
+                    } else {
+                        emit_un(mod, fn, b, &new_insts, PIR_OP_CONST, t64, ahi, ln, lc, rhi);
+                    }
+                    continue;
+                }
                 PirInst al = pir_make_inst(PIR_OP_ALLOCA_PTR, tptr, ln, lc);
                 al.imm_u64 = 16u; al.align = 16u;
                 al.results[0] = pir_fn_new_val(mod, fn, "bc128", tptr, b, PIR_INVALID_ID, 0u);

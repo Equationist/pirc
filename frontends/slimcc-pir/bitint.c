@@ -156,15 +156,19 @@ void *eval_bitint_bitfield_load(int32_t bits, BitBuf *src, BitBuf *dst, int32_t 
 void eval_bitint_bitfield_save(int32_t bits, BitBuf *src, BitBuf *dst, int32_t width,
                                int32_t ofs) {
 #ifndef BOOTSTRAP_NO_VLA
-  int32_t cnt = (bits + 63) / 64;
+  int32_t src_cnt = (bits + 63) / 64;
+  int32_t need_bits = bits > (width + ofs) ? bits : (width + ofs);
+  int32_t cnt = (need_bits + 63) / 64;
   int32_t full_bits = cnt * 64;
 
-  BitBuf mb[cnt], sb[cnt];
-  for (int32_t i = 0; i < cnt; i++)
+  BitBuf mb[cnt], sb[cnt], sb_in[cnt];
+  for (int32_t i = 0; i < cnt; i++) {
     (&mb->as64)[i] = -1;
+    (&sb_in->as64)[i] = (i < src_cnt) ? (&src->as64)[i] : 0;
+  }
 
   eval_bitint_shl(full_bits, mb, mb, full_bits - width);
-  eval_bitint_shl(full_bits, src, sb, full_bits - width);
+  eval_bitint_shl(full_bits, sb_in, sb, full_bits - width);
 
   eval_bitint_shr(full_bits, mb, mb, full_bits - width - ofs, true);
   eval_bitint_shr(full_bits, sb, sb, full_bits - width - ofs, true);

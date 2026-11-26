@@ -449,7 +449,11 @@ static void print_global_item(const PirGlobalItem *it, PirType hint_ty, FILE *ou
             print_escaped_string(it->bytes, (size_t)it->len, out);
             break;
         case PIR_GITEM_ZERO:
-            fputs("zeroinit", out);
+            if (it->len > 1u) {
+                fprintf(out, "zeroinit %" PRIu64, it->len);
+            } else {
+                fputs("zeroinit", out);
+            }
             break;
         case PIR_GITEM_INT:
             print_u128(it->int_hi, it->int_lo, it->int_neg, out);

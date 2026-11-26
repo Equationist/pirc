@@ -1259,7 +1259,7 @@ static void plan_call_args(const PirTargetSpec *target,
 
         if (is_darwin && is_va_arg) {
             /* Darwin ARM64: ALL variadic arguments pass strictly on the stack (min 8B; 16B if over-aligned). */
-            uint64_t al = 8u;
+            uint64_t al = (mb >= 16u) ? 16u : 8u;
             if (arg_aligns && arg_aligns[i] > al) al = arg_aligns[i];
             st_off = align_up_u64(st_off, al);
             locs[i].is_reg    = false;
@@ -1275,6 +1275,11 @@ static void plan_call_args(const PirTargetSpec *target,
         }
 
         if (is_fp) {
+            if (!is_darwin && is_va_arg && ty.kind == PIR_TYPE_SCALAR && ty.u.scalar == PIR_SCALAR_F32) {
+                locs[i].promote_f32_to_f64 = true;
+                locs[i].mem_bytes = 8u;
+                mb = 8u;
+            }
             if (fp < 8u) {
                 locs[i].is_reg = true;
                 locs[i].preg   = A64_FP(fp++);
@@ -2798,7 +2803,7 @@ static bool isel_inst(ISelCtx *c, PirInstId iid, PirBlockId cur_pir_blk) {
                 new_sp = al_sp;
             }
             MInst ssp = minst_make(MI_A64_MOV_SP, 8u, loc);
-            ssp.aux_id = 1u; ssp.op_count = 1u; ssp.ops[0] = mop_vreg_use(new_sp);
+            ssp.aux_id = 2u; ssp.op_count = 1u; ssp.ops[0] = mop_vreg_use(new_sp);
             emit(c, ssp);
             MInst cp = minst_make(MI_COPY, 8u, loc);
             cp.op_count = 2u; cp.ops[0] = mop_vreg_def(dst0); cp.ops[1] = mop_vreg_use(new_sp);

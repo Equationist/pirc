@@ -5,6 +5,8 @@
 
 #include "ir/parser.h"
 #include "ir/lexer.h"
+#include "analysis/cfg.h"
+#include "analysis/dom.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -477,13 +479,17 @@ static bool parse_align_clause(Parser *p, uint32_t *align_out) {
     }
     advance_tok(p);
     if (p->cur.kind != TOK_INT || p->cur.int_neg || p->cur.int_hi != 0u ||
-        p->cur.int_lo > UINT32_MAX) {
-        pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected integer alignment");
+        p->cur.int_lo == 0u || p->cur.int_lo > UINT32_MAX) {
+        pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected non-zero integer alignment");
         return false;
     }
     *align_out = (uint32_t)p->cur.int_lo;
     advance_tok(p);
     return true;
+}
+
+static bool token_has_nul(const PirToken *t) {
+    return t->len > 0u && memchr(t->text, '\0', t->len) != NULL;
 }
 
 static bool parse_operand(Parser *p, PirFuncId func_idx, PirBlockId blk_idx,
@@ -526,6 +532,10 @@ static bool parse_operand(Parser *p, PirFuncId func_idx, PirBlockId blk_idx,
             }
             uint64_t mag = p->cur.int_lo;
             bool neg = (sub != p->cur.int_neg);
+            if (neg ? (mag > (uint64_t)INT64_MAX + 1u) : (mag > (uint64_t)INT64_MAX)) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "symbol offset out of signed 64-bit range");
+                return false;
+            }
             out->u.sym.offset = neg ? (int64_t)(UINT64_C(0) - mag) : (int64_t)mag;
             advance_tok(p);
         }
@@ -810,6 +820,7 @@ static bool parse_instruction(Parser *p, PirFuncId func_idx, PirBlockId blk_idx,
         }
         advance_tok(p);
     }
+    bool had_type_suffix = false;
     if (op == PIR_OP_ALLOCA && p->cur.kind == TOK_LABEL && p->cur.attached &&
         strcmp(p->cur.text, "ptr") == 0) {
         inst.op = PIR_OP_ALLOCA_PTR;
@@ -820,7 +831,127 @@ static bool parse_instruction(Parser *p, PirFuncId func_idx, PirBlockId blk_idx,
             pir_diag_error(p->diag, p->cur.line, p->cur.col, "invalid opcode type suffix '.%s'", p->cur.text);
             return false;
         }
+        had_type_suffix = true;
         advance_tok(p);
+    }
+    if (had_type_suffix) {
+        bool forbids_suffix = false;
+        switch (inst.op) {
+            case PIR_OP_FENCE:
+            case PIR_OP_JMP:
+            case PIR_OP_BR:
+            case PIR_OP_TRAP:
+            case PIR_OP_UNREACHABLE:
+            case PIR_OP_RESUME:
+            case PIR_OP_RET:
+            case PIR_OP_ADDR:
+            case PIR_OP_ALLOCA:
+            case PIR_OP_ALLOCA_DYN:
+            case PIR_OP_STACKSAVE:
+            case PIR_OP_STACKRESTORE:
+            case PIR_OP_FIELD_PTR:
+            case PIR_OP_ELEM_PTR:
+            case PIR_OP_MEMCPY:
+            case PIR_OP_MEMMOVE:
+            case PIR_OP_MEMSET:
+            case PIR_OP_VA_START:
+            case PIR_OP_VA_ARG_BUF:
+            case PIR_OP_VA_COPY:
+            case PIR_OP_VA_END:
+                forbids_suffix = true;
+                break;
+            case PIR_OP_CONST:
+            case PIR_OP_ADD:
+            case PIR_OP_SUB:
+            case PIR_OP_MUL:
+            case PIR_OP_DIV_S:
+            case PIR_OP_DIV_U:
+            case PIR_OP_REM_S:
+            case PIR_OP_REM_U:
+            case PIR_OP_AND:
+            case PIR_OP_OR:
+            case PIR_OP_XOR:
+            case PIR_OP_SHL:
+            case PIR_OP_SHR:
+            case PIR_OP_SAR:
+            case PIR_OP_ADD_OVF_S:
+            case PIR_OP_ADD_OVF_U:
+            case PIR_OP_SUB_OVF_S:
+            case PIR_OP_SUB_OVF_U:
+            case PIR_OP_MUL_OVF_S:
+            case PIR_OP_MUL_OVF_U:
+            case PIR_OP_ADD_CARRY:
+            case PIR_OP_SUB_BORROW:
+            case PIR_OP_MUL_WIDE_S:
+            case PIR_OP_MUL_WIDE_U:
+            case PIR_OP_CLZ:
+            case PIR_OP_CTZ:
+            case PIR_OP_POPCNT:
+            case PIR_OP_BSWAP:
+            case PIR_OP_FADD:
+            case PIR_OP_FSUB:
+            case PIR_OP_FMUL:
+            case PIR_OP_FDIV:
+            case PIR_OP_FNEG:
+            case PIR_OP_CMP_EQ:
+            case PIR_OP_CMP_NE:
+            case PIR_OP_CMP_LT_S:
+            case PIR_OP_CMP_LE_S:
+            case PIR_OP_CMP_GT_S:
+            case PIR_OP_CMP_GE_S:
+            case PIR_OP_CMP_LT_U:
+            case PIR_OP_CMP_LE_U:
+            case PIR_OP_CMP_GT_U:
+            case PIR_OP_CMP_GE_U:
+            case PIR_OP_FCMP_OEQ:
+            case PIR_OP_FCMP_ONE:
+            case PIR_OP_FCMP_OLT:
+            case PIR_OP_FCMP_OLE:
+            case PIR_OP_FCMP_OGT:
+            case PIR_OP_FCMP_OGE:
+            case PIR_OP_FCMP_UEQ:
+            case PIR_OP_FCMP_UNE:
+            case PIR_OP_FCMP_ULT:
+            case PIR_OP_FCMP_ULE:
+            case PIR_OP_FCMP_UGT:
+            case PIR_OP_FCMP_UGE:
+            case PIR_OP_TRUNC:
+            case PIR_OP_SEXT:
+            case PIR_OP_ZEXT:
+            case PIR_OP_FPTRUNC:
+            case PIR_OP_FPEXT:
+            case PIR_OP_SITOFP:
+            case PIR_OP_UITOFP:
+            case PIR_OP_FPTOSI:
+            case PIR_OP_FPTOUI:
+            case PIR_OP_PTRTOINT:
+            case PIR_OP_INTTOPTR:
+            case PIR_OP_BITCAST:
+            case PIR_OP_SPLAT:
+            case PIR_OP_EXTRACT:
+            case PIR_OP_INSERT:
+            case PIR_OP_SHUFFLE:
+            case PIR_OP_SELECT:
+            case PIR_OP_ALLOCA_PTR:
+            case PIR_OP_PTR_ADD:
+            case PIR_OP_LOAD:
+            case PIR_OP_STORE:
+            case PIR_OP_ATOMIC_LOAD:
+            case PIR_OP_ATOMIC_STORE:
+            case PIR_OP_ATOMIC_RMW:
+            case PIR_OP_ATOMIC_CMPXCHG:
+            case PIR_OP_VA_ARG:
+            case PIR_OP_CALL:
+            case PIR_OP_CALL_INDIRECT:
+            case PIR_OP_SWITCH:
+            case PIR_OP_INVOKE:
+            case PIR_OP_INVOKE_INDIRECT:
+                break;
+        }
+        if (forbids_suffix) {
+            pir_diag_error(p->diag, line, 0u, "opcode does not take a type suffix");
+            return false;
+        }
     }
 
     PirInstId inst_idx = fn->insts.len;
@@ -1331,6 +1462,13 @@ static bool parse_instruction(Parser *p, PirFuncId func_idx, PirBlockId blk_idx,
                     expected = pir_type_scalar(PIR_SCALAR_F64);
                 } else if (inst.op == PIR_OP_FPEXT) {
                     expected = pir_type_scalar(PIR_SCALAR_F32);
+                } else if (inst.op == PIR_OP_BITCAST && ops.data[k].kind == PIR_OPER_IMM_FLOAT &&
+                           inst.ty.kind == PIR_TYPE_SCALAR) {
+                    if (inst.ty.u.scalar == PIR_SCALAR_I32) {
+                        expected = pir_type_scalar(PIR_SCALAR_F32);
+                    } else if (inst.ty.u.scalar == PIR_SCALAR_I64) {
+                        expected = pir_type_scalar(PIR_SCALAR_F64);
+                    }
                 }
                 assign_literal_type(&ops.data[k], expected);
             }
@@ -1463,7 +1601,7 @@ static bool parse_fn_cc_and_attrs(Parser *p, PirCallingConv *cc_out,
     for (;;) {
         if (is_ident(p, "cc")) {
             advance_tok(p);
-            if (p->cur.kind != TOK_STRING) {
+            if (p->cur.kind != TOK_STRING || token_has_nul(&p->cur)) {
                 pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected calling convention string");
                 return false;
             }
@@ -1478,7 +1616,7 @@ static bool parse_fn_cc_and_attrs(Parser *p, PirCallingConv *cc_out,
             advance_tok(p);
         } else if (is_ident(p, "section") && sec_out) {
             advance_tok(p);
-            if (p->cur.kind != TOK_STRING) {
+            if (p->cur.kind != TOK_STRING || token_has_nul(&p->cur)) {
                 pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected section name string");
                 return false;
             }
@@ -1666,6 +1804,10 @@ static bool parse_global_item(Parser *p, PirType hint_ty, PirGlobalItem *out) {
     if (is_ident(p, "zeroinit")) {
         out->kind = PIR_GITEM_ZERO;
         advance_tok(p);
+        if (p->cur.kind == TOK_INT && !p->cur.int_neg && p->cur.int_hi == 0u) {
+            out->len = p->cur.int_lo;
+            advance_tok(p);
+        }
         return true;
     }
     if (is_ident(p, "ptr")) {
@@ -1686,6 +1828,10 @@ static bool parse_global_item(Parser *p, PirType hint_ty, PirGlobalItem *out) {
             }
             uint64_t mag = p->cur.int_lo;
             bool neg = (sub != p->cur.int_neg);
+            if (neg ? (mag > (uint64_t)INT64_MAX + 1u) : (mag > (uint64_t)INT64_MAX)) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "relocation offset out of signed 64-bit range");
+                return false;
+            }
             out->sym_offset = neg ? (int64_t)(UINT64_C(0) - mag) : (int64_t)mag;
             advance_tok(p);
         }
@@ -1726,7 +1872,7 @@ static bool parse_global_decl(Parser *p, PirLinkage linkage) {
             if (!parse_align_clause(p, &g.align)) return false;
         } else if (is_ident(p, "section")) {
             advance_tok(p);
-            if (p->cur.kind != TOK_STRING) {
+            if (p->cur.kind != TOK_STRING || token_has_nul(&p->cur)) {
                 pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected section string");
                 return false;
             }
@@ -1768,6 +1914,11 @@ static bool parse_global_decl(Parser *p, PirLinkage linkage) {
         advance_tok(p);
         if (match_tok(p, TOK_RBRACKET)) {
             /* Flattened LIR byte-count zeroinit global: `[<bytes>] = zeroinit, align <n>` */
+            if (alen == 0u) {
+                PIR_VEC_FREE(&items);
+                pir_diag_error(p->diag, bline, 0u, "flattened zeroinit global size must be > 0");
+                return false;
+            }
             g.has_type    = false;
             g.is_zeroinit = true;
             if (match_tok(p, TOK_EQ)) {
@@ -2162,7 +2313,13 @@ static bool resolve_module(Parser *p) {
         }
     }
 
-    /* 5. Resolve %val references to PirValueId and copy resolved types onto operands. */
+    /* 5. Resolve %val references using exact dominator-tree lookup for same-named block params. */
+    PirFuncId dom_fn_id = PIR_INVALID_ID;
+    PirCfg dom_cfg;
+    PirDom dom_tree;
+    memset(&dom_cfg, 0, sizeof(dom_cfg));
+    memset(&dom_tree, 0, sizeof(dom_tree));
+
     for (uint32_t i = 0u; i < p->pending_vals.len; ++i) {
         PendingValRef *vr = &p->pending_vals.data[i];
         PirFunction *fn = &mod->funcs.data[vr->func_idx];
@@ -2188,13 +2345,31 @@ static bool resolve_module(Parser *p) {
             }
         }
         if (found == PIR_INVALID_ID) {
-            /* Finally pick the nearest preceding block parameter (or any matching block param). */
-            for (uint32_t v = fn->values.len; v > 0u; --v) {
-                uint32_t idx = v - 1u;
-                if (strcmp(fn->values.data[idx].name, vr->name) == 0 &&
-                    fn->values.data[idx].def_block < vr->use_block) {
-                    found = idx;
-                    break;
+            /* Walk strict dominators of use_block to pick the nearest dominating block param. */
+            if (dom_fn_id != vr->func_idx) {
+                if (dom_fn_id != PIR_INVALID_ID) {
+                    pir_dom_destroy(&dom_tree);
+                    pir_cfg_destroy(&dom_cfg);
+                }
+                pir_cfg_build(&dom_cfg, fn);
+                pir_dom_build(&dom_tree, &dom_cfg);
+                dom_fn_id = vr->func_idx;
+            }
+            if (vr->use_block < dom_cfg.num_blocks && dom_cfg.reachable[vr->use_block]) {
+                uint32_t cur_b = dom_tree.idom[vr->use_block];
+                while (cur_b != UINT32_MAX && cur_b != vr->use_block) {
+                    for (uint32_t v = 0u; v < fn->values.len; ++v) {
+                        if (fn->values.data[v].def_block == cur_b &&
+                            fn->values.data[v].def_inst == PIR_INVALID_ID &&
+                            strcmp(fn->values.data[v].name, vr->name) == 0) {
+                            found = v;
+                            break;
+                        }
+                    }
+                    if (found != PIR_INVALID_ID) break;
+                    uint32_t next_b = dom_tree.idom[cur_b];
+                    if (next_b == cur_b) break;
+                    cur_b = next_b;
                 }
             }
         }
@@ -2217,6 +2392,10 @@ static bool resolve_module(Parser *p) {
             slot->type = fn->values.data[found].type;
         }
     }
+    if (dom_fn_id != PIR_INVALID_ID) {
+        pir_dom_destroy(&dom_tree);
+        pir_cfg_destroy(&dom_cfg);
+    }
 
     return !pir_diag_has_errors(p->diag);
 }
@@ -2238,7 +2417,7 @@ bool pir_parse_module(const char *src, size_t len, const char *filename,
         goto done;
     }
     advance_tok(&p);
-    if (p.cur.kind != TOK_STRING) {
+    if (p.cur.kind != TOK_STRING || token_has_nul(&p.cur)) {
         pir_diag_error(diag, p.cur.line, p.cur.col, "expected target triple string");
         goto done;
     }
@@ -2257,7 +2436,7 @@ bool pir_parse_module(const char *src, size_t len, const char *filename,
             PirFileDecl fd;
             fd.id = (uint32_t)p.cur.int_lo;
             advance_tok(&p);
-            if (p.cur.kind != TOK_STRING) {
+            if (p.cur.kind != TOK_STRING || token_has_nul(&p.cur)) {
                 pir_diag_error(diag, p.cur.line, p.cur.col, "expected file path string");
                 break;
             }

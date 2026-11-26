@@ -458,7 +458,7 @@ static bool invalid_cast(Node *node, Type *to) {
     if (node->ty->kind == TY_VOID)
       return true;
     if (node->ty->kind == TY_STRUCT || node->ty->kind == TY_UNION)
-      return !is_compatible(node->ty, to);
+      return is_iso_std ? true : !is_compatible(node->ty, to);
     if (to->kind == TY_STRUCT || to->kind == TY_UNION)
       return true;
   }
@@ -1201,7 +1201,10 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr, StorageClass ctx)
     case DOUBLE:                       ty = ty_double; break;
     case LONG + DOUBLE:                ty = ty_ldouble; break;
     case BITINT:
-    case BITINT + SIGNED:              break;
+    case BITINT + SIGNED:
+      if (ty->bit_cnt < 2)
+        error_tok(tok, "signed _BitInt requires width >= 2");
+      break;
     case BITINT + UNSIGNED:            ty->is_unsigned = true; break;
     default:                           error_tok(tok, "invalid type");
     }
@@ -1840,7 +1843,8 @@ static Type *typeof_specifier(Token **rest, Token *tok, VarAttr *attr) {
 
   Type *ty;
   if (is_typename(tok)) {
-    ty = declspec(&tok, tok, attr, SC_ALL | SC_INLINE);
+    VarAttr attr2 = {0};
+    ty = declspec(&tok, tok, &attr2, 0);
     ty = declarator(&tok, tok, ty, NULL);
   } else {
     Node *node = expression(&tok, tok);
@@ -2298,12 +2302,14 @@ static void aggregate_initializer(Token **rest, Token *tok, Initializer *init, N
     list_initializer(&tok, tok, init, 0);
   } else {
     start = NULL;
-    initializer3(&tok, tok, &init->list.data[0], expr);
+    if (init->list.cnt > 0) {
+      initializer3(&tok, tok, &init->list.data[0], expr);
 
-    if (init->ty->kind == TY_UNION)
-      init->list.union_idx = 0;
-    else
-      list_initializer(&tok, tok, init, 1);
+      if (init->ty->kind == TY_UNION)
+        init->list.union_idx = 0;
+      else
+        list_initializer(&tok, tok, init, 1);
+    }
   }
 
   if (has_brace) {
@@ -2736,7 +2742,7 @@ static void write_gvar_data(Relocation **cur, Initializer *init, char *buf, int 
     if (init->kind == INIT_EXPR) {
       int64_t sofs;
       Obj *var = NULL;
-      if (is_compatible(init->ty, init->expr->ty))
+      if (is_compatible(init->ty, init->expr->ty) && !is_bitfield(init->expr))
         var = eval_var(init->expr, &sofs, false);
 
       if (var && (var->is_compound_lit || is_static_const_var(var)) &&
@@ -3185,8 +3191,11 @@ static JumpContext *resolve_labeled_jump(Token **rest, Token *tok) {
   bool is_cont = tok->kind == TK_continue;
 
   Token *name = NULL;
-  if (tok->next->kind == TK_IDENT)
+  if (tok->next->kind == TK_IDENT) {
+    if (is_iso_std && !tok->file->is_syshdr)
+      error_tok(tok->next, "labeled break/continue is not allowed in ISO C");
     name = tok = tok->next;
+  }
   *rest = skip_tk(tok->next, TK_SEMI);
 
   for (JumpContext *ctx = jump_ctx; ctx; ctx = ctx->next) {
@@ -4389,7 +4398,13 @@ static BitBuf *eval_bitint(Node *node) {
 
   char *data = eval_constexpr_data(node);
   if (data) {
-    BitBuf *val = malloc(bitint_buffer_size(ty));
+    size_t bsz = bitint_buffer_size(ty);
+    if (is_bitfield(node)) {
+      size_t fsz = (size_t)bitfield_footprint(node->m.member);
+      if (fsz > bsz)
+        bsz = fsz;
+    }
+    BitBuf *val = calloc(1, bsz);
     if (is_bitfield(node)) {
       memcpy(val, data, bitfield_footprint(node->m.member));
       eval_bitint_bitfield_load(ty->bit_cnt, val, val, node->m.member->bit_width,
@@ -4905,6 +4920,14 @@ static Node *unary(Token **rest, Token *tok) {
 
   if (tok->kind == TK_AND) {
     Node *lhs = unary(rest, tok->next);
+    if (lhs->kind == ND_DEREF) {
+      add_type(lhs->m.lhs);
+      if (lhs->m.lhs->ty->kind == TY_PTR && lhs->m.lhs->ty->base->kind == TY_VOID) {
+        Node *r = new_cast(lhs->m.lhs, lhs->m.lhs->ty);
+        r->is_nonlval = true;
+        return r;
+      }
+    }
     add_type(lhs);
     if (lhs->ty->kind != TY_FUNC && !is_lvalue_expr(lhs))
       error_tok(tok, "cannot take address of non-lvalue");
@@ -5337,6 +5360,10 @@ static Type *struct_union_decl(Token **rest, Token *tok, TypeKind kind) {
     int align = t2->align;
     new_derived_type(t2, t2->qual, ty);
     t2->align = MAX(t2->align, align);
+    if ((t2->qual & Q_ATOMIC) &&
+        (t2->size == 2 || t2->size == 4 || t2->size == 8 || t2->size == 16) &&
+        t2->align < t2->size)
+      t2->align = (int32_t)t2->size;
   }
   return ty;
 }
@@ -5531,7 +5558,7 @@ static Node *postfix(Node *node, Token **rest, Token *tok) {
 static Node *funcall(Token **rest, Token *tok, Node *fn) {
   Type *ty = get_func_ty(fn);
 
-  if (fn->kind == ND_VAR && fn->m.var->returns_twice)
+  if (fnctx && fn->kind == ND_VAR && fn->m.var->returns_twice)
     fnctx->fn->dont_reuse_stk = true;
 
   Obj *param = ty->is_oldstyle ? NULL : ty->param_list;
@@ -5552,6 +5579,8 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
     } else {
       if (!ty->is_variadic && !ty->is_oldstyle)
         error_tok(tok, "too many arguments");
+      if (arg->ty->kind == TY_VOID || (arg->ty->size < 0 && !is_array(arg->ty)))
+        error_tok(arg->tok, "invalid argument of void or incomplete type");
 
       if (is_integer(arg->ty) && arg->ty->size < ty_int->size)
         arg = new_cast(arg, ty_int);
@@ -5762,7 +5791,8 @@ static Node *builtin_functions(Token **rest, Token *tok) {
     *rest = skip_tk(tok, TK_RPAREN);
 
     scope->has_alloca = true;
-    fnctx->dont_dealloc_vla = true;
+    if (fnctx)
+      fnctx->dont_dealloc_vla = true;
     return node;
   }
 
@@ -5837,6 +5867,8 @@ static Node *builtin_functions(Token **rest, Token *tok) {
     Token dot = {.kind = TK_DOT, .loc = ".", .len = 1, .next = tok, .origin = tok};
     node = postfix(node, &tok, &dot);
     add_type(node);
+    if (is_bitfield(node))
+      error_tok(tok, "cannot apply offsetof to bit-field");
     *rest = skip_tk(tok, TK_RPAREN);
 
     int64_t ofs;
@@ -6051,17 +6083,31 @@ static Node *primary(Token **rest, Token *tok) {
   }
 
   if (tok->kind == TK_PP_NUM_PPEV || tok->kind == TK_CHAR_LIT_PPEV) {
+    bool is_num = (tok->kind == TK_PP_NUM_PPEV);
     tok->kind--;
     Node *node = new_node(ND_NUM, tok);
     convert_pp_number(tok, node);
     *rest = tok->next;
 
-    if (is_integer(node->ty))
-      node->ty = node->ty->is_unsigned ? ty_uintmax_t : ty_intmax_t;
-    else if (node->ty->kind == TY_BITINT)
+    if (is_integer(node->ty)) {
+      if (is_num) {
+        bool has_u = false;
+        for (int i = 0; i < tok->len; i++) {
+          if (tok->loc[i] == 'u' || tok->loc[i] == 'U') {
+            has_u = true;
+            break;
+          }
+        }
+        node->ty = (has_u || (uint64_t)node->num.val > (uint64_t)INT64_MAX)
+                       ? ty_uintmax_t : ty_intmax_t;
+      } else {
+        node->ty = node->ty->is_unsigned ? ty_uintmax_t : ty_intmax_t;
+      }
+    } else if (node->ty->kind == TY_BITINT) {
       int_or_trunc_bitint(&node, true);
-    else
+    } else {
       error_tok(tok, "non-integer numeric literal in preprocessor expression");
+    }
     return node;
   }
 
@@ -6319,6 +6365,8 @@ static Node *func_old_style_param(Token **rest, Token *tok, Type *prot_ty, Type 
     if (var->ty)
       continue;
 
+    if (is_iso_std && opt_std >= STD_C99 && !tok->file->is_syshdr)
+      error_tok(tok, "type of K&R parameter defaults to 'int'");
     if (!prot_ty->is_oldstyle)
       chk_param_ty(prot_ty, ty_int, idx, tok);
 

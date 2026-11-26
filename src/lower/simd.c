@@ -655,7 +655,16 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
                         splits[a.u.val].count > 0u) {
                         const VecSplit *sp = &splits[a.u.val];
                         for (uint32_t p = 0u; p < sp->count; ++p) {
-                            PIR_VEC_PUSH(&nargs, pir_op_val(sp->ids[p], sp->piece_ty));
+                            PirOperand po = pir_op_val(sp->ids[p], sp->piece_ty);
+                            if (a.call_stack_align > 0u) {
+                                if (p == 0u) {
+                                    po.call_stack_align = a.call_stack_align;
+                                } else if (sp->piece_ty.kind == PIR_TYPE_VECTOR &&
+                                           pir_vec_bits(sp->piece_ty.u.vec) >= 128u) {
+                                    po.call_stack_align = 16u;
+                                }
+                            }
+                            PIR_VEC_PUSH(&nargs, po);
                         }
                     } else {
                         PIR_VEC_PUSH(&nargs, a);
@@ -787,6 +796,15 @@ bool pir_legalize_simd(PirModule *mod, const PirTargetSpec *target, PirDiag *dia
         uint32_t esz = pir_scalar_bits(elem, target->ptr_bytes) / 8u;
         uint32_t total_bytes = lanes * esz;
         if (g->align < total_bytes) g->align = total_bytes;
+        if (g->linkage == PIR_LINK_EXTERN) {
+            g->has_type    = true;
+            g->type        = pir_type_scalar(PIR_SCALAR_I8);
+            g->is_zeroinit = false;
+            g->is_braced   = false;
+            g->item_count  = 0u;
+            g->items       = NULL;
+            continue;
+        }
         g->has_type = false;
         g->type     = pir_type_scalar(PIR_SCALAR_VOID);
         if (g->is_zeroinit || g->item_count == 0u ||
@@ -818,12 +836,7 @@ bool pir_legalize_simd(PirModule *mod, const PirTargetSpec *target, PirDiag *dia
                     }
                 } else if (it->kind == PIR_GITEM_FLOAT) {
                     if (elem == PIR_SCALAR_F32) {
-                        double dv = 0.0;
-                        memcpy(&dv, &it->float_bits, 8u);
-                        float fv = (float)dv;
-                        uint32_t fb = 0u;
-                        memcpy(&fb, &fv, 4u);
-                        raw = fb;
+                        raw = (uint32_t)it->float_bits;
                     } else {
                         raw = it->float_bits;
                     }
