@@ -7,19 +7,22 @@
  * Minimal C99 Ada 83 Runtime for diana2pir + pirc.
  * Provides:
  *   - Standard Ada exception tags & unhandled exception handler
- *   - Text_IO (Character, String, Integer_IO, Float_IO)
- *   - Calendar (Clock in nanoseconds via CLOCK_MONOTONIC)
- *   - Integer/Float exponentiation helpers with optional overflow checks
+ *   - Calendar (Clock in nanoseconds via CLOCK_REALTIME)
+ *   - 'Image / 'Value, exponentiation, fixed-point, heap & secondary stack helpers
  */
+#define _POSIX_C_SOURCE 200809L
 #ifdef __APPLE__
 #define _DARWIN_C_SOURCE
-#include <sys/ucontext.h>
 #elif defined(__linux__)
 #define _GNU_SOURCE
+#endif
+#ifdef __APPLE__
+#include <sys/ucontext.h>
+#elif defined(__linux__)
 #include <ucontext.h>
 #endif
-#define _POSIX_C_SOURCE 200809L
 #include <inttypes.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <signal.h>
@@ -49,125 +52,18 @@ const char __ada_exc_data_error[]       = "IO_EXCEPTIONS.DATA_ERROR";
 const char __ada_exc_layout_error[]     = "IO_EXCEPTIONS.LAYOUT_ERROR";
 const char __ada_exc_time_error[]       = "CALENDAR.TIME_ERROR";
 
+__attribute__((noreturn))
 void __ada_raise(const void *exc_tag) {
     __pir_unwind_resume((void *)exc_tag);
     abort();
 }
 
+__attribute__((noreturn))
 void __ada_unhandled_exception(const void *exc_tag) {
     const char *name = exc_tag ? (const char *)exc_tag : "UNKNOWN_EXCEPTION";
     fprintf(stderr, "raised %s\n", name);
     fflush(stderr);
     exit(1);
-}
-
-/* =========================================================================
- * Text_IO Runtime Support
- * ========================================================================= */
-
-static int32_t g_stdout_col = 1;
-
-void __ada_put_char(int8_t c) {
-    unsigned char uc = (unsigned char)c;
-    putchar(uc);
-    if (uc == '\n') {
-        g_stdout_col = 1;
-    } else {
-        g_stdout_col++;
-    }
-}
-
-void __ada_put_str(const char *ptr, int32_t len) {
-    if (len > 0 && ptr != NULL) {
-        fwrite(ptr, 1u, (size_t)len, stdout);
-        for (int32_t i = 0; i < len; ++i) {
-            if (ptr[i] == '\n') g_stdout_col = 1;
-            else g_stdout_col++;
-        }
-    }
-}
-
-void __ada_put_line(const char *ptr, int32_t len) {
-    if (len > 0 && ptr != NULL) {
-        fwrite(ptr, 1u, (size_t)len, stdout);
-    }
-    putchar('\n');
-    g_stdout_col = 1;
-}
-
-void __ada_new_line(int32_t spacing) {
-    for (int32_t i = 0; i < spacing; ++i) {
-        putchar('\n');
-    }
-    if (spacing > 0) {
-        g_stdout_col = 1;
-    }
-}
-
-void __ada_set_col(int32_t to) {
-    if (to < 1) to = 1;
-    if (g_stdout_col > to) {
-        putchar('\n');
-        g_stdout_col = 1;
-    }
-    while (g_stdout_col < to) {
-        putchar(' ');
-        g_stdout_col++;
-    }
-}
-
-void __ada_put_i64(int64_t val, int32_t width, int32_t base) {
-    char buf[128];
-    if (base == 10 || base < 2 || base > 16) {
-        snprintf(buf, sizeof(buf), "%" PRId64, val);
-    } else {
-        /* Ada based literal format: BASE#DIGITS# */
-        static const char digits[] = "0123456789ABCDEF";
-        char rev[96];
-        int neg = 0;
-        uint64_t u = (uint64_t)val;
-        if (val < 0) {
-            neg = 1;
-            u = (uint64_t)(-(val + 1)) + 1u;
-        }
-        int rlen = 0;
-        if (u == 0) {
-            rev[rlen++] = '0';
-        } else {
-            while (u > 0) {
-                rev[rlen++] = digits[u % (uint64_t)base];
-                u /= (uint64_t)base;
-            }
-        }
-        int pos = snprintf(buf, sizeof(buf), "%s%d#", neg ? "-" : "", (int)base);
-        for (int i = rlen - 1; i >= 0 && pos < (int)sizeof(buf) - 2; --i) {
-            buf[pos++] = rev[i];
-        }
-        buf[pos++] = '#';
-        buf[pos] = '\0';
-    }
-    int len = (int)strlen(buf);
-    for (int i = len; i < (int)width; ++i) {
-        putchar(' ');
-    }
-    fputs(buf, stdout);
-}
-
-void __ada_put_f64(double val, int32_t fore, int32_t aft, int32_t exp_digits) {
-    if (aft < 1) aft = 1;
-    char buf[128];
-    if (exp_digits <= 0) {
-        snprintf(buf, sizeof(buf), "%.*f", (int)aft, val);
-    } else {
-        snprintf(buf, sizeof(buf), "%.*E", (int)aft, val);
-    }
-    /* Pad fore (characters before '.') */
-    const char *dot = strchr(buf, '.');
-    int before_dot = dot ? (int)(dot - buf) : (int)strlen(buf);
-    for (int i = before_dot; i < (int)fore; ++i) {
-        putchar(' ');
-    }
-    fputs(buf, stdout);
 }
 
 /* =========================================================================
@@ -186,9 +82,9 @@ static int ada_days_in_month(int y, int m) {
 }
 
 /* Seconds between 1901-01-01 00:00:00 UTC and 1970-01-01 00:00:00 UTC:
- * 69 years including 17 leap years (1904..1968) = 25202 days = 2177452800 s
- * STANDARD.DURATION has small = 2^(-30) s, so 1 second = (1LL << 30) ticks.
- * 199 years (72683 days) * 86400 * 2^30 = 6.74e18 < INT64_MAX (9.22e18). */
+ * 69 years including 17 leap years (1904..1968) = 25202 days = 2177452800 s.
+ * STANDARD.DURATION has small = 10^(-9) s (1 ns), so 1 second = 10^9 ticks.
+ * 199 years (1901..2099 inclusive = 72684 days) * 86400 * 10^9 = 6.2799e18 < INT64_MAX. */
 #define ADA_EPOCH_OFFSET_SECS 2177452800LL
 #define ADA_TICKS_PER_SEC     1000000000LL
 #define ADA_TICKS_PER_DAY     (86400LL * ADA_TICKS_PER_SEC)
@@ -197,10 +93,15 @@ static int ada_days_in_month(int y, int m) {
 
 int64_t __ada_clock_ns(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    int64_t sec_ticks = ((int64_t)ts.tv_sec + ADA_EPOCH_OFFSET_SECS) * ADA_TICKS_PER_SEC;
-    int64_t sub_ticks = (int64_t)ts.tv_nsec;
-    return sec_ticks + sub_ticks;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        __ada_raise(__ada_exc_time_error);
+    }
+    __int128 total = ((__int128)ts.tv_sec + (__int128)ADA_EPOCH_OFFSET_SECS) * (__int128)ADA_TICKS_PER_SEC
+                     + (__int128)ts.tv_nsec;
+    if (total < 0 || total >= (__int128)ADA_MAX_TIME_TICKS) {
+        __ada_raise(__ada_exc_time_error);
+    }
+    return (int64_t)total;
 }
 
 int64_t __ada_cal_time_of(int32_t year, int32_t month, int32_t day, int64_t seconds_ticks) {
@@ -260,41 +161,28 @@ void __ada_cal_split(int64_t date_ticks, int32_t *year_out, int32_t *month_out,
 }
 
 int64_t __ada_cal_add(int64_t t, int64_t d) {
-    /* Use __int128 or safe bounds check to avoid signed overflow */
-    if (d > 0 && t > ADA_MAX_TIME_TICKS - d) {
+    __int128 res = (__int128)t + (__int128)d;
+    if (res < 0 || res >= (__int128)ADA_MAX_TIME_TICKS) {
         __ada_raise(__ada_exc_time_error);
     }
-    if (d < 0 && t < -d) {
-        __ada_raise(__ada_exc_time_error);
-    }
-    int64_t res = t + d;
-    if (res < 0 || res >= ADA_MAX_TIME_TICKS) {
-        __ada_raise(__ada_exc_time_error);
-    }
-    return res;
+    return (int64_t)res;
 }
 
 int64_t __ada_cal_sub_dur(int64_t t, int64_t d) {
-    if (d < 0 && t > ADA_MAX_TIME_TICKS + d) {
+    __int128 res = (__int128)t - (__int128)d;
+    if (res < 0 || res >= (__int128)ADA_MAX_TIME_TICKS) {
         __ada_raise(__ada_exc_time_error);
     }
-    if (d > 0 && t < d) {
-        __ada_raise(__ada_exc_time_error);
-    }
-    int64_t res = t - d;
-    if (res < 0 || res >= ADA_MAX_TIME_TICKS) {
-        __ada_raise(__ada_exc_time_error);
-    }
-    return res;
+    return (int64_t)res;
 }
 
 int64_t __ada_cal_sub_time(int64_t t1, int64_t t2) {
     /* Result must fit within STANDARD.DURATION (-86400.0 .. +86400.0) */
-    int64_t diff = t1 - t2;
-    if (diff < -ADA_TICKS_PER_DAY || diff > ADA_TICKS_PER_DAY) {
+    __int128 diff = (__int128)t1 - (__int128)t2;
+    if (diff < -(__int128)ADA_TICKS_PER_DAY || diff > (__int128)ADA_TICKS_PER_DAY) {
         __ada_raise(__ada_exc_time_error);
     }
-    return diff;
+    return (int64_t)diff;
 }
 
 int32_t __ada_cal_year(int64_t date_ns) {
@@ -337,10 +225,11 @@ int32_t __ada_cstr_len(const char *s) {
 }
 
 int32_t __ada_img_i64(int64_t val, char *buf) {
-    if (val >= 0) {
-        return (int32_t)snprintf(buf, 32, " %" PRId64, val);
-    }
-    return (int32_t)snprintf(buf, 32, "%" PRId64, val);
+    if (!buf) return 0;
+    int n = (val >= 0) ? snprintf(buf, 32, " %" PRId64, val)
+                       : snprintf(buf, 32, "%" PRId64, val);
+    if (n < 0) return 0;
+    return (n < 32) ? (int32_t)n : 31;
 }
 
 int32_t __ada_img_char(int8_t c, char *buf) {
@@ -394,7 +283,6 @@ int8_t __ada_val_char(const char *ptr, int32_t len) {
     }
     if (ada_ci_eq(ptr + s, n, "DEL")) return (int8_t)127;
     __ada_raise(__ada_exc_constraint_error);
-    return 0;
 }
 
 int32_t __ada_val_enum(const char *ptr, int32_t len, const char *const *table, int32_t count) {
@@ -413,7 +301,6 @@ int32_t __ada_val_enum(const char *ptr, int32_t len, const char *const *table, i
         }
     }
     __ada_raise(__ada_exc_constraint_error);
-    return 0;
 }
 
 static int ada_digit_val(char c) {
@@ -537,7 +424,7 @@ int64_t __ada_ipow_i64(int64_t base, int32_t exp, int32_t checked) {
                 }
                 res = (int64_t)prod;
             } else {
-                res *= b;
+                res = (int64_t)((uint64_t)res * (uint64_t)b);
             }
         }
         e >>= 1;
@@ -549,7 +436,7 @@ int64_t __ada_ipow_i64(int64_t base, int32_t exp, int32_t checked) {
                 }
                 b = (int64_t)prod;
             } else {
-                b *= b;
+                b = (int64_t)((uint64_t)b * (uint64_t)b);
             }
         }
     }
@@ -608,97 +495,97 @@ int64_t __ada_f64_to_i64_round(double x, int64_t lo, int64_t hi, int32_t chk) {
     return v;
 }
 
-int64_t __ada_f64_to_i64_trunc(double x, int64_t lo, int64_t hi, int32_t chk) {
-    if (isnan(x) || isinf(x)) {
-        if (chk) __ada_raise(__ada_exc_constraint_error);
-        return 0;
-    }
-    double r = trunc(x);
-    if (r < -9223372036854775808.0 || r >= 9223372036854775808.0) {
-        if (chk) __ada_raise(__ada_exc_constraint_error);
-        return r < 0.0 ? INT64_MIN : INT64_MAX;
-    }
-    int64_t v = (int64_t)r;
-    if (chk && (v < lo || v > hi)) {
-        __ada_raise(__ada_exc_constraint_error);
-    }
-    return v;
-}
-
 #define ADA_HEAP_MAGIC 0xADA83A110C55AA11ULL
 
 typedef struct AdaHeapHdr {
     uint64_t magic;
-    size_t   size;
+    uint64_t size;
 } AdaHeapHdr;
 
-static volatile size_t g_ada_heap_used  = 0u;
-static volatile size_t g_ada_heap_limit = 0u;
+_Static_assert(sizeof(AdaHeapHdr) % 16u == 0u, "AdaHeapHdr must preserve 16-byte alignment");
 
-static size_t ada_get_heap_limit(void) {
-    size_t lim = g_ada_heap_limit;
-    if (lim == 0u) {
-        lim = (size_t)256u * 1024u * 1024u; /* 256 MiB default cap (cb1010b) */
-        const char *env = getenv("ADA_HEAP_LIMIT_MB");
-        if (env && env[0] != '\0') {
-            long mb = strtol(env, NULL, 10);
-            if (mb >= 1 && mb <= 65536) {
-                lim = (size_t)mb * 1024u * 1024u;
+static size_t g_ada_heap_used  = 0u;
+static size_t g_ada_heap_limit = 0u;
+static pthread_once_t g_ada_heap_once = PTHREAD_ONCE_INIT;
+
+static void ada_init_heap_limit_once(void) {
+    uint64_t lim = (uint64_t)256u * 1024u * 1024u; /* 256 MiB default cap (cb1010b) */
+    const char *env = getenv("ADA_HEAP_LIMIT_MB");
+    if (env && env[0] != '\0') {
+        char *endp = NULL;
+        long mb = strtol(env, &endp, 10);
+        if (endp != env && *endp == '\0' && mb >= 1 && mb <= 65536) {
+            uint64_t req = (uint64_t)mb * 1024u * 1024u;
+            if (req <= (uint64_t)SIZE_MAX) {
+                lim = req;
             }
         }
-        g_ada_heap_limit = lim;
     }
-    return lim;
+    __atomic_store_n(&g_ada_heap_limit, (size_t)lim, __ATOMIC_RELEASE);
+}
+
+static size_t ada_get_heap_limit(void) {
+    pthread_once(&g_ada_heap_once, ada_init_heap_limit_once);
+    return __atomic_load_n(&g_ada_heap_limit, __ATOMIC_ACQUIRE);
 }
 
 void *__ada_alloc(int64_t bytes) {
-    if (bytes <= 0) bytes = 1;
-    size_t sz = (size_t)bytes;
-    size_t lim = ada_get_heap_limit();
-    if (sz > lim) {
+    if (bytes < 0) {
         __ada_raise(__ada_exc_storage_error);
     }
-    size_t prev = __sync_fetch_and_add(&g_ada_heap_used, sz);
-    if (prev + sz > lim || prev + sz < prev) {
-        __sync_fetch_and_sub(&g_ada_heap_used, sz);
+    size_t sz = (bytes > 0) ? (size_t)bytes : 1u;
+    size_t lim = ada_get_heap_limit();
+    if (sz > lim || sz > SIZE_MAX - sizeof(AdaHeapHdr)) {
+        __ada_raise(__ada_exc_storage_error);
+    }
+    size_t prev = __atomic_fetch_add(&g_ada_heap_used, sz, __ATOMIC_ACQ_REL);
+    if (prev > lim || sz > lim - prev) {
+        __atomic_fetch_sub(&g_ada_heap_used, sz, __ATOMIC_ACQ_REL);
         __ada_raise(__ada_exc_storage_error);
     }
     AdaHeapHdr *hdr = (AdaHeapHdr *)calloc(1u, sizeof(AdaHeapHdr) + sz);
     if (!hdr) {
-        __sync_fetch_and_sub(&g_ada_heap_used, sz);
+        __atomic_fetch_sub(&g_ada_heap_used, sz, __ATOMIC_ACQ_REL);
         __ada_raise(__ada_exc_storage_error);
     }
-    hdr->magic = ADA_HEAP_MAGIC;
-    hdr->size  = sz;
+    hdr->size = (uint64_t)sz;
+    __atomic_store_n(&hdr->magic, ADA_HEAP_MAGIC, __ATOMIC_RELEASE);
     return (void *)(hdr + 1);
 }
 
-void __ada_free(void *p) {
+static void ada_free_impl(int64_t *used_p, void *p) {
     if (!p) return;
     AdaHeapHdr *hdr = ((AdaHeapHdr *)p) - 1;
-    if (hdr->magic == ADA_HEAP_MAGIC) {
-        size_t sz = hdr->size;
-        hdr->magic = 0u;
-        __sync_fetch_and_sub(&g_ada_heap_used, sz);
+    if (__atomic_exchange_n(&hdr->magic, 0u, __ATOMIC_ACQ_REL) == ADA_HEAP_MAGIC) {
+        size_t sz = (size_t)hdr->size;
+        if (used_p) {
+            __atomic_fetch_sub(used_p, (int64_t)sz, __ATOMIC_ACQ_REL);
+        }
+        __atomic_fetch_sub(&g_ada_heap_used, sz, __ATOMIC_ACQ_REL);
         free(hdr);
-    } else {
-        free(p);
     }
 }
 
+void __ada_free(void *p) {
+    ada_free_impl(NULL, p);
+}
+
 void *__ada_pool_alloc(int64_t *used_p, int64_t limit, int64_t bytes) {
-    if (bytes <= 0) bytes = 1;
-    if (limit <= 0 || bytes > limit) {
+    if (!used_p || limit <= 0 || bytes < 0) {
+        __ada_raise(__ada_exc_storage_error);
+    }
+    int64_t req = (bytes > 0) ? bytes : 1;
+    if (req > limit) {
         __ada_raise(__ada_exc_storage_error);
     }
     int64_t cur = __atomic_load_n(used_p, __ATOMIC_ACQUIRE);
-    if (cur + bytes > limit || cur + bytes < cur) {
+    if (cur < 0 || cur > limit - req) {
         __ada_raise(__ada_exc_storage_error);
     }
-    void *p = __ada_alloc(bytes);
-    int64_t prev = __sync_fetch_and_add(used_p, bytes);
-    if (prev + bytes > limit || prev + bytes < prev) {
-        __sync_fetch_and_sub(used_p, bytes);
+    void *p = __ada_alloc(req);
+    int64_t prev = __atomic_fetch_add(used_p, req, __ATOMIC_ACQ_REL);
+    if (prev < 0 || prev > limit - req) {
+        __atomic_fetch_sub(used_p, req, __ATOMIC_ACQ_REL);
         __ada_free(p);
         __ada_raise(__ada_exc_storage_error);
     }
@@ -706,107 +593,120 @@ void *__ada_pool_alloc(int64_t *used_p, int64_t limit, int64_t bytes) {
 }
 
 void __ada_pool_free(int64_t *used_p, void *p) {
-    if (!p) return;
-    AdaHeapHdr *hdr = ((AdaHeapHdr *)p) - 1;
-    if (hdr->magic == ADA_HEAP_MAGIC && used_p) {
-        int64_t sz = (int64_t)hdr->size;
-        __sync_fetch_and_sub(used_p, sz);
-    }
-    __ada_free(p);
+    ada_free_impl(used_p, p);
 }
 
 /* =========================================================================
  * Stack Overflow -> STORAGE_ERROR Signal Handler (cb1010a/c/d)
  * ========================================================================= */
 
-static volatile int g_sig_installed = 0;
+static int g_sig_installed = 0;
 static __thread uint64_t g_ada_emerg_stk[2048];
+static __thread uintptr_t g_ada_stk_bot = 0u;
+static __thread int g_ada_stk_known = 0;
 
+void __ada_ss_destroy(void);
+
+__attribute__((noreturn))
 static void ada_raise_storage_error_trampoline(void) {
     __ada_raise(__ada_exc_storage_error);
 }
 
-static void ada_stack_sig_handler(int sig, siginfo_t *si, void *uc) {
+static void ada_cache_thread_stack_bounds(void) {
+    g_ada_stk_known = 0;
+    g_ada_stk_bot = 0u;
 #ifdef __APPLE__
-    if (si && si->si_addr != NULL && uc != NULL) {
-        pthread_t self = pthread_self();
-        uintptr_t top = (uintptr_t)pthread_get_stackaddr_np(self);
-        size_t    sz  = pthread_get_stacksize_np(self);
-        uintptr_t bot = (top > sz) ? (top - sz) : 0u;
+    pthread_t self = pthread_self();
+    uintptr_t top = (uintptr_t)pthread_get_stackaddr_np(self);
+    size_t    sz  = pthread_get_stacksize_np(self);
+    if (top > sz && sz > 0u) {
+        g_ada_stk_bot = top - sz;
+        g_ada_stk_known = 1;
+    }
+#elif defined(__linux__)
+    pthread_attr_t attr;
+    void *stk_addr = NULL;
+    size_t stk_sz  = 0u;
+    if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+        int rc = pthread_attr_getstack(&attr, &stk_addr, &stk_sz);
+        pthread_attr_destroy(&attr);
+        if (rc == 0 && stk_addr != NULL && stk_sz > 0u) {
+            g_ada_stk_bot = (uintptr_t)stk_addr;
+            g_ada_stk_known = 1;
+        }
+    }
+#endif
+}
+
+static void ada_stack_sig_handler(int sig, siginfo_t *si, void *uc) {
+    if (g_ada_stk_known && si && si->si_addr != NULL && uc != NULL) {
+        uintptr_t bot = g_ada_stk_bot;
         uintptr_t fa  = (uintptr_t)si->si_addr;
         uintptr_t lo  = (bot > 4194304u) ? (bot - 4194304u) : 65536u;
         if (lo < 65536u) lo = 65536u;
         uintptr_t hi  = bot + 65536u;
+        uintptr_t em_lo = (uintptr_t)&g_ada_emerg_stk[0];
+        uintptr_t em_hi = (uintptr_t)&g_ada_emerg_stk[2048];
         if (fa >= lo && fa <= hi) {
             ucontext_t *uctx = (ucontext_t *)uc;
-            uintptr_t esp = ((uintptr_t)&g_ada_emerg_stk[2048]) & ~(uintptr_t)15u;
-#if defined(__aarch64__)
-            uctx->uc_mcontext->__ss.__pc = (uint64_t)(uintptr_t)&ada_raise_storage_error_trampoline;
-            uctx->uc_mcontext->__ss.__sp = (uint64_t)esp;
-            uctx->uc_mcontext->__ss.__fp = (uint64_t)esp;
-            uctx->uc_mcontext->__ss.__lr = 0u;
-            return;
-#elif defined(__x86_64__)
-            uctx->uc_mcontext->__ss.__rip = (uint64_t)(uintptr_t)&ada_raise_storage_error_trampoline;
-            uctx->uc_mcontext->__ss.__rsp = (uint64_t)(esp - 8u);
-            uctx->uc_mcontext->__ss.__rbp = (uint64_t)esp;
-            return;
-#else
-            __ada_raise(__ada_exc_storage_error);
-#endif
-        }
-    }
-#elif defined(__linux__)
-    if (si && si->si_addr != NULL && uc != NULL) {
-        pthread_attr_t attr;
-        void *stk_addr = NULL;
-        size_t stk_sz  = 0u;
-        if (pthread_getattr_np(pthread_self(), &attr) == 0) {
-            int rc = pthread_attr_getstack(&attr, &stk_addr, &stk_sz);
-            pthread_attr_destroy(&attr);
-            if (rc == 0 && stk_addr != NULL && stk_sz > 0u) {
-                uintptr_t bot = (uintptr_t)stk_addr;
-                uintptr_t fa  = (uintptr_t)si->si_addr;
-                uintptr_t lo  = (bot > 4194304u) ? (bot - 4194304u) : 65536u;
-                if (lo < 65536u) lo = 65536u;
-                uintptr_t hi  = bot + 65536u;
-                if (fa >= lo && fa <= hi) {
-                    ucontext_t *uctx = (ucontext_t *)uc;
-                    uintptr_t esp = ((uintptr_t)&g_ada_emerg_stk[2048]) & ~(uintptr_t)15u;
-#if defined(__aarch64__)
-                    uctx->uc_mcontext.pc = (uint64_t)(uintptr_t)&ada_raise_storage_error_trampoline;
-                    uctx->uc_mcontext.sp = (uint64_t)esp;
-                    uctx->uc_mcontext.regs[29] = (uint64_t)esp;
-                    uctx->uc_mcontext.regs[30] = 0u;
-                    return;
-#elif defined(__x86_64__)
-                    uctx->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)&ada_raise_storage_error_trampoline;
-                    uctx->uc_mcontext.gregs[REG_RSP] = (greg_t)(esp - 8u);
-                    uctx->uc_mcontext.gregs[REG_RBP] = (greg_t)esp;
-                    return;
-#else
-                    __ada_raise(__ada_exc_storage_error);
-#endif
-                }
+            uintptr_t cur_sp = 0u;
+            uintptr_t esp = em_hi & ~(uintptr_t)15u;
+#if defined(__APPLE__) && defined(__aarch64__)
+            cur_sp = (uintptr_t)uctx->uc_mcontext->__ss.__sp;
+            if (cur_sp < em_lo || cur_sp > em_hi) {
+                uctx->uc_mcontext->__ss.__pc = (uint64_t)(uintptr_t)&ada_raise_storage_error_trampoline;
+                uctx->uc_mcontext->__ss.__sp = (uint64_t)esp;
+                uctx->uc_mcontext->__ss.__fp = (uint64_t)esp;
+                uctx->uc_mcontext->__ss.__lr = 0u;
+                return;
             }
+#elif defined(__APPLE__) && defined(__x86_64__)
+            cur_sp = (uintptr_t)uctx->uc_mcontext->__ss.__rsp;
+            if (cur_sp < em_lo || cur_sp > em_hi) {
+                uctx->uc_mcontext->__ss.__rip = (uint64_t)(uintptr_t)&ada_raise_storage_error_trampoline;
+                uctx->uc_mcontext->__ss.__rsp = (uint64_t)(esp - 8u);
+                uctx->uc_mcontext->__ss.__rbp = (uint64_t)esp;
+                return;
+            }
+#elif defined(__linux__) && defined(__aarch64__)
+            cur_sp = (uintptr_t)uctx->uc_mcontext.sp;
+            if (cur_sp < em_lo || cur_sp > em_hi) {
+                uctx->uc_mcontext.pc = (uint64_t)(uintptr_t)&ada_raise_storage_error_trampoline;
+                uctx->uc_mcontext.sp = (uint64_t)esp;
+                uctx->uc_mcontext.regs[29] = (uint64_t)esp;
+                uctx->uc_mcontext.regs[30] = 0u;
+                return;
+            }
+#elif defined(__linux__) && defined(__x86_64__)
+            cur_sp = (uintptr_t)uctx->uc_mcontext.gregs[REG_RSP];
+            if (cur_sp < em_lo || cur_sp > em_hi) {
+                uctx->uc_mcontext.gregs[REG_RIP] = (greg_t)(uintptr_t)&ada_raise_storage_error_trampoline;
+                uctx->uc_mcontext.gregs[REG_RSP] = (greg_t)(esp - 8u);
+                uctx->uc_mcontext.gregs[REG_RBP] = (greg_t)esp;
+                return;
+            }
+#else
+            (void)uctx;
+            (void)cur_sp;
+            (void)esp;
+            (void)em_lo;
+#endif
         }
     }
-#else
-    (void)si;
-    (void)uc;
-#endif
     struct sigaction dfl;
     memset(&dfl, 0, sizeof(dfl));
     dfl.sa_handler = SIG_DFL;
     sigemptyset(&dfl.sa_mask);
     sigaction(sig, &dfl, NULL);
-    raise(sig);
+    /* Returning re-executes the faulting instruction with SIG_DFL, preserving original PC. */
 }
 
 void *__ada_install_stack_overflow_handler(void) {
+    ada_cache_thread_stack_bounds();
     size_t alt_sz = 65536u;
 #ifdef SIGSTKSZ
-    if ((size_t)SIGSTKSZ > alt_sz) alt_sz = (size_t)SIGSTKSZ;
+    long sys_alt = (long)SIGSTKSZ;
+    if (sys_alt > 0 && (size_t)sys_alt > alt_sz) alt_sz = (size_t)sys_alt;
 #endif
     void *alt_buf = malloc(alt_sz);
     if (alt_buf) {
@@ -814,9 +714,13 @@ void *__ada_install_stack_overflow_handler(void) {
         ss.ss_sp    = alt_buf;
         ss.ss_size  = alt_sz;
         ss.ss_flags = 0;
-        sigaltstack(&ss, NULL);
+        if (sigaltstack(&ss, NULL) != 0) {
+            free(alt_buf);
+            alt_buf = NULL;
+        }
     }
-    if (__sync_bool_compare_and_swap(&g_sig_installed, 0, 1)) {
+    int expected = 0;
+    if (__atomic_compare_exchange_n(&g_sig_installed, &expected, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
         struct sigaction sa;
         memset(&sa, 0, sizeof(sa));
         sa.sa_sigaction = ada_stack_sig_handler;
@@ -829,11 +733,13 @@ void *__ada_install_stack_overflow_handler(void) {
 }
 
 void __ada_uninstall_stack_overflow_handler(void *alt_buf) {
+    __ada_ss_destroy();
+    g_ada_stk_known = 0;
     if (alt_buf) {
         stack_t ss;
         memset(&ss, 0, sizeof(ss));
         ss.ss_flags = SS_DISABLE;
-        sigaltstack(&ss, NULL);
+        (void)sigaltstack(&ss, NULL);
         free(alt_buf);
     }
 }
@@ -846,13 +752,6 @@ static void ada_rt_init_stack_handler(void) {
 /* =========================================================================
  * Ada Secondary Stack (for unconstrained / dynamic array function returns
  * and `&` concatenation temporaries).
- *
- * Uses a linked list of pointer-stable chunks with cached reuse:
- *   - O(1) mark, O(1) bump-pointer alloc, O(1) release (zero malloc/free
- *     churn in loops)
- *   - Pointer stability: growing allocates a new linked chunk without
- *     moving previously returned arrays in earlier chunks
- *   - Exception safe: restoring a saved mark reclaims all unwound frames
  * ========================================================================= */
 
 typedef struct AdaSSChunk {
@@ -861,13 +760,51 @@ typedef struct AdaSSChunk {
     uint64_t           base_offset;
     size_t             cap;
     size_t             used;
+    uint64_t           _pad; /* ensures 48-byte header -> 16-byte aligned data[] */
     uint8_t            data[];
 } AdaSSChunk;
 
+_Static_assert(sizeof(AdaSSChunk) % 16u == 0u, "AdaSSChunk.data must be 16-byte aligned");
+
 static __thread AdaSSChunk *g_ada_ss_cur = NULL;
+static pthread_key_t g_ada_ss_key;
+static pthread_once_t g_ada_ss_key_once = PTHREAD_ONCE_INIT;
+
+static void ada_ss_free_chain(AdaSSChunk *c) {
+    if (!c) return;
+    while (c->prev) c = c->prev;
+    while (c) {
+        AdaSSChunk *nx = c->next;
+        free(c);
+        c = nx;
+    }
+}
+
+static void ada_ss_tls_destructor(void *val) {
+    AdaSSChunk *c = (AdaSSChunk *)val;
+    if (c == g_ada_ss_cur) {
+        g_ada_ss_cur = NULL;
+    }
+    ada_ss_free_chain(c);
+}
+
+static void ada_ss_init_key(void) {
+    (void)pthread_key_create(&g_ada_ss_key, ada_ss_tls_destructor);
+}
+
+void __ada_ss_destroy(void) {
+    AdaSSChunk *c = g_ada_ss_cur;
+    g_ada_ss_cur = NULL;
+    pthread_once(&g_ada_ss_key_once, ada_ss_init_key);
+    (void)pthread_setspecific(g_ada_ss_key, NULL);
+    ada_ss_free_chain(c);
+}
 
 static AdaSSChunk *ada_ss_new_chunk(size_t cap, uint64_t base_offset) {
     if (cap < 65536u) cap = 65536u;
+    if (cap > SIZE_MAX - sizeof(AdaSSChunk)) {
+        __ada_raise(__ada_exc_storage_error);
+    }
     AdaSSChunk *c = (AdaSSChunk *)malloc(sizeof(AdaSSChunk) + cap);
     if (!c) {
         __ada_raise(__ada_exc_storage_error);
@@ -877,6 +814,7 @@ static AdaSSChunk *ada_ss_new_chunk(size_t cap, uint64_t base_offset) {
     c->base_offset = base_offset;
     c->cap         = cap;
     c->used        = 0u;
+    c->_pad        = 0u;
     return c;
 }
 
@@ -885,29 +823,53 @@ uint64_t __ada_ss_mark(void) {
     return g_ada_ss_cur->base_offset + (uint64_t)g_ada_ss_cur->used;
 }
 
+static int ada_ss_try_alloc_in_chunk(AdaSSChunk *c, size_t sz, size_t al, void **out_ptr) {
+    uintptr_t base_addr = (uintptr_t)c->data;
+    if (c->used > c->cap) return 0;
+    uintptr_t cur_addr = base_addr + c->used;
+    size_t mis = (size_t)(cur_addr & (al - 1u));
+    size_t pad = (mis == 0u) ? 0u : (al - mis);
+    if (pad > c->cap - c->used) return 0;
+    size_t aligned = c->used + pad;
+    if (sz > c->cap - aligned) return 0;
+    *out_ptr = &c->data[aligned];
+    c->used = aligned + sz;
+    return 1;
+}
+
 void *__ada_ss_alloc(int64_t bytes, int64_t align) {
+    if (bytes < 0) {
+        __ada_raise(__ada_exc_storage_error);
+    }
     size_t sz = (bytes > 0) ? (size_t)bytes : 1u;
     size_t al = (align > 1) ? (size_t)align : 1u;
-    if ((al & (al - 1u)) != 0u) al = 16u;
+    if ((al & (al - 1u)) != 0u || al > 4096u) al = 16u;
     if (al < 8u) al = 8u;
-
-    if (!g_ada_ss_cur) {
-        size_t init_cap = (sz + al > 65536u) ? (sz + al) : 65536u;
-        g_ada_ss_cur = ada_ss_new_chunk(init_cap, 0u);
+    if (sz > SIZE_MAX - al) {
+        __ada_raise(__ada_exc_storage_error);
     }
 
-    size_t aligned = (g_ada_ss_cur->used + (al - 1u)) & ~(al - 1u);
-    if (aligned + sz <= g_ada_ss_cur->cap) {
-        void *p = &g_ada_ss_cur->data[aligned];
-        g_ada_ss_cur->used = aligned + sz;
+    if (!g_ada_ss_cur) {
+        size_t need = sz + al;
+        size_t init_cap = (need > 65536u) ? need : 65536u;
+        g_ada_ss_cur = ada_ss_new_chunk(init_cap, 0u);
+        pthread_once(&g_ada_ss_key_once, ada_ss_init_key);
+        (void)pthread_setspecific(g_ada_ss_key, g_ada_ss_cur);
+    }
+
+    void *p = NULL;
+    if (ada_ss_try_alloc_in_chunk(g_ada_ss_cur, sz, al, &p)) {
         return p;
     }
 
     /* Fast reuse of cached next chunk if large enough. */
-    if (g_ada_ss_cur->next && g_ada_ss_cur->next->cap >= sz) {
-        g_ada_ss_cur = g_ada_ss_cur->next;
-        g_ada_ss_cur->used = sz;
-        return g_ada_ss_cur->data;
+    if (g_ada_ss_cur->next) {
+        g_ada_ss_cur->next->used = 0u;
+        if (ada_ss_try_alloc_in_chunk(g_ada_ss_cur->next, sz, al, &p)) {
+            g_ada_ss_cur = g_ada_ss_cur->next;
+            (void)pthread_setspecific(g_ada_ss_key, g_ada_ss_cur);
+            return p;
+        }
     }
 
     /* Free any too-small cached tail chunks above current top. */
@@ -919,15 +881,19 @@ void *__ada_ss_alloc(int64_t bytes, int64_t align) {
     }
     g_ada_ss_cur->next = NULL;
 
-    size_t next_cap = g_ada_ss_cur->cap * 2u;
-    if (next_cap < sz) next_cap = sz;
+    size_t need = sz + al;
+    size_t next_cap = (g_ada_ss_cur->cap <= SIZE_MAX / 2u) ? (g_ada_ss_cur->cap * 2u) : SIZE_MAX;
+    if (next_cap < need) next_cap = need;
     uint64_t next_base = g_ada_ss_cur->base_offset + (uint64_t)g_ada_ss_cur->cap;
     AdaSSChunk *nc = ada_ss_new_chunk(next_cap, next_base);
     nc->prev = g_ada_ss_cur;
     g_ada_ss_cur->next = nc;
     g_ada_ss_cur = nc;
-    g_ada_ss_cur->used = sz;
-    return g_ada_ss_cur->data;
+    (void)pthread_setspecific(g_ada_ss_key, g_ada_ss_cur);
+    if (!ada_ss_try_alloc_in_chunk(nc, sz, al, &p)) {
+        __ada_raise(__ada_exc_storage_error);
+    }
+    return p;
 }
 
 void __ada_ss_release(uint64_t mark) {
@@ -942,6 +908,17 @@ void __ada_ss_release(uint64_t mark) {
     } else {
         g_ada_ss_cur->used = 0u;
     }
+    /* Reclaim oversized (> 1 MiB) cached tail chunks to prevent permanent spike retention */
+    if (g_ada_ss_cur->next && g_ada_ss_cur->next->cap > (size_t)1024u * 1024u) {
+        AdaSSChunk *tail = g_ada_ss_cur->next;
+        g_ada_ss_cur->next = NULL;
+        while (tail) {
+            AdaSSChunk *nx = tail->next;
+            free(tail);
+            tail = nx;
+        }
+    }
+    (void)pthread_setspecific(g_ada_ss_key, g_ada_ss_cur);
 }
 
 /* =========================================================================
@@ -951,10 +928,10 @@ void __ada_ss_release(uint64_t mark) {
 int32_t __ada_int_width(int64_t lo, int64_t hi) {
     if (hi < lo) return 0;
     char b1[32], b2[32];
-    int n1 = (lo >= 0) ? snprintf(b1, sizeof(b1), " %lld", (long long)lo)
-                       : snprintf(b1, sizeof(b1), "%lld", (long long)lo);
-    int n2 = (hi >= 0) ? snprintf(b2, sizeof(b2), " %lld", (long long)hi)
-                       : snprintf(b2, sizeof(b2), "%lld", (long long)hi);
+    int n1 = (lo >= 0) ? snprintf(b1, sizeof(b1), " %" PRId64, lo)
+                       : snprintf(b1, sizeof(b1), "%" PRId64, lo);
+    int n2 = (hi >= 0) ? snprintf(b2, sizeof(b2), " %" PRId64, hi)
+                       : snprintf(b2, sizeof(b2), "%" PRId64, hi);
     return (n1 > n2) ? (int32_t)n1 : (int32_t)n2;
 }
 
@@ -975,13 +952,23 @@ static uint64_t ada_abs_i64(int64_t v) {
     return (uint64_t)(-(v + 1)) + 1ULL;
 }
 
+static uint64_t ada_gcd_u64(uint64_t a, uint64_t b) {
+    while (b != 0ULL) {
+        uint64_t t = a % b;
+        a = b;
+        b = t;
+    }
+    return a;
+}
+
 int32_t __ada_fixed_mantissa(int64_t lo_ticks, int64_t hi_ticks, double base_small, double sub_small) {
     if (hi_ticks < lo_ticks) return 0;
     uint64_t alo = ada_abs_i64(lo_ticks);
     uint64_t ahi = ada_abs_i64(hi_ticks);
     uint64_t mt = (alo > ahi) ? alo : ahi;
     if (mt == 0ULL) return 0;
-    if (base_small > 0.0 && sub_small >= base_small) {
+    if (!(base_small > 0.0) || !(sub_small > 0.0)) return 1;
+    if (sub_small >= base_small) {
         double div = sub_small / base_small;
         int exp = 0;
         double m = frexp(div, &exp);
@@ -995,6 +982,7 @@ int32_t __ada_fixed_mantissa(int64_t lo_ticks, int64_t hi_ticks, double base_sma
         }
     }
     double r = (double)mt * (base_small / sub_small);
+    if (!(r > 0.0)) return 1;
     int b = 1;
     double p2 = 2.0;
     while (b < 63 && p2 < r) {
@@ -1008,7 +996,8 @@ int64_t __ada_fixed_large_ticks(int64_t lo_ticks, int64_t hi_ticks, double base_
     int32_t b = __ada_fixed_mantissa(lo_ticks, hi_ticks, base_small, sub_small);
     if (b <= 0) return 0;
     uint64_t mag = (b >= 63) ? 0x7FFFFFFFFFFFFFFFULL : ((1ULL << b) - 1ULL);
-    if (base_small > 0.0 && sub_small >= base_small) {
+    if (!(base_small > 0.0) || !(sub_small > 0.0)) return (int64_t)mag;
+    if (sub_small >= base_small) {
         double div = sub_small / base_small;
         int exp = 0;
         double m = frexp(div, &exp);
@@ -1021,8 +1010,11 @@ int64_t __ada_fixed_large_ticks(int64_t lo_ticks, int64_t hi_ticks, double base_
         }
     }
     double v = (double)mag * (sub_small / base_small);
-    if (v >= (double)INT64_MAX) return INT64_MAX;
-    return (int64_t)(v + 0.5);
+    if (!(v >= 0.0)) return 0;
+    if (!(v < 9223372036854775808.0)) return INT64_MAX;
+    double r = v + 0.5;
+    if (!(r < 9223372036854775808.0)) return INT64_MAX;
+    return (int64_t)r;
 }
 
 int32_t __ada_fixed_fore(int64_t lo_ticks, int64_t hi_ticks, double base_small) {
@@ -1033,7 +1025,7 @@ int32_t __ada_fixed_fore(int64_t lo_ticks, int64_t hi_ticks, double base_small) 
     double m = (double)mt * base_small;
     int32_t n = 2;
     double p10 = 10.0;
-    while (n < 38 && m >= p10) {
+    while (n < 39 && m >= p10) {
         n++;
         p10 *= 10.0;
     }
@@ -1051,7 +1043,7 @@ int32_t __ada_fixed_fore_rat(int64_t lo_ticks, int64_t hi_ticks, int64_t sm_num,
     unsigned __int128 prod = mt * (unsigned __int128)sm_num;
     unsigned __int128 thresh = (unsigned __int128)sm_den * 10u;
     int32_t n = 2;
-    while (n < 38 && prod >= thresh) {
+    while (n < 39 && prod >= thresh) {
         n++;
         if (thresh > (((unsigned __int128)0 - (unsigned __int128)1) / 10u)) break;
         thresh *= 10u;
@@ -1059,20 +1051,7 @@ int32_t __ada_fixed_fore_rat(int64_t lo_ticks, int64_t hi_ticks, int64_t sm_num,
     return n;
 }
 
-static int64_t ada_i128_div_round(__int128 num, __int128 den, int64_t lo, int64_t hi, int32_t chk) {
-    if (den == 0) {
-        if (chk) __ada_raise(__ada_exc_constraint_error);
-        return 0;
-    }
-    int neg = 0;
-    unsigned __int128 un, ud;
-    if (num < 0) { neg = !neg; un = (unsigned __int128)(-(num + 1)) + 1u; }
-    else { un = (unsigned __int128)num; }
-    if (den < 0) { neg = !neg; ud = (unsigned __int128)(-(den + 1)) + 1u; }
-    else { ud = (unsigned __int128)den; }
-    unsigned __int128 q = un / ud;
-    unsigned __int128 r = un % ud;
-    if (r * 2u >= ud) q += 1u; /* round halfway away from zero */
+static int64_t ada_apply_signed_q(unsigned __int128 q, int neg, int64_t lo, int64_t hi, int32_t chk) {
     if (!neg) {
         if (q > (unsigned __int128)INT64_MAX) {
             if (chk) __ada_raise(__ada_exc_constraint_error);
@@ -1093,31 +1072,83 @@ static int64_t ada_i128_div_round(__int128 num, __int128 den, int64_t lo, int64_
     }
 }
 
+static int64_t ada_i128_div_round(__int128 num, __int128 den, int64_t lo, int64_t hi, int32_t chk) {
+    if (den == 0) {
+        if (chk) __ada_raise(__ada_exc_constraint_error);
+        return 0;
+    }
+    int neg = 0;
+    unsigned __int128 un, ud;
+    if (num < 0) { neg = !neg; un = (unsigned __int128)(-(num + 1)) + 1u; }
+    else { un = (unsigned __int128)num; }
+    if (den < 0) { neg = !neg; ud = (unsigned __int128)(-(den + 1)) + 1u; }
+    else { ud = (unsigned __int128)den; }
+    unsigned __int128 q = un / ud;
+    unsigned __int128 r = un % ud;
+    if (r * 2u >= ud) q += 1u; /* round halfway away from zero */
+    return ada_apply_signed_q(q, neg, lo, hi, chk);
+}
+
 int64_t __ada_fixed_mul_i64(int64_t a, int64_t b, int64_t snum, int64_t sden,
                             int64_t lo, int64_t hi, int32_t chk) {
-    if (a == 0 || b == 0) {
+    if (sden == 0) {
+        if (chk) __ada_raise(__ada_exc_constraint_error);
+        return 0;
+    }
+    if (a == 0 || b == 0 || snum == 0) {
         if (chk && (0 < lo || 0 > hi)) __ada_raise(__ada_exc_constraint_error);
         return 0;
     }
-    /* Compute (a * b * snum) / sden; reduce factors to prevent 128-bit overflow */
-    __int128 p = (__int128)a * (__int128)b;
-    unsigned __int128 up = (p < 0) ? ((unsigned __int128)(-(p + 1)) + 1u) : (unsigned __int128)p;
-    unsigned __int128 usn = (snum < 0) ? (unsigned __int128)(-snum) : (unsigned __int128)snum;
-    if (usn > 0 && up > (((unsigned __int128)1 << 126) / usn)) {
-        /* Fallback to double if triple product exceeds 126 bits */
-        double x = ((double)a * (double)b) * ((double)snum / (double)sden);
-        return __ada_f64_to_i64_round(x, lo, hi, chk);
+    int neg = (a < 0) ^ (b < 0) ^ (snum < 0) ^ (sden < 0);
+    uint64_t ua = ada_abs_i64(a);
+    uint64_t ub = ada_abs_i64(b);
+    uint64_t usn = ada_abs_i64(snum);
+    uint64_t ud = ada_abs_i64(sden);
+
+    /* Exact GCD reduction before 192-bit / 64-bit exact division (zero double precision loss). */
+    uint64_t g = ada_gcd_u64(usn, ud);
+    usn /= g; ud /= g;
+    if (ud > 1ULL) { g = ada_gcd_u64(ua, ud); ua /= g; ud /= g; }
+    if (ud > 1ULL) { g = ada_gcd_u64(ub, ud); ub /= g; ud /= g; }
+
+    unsigned __int128 p01 = (unsigned __int128)ua * (unsigned __int128)ub;
+    uint64_t p_lo = (uint64_t)p01;
+    uint64_t p_hi = (uint64_t)(p01 >> 64);
+
+    unsigned __int128 t0 = (unsigned __int128)p_lo * (unsigned __int128)usn;
+    uint64_t w0 = (uint64_t)t0;
+    uint64_t c0 = (uint64_t)(t0 >> 64);
+    unsigned __int128 t1 = (unsigned __int128)p_hi * (unsigned __int128)usn + (unsigned __int128)c0;
+    uint64_t w1 = (uint64_t)t1;
+    uint64_t w2 = (uint64_t)(t1 >> 64);
+
+    uint64_t q2 = w2 / ud;
+    uint64_t r2 = w2 % ud;
+    if (q2 > 0ULL) {
+        if (chk) __ada_raise(__ada_exc_constraint_error);
+        return neg ? INT64_MIN : INT64_MAX;
     }
-    return ada_i128_div_round(p * (__int128)snum, (__int128)sden, lo, hi, chk);
+    unsigned __int128 d1 = ((unsigned __int128)r2 << 64) | (unsigned __int128)w1;
+    uint64_t q1 = (uint64_t)(d1 / (unsigned __int128)ud);
+    uint64_t r1 = (uint64_t)(d1 % (unsigned __int128)ud);
+    if (q1 > 0ULL) {
+        if (chk) __ada_raise(__ada_exc_constraint_error);
+        return neg ? INT64_MIN : INT64_MAX;
+    }
+    unsigned __int128 d0 = ((unsigned __int128)r1 << 64) | (unsigned __int128)w0;
+    unsigned __int128 q = d0 / (unsigned __int128)ud;
+    unsigned __int128 r = d0 % (unsigned __int128)ud;
+    if (r * 2u >= (unsigned __int128)ud) q += 1u;
+    return ada_apply_signed_q(q, neg, lo, hi, chk);
 }
 
 int64_t __ada_fixed_div_i64(int64_t a, int64_t b, int64_t snum, int64_t sden,
                             int64_t lo, int64_t hi, int32_t chk) {
-    if (b == 0) {
+    if (b == 0 || sden == 0) {
         if (chk) __ada_raise(__ada_exc_constraint_error);
         return 0;
     }
-    if (a == 0) {
+    if (a == 0 || snum == 0) {
         if (chk && (0 < lo || 0 > hi)) __ada_raise(__ada_exc_constraint_error);
         return 0;
     }

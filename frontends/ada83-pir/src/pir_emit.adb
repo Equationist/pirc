@@ -10,34 +10,46 @@ package body Pir_Emit is
 
    procedure Init (E : in out Emitter; Target_Triple : String) is
    begin
-      E.Target      := To_Unbounded_String (Target_Triple);
-      E.Types_Buf   := Null_Unbounded_String;
-      E.Sigs_Buf    := Null_Unbounded_String;
-      E.Data_Buf    := Null_Unbounded_String;
-      E.Globals_Buf := Null_Unbounded_String;
-      E.Externs_Buf := Null_Unbounded_String;
-      E.Funcs_Buf   := Null_Unbounded_String;
-      E.Sym_Set     := To_Unbounded_String ("|");
-      E.Def_Funcs   := To_Unbounded_String ("|");
-      E.Type_Set    := To_Unbounded_String ("|");
+      E.Target       := To_Unbounded_String (Target_Triple);
+      E.Types_Buf    := Null_Unbounded_String;
+      E.Data_Buf     := Null_Unbounded_String;
+      E.Globals_Buf  := Null_Unbounded_String;
+      E.Ext_Data_Buf := Null_Unbounded_String;
+      E.Externs_Buf  := Null_Unbounded_String;
+      E.Funcs_Buf    := Null_Unbounded_String;
+      E.Def_Data_Syms.Clear;
+      E.Ext_Data_Syms.Clear;
+      E.Ext_Func_Syms.Clear;
+      E.Def_Funcs.Clear;
+      E.Type_Set.Clear;
+      E.Cur := (Header      => Null_Unbounded_String,
+                Entry_Alloc => Null_Unbounded_String,
+                Entry_Body  => Null_Unbounded_String,
+                Rest_Body   => Null_Unbounded_String,
+                In_Entry    => True,
+                Terminated  => False,
+                Reg_Counter => 0,
+                Lbl_Counter => 0);
       E.Sym_Counter := 0;
    end Init;
 
-   function Has_Symbol (E : Emitter; Name : String) return Boolean is
+   function Is_Extern_Decl (Decl : String) return Boolean is
    begin
-      return Index (E.Sym_Set, "|" & Name & "|") > 0;
-   end Has_Symbol;
+      return Decl'Length >= 7 and then Decl (Decl'First .. Decl'First + 6) = "extern ";
+   end Is_Extern_Decl;
 
-   procedure Mark_Symbol (E : in out Emitter; Name : String) is
+   function Has_Symbol (E : Emitter; Name : String) return Boolean is
+      U : constant Unbounded_String := To_Unbounded_String (Name);
    begin
-      if not Has_Symbol (E, Name) then
-         Append (E.Sym_Set, Name & "|");
-      end if;
-   end Mark_Symbol;
+      return E.Def_Data_Syms.Contains (U)
+        or else E.Ext_Data_Syms.Contains (U)
+        or else E.Ext_Func_Syms.Contains (U)
+        or else E.Def_Funcs.Contains (U);
+   end Has_Symbol;
 
    function Has_Type (E : Emitter; Name : String) return Boolean is
    begin
-      return Index (E.Type_Set, "|" & Name & "|") > 0;
+      return E.Type_Set.Contains (To_Unbounded_String (Name));
    end Has_Type;
 
    procedure Add_Type_Decl (E : in out Emitter; Decl : String) is
@@ -47,47 +59,61 @@ package body Pir_Emit is
    begin
       if At_Pos > 0 and then Eq_Pos > At_Pos then
          declare
-            TName : constant String :=
-              Ada.Strings.Fixed.Trim (Decl (At_Pos .. Eq_Pos - 1), Ada.Strings.Both);
+            TName : constant Unbounded_String :=
+              To_Unbounded_String (Ada.Strings.Fixed.Trim (Decl (At_Pos .. Eq_Pos - 1), Ada.Strings.Both));
          begin
-            if Has_Type (E, TName) then
+            if E.Type_Set.Contains (TName) then
                return;
             end if;
-            Append (E.Type_Set, TName & "|");
+            E.Type_Set.Include (TName);
          end;
       end if;
       Append (E.Types_Buf, Decl & NL);
    end Add_Type_Decl;
 
-   procedure Add_Sig_Decl (E : in out Emitter; Decl : String) is
-   begin
-      Append (E.Sigs_Buf, Decl & NL);
-   end Add_Sig_Decl;
-
    procedure Add_Data_Decl (E : in out Emitter; Name : String; Decl : String) is
+      U : constant Unbounded_String := To_Unbounded_String (Name);
    begin
-      if Has_Symbol (E, Name) then
-         return;
+      if Is_Extern_Decl (Decl) then
+         if E.Def_Data_Syms.Contains (U) or else E.Ext_Data_Syms.Contains (U) then
+            return;
+         end if;
+         E.Ext_Data_Syms.Include (U);
+         Append (E.Ext_Data_Buf, Decl & NL);
+      else
+         if E.Def_Data_Syms.Contains (U) then
+            return;
+         end if;
+         E.Def_Data_Syms.Include (U);
+         Append (E.Data_Buf, Decl & NL);
       end if;
-      Mark_Symbol (E, Name);
-      Append (E.Data_Buf, Decl & NL);
    end Add_Data_Decl;
 
    procedure Add_Global_Decl (E : in out Emitter; Name : String; Decl : String) is
+      U : constant Unbounded_String := To_Unbounded_String (Name);
    begin
-      if Has_Symbol (E, Name) then
-         return;
+      if Is_Extern_Decl (Decl) then
+         if E.Def_Data_Syms.Contains (U) or else E.Ext_Data_Syms.Contains (U) then
+            return;
+         end if;
+         E.Ext_Data_Syms.Include (U);
+         Append (E.Ext_Data_Buf, Decl & NL);
+      else
+         if E.Def_Data_Syms.Contains (U) then
+            return;
+         end if;
+         E.Def_Data_Syms.Include (U);
+         Append (E.Globals_Buf, Decl & NL);
       end if;
-      Mark_Symbol (E, Name);
-      Append (E.Globals_Buf, Decl & NL);
    end Add_Global_Decl;
 
    procedure Add_Extern_Func (E : in out Emitter; Name : String; Decl : String) is
+      U : constant Unbounded_String := To_Unbounded_String (Name);
    begin
-      if Has_Symbol (E, Name) then
+      if E.Def_Funcs.Contains (U) or else E.Ext_Func_Syms.Contains (U) then
          return;
       end if;
-      Mark_Symbol (E, Name);
+      E.Ext_Func_Syms.Include (U);
       Append (E.Externs_Buf, Decl & NL);
    end Add_Extern_Func;
 
@@ -117,10 +143,11 @@ package body Pir_Emit is
       LP_Pos : constant Natural := (if At_Pos > 0 then Ada.Strings.Fixed.Index (Hdr, "(", From => At_Pos) else 0);
       FName  : constant String :=
         (if At_Pos > 0 and then LP_Pos > At_Pos then Hdr (At_Pos .. LP_Pos - 1) else "");
+      FKey   : constant Unbounded_String := To_Unbounded_String (FName);
    begin
-      if FName'Length = 0 or else Index (E.Def_Funcs, "|" & FName & "|") = 0 then
+      if FName'Length = 0 or else not E.Def_Funcs.Contains (FKey) then
          if FName'Length > 0 then
-            Append (E.Def_Funcs, FName & "|");
+            E.Def_Funcs.Include (FKey);
          end if;
          Append (E.Funcs_Buf, E.Cur.Header & " {" & NL);
          Append (E.Funcs_Buf, ".entry:" & NL);
@@ -228,11 +255,6 @@ package body Pir_Emit is
       return E.Cur.Terminated;
    end Is_Terminated;
 
-   procedure Set_Terminated (E : in out Emitter; Val : Boolean) is
-   begin
-      E.Cur.Terminated := Val;
-   end Set_Terminated;
-
    function Escape_Pir_String (S : String) return String is
       Hex : constant String := "0123456789abcdef";
       Res : Unbounded_String;
@@ -262,6 +284,51 @@ package body Pir_Emit is
 
    procedure Write_Module (E : Emitter; Output_Path : String := "") is
       Out_File : Ada.Text_IO.File_Type;
+
+      procedure Dump_Filtered_Lines
+        (F         : Ada.Text_IO.File_Type;
+         Buf       : Unbounded_String;
+         Skip_Set  : Str_Sets.Set;
+         End_Delim : String)
+      is
+         S   : constant String := To_String (Buf);
+         Pos : Positive := S'First;
+      begin
+         if S'Length = 0 then
+            return;
+         end if;
+         while Pos <= S'Last loop
+            declare
+               LF_Pos : constant Natural := Ada.Strings.Fixed.Index (S, (1 => NL), From => Pos);
+               End_P  : constant Natural := (if LF_Pos > 0 then LF_Pos - 1 else S'Last);
+               Line   : constant String := S (Pos .. End_P);
+               At_Pos : constant Natural := Ada.Strings.Fixed.Index (Line, "@");
+               DL_Pos : constant Natural :=
+                 (if At_Pos > 0 then Ada.Strings.Fixed.Index (Line, End_Delim, From => At_Pos) else 0);
+               Skip   : Boolean := False;
+            begin
+               if At_Pos > 0 and then DL_Pos > At_Pos then
+                  declare
+                     EName : constant String :=
+                       Ada.Strings.Fixed.Trim (Line (At_Pos .. DL_Pos - 1), Ada.Strings.Both);
+                  begin
+                     if Skip_Set.Contains (To_Unbounded_String (EName)) then
+                        Skip := True;
+                     end if;
+                  end;
+               end if;
+               if not Skip and then Line'Length > 0 then
+                  Ada.Text_IO.Put_Line (F, Line);
+               end if;
+               if LF_Pos = 0 then
+                  exit;
+               end if;
+               Pos := LF_Pos + 1;
+            end;
+         end loop;
+         Ada.Text_IO.New_Line (F);
+      end Dump_Filtered_Lines;
+
       procedure Dump (F : Ada.Text_IO.File_Type) is
       begin
          Ada.Text_IO.Put_Line (F, "target """ & To_String (E.Target) & """");
@@ -269,50 +336,19 @@ package body Pir_Emit is
          if Length (E.Types_Buf) > 0 then
             Ada.Text_IO.Put_Line (F, To_String (E.Types_Buf));
          end if;
-         if Length (E.Sigs_Buf) > 0 then
-            Ada.Text_IO.Put_Line (F, To_String (E.Sigs_Buf));
-         end if;
          if Length (E.Data_Buf) > 0 then
             Ada.Text_IO.Put_Line (F, To_String (E.Data_Buf));
          end if;
          if Length (E.Globals_Buf) > 0 then
             Ada.Text_IO.Put_Line (F, To_String (E.Globals_Buf));
          end if;
+         if Length (E.Ext_Data_Buf) > 0 then
+            -- Filter out extern data/global decls that were subsequently defined in this module
+            Dump_Filtered_Lines (F, E.Ext_Data_Buf, E.Def_Data_Syms, "=");
+         end if;
          if Length (E.Externs_Buf) > 0 then
-            -- Filter out extern func declarations that were subsequently defined in this module
-            declare
-               Ext_S : constant String := To_String (E.Externs_Buf);
-               Pos   : Positive := Ext_S'First;
-            begin
-               while Pos <= Ext_S'Last loop
-                  declare
-                     LF_Pos : constant Natural := Ada.Strings.Fixed.Index (Ext_S, (1 => NL), From => Pos);
-                     End_P  : constant Natural := (if LF_Pos > 0 then LF_Pos - 1 else Ext_S'Last);
-                     Line   : constant String := Ext_S (Pos .. End_P);
-                     At_Pos : constant Natural := Ada.Strings.Fixed.Index (Line, "@");
-                     LP_Pos : constant Natural := (if At_Pos > 0 then Ada.Strings.Fixed.Index (Line, "(", From => At_Pos) else 0);
-                     Skip   : Boolean := False;
-                  begin
-                     if At_Pos > 0 and then LP_Pos > At_Pos then
-                        declare
-                           EName : constant String := Line (At_Pos .. LP_Pos - 1);
-                        begin
-                           if Index (E.Def_Funcs, "|" & EName & "|") > 0 then
-                              Skip := True;
-                           end if;
-                        end;
-                     end if;
-                     if not Skip and then Line'Length > 0 then
-                        Ada.Text_IO.Put_Line (F, Line);
-                     end if;
-                     if LF_Pos = 0 then
-                        exit;
-                     end if;
-                     Pos := LF_Pos + 1;
-                  end;
-               end loop;
-               Ada.Text_IO.New_Line (F);
-            end;
+            -- Filter out extern func decls that were subsequently defined in this module
+            Dump_Filtered_Lines (F, E.Externs_Buf, E.Def_Funcs, "(");
          end if;
          Ada.Text_IO.Put (F, To_String (E.Funcs_Buf));
       end Dump;
@@ -321,8 +357,16 @@ package body Pir_Emit is
          Dump (Ada.Text_IO.Standard_Output);
       else
          Ada.Text_IO.Create (Out_File, Ada.Text_IO.Out_File, Output_Path);
-         Dump (Out_File);
-         Ada.Text_IO.Close (Out_File);
+         begin
+            Dump (Out_File);
+            Ada.Text_IO.Close (Out_File);
+         exception
+            when others =>
+               if Ada.Text_IO.Is_Open (Out_File) then
+                  Ada.Text_IO.Close (Out_File);
+               end if;
+               raise;
+         end;
       end if;
    end Write_Module;
 

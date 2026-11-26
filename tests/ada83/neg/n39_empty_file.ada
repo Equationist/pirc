@@ -1,0 +1,2 @@
+-- Pass 4 negative test: empty / comment-only file must not crash parphase
+-- Just a comment, no compilation unit.

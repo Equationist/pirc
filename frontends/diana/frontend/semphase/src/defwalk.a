@@ -221,8 +221,9 @@ package body DEFWALK is
                 D(AS_EXP2, RANGE_NODE, EXP2);
                 UPPER_BOUND := GET_STATIC_VALUE(EXP2);
 
-                -- if both bounds are static
-                if LOWER_BOUND /= CONST_VOID and UPPER_BOUND /= CONST_VOID then
+                -- if both bounds are static integers
+                if LOWER_BOUND /= CONST_VOID and then KIND(LOWER_BOUND) = DN_NUM_VAL
+                and then UPPER_BOUND /= CONST_VOID and then KIND(UPPER_BOUND) = DN_NUM_VAL then
 
                     -- if both bounds fit within short_integer (including null ranges)
                     if LOWER_BOUND >= PREDEFINED_SHORT_INTEGER_FIRST
@@ -580,25 +581,39 @@ package body DEFWALK is
                 end if;
 
 
-                -- Compute Ada 83 default 'SMALL: largest power of 2 <= ACCURACY
+                -- Compute Ada 83 default 'SMALL: largest power of 2 <= ACCURACY (bounded loop)
                 REAL_ONE := MAKE(DN_REAL_VAL);
                 D(XD_NUMER, REAL_ONE, U_VAL(1));
                 D(XD_DENOM, REAL_ONE, U_VAL(1));
                 IMPL_SMALL := REAL_ONE;
+                if KIND(ACCURACY) /= DN_REAL_VAL
+                or else KIND(LOWER_BOUND) /= DN_REAL_VAL
+                or else KIND(UPPER_BOUND) /= DN_REAL_VAL then
+                    return CONST_VOID;
+                end if;
                 if ACCURACY >= REAL_ONE then
-                    while IMPL_SMALL * P2_16 <= ACCURACY loop
+                    for STEP in 1 .. 64 loop
+                        exit when not (IMPL_SMALL * P2_16 <= ACCURACY);
                         IMPL_SMALL := IMPL_SMALL * P2_16;
+                        exit when IMPL_SMALL = CONST_VOID;
                     end loop;
-                    while IMPL_SMALL * P2_1 <= ACCURACY loop
+                    for STEP in 1 .. 20 loop
+                        exit when IMPL_SMALL = CONST_VOID or else not (IMPL_SMALL * P2_1 <= ACCURACY);
                         IMPL_SMALL := IMPL_SMALL * P2_1;
                     end loop;
                 else
-                    while not (IMPL_SMALL / P2_16 <= ACCURACY) loop
+                    for STEP in 1 .. 64 loop
+                        exit when IMPL_SMALL = CONST_VOID or else (IMPL_SMALL / P2_16 <= ACCURACY);
                         IMPL_SMALL := IMPL_SMALL / P2_16;
                     end loop;
-                    while not (IMPL_SMALL <= ACCURACY) loop
+                    for STEP in 1 .. 20 loop
+                        exit when IMPL_SMALL = CONST_VOID or else (IMPL_SMALL <= ACCURACY);
                         IMPL_SMALL := IMPL_SMALL / P2_1;
                     end loop;
+                end if;
+                if IMPL_SMALL = CONST_VOID then
+                    ERROR(D(LX_SRCPOS, D(AS_EXP, TYPE_DEF)), "Fixed point delta out of implementation range");
+                    return CONST_VOID;
                 end if;
 
                 -- if both bounds fit within 32-bit fixed type (including null ranges)
@@ -839,7 +854,9 @@ package body DEFWALK is
                     D(AS_NAME, INDEX, TYPE_MARK);
 
                     -- if type mark was accepted
-                    if TYPE_MARK /= CONST_VOID then
+                    if TYPE_MARK /= CONST_VOID
+                    and then GET_NAME_DEFN(TYPE_MARK) /= CONST_VOID
+                    and then KIND(GET_NAME_DEFN(TYPE_MARK)) in CLASS_TYPE_NAME then
                         declare
                             IDX_TS: constant TREE := D(SM_TYPE_SPEC, GET_NAME_DEFN(TYPE_MARK));
                         begin

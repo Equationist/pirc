@@ -1,7 +1,9 @@
 -- Copyright (c) 2026 Ummon Karpe
 -- SPDX-License-Identifier: BSD-3-Clause
 
+with Ada.Containers.Hashed_Sets;
 with Ada.Strings.Unbounded; use Ada.Strings.Unbounded;
+with Ada.Strings.Unbounded.Hash;
 
 package Pir_Emit is
 
@@ -11,7 +13,6 @@ package Pir_Emit is
 
    -- Module-level sections
    procedure Add_Type_Decl (E : in out Emitter; Decl : String);
-   procedure Add_Sig_Decl (E : in out Emitter; Decl : String);
    procedure Add_Data_Decl (E : in out Emitter; Name : String; Decl : String);
    procedure Add_Global_Decl (E : in out Emitter; Name : String; Decl : String);
    procedure Add_Extern_Func (E : in out Emitter; Name : String; Decl : String);
@@ -44,7 +45,6 @@ package Pir_Emit is
    procedure Emit_Comment (E : in out Emitter; Text : String);
 
    function Is_Terminated (E : Emitter) return Boolean;
-   procedure Set_Terminated (E : in out Emitter; Val : Boolean);
 
    -- String escaping for PIR data literals
    function Escape_Pir_String (S : String) return String;
@@ -55,6 +55,11 @@ package Pir_Emit is
    procedure Write_Module (E : Emitter; Output_Path : String := "");
 
 private
+
+   package Str_Sets is new Ada.Containers.Hashed_Sets
+     (Element_Type        => Unbounded_String,
+      Hash                => Ada.Strings.Unbounded.Hash,
+      Equivalent_Elements => "=");
 
    type Func_Buffer is record
       Header       : Unbounded_String;
@@ -68,18 +73,20 @@ private
    end record;
 
    type Emitter is limited record
-      Target      : Unbounded_String;
-      Types_Buf   : Unbounded_String;
-      Sigs_Buf    : Unbounded_String;
-      Data_Buf    : Unbounded_String;
-      Globals_Buf : Unbounded_String;
-      Externs_Buf : Unbounded_String;
-      Funcs_Buf   : Unbounded_String;
-      Sym_Set     : Unbounded_String; -- pipe-delimited set of declared symbols
-      Def_Funcs   : Unbounded_String; -- pipe-delimited set of defined function symbols
-      Type_Set    : Unbounded_String; -- pipe-delimited set of declared type names
-      Cur         : Func_Buffer;
-      Sym_Counter : Natural := 0;
+      Target        : Unbounded_String;
+      Types_Buf     : Unbounded_String;
+      Data_Buf      : Unbounded_String;
+      Globals_Buf   : Unbounded_String;
+      Ext_Data_Buf  : Unbounded_String;
+      Externs_Buf   : Unbounded_String;
+      Funcs_Buf     : Unbounded_String;
+      Def_Data_Syms : Str_Sets.Set; -- defined data/global symbols
+      Ext_Data_Syms : Str_Sets.Set; -- extern data/global symbols
+      Ext_Func_Syms : Str_Sets.Set; -- extern func symbols
+      Def_Funcs     : Str_Sets.Set; -- defined func symbols
+      Type_Set      : Str_Sets.Set; -- declared type names
+      Cur           : Func_Buffer;
+      Sym_Counter   : Natural := 0;
    end record;
 
 end Pir_Emit;

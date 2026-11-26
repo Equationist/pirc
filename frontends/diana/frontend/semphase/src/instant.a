@@ -697,7 +697,7 @@ package body INSTANT is
 			when DN_PARENTHESIZED | DN_FUNCTION_CALL | DN_NULLARY_CALL | DN_CONVERSION
 			   | DN_QUALIFIED | DN_ATTRIBUTE | DN_AGGREGATE | DN_NUMERIC_LITERAL
 			   | DN_STRING_LITERAL | DN_NULL_ACCESS | DN_USED_CHAR
-			   | DN_AND_THEN | DN_OR_ELSE | DN_RANGE_MEMBERSHIP | DN_TYPE_MEMBERSHIP
+			   | DN_SHORT_CIRCUIT | DN_RANGE_MEMBERSHIP | DN_TYPE_MEMBERSHIP
 			   | DN_QUALIFIED_ALLOCATOR | DN_SUBTYPE_ALLOCATOR =>
 			    BAD_IO := TRUE;
 			    exit;
@@ -1828,10 +1828,16 @@ package body INSTANT is
 		when DN_RETURN =>
 		    if EXP_BAD(D(AS_EXP, S)) then return TRUE; end if;
 		when DN_BLOCK =>
-		    if ITEM_S_BAD(D(AS_ITEM_S, S), DEPTH + 1)
-		    or else STM_S_BAD(D(AS_STM_S, S), DEPTH + 1) then
-			return TRUE;
-		    end if;
+		    declare
+			BB_INNER: constant TREE := D(AS_BLOCK_BODY, S);
+		    begin
+			if BB_INNER /= CONST_VOID and then KIND(BB_INNER) = DN_BLOCK_BODY then
+			    if ITEM_S_BAD(D(AS_ITEM_S, BB_INNER), DEPTH + 1)
+			    or else STM_S_BAD(D(AS_STM_S, BB_INNER), DEPTH + 1) then
+				return TRUE;
+			    end if;
+			end if;
+		    end;
 		when DN_LOOP =>
 		    if STM_S_BAD(D(AS_STM_S, S), DEPTH + 1) then return TRUE; end if;
 		when DN_IF =>
@@ -1870,7 +1876,29 @@ package body INSTANT is
 		when DN_ACCEPT =>
 		    if STM_S_BAD(D(AS_STM_S, S), DEPTH + 1) then return TRUE; end if;
 		when DN_LABELED =>
-		    if STM_S_BAD(D(AS_STM, S), DEPTH + 1) then return TRUE; end if;
+		    declare
+			INNER_S: constant TREE := D(AS_STM, S);
+		    begin
+			if INNER_S /= CONST_VOID then
+			    if KIND(INNER_S) = DN_BLOCK then
+				declare
+				    BB_L: constant TREE := D(AS_BLOCK_BODY, INNER_S);
+				begin
+				    if BB_L /= CONST_VOID and then KIND(BB_L) = DN_BLOCK_BODY
+				    and then (ITEM_S_BAD(D(AS_ITEM_S, BB_L), DEPTH + 1)
+					      or else STM_S_BAD(D(AS_STM_S, BB_L), DEPTH + 1)) then
+					return TRUE;
+				    end if;
+				end;
+			    elsif KIND(INNER_S) = DN_ASSIGN then
+				if EXP_BAD(D(AS_EXP, INNER_S)) then return TRUE; end if;
+			    elsif KIND(INNER_S) = DN_RETURN then
+				if EXP_BAD(D(AS_EXP, INNER_S)) then return TRUE; end if;
+			    elsif KIND(INNER_S) = DN_LOOP or else KIND(INNER_S) = DN_ACCEPT then
+				if STM_S_BAD(D(AS_STM_S, INNER_S), DEPTH + 1) then return TRUE; end if;
+			    end if;
+			end if;
+		    end;
 		when others =>
 		    null;
 		end case;

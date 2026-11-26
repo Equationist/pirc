@@ -11,11 +11,12 @@
  *   Handle 0 = closed / never opened.
  *   Handle 1 = Standard_Input (stdin)
  *   Handle 2 = Standard_Output (stdout)
- *   Handles 3..256 = user-created / user-opened Text_IO, Sequential_IO, or Direct_IO files.
+ *   Handles 3..255 = user-created / user-opened Text_IO, Sequential_IO, or Direct_IO files.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <math.h>
@@ -24,12 +25,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 extern void __ada_raise(const void *exc_tag);
 extern void *__ada_ss_alloc(int64_t bytes, int64_t align);
-extern int64_t __ada_val_i64(const char *ptr, int32_t len);
-extern int32_t __ada_val_enum(const char *ptr, int32_t len, const char *const *table, int32_t count);
 
 extern const char __ada_exc_constraint_error[];
 extern const char __ada_exc_storage_error[];
@@ -43,6 +43,7 @@ extern const char __ada_exc_data_error[];
 extern const char __ada_exc_layout_error[];
 
 #define ADA_MAX_FILES 256
+#define ADA_PATH_CAP  1024
 
 /* Ada Text_IO modes: IN_FILE=0, OUT_FILE=1
  * Ada Direct_IO modes: IN_FILE=0, INOUT_FILE=1, OUT_FILE=2 */
@@ -54,7 +55,6 @@ enum {
 };
 
 typedef struct AdaFile {
-    pthread_mutex_t mtx;
     int       kind;
     int       is_open;
     int       is_std;
@@ -62,7 +62,7 @@ typedef struct AdaFile {
     int       mode;
     uint32_t  gen;
     FILE     *fp;
-    char      name[512];
+    char      name[ADA_PATH_CAP];
     char      form[256];
     /* Text_IO state */
     int32_t   line_len;   /* 0 = UNBOUNDED */
@@ -73,7 +73,7 @@ typedef struct AdaFile {
     int       last_was_nl;
     int       last_was_ff;
     int       wrote_any;
-    int       pb[4];      /* internal pushback stack (no fseek on pipes/stdin!) */
+    int       pb[8];      /* internal pushback stack (no fseek on pipes/stdin!) */
     int       pb_len;
     /* Direct_IO state */
     int64_t   dir_index;  /* 1-based element index */
@@ -86,6 +86,7 @@ void __ada_raise_data_error(void) {
 }
 
 static AdaFile g_files[ADA_MAX_FILES];
+static pthread_mutex_t g_file_mtx[ADA_MAX_FILES];
 static uint32_t g_next_gen = 1u;
 static pthread_once_t g_io_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t g_io_table_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -95,6 +96,10 @@ static int32_t g_cur_input = 1;
 static int32_t g_cur_output = 2;
 static int32_t *g_cur_input_var = NULL;
 static int32_t *g_cur_output_var = NULL;
+
+static pthread_mutex_t *af_mutex(const AdaFile *af) {
+    return &g_file_mtx[(size_t)(af - g_files)];
+}
 
 static void io_raise(const void *exc_tag) {
     while (g_io_held_depth > 0 && g_io_held_mtx != NULL) {
@@ -128,17 +133,16 @@ static int tio_getc(AdaFile *af) {
 
 static void tio_ungetc(AdaFile *af, int c) {
     if (c == EOF) return;
-    if (af->pb_len < 4) {
+    if (af->pb_len < (int)(sizeof(af->pb) / sizeof(af->pb[0]))) {
         af->pb[af->pb_len++] = c;
-    } else {
-        ungetc(c, af->fp);
     }
 }
 
 static void ada_io_cleanup_temps(void) {
-    pthread_mutex_lock(&g_io_table_mtx);
+    if (pthread_mutex_trylock(&g_io_table_mtx) != 0) return;
     for (int32_t i = 3; i < ADA_MAX_FILES; ++i) {
         if (g_files[i].is_open && g_files[i].is_temp) {
+            int locked = (pthread_mutex_trylock(&g_file_mtx[i]) == 0);
             if (g_files[i].fp) {
                 fclose(g_files[i].fp);
                 g_files[i].fp = NULL;
@@ -147,6 +151,7 @@ static void ada_io_cleanup_temps(void) {
                 unlink(g_files[i].name);
             }
             g_files[i].is_open = 0;
+            if (locked) pthread_mutex_unlock(&g_file_mtx[i]);
         }
     }
     pthread_mutex_unlock(&g_io_table_mtx);
@@ -158,7 +163,7 @@ static void io_init_impl(void) {
     pthread_mutexattr_init(&mattr);
     pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_RECURSIVE);
     for (int32_t i = 0; i < ADA_MAX_FILES; ++i) {
-        pthread_mutex_init(&g_files[i].mtx, &mattr);
+        pthread_mutex_init(&g_file_mtx[i], &mattr);
     }
     pthread_mutexattr_destroy(&mattr);
     atexit(ada_io_cleanup_temps);
@@ -204,12 +209,10 @@ static void ensure_free_slot(void) {
 }
 
 static int32_t alloc_slot_locked(void) {
-    /* Caller holds g_io_table_mtx */
+    /* Caller holds g_io_table_mtx; mutex lives in separate g_file_mtx[] (no POSIX UB copy!) */
     for (int32_t i = 3; i < ADA_MAX_FILES; ++i) {
         if (!g_files[i].is_open && g_files[i].fp == NULL) {
-            pthread_mutex_t saved_mtx = g_files[i].mtx;
             memset(&g_files[i], 0, sizeof(AdaFile));
-            g_files[i].mtx = saved_mtx;
             g_files[i].gen = g_next_gen++;
             if (g_next_gen == 0u || g_next_gen >= 0x7FFFFFu) g_next_gen = 1u;
             return i;
@@ -230,18 +233,32 @@ static AdaFile *acquire_open_file(int32_t h) {
         __ada_raise(__ada_exc_status_error);
     }
     AdaFile *af = &g_files[slot];
-    pthread_mutex_lock(&af->mtx);
-    g_io_held_mtx = &af->mtx;
+    pthread_mutex_t *mtx = &g_file_mtx[slot];
+    pthread_mutex_lock(mtx);
+    g_io_held_mtx = mtx;
     g_io_held_depth++;
     pthread_mutex_unlock(&g_io_table_mtx);
     return af;
+}
+
+static AdaFile *acquire_target_file(const int32_t *f_ptr, int is_output) {
+    io_init();
+    int32_t h;
+    if (f_ptr) {
+        h = *f_ptr;
+    } else {
+        pthread_mutex_lock(&g_io_table_mtx);
+        h = is_output ? g_cur_output : g_cur_input;
+        pthread_mutex_unlock(&g_io_table_mtx);
+    }
+    return acquire_open_file(h);
 }
 
 static void release_open_file(AdaFile *af) {
     if (!af) return;
     if (g_io_held_depth > 0) g_io_held_depth--;
     if (g_io_held_depth == 0) g_io_held_mtx = NULL;
-    pthread_mutex_unlock(&af->mtx);
+    pthread_mutex_unlock(af_mutex(af));
 }
 
 static int32_t read_handle(const int32_t *f_ptr) {
@@ -280,10 +297,14 @@ static void copy_ada_name(char *dst, size_t dst_cap, const char *src, int32_t le
 }
 
 static FILE *open_temp_file(char *out_name, size_t cap) {
-    char tmpl[512];
+    char tmpl[ADA_PATH_CAP];
     const char *tmpd = getenv("TMPDIR");
     if (!tmpd || tmpd[0] == '\0') tmpd = "/tmp";
-    snprintf(tmpl, sizeof(tmpl), "%s/ada_io_XXXXXX", tmpd);
+    int n = snprintf(tmpl, sizeof(tmpl), "%s/ada_io_XXXXXX", tmpd);
+    if (n < 0 || (size_t)n >= sizeof(tmpl)) {
+        n = snprintf(tmpl, sizeof(tmpl), "/tmp/ada_io_XXXXXX");
+        if (n < 0 || (size_t)n >= sizeof(tmpl)) return NULL;
+    }
     int fd = mkstemp(tmpl);
     if (fd < 0) {
         return NULL;
@@ -294,8 +315,46 @@ static FILE *open_temp_file(char *out_name, size_t cap) {
         unlink(tmpl);
         return NULL;
     }
-    strncpy(out_name, tmpl, cap - 1);
-    out_name[cap - 1] = '\0';
+    if ((size_t)n >= cap) {
+        fclose(fp);
+        unlink(tmpl);
+        return NULL;
+    }
+    memcpy(out_name, tmpl, (size_t)n + 1u);
+    return fp;
+}
+
+/* Open an existing regular file without TOCTOU (no O_CREAT) and reject directories */
+static FILE *open_existing_file_safe(const char *cname, int mode, int kind) {
+    int flags;
+    const char *fmode;
+    if (mode == 0) {
+        flags = O_RDONLY;
+        fmode = "rb";
+    } else if (kind == ADA_FK_DIR && mode >= 1) {
+        flags = O_RDWR;
+        fmode = "r+b";
+    } else {
+        flags = O_RDWR | O_TRUNC;
+        fmode = "w+b";
+    }
+    int fd = open(cname, flags);
+    if (fd < 0) {
+        if (errno == ENOENT || errno == ENOTDIR || errno == EINVAL || errno == ENAMETOOLONG) {
+            __ada_raise(__ada_exc_name_error);
+        }
+        __ada_raise(__ada_exc_use_error);
+    }
+    struct stat st;
+    if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
+        close(fd);
+        __ada_raise(__ada_exc_use_error);
+    }
+    FILE *fp = fdopen(fd, fmode);
+    if (!fp) {
+        close(fd);
+        __ada_raise(__ada_exc_use_error);
+    }
     return fp;
 }
 
@@ -304,11 +363,11 @@ static void flush_all_open_files(void) {
     pthread_mutex_lock(&g_io_table_mtx);
     for (int32_t i = 3; i < ADA_MAX_FILES; ++i) {
         if (g_files[i].is_open && g_files[i].fp && g_files[i].mode != 0) {
-            pthread_mutex_lock(&g_files[i].mtx);
+            pthread_mutex_lock(&g_file_mtx[i]);
             if (g_files[i].is_open && g_files[i].fp && g_files[i].mode != 0) {
                 fflush(g_files[i].fp);
             }
-            pthread_mutex_unlock(&g_files[i].mtx);
+            pthread_mutex_unlock(&g_file_mtx[i]);
         }
     }
     pthread_mutex_unlock(&g_io_table_mtx);
@@ -318,34 +377,37 @@ static void refresh_dir_size(AdaFile *af, int64_t elem_sz) {
     if (!af || !af->fp) return;
     if (elem_sz > 0) af->elem_sz = elem_sz;
     if (af->elem_sz <= 0) return;
-    long cur = ftell(af->fp);
-    if (fseek(af->fp, 0, SEEK_END) == 0) {
-        long sz = ftell(af->fp);
+    off_t cur = ftello(af->fp);
+    if (fseeko(af->fp, 0, SEEK_END) == 0) {
+        off_t sz = ftello(af->fp);
         if (sz >= 0) {
             int64_t cnt = (int64_t)sz / af->elem_sz;
             if (cnt > af->dir_size) af->dir_size = cnt;
         }
     }
-    if (cur >= 0) fseek(af->fp, cur, SEEK_SET);
+    if (cur >= 0) (void)fseeko(af->fp, cur, SEEK_SET);
 }
 
-static void store_full_name(char *dst, size_t cap, const char *cname) {
+static int store_full_name(char *dst, size_t cap, const char *cname) {
     if (cname[0] == '\0') {
         dst[0] = '\0';
-        return;
+        return 1;
     }
+    size_t clen = strlen(cname);
     if (cname[0] == '/') {
-        strncpy(dst, cname, cap - 1);
-        dst[cap - 1] = '\0';
-        return;
+        if (clen >= cap) return 0;
+        memcpy(dst, cname, clen + 1u);
+        return 1;
     }
-    char cwd[384];
+    char cwd[ADA_PATH_CAP];
     if (getcwd(cwd, sizeof(cwd)) != NULL) {
-        snprintf(dst, cap, "%s/%s", cwd, cname);
-    } else {
-        strncpy(dst, cname, cap - 1);
-        dst[cap - 1] = '\0';
+        int n = snprintf(dst, cap, "%s/%s", cwd, cname);
+        if (n < 0 || (size_t)n >= cap) return 0;
+        return 1;
     }
+    if (clen >= cap) return 0;
+    memcpy(dst, cname, clen + 1u);
+    return 1;
 }
 
 /* =========================================================================
@@ -356,15 +418,19 @@ void __ada_tio_create(int32_t *f_ptr, int32_t mode,
                       const char *name_p, int32_t name_len,
                       const char *form_p, int32_t form_len) {
     io_init();
-    if (read_handle(f_ptr) != 0) {
-        __ada_raise(__ada_exc_status_error);
-    }
-    if ((f_ptr == g_cur_input_var && mode != 0) || (f_ptr == g_cur_output_var && mode != 1)) {
-        __ada_raise(__ada_exc_mode_error);
-    }
-    char cname[512], cform[256];
+    pthread_mutex_lock(&g_io_table_mtx);
+    int already_open = (f_ptr && *f_ptr != 0);
+    int bad_mode = ((f_ptr == g_cur_input_var && mode != 0) || (f_ptr == g_cur_output_var && mode != 1));
+    pthread_mutex_unlock(&g_io_table_mtx);
+    if (already_open) __ada_raise(__ada_exc_status_error);
+    if (bad_mode) __ada_raise(__ada_exc_mode_error);
+
+    char cname[ADA_PATH_CAP], full_name[ADA_PATH_CAP], cform[256];
     copy_ada_name(cname, sizeof(cname), name_p, name_len);
     copy_ada_str(cform, sizeof(cform), form_p, form_len);
+    if (cname[0] != '\0' && !store_full_name(full_name, sizeof(full_name), cname)) {
+        __ada_raise(__ada_exc_name_error);
+    }
 
     ensure_free_slot();
     FILE *fp = NULL;
@@ -373,6 +439,11 @@ void __ada_tio_create(int32_t *f_ptr, int32_t mode,
         fp = open_temp_file(cname, sizeof(cname));
         is_temp = 1;
         if (!fp) __ada_raise(__ada_exc_use_error);
+        if (!store_full_name(full_name, sizeof(full_name), cname)) {
+            fclose(fp);
+            unlink(cname);
+            __ada_raise(__ada_exc_use_error);
+        }
     } else {
         fp = fopen(cname, "w+b");
         if (!fp) {
@@ -384,6 +455,12 @@ void __ada_tio_create(int32_t *f_ptr, int32_t mode,
     }
 
     pthread_mutex_lock(&g_io_table_mtx);
+    if (f_ptr && *f_ptr != 0) {
+        pthread_mutex_unlock(&g_io_table_mtx);
+        fclose(fp);
+        if (is_temp && cname[0] != '\0') unlink(cname);
+        __ada_raise(__ada_exc_status_error);
+    }
     int32_t slot = alloc_slot_locked();
     if (slot == 0) {
         pthread_mutex_unlock(&g_io_table_mtx);
@@ -398,7 +475,7 @@ void __ada_tio_create(int32_t *f_ptr, int32_t mode,
     af->mode = mode;
     af->fp = fp;
     af->pb_len = 0;
-    store_full_name(af->name, sizeof(af->name), cname);
+    strcpy(af->name, full_name);
     strcpy(af->form, cform);
     af->col = 1;
     af->line = 1;
@@ -414,33 +491,30 @@ void __ada_tio_open(int32_t *f_ptr, int32_t mode,
                     const char *name_p, int32_t name_len,
                     const char *form_p, int32_t form_len) {
     io_init();
-    if (read_handle(f_ptr) != 0) {
-        __ada_raise(__ada_exc_status_error);
-    }
-    if ((f_ptr == g_cur_input_var && mode != 0) || (f_ptr == g_cur_output_var && mode != 1)) {
-        __ada_raise(__ada_exc_mode_error);
-    }
-    char cname[512], cform[256];
+    pthread_mutex_lock(&g_io_table_mtx);
+    int already_open = (f_ptr && *f_ptr != 0);
+    int bad_mode = ((f_ptr == g_cur_input_var && mode != 0) || (f_ptr == g_cur_output_var && mode != 1));
+    pthread_mutex_unlock(&g_io_table_mtx);
+    if (already_open) __ada_raise(__ada_exc_status_error);
+    if (bad_mode) __ada_raise(__ada_exc_mode_error);
+
+    char cname[ADA_PATH_CAP], full_name[ADA_PATH_CAP], cform[256];
     copy_ada_name(cname, sizeof(cname), name_p, name_len);
     copy_ada_str(cform, sizeof(cform), form_p, form_len);
-    if (cname[0] == '\0') {
+    if (cname[0] == '\0' || !store_full_name(full_name, sizeof(full_name), cname)) {
         __ada_raise(__ada_exc_name_error);
     }
     /* Ada 83 LRM 14.2.1(9): Open requires the external file to already exist! */
     flush_all_open_files();
-    if (access(cname, F_OK) != 0) {
-        __ada_raise(__ada_exc_name_error);
-    }
     ensure_free_slot();
-    const char *fmode = (mode == 0) ? "rb" : "w+b";
-    FILE *fp = fopen(cname, fmode);
-    if (!fp) {
-        if (errno == ENOENT || errno == ENOTDIR || errno == EINVAL || errno == ENAMETOOLONG) {
-            __ada_raise(__ada_exc_name_error);
-        }
-        __ada_raise(__ada_exc_use_error);
-    }
+    FILE *fp = open_existing_file_safe(cname, mode, ADA_FK_TEXT);
+
     pthread_mutex_lock(&g_io_table_mtx);
+    if (f_ptr && *f_ptr != 0) {
+        pthread_mutex_unlock(&g_io_table_mtx);
+        fclose(fp);
+        __ada_raise(__ada_exc_status_error);
+    }
     int32_t slot = alloc_slot_locked();
     if (slot == 0) {
         pthread_mutex_unlock(&g_io_table_mtx);
@@ -453,7 +527,7 @@ void __ada_tio_open(int32_t *f_ptr, int32_t mode,
     af->mode = mode;
     af->fp = fp;
     af->pb_len = 0;
-    store_full_name(af->name, sizeof(af->name), cname);
+    strcpy(af->name, full_name);
     strcpy(af->form, cform);
     af->col = 1;
     af->line = 1;
@@ -503,13 +577,19 @@ void __ada_tio_close(int32_t *f_ptr) {
         __ada_raise(__ada_exc_status_error);
     }
     AdaFile *af = &g_files[slot];
-    pthread_mutex_lock(&af->mtx);
-    char temp_path[512];
+    pthread_mutex_t *mtx = &g_file_mtx[slot];
+    pthread_mutex_lock(mtx);
+    if (af->is_std) {
+        pthread_mutex_unlock(mtx);
+        pthread_mutex_unlock(&g_io_table_mtx);
+        __ada_raise(__ada_exc_use_error);
+    }
+    char temp_path[ADA_PATH_CAP];
     temp_path[0] = '\0';
     if (af->kind == ADA_FK_TEXT) {
         tio_finalize_page(af);
     }
-    if (!af->is_std && af->fp) {
+    if (af->fp) {
         fclose(af->fp);
         af->fp = NULL;
     }
@@ -518,7 +598,7 @@ void __ada_tio_close(int32_t *f_ptr) {
     }
     af->is_open = 0;
     *f_ptr = 0;
-    pthread_mutex_unlock(&af->mtx);
+    pthread_mutex_unlock(mtx);
     pthread_mutex_unlock(&g_io_table_mtx);
     if (temp_path[0] != '\0') {
         unlink(temp_path);
@@ -538,13 +618,14 @@ void __ada_tio_delete(int32_t *f_ptr) {
         __ada_raise(__ada_exc_status_error);
     }
     AdaFile *af = &g_files[slot];
-    pthread_mutex_lock(&af->mtx);
+    pthread_mutex_t *mtx = &g_file_mtx[slot];
+    pthread_mutex_lock(mtx);
     if (af->is_std) {
-        pthread_mutex_unlock(&af->mtx);
+        pthread_mutex_unlock(mtx);
         pthread_mutex_unlock(&g_io_table_mtx);
         __ada_raise(__ada_exc_use_error);
     }
-    char path[512];
+    char path[ADA_PATH_CAP];
     strcpy(path, af->name);
     if (af->fp) {
         fclose(af->fp);
@@ -553,7 +634,7 @@ void __ada_tio_delete(int32_t *f_ptr) {
     af->is_open = 0;
     af->pb_len = 0;
     *f_ptr = 0;
-    pthread_mutex_unlock(&af->mtx);
+    pthread_mutex_unlock(mtx);
     pthread_mutex_unlock(&g_io_table_mtx);
     if (path[0] != '\0') {
         if (unlink(path) != 0 && errno != ENOENT) {
@@ -562,22 +643,19 @@ void __ada_tio_delete(int32_t *f_ptr) {
     }
 }
 
-void __ada_tio_reset_mode(int32_t *f_ptr, int32_t new_mode) {
-    int32_t h = read_handle(f_ptr);
-    AdaFile *af = acquire_open_file(h);
+static void tio_reset_mode_locked(AdaFile *af, int32_t h, int32_t new_mode) {
     if (af->is_std) {
         if (new_mode != af->mode) __ada_raise(__ada_exc_mode_error);
-        release_open_file(af);
         return;
     }
-    if ((h == g_cur_input && new_mode != 0) || (h == g_cur_output && new_mode != 1)) {
+    /* Read default handles safely without violating lock order (atomic load) */
+    int32_t cur_in = __atomic_load_n(&g_cur_input, __ATOMIC_ACQUIRE);
+    int32_t cur_out = __atomic_load_n(&g_cur_output, __ATOMIC_ACQUIRE);
+    if ((h == cur_in && new_mode != 0) || (h == cur_out && new_mode != 1)) {
         __ada_raise(__ada_exc_mode_error);
     }
     af->pb_len = 0;
     if (af->kind == ADA_FK_TEXT) {
-        if (af->mode == 1) {
-            tio_finalize_page(af);
-        }
         if (new_mode == 1) {
             /* Reset to OUT_FILE: truncate */
             if (!af->is_temp && af->name[0] != '\0') {
@@ -589,13 +667,18 @@ void __ada_tio_reset_mode(int32_t *f_ptr, int32_t new_mode) {
                 af->fp = nfp;
             } else {
                 rewind(af->fp);
-                if (ftruncate(fileno(af->fp), 0) != 0) { /* ignore */ }
+                if (ftruncate(fileno(af->fp), 0) != 0) {
+                    __ada_raise(__ada_exc_use_error);
+                }
             }
             af->wrote_any = 0;
             af->last_was_nl = 0;
             af->last_was_ff = 0;
         } else {
-            /* Reset to IN_FILE: rewind to start */
+            /* Reset to IN_FILE: finalize any pending output page, then reopen/rewind */
+            if (af->mode == 1) {
+                tio_finalize_page(af);
+            }
             if (!af->is_temp && af->name[0] != '\0') {
                 fflush(af->fp);
                 FILE *nfp = fopen(af->name, "rb");
@@ -633,7 +716,9 @@ void __ada_tio_reset_mode(int32_t *f_ptr, int32_t new_mode) {
             af->fp = nfp;
         } else if (af->kind == ADA_FK_SEQ && new_mode == 1) {
             rewind(af->fp);
-            if (ftruncate(fileno(af->fp), 0) != 0) { /* ignore */ }
+            if (ftruncate(fileno(af->fp), 0) != 0) {
+                __ada_raise(__ada_exc_use_error);
+            }
         } else {
             rewind(af->fp);
         }
@@ -643,15 +728,20 @@ void __ada_tio_reset_mode(int32_t *f_ptr, int32_t new_mode) {
         af->mode = new_mode;
         af->dir_index = 1;
     }
+}
+
+void __ada_tio_reset_mode(int32_t *f_ptr, int32_t new_mode) {
+    int32_t h = read_handle(f_ptr);
+    AdaFile *af = acquire_open_file(h);
+    tio_reset_mode_locked(af, h, new_mode);
     release_open_file(af);
 }
 
 void __ada_tio_reset(int32_t *f_ptr) {
     int32_t h = read_handle(f_ptr);
     AdaFile *af = acquire_open_file(h);
-    int32_t cur_mode = af->mode;
+    tio_reset_mode_locked(af, h, af->mode);
     release_open_file(af);
-    __ada_tio_reset_mode(f_ptr, cur_mode);
 }
 
 int8_t __ada_tio_is_open(const int32_t *f_ptr) {
@@ -675,50 +765,63 @@ int8_t __ada_tio_mode(const int32_t *f_ptr) {
 
 const char *__ada_tio_name(const int32_t *f_ptr, int32_t *len_out) {
     AdaFile *af = acquire_open_file(read_handle(f_ptr));
+    char tmp[ADA_PATH_CAP];
     int32_t n = (int32_t)strlen(af->name);
-    char *p = (char *)__ada_ss_alloc((int64_t)(n > 0 ? n : 1), 1);
-    if (n > 0) memcpy(p, af->name, (size_t)n);
-    *len_out = n;
+    if (n >= ADA_PATH_CAP) n = ADA_PATH_CAP - 1;
+    if (n > 0) memcpy(tmp, af->name, (size_t)n);
     release_open_file(af);
+    /* Allocate on secondary stack AFTER releasing af mutex so STORAGE_ERROR never leaks lock! */
+    char *p = (char *)__ada_ss_alloc((int64_t)(n > 0 ? n : 1), 1);
+    if (n > 0) memcpy(p, tmp, (size_t)n);
+    *len_out = n;
     return p;
 }
 
 const char *__ada_tio_form(const int32_t *f_ptr, int32_t *len_out) {
     AdaFile *af = acquire_open_file(read_handle(f_ptr));
+    char tmp[256];
     int32_t n = (int32_t)strlen(af->form);
-    char *p = (char *)__ada_ss_alloc((int64_t)(n > 0 ? n : 1), 1);
-    if (n > 0) memcpy(p, af->form, (size_t)n);
-    *len_out = n;
+    if (n >= (int32_t)sizeof(tmp)) n = (int32_t)sizeof(tmp) - 1;
+    if (n > 0) memcpy(tmp, af->form, (size_t)n);
     release_open_file(af);
+    char *p = (char *)__ada_ss_alloc((int64_t)(n > 0 ? n : 1), 1);
+    if (n > 0) memcpy(p, tmp, (size_t)n);
+    *len_out = n;
     return p;
 }
 
 /* Default input/output file control */
 int32_t __ada_tio_standard_input(void)  { io_init(); return 1; }
 int32_t __ada_tio_standard_output(void) { io_init(); return 2; }
-int32_t __ada_tio_current_input(void)   { io_init(); return g_cur_input; }
-int32_t __ada_tio_current_output(void)  { io_init(); return g_cur_output; }
+int32_t __ada_tio_current_input(void)   { io_init(); return __atomic_load_n(&g_cur_input, __ATOMIC_ACQUIRE); }
+int32_t __ada_tio_current_output(void)  { io_init(); return __atomic_load_n(&g_cur_output, __ATOMIC_ACQUIRE); }
 
 void __ada_tio_set_input(const int32_t *f_ptr) {
     int32_t h = read_handle(f_ptr);
     AdaFile *af = acquire_open_file(h);
     if (af->mode != 0) __ada_raise(__ada_exc_mode_error);
-    if (h != g_cur_input) {
-        g_cur_input = h;
-        g_cur_input_var = (af->is_std) ? NULL : (int32_t *)f_ptr;
-    }
+    int is_std = af->is_std;
     release_open_file(af);
+    pthread_mutex_lock(&g_io_table_mtx);
+    if (h != g_cur_input) {
+        __atomic_store_n(&g_cur_input, h, __ATOMIC_RELEASE);
+        g_cur_input_var = is_std ? NULL : (int32_t *)f_ptr;
+    }
+    pthread_mutex_unlock(&g_io_table_mtx);
 }
 
 void __ada_tio_set_output(const int32_t *f_ptr) {
     int32_t h = read_handle(f_ptr);
     AdaFile *af = acquire_open_file(h);
     if (af->mode != 1) __ada_raise(__ada_exc_mode_error);
-    if (h != g_cur_output) {
-        g_cur_output = h;
-        g_cur_output_var = (af->is_std) ? NULL : (int32_t *)f_ptr;
-    }
+    int is_std = af->is_std;
     release_open_file(af);
+    pthread_mutex_lock(&g_io_table_mtx);
+    if (h != g_cur_output) {
+        __atomic_store_n(&g_cur_output, h, __ATOMIC_RELEASE);
+        g_cur_output_var = is_std ? NULL : (int32_t *)f_ptr;
+    }
+    pthread_mutex_unlock(&g_io_table_mtx);
 }
 
 /* =========================================================================
@@ -727,7 +830,7 @@ void __ada_tio_set_output(const int32_t *f_ptr) {
 
 void __ada_tio_set_line_length(const int32_t *f_ptr, int32_t to) {
     if (to < 0) __ada_raise(__ada_exc_constraint_error);
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_output);
+    AdaFile *af = acquire_target_file(f_ptr, 1);
     if (af->mode != 1) __ada_raise(__ada_exc_mode_error);
     af->line_len = to;
     release_open_file(af);
@@ -735,14 +838,14 @@ void __ada_tio_set_line_length(const int32_t *f_ptr, int32_t to) {
 
 void __ada_tio_set_page_length(const int32_t *f_ptr, int32_t to) {
     if (to < 0) __ada_raise(__ada_exc_constraint_error);
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_output);
+    AdaFile *af = acquire_target_file(f_ptr, 1);
     if (af->mode != 1) __ada_raise(__ada_exc_mode_error);
     af->page_len = to;
     release_open_file(af);
 }
 
 int32_t __ada_tio_line_length(const int32_t *f_ptr) {
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_output);
+    AdaFile *af = acquire_target_file(f_ptr, 1);
     if (af->mode != 1) __ada_raise(__ada_exc_mode_error);
     int32_t r = af->line_len;
     release_open_file(af);
@@ -750,7 +853,7 @@ int32_t __ada_tio_line_length(const int32_t *f_ptr) {
 }
 
 int32_t __ada_tio_page_length(const int32_t *f_ptr) {
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_output);
+    AdaFile *af = acquire_target_file(f_ptr, 1);
     if (af->mode != 1) __ada_raise(__ada_exc_mode_error);
     int32_t r = af->page_len;
     release_open_file(af);
@@ -758,7 +861,7 @@ int32_t __ada_tio_page_length(const int32_t *f_ptr) {
 }
 
 int32_t __ada_tio_col(const int32_t *f_ptr) {
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_output);
+    AdaFile *af = acquire_target_file(f_ptr, 1);
     if (af->col > (int64_t)INT32_MAX) __ada_raise(__ada_exc_layout_error);
     int32_t r = (int32_t)af->col;
     release_open_file(af);
@@ -766,7 +869,7 @@ int32_t __ada_tio_col(const int32_t *f_ptr) {
 }
 
 int32_t __ada_tio_line(const int32_t *f_ptr) {
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_output);
+    AdaFile *af = acquire_target_file(f_ptr, 1);
     if (af->line > (int64_t)INT32_MAX) __ada_raise(__ada_exc_layout_error);
     int32_t r = (int32_t)af->line;
     release_open_file(af);
@@ -774,7 +877,7 @@ int32_t __ada_tio_line(const int32_t *f_ptr) {
 }
 
 int32_t __ada_tio_page(const int32_t *f_ptr) {
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_output);
+    AdaFile *af = acquire_target_file(f_ptr, 1);
     if (af->page > (int64_t)INT32_MAX) __ada_raise(__ada_exc_layout_error);
     int32_t r = (int32_t)af->page;
     release_open_file(af);
@@ -798,19 +901,13 @@ static void tio_write_nl(AdaFile *af) {
     }
 }
 
-void __ada_tio_new_line(const int32_t *f_ptr, int32_t spacing) {
-    if (spacing < 1) __ada_raise(__ada_exc_constraint_error);
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_output);
-    if (af->mode != 1) __ada_raise(__ada_exc_mode_error);
-    for (int32_t i = 0; i < spacing; ++i) {
-        tio_write_nl(af);
+static void tio_flush_out(AdaFile *af) {
+    if (!af->is_std && af->fp) {
+        fflush(af->fp);
     }
-    release_open_file(af);
 }
 
-void __ada_tio_new_page(const int32_t *f_ptr) {
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_output);
-    if (af->mode != 1) __ada_raise(__ada_exc_mode_error);
+static void tio_new_page_locked(AdaFile *af) {
     if (af->col > 1 || (af->line == 1 && !af->last_was_nl)) {
         fputc('\n', af->fp);
         af->col = 1;
@@ -821,6 +918,24 @@ void __ada_tio_new_page(const int32_t *f_ptr) {
     af->wrote_any = 1;
     af->last_was_nl = 0;
     af->last_was_ff = 1;
+    tio_flush_out(af);
+}
+
+void __ada_tio_new_line(const int32_t *f_ptr, int32_t spacing) {
+    if (spacing < 1) __ada_raise(__ada_exc_constraint_error);
+    AdaFile *af = acquire_target_file(f_ptr, 1);
+    if (af->mode != 1) __ada_raise(__ada_exc_mode_error);
+    for (int32_t i = 0; i < spacing; ++i) {
+        tio_write_nl(af);
+    }
+    tio_flush_out(af);
+    release_open_file(af);
+}
+
+void __ada_tio_new_page(const int32_t *f_ptr) {
+    AdaFile *af = acquire_target_file(f_ptr, 1);
+    if (af->mode != 1) __ada_raise(__ada_exc_mode_error);
+    tio_new_page_locked(af);
     release_open_file(af);
 }
 
@@ -830,16 +945,21 @@ static int tio_peek(AdaFile *af) {
     return c;
 }
 
-int8_t __ada_tio_end_of_line(const int32_t *f_ptr) {
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_input);
-    if (af->mode != 0) __ada_raise(__ada_exc_mode_error);
+static int8_t tio_end_of_line_locked(AdaFile *af) {
     int c = tio_peek(af);
-    release_open_file(af);
     return (c == EOF || c == '\n' || c == '\f') ? 1 : 0;
 }
 
+int8_t __ada_tio_end_of_line(const int32_t *f_ptr) {
+    AdaFile *af = acquire_target_file(f_ptr, 0);
+    if (af->mode != 0) __ada_raise(__ada_exc_mode_error);
+    int8_t res = tio_end_of_line_locked(af);
+    release_open_file(af);
+    return res;
+}
+
 int8_t __ada_tio_end_of_page(const int32_t *f_ptr) {
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_input);
+    AdaFile *af = acquire_target_file(f_ptr, 0);
     if (af->mode != 0) __ada_raise(__ada_exc_mode_error);
     int c = tio_getc(af);
     int8_t res = 0;
@@ -860,7 +980,7 @@ int8_t __ada_tio_end_of_page(const int32_t *f_ptr) {
 }
 
 int8_t __ada_tio_end_of_file(const int32_t *f_ptr) {
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_input);
+    AdaFile *af = acquire_target_file(f_ptr, 0);
     if (af->mode != 0) __ada_raise(__ada_exc_mode_error);
     int c = tio_getc(af);
     int8_t res = 0;
@@ -924,10 +1044,7 @@ static void tio_consume_eol(AdaFile *af, int term_c) {
     }
 }
 
-void __ada_tio_skip_line(const int32_t *f_ptr, int32_t spacing) {
-    if (spacing < 1) __ada_raise(__ada_exc_constraint_error);
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_input);
-    if (af->mode != 0) __ada_raise(__ada_exc_mode_error);
+static void tio_skip_line_locked(AdaFile *af, int32_t spacing) {
     for (int32_t i = 0; i < spacing; ++i) {
         int c = tio_getc(af);
         if (c == EOF) __ada_raise(__ada_exc_end_error);
@@ -936,11 +1053,18 @@ void __ada_tio_skip_line(const int32_t *f_ptr, int32_t spacing) {
         }
         tio_consume_eol(af, c);
     }
+}
+
+void __ada_tio_skip_line(const int32_t *f_ptr, int32_t spacing) {
+    if (spacing < 1) __ada_raise(__ada_exc_constraint_error);
+    AdaFile *af = acquire_target_file(f_ptr, 0);
+    if (af->mode != 0) __ada_raise(__ada_exc_mode_error);
+    tio_skip_line_locked(af, spacing);
     release_open_file(af);
 }
 
 void __ada_tio_skip_page(const int32_t *f_ptr) {
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_input);
+    AdaFile *af = acquire_target_file(f_ptr, 0);
     if (af->mode != 0) __ada_raise(__ada_exc_mode_error);
     int c = tio_getc(af);
     if (c == EOF) __ada_raise(__ada_exc_end_error);
@@ -955,7 +1079,7 @@ void __ada_tio_skip_page(const int32_t *f_ptr) {
 
 void __ada_tio_set_col(const int32_t *f_ptr, int32_t to) {
     if (to < 1) __ada_raise(__ada_exc_constraint_error);
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_output);
+    AdaFile *af = acquire_target_file(f_ptr, 1);
     if (af->mode == 1) {
         if (af->line_len > 0 && to > af->line_len) {
             __ada_raise(__ada_exc_layout_error);
@@ -970,6 +1094,7 @@ void __ada_tio_set_col(const int32_t *f_ptr, int32_t to) {
             af->last_was_nl = 0;
             af->last_was_ff = 0;
         }
+        tio_flush_out(af);
     } else {
         /* LRM 14.3.4(23): If current column equals To, Set_Col has no effect (even at EOL) */
         if (af->col == (int64_t)to) {
@@ -977,9 +1102,9 @@ void __ada_tio_set_col(const int32_t *f_ptr, int32_t to) {
             return;
         }
         for (;;) {
-            if (af->col == (int64_t)to && !__ada_tio_end_of_line(f_ptr)) break;
-            if (__ada_tio_end_of_line(f_ptr)) {
-                __ada_tio_skip_line(f_ptr, 1);
+            if (af->col == (int64_t)to && !tio_end_of_line_locked(af)) break;
+            if (tio_end_of_line_locked(af)) {
+                tio_skip_line_locked(af, 1);
             } else {
                 int c = tio_getc(af);
                 if (c == EOF) __ada_raise(__ada_exc_end_error);
@@ -992,20 +1117,21 @@ void __ada_tio_set_col(const int32_t *f_ptr, int32_t to) {
 
 void __ada_tio_set_line(const int32_t *f_ptr, int32_t to) {
     if (to < 1) __ada_raise(__ada_exc_constraint_error);
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_output);
+    AdaFile *af = acquire_target_file(f_ptr, 1);
     if (af->mode == 1) {
         if (af->page_len > 0 && to > af->page_len) {
             __ada_raise(__ada_exc_layout_error);
         }
         if (af->line > to) {
-            __ada_tio_new_page(f_ptr);
+            tio_new_page_locked(af);
         }
         while (af->line < to) {
             tio_write_nl(af);
         }
+        tio_flush_out(af);
     } else {
         while (af->line != to) {
-            __ada_tio_skip_line(f_ptr, 1);
+            tio_skip_line_locked(af, 1);
         }
     }
     release_open_file(af);
@@ -1020,7 +1146,6 @@ static void tio_put_one(AdaFile *af, char c) {
         tio_write_nl(af);
     }
     fputc((unsigned char)c, af->fp);
-    if (!af->is_std) fflush(af->fp);
     af->col++;
     af->wrote_any = 1;
     af->last_was_nl = 0;
@@ -1028,34 +1153,35 @@ static void tio_put_one(AdaFile *af, char c) {
 }
 
 void __ada_tio_put_char(const int32_t *f_ptr, int8_t c) {
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_output);
+    AdaFile *af = acquire_target_file(f_ptr, 1);
     if (af->mode != 1) __ada_raise(__ada_exc_mode_error);
     tio_put_one(af, (char)c);
+    tio_flush_out(af);
     release_open_file(af);
 }
 
 void __ada_tio_put_str(const int32_t *f_ptr, const char *ptr, int32_t len) {
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_output);
+    AdaFile *af = acquire_target_file(f_ptr, 1);
     if (af->mode != 1) __ada_raise(__ada_exc_mode_error);
     for (int32_t i = 0; i < len; ++i) {
         tio_put_one(af, ptr[i]);
     }
+    tio_flush_out(af);
     release_open_file(af);
 }
 
 void __ada_tio_put_line(const int32_t *f_ptr, const char *ptr, int32_t len) {
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_output);
+    AdaFile *af = acquire_target_file(f_ptr, 1);
     if (af->mode != 1) __ada_raise(__ada_exc_mode_error);
     for (int32_t i = 0; i < len; ++i) {
         tio_put_one(af, ptr[i]);
     }
     tio_write_nl(af);
+    tio_flush_out(af);
     release_open_file(af);
 }
 
-int8_t __ada_tio_get_char(const int32_t *f_ptr) {
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_input);
-    if (af->mode != 0) __ada_raise(__ada_exc_mode_error);
+static int8_t tio_get_char_locked(AdaFile *af) {
     for (;;) {
         int c = tio_getc(af);
         if (c == EOF) __ada_raise(__ada_exc_end_error);
@@ -1064,23 +1190,30 @@ int8_t __ada_tio_get_char(const int32_t *f_ptr) {
             continue;
         }
         af->col++;
-        release_open_file(af);
         return (int8_t)c;
     }
 }
 
+int8_t __ada_tio_get_char(const int32_t *f_ptr) {
+    AdaFile *af = acquire_target_file(f_ptr, 0);
+    if (af->mode != 0) __ada_raise(__ada_exc_mode_error);
+    int8_t c = tio_get_char_locked(af);
+    release_open_file(af);
+    return c;
+}
+
 void __ada_tio_get_str(const int32_t *f_ptr, char *ptr, int32_t len) {
     /* LRM 14.3.6(9): check open status & mode even for null string */
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_input);
+    AdaFile *af = acquire_target_file(f_ptr, 0);
     if (af->mode != 0) __ada_raise(__ada_exc_mode_error);
     for (int32_t i = 0; i < len; ++i) {
-        ptr[i] = (char)__ada_tio_get_char(f_ptr);
+        ptr[i] = (char)tio_get_char_locked(af);
     }
     release_open_file(af);
 }
 
 void __ada_tio_get_line(const int32_t *f_ptr, char *ptr, int32_t first, int32_t len, int32_t *last_out) {
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_input);
+    AdaFile *af = acquire_target_file(f_ptr, 0);
     if (af->mode != 0) __ada_raise(__ada_exc_mode_error);
     if (len <= 0) {
         *last_out = first - 1;
@@ -1107,7 +1240,10 @@ void __ada_tio_get_line(const int32_t *f_ptr, char *ptr, int32_t first, int32_t 
  * ========================================================================= */
 
 static int format_int_ada(char *buf, size_t cap, int64_t val, int32_t base) {
-    if (base == 10 || base < 2 || base > 16) {
+    if (base < 2 || base > 16) {
+        __ada_raise(__ada_exc_constraint_error);
+    }
+    if (base == 10) {
         return snprintf(buf, cap, "%" PRId64, val);
     }
     static const char digits[] = "0123456789ABCDEF";
@@ -1137,7 +1273,8 @@ static int format_int_ada(char *buf, size_t cap, int64_t val, int32_t base) {
 }
 
 void __ada_tio_put_i64(const int32_t *f_ptr, int64_t val, int32_t width, int32_t base) {
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_output);
+    if (width < 0) __ada_raise(__ada_exc_constraint_error);
+    AdaFile *af = acquire_target_file(f_ptr, 1);
     if (af->mode != 1) __ada_raise(__ada_exc_mode_error);
     char num[128];
     int nlen = format_int_ada(num, sizeof(num), val, base);
@@ -1151,6 +1288,7 @@ void __ada_tio_put_i64(const int32_t *f_ptr, int64_t val, int32_t width, int32_t
     }
     for (int64_t i = 0; i < pad; ++i) tio_put_one(af, ' ');
     for (int i = 0; i < nlen; ++i) tio_put_one(af, num[i]);
+    tio_flush_out(af);
     release_open_file(af);
 }
 
@@ -1355,6 +1493,7 @@ static int lex_parse_i64_core(LexSrc *s, int require_all, int64_t *out_val) {
         }
         char bd[128];
         int ovfb = 0;
+        /* Consume full based-literal extended digits + closing delimiter before validating base (LRM 14.3.7(7), CE3704N) */
         int nb = lex_based_digits_ex(s, 16, bd, (int)sizeof(bd), 1, &ovfb, NULL);
         int had_delim = 0;
         if (lex_peek(s) == delim) {
@@ -1424,17 +1563,40 @@ static int lex_parse_i64_core(LexSrc *s, int require_all, int64_t *out_val) {
     return 1;
 }
 
-static double ada_pow_int(double base, int expv) {
+static double ada_pow_int(double base, int64_t expv) {
     double res = 1.0;
     int neg = 0;
-    if (expv < 0) { neg = 1; expv = -expv; }
+    uint64_t e;
+    if (expv < 0) {
+        neg = 1;
+        e = (uint64_t)(-(expv + 1)) + 1u;
+    } else {
+        e = (uint64_t)expv;
+    }
     double b = base;
-    while (expv > 0) {
-        if (expv & 1) res *= b;
+    while (e > 0u) {
+        if (e & 1u) res *= b;
         b *= b;
-        expv >>= 1;
+        e >>= 1;
     }
     return neg ? (1.0 / res) : res;
+}
+
+static double ada_scale_base(double val, int base, int64_t expv) {
+    if (val == 0.0 || expv == 0) return val;
+    if (base == 2 || base == 4 || base == 8 || base == 16) {
+        int shift = (base == 2) ? 1 : (base == 4) ? 2 : (base == 8) ? 3 : 4;
+        int64_t tot = expv * (int64_t)shift;
+        if (tot > 100000) tot = 100000;
+        if (tot < -100000) tot = -100000;
+        return ldexp(val, (int)tot);
+    }
+    /* Split large exponents so intermediate power doesn't overflow/underflow prematurely */
+    int64_t rem = expv;
+    while (rem > 200) { val *= ada_pow_int((double)base, 200); rem -= 200; }
+    while (rem < -200) { val *= ada_pow_int((double)base, -200); rem += 200; }
+    if (rem != 0) val *= ada_pow_int((double)base, rem);
+    return val;
 }
 
 static int lex_parse_f64_core(LexSrc *s, int require_all, double *out_val) {
@@ -1475,22 +1637,48 @@ static int lex_parse_f64_core(LexSrc *s, int require_all, double *out_val) {
         if (nbf <= 0) return 0;
         if (lex_peek(s) != delim) return 0;
         lex_get(s);
-        for (int i = 0; i < nbi; ++i) {
-            val = val * (double)base + (double)ada_digit_val((unsigned char)bi[i]);
+        int int_zero = (nbi == 1 && bi[0] == '0' && ovf_bi == 0);
+        int64_t exp_adj = 0;
+        if (!int_zero) {
+            /* Keep significant digits without intermediate overflow: accumulate normalized mantissa */
+            int keep = (nbi > 64) ? 64 : nbi;
+            for (int i = 0; i < keep; ++i) {
+                val = val * (double)base + (double)ada_digit_val((unsigned char)bi[i]);
+            }
+            exp_adj = (int64_t)(nbi - keep) + (int64_t)ovf_bi;
+            if (exp_adj == 0) {
+                double frac = 0.0, scale = 1.0 / (double)base;
+                if (lz_bf == 0) {
+                    int fkeep = (nbf > 64) ? 64 : nbf;
+                    for (int i = 0; i < fkeep; ++i) {
+                        frac += (double)ada_digit_val((unsigned char)bf[i]) * scale;
+                        scale /= (double)base;
+                    }
+                    val += frac;
+                } else if (lz_bf < 64) {
+                    double frac2 = 0.0;
+                    int fkeep = (nbf > 64) ? 64 : nbf;
+                    for (int i = 0; i < fkeep; ++i) {
+                        frac2 += (double)ada_digit_val((unsigned char)bf[i]) * scale;
+                        scale /= (double)base;
+                    }
+                    val += ada_scale_base(frac2, base, -(int64_t)lz_bf);
+                }
+            }
+        } else {
+            /* Integer part is zero: accumulate significant fractional digits, deferring -lz_bf */
+            int fkeep = (nbf > 64) ? 64 : nbf;
+            double scale = 1.0 / (double)base;
+            for (int i = 0; i < fkeep; ++i) {
+                val += (double)ada_digit_val((unsigned char)bf[i]) * scale;
+                scale /= (double)base;
+            }
+            if (val != 0.0) {
+                exp_adj = -(int64_t)lz_bf;
+            }
         }
-        if (ovf_bi > 0 && val != 0.0) {
-            val *= ada_pow_int((double)base, ovf_bi);
-        }
-        double frac = 0.0, scale = 1.0 / (double)base;
-        for (int i = 0; i < nbf; ++i) {
-            frac += (double)ada_digit_val((unsigned char)bf[i]) * scale;
-            scale /= (double)base;
-        }
-        if (lz_bf > 0 && frac != 0.0) {
-            frac /= ada_pow_int((double)base, lz_bf > 2000 ? 2000 : lz_bf);
-        }
-        val += frac;
         /* Optional exponent */
+        int64_t expv = 0;
         c = lex_peek(s);
         if (c == 'E' || c == 'e') {
             lex_get(s);
@@ -1504,23 +1692,16 @@ static int lex_parse_f64_core(LexSrc *s, int require_all, double *out_val) {
             int ovfe = 0;
             int ne = lex_dec_digits_ex(s, ed, (int)sizeof(ed), 1, &ovfe, NULL);
             if (ne <= 0) return 0;
-            int expv = ovfe > 0 ? 5000 : 0;
-            for (int i = 0; i < ne && expv < 5000; ++i) {
+            expv = ovfe > 0 ? 50000 : 0;
+            for (int i = 0; i < ne && expv < 50000; ++i) {
                 expv = expv * 10 + (ed[i] - '0');
-                if (expv > 5000) expv = 5000;
+                if (expv > 50000) expv = 50000;
             }
             if (eneg) expv = -expv;
-            if (val != 0.0) {
-                if (base == 2 || base == 4 || base == 8 || base == 16) {
-                    int shift = (base == 2) ? 1 : (base == 4) ? 2 : (base == 8) ? 3 : 4;
-                    val = ldexp(val, expv * shift);
-                } else {
-                    int e1 = expv / 2;
-                    int e2 = expv - e1;
-                    val *= ada_pow_int((double)base, e1);
-                    val *= ada_pow_int((double)base, e2);
-                }
-            }
+        }
+        if (val != 0.0) {
+            int64_t net_exp = expv + exp_adj;
+            val = ada_scale_base(val, base, net_exp);
         }
         if (neg) val = -val;
     } else {
@@ -1588,38 +1769,61 @@ static int lex_parse_f64_core(LexSrc *s, int require_all, double *out_val) {
     return 1;
 }
 
-static int lex_read_fixed_width(AdaFile *af, char *buf, int max_len, int32_t width) {
-    int n = 0;
-    int rem = width;
+/* Grow dynamically up to width (stops at EOL/EOF) so Width => FIELD'LAST never overflows or OOMs on short lines */
+static int32_t lex_read_fixed_width_alloc(AdaFile *af, int32_t width,
+                                          char *sbuf, size_t sbuf_cap, char **out_buf) {
+    char *buf = sbuf;
+    size_t cap = sbuf_cap;
+    size_t n = 0;
+    int32_t rem = width;
     clearerr(af->fp);
-    while (rem > 0 && n < max_len - 1) {
+    while (rem > 0) {
         int c = tio_getc(af);
         if (c == EOF) {
-            if (n == 0) return -1;
+            if (n == 0) {
+                if (buf != sbuf) free(buf);
+                *out_buf = sbuf;
+                return -1;
+            }
             break;
         }
         if (c == '\n' || c == '\f') {
             tio_ungetc(af, c);
             break;
         }
+        if (n + 1u >= cap) {
+            size_t ncap = (cap <= SIZE_MAX / 2u) ? (cap * 2u) : SIZE_MAX;
+            if (ncap <= cap) {
+                if (buf != sbuf) free(buf);
+                __ada_raise(__ada_exc_storage_error);
+            }
+            char *nb = (buf == sbuf) ? (char *)malloc(ncap) : (char *)realloc(buf, ncap);
+            if (!nb) {
+                if (buf != sbuf) free(buf);
+                __ada_raise(__ada_exc_storage_error);
+            }
+            if (buf == sbuf) memcpy(nb, sbuf, n);
+            buf = nb;
+            cap = ncap;
+        }
         buf[n++] = (char)c;
         af->col++;
         rem--;
     }
     buf[n] = '\0';
-    return n;
+    *out_buf = buf;
+    return (int32_t)n;
 }
 
 int64_t __ada_tio_get_i64(const int32_t *f_ptr, int32_t width) {
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_input);
+    if (width < 0) __ada_raise(__ada_exc_constraint_error);
+    AdaFile *af = acquire_target_file(f_ptr, 0);
     if (af->mode != 0) __ada_raise(__ada_exc_mode_error);
     int64_t val = 0;
     if (width > 0) {
         char sbuf[256];
-        int cap = (width + 1 > (int)sizeof(sbuf)) ? (width + 1) : (int)sizeof(sbuf);
-        char *buf = (cap <= (int)sizeof(sbuf)) ? sbuf : (char *)malloc((size_t)cap);
-        if (!buf) { buf = sbuf; cap = (int)sizeof(sbuf); }
-        int n = lex_read_fixed_width(af, buf, cap, width);
+        char *buf = sbuf;
+        int32_t n = lex_read_fixed_width_alloc(af, width, sbuf, sizeof(sbuf), &buf);
         if (n < 0) {
             if (buf != sbuf) free(buf);
             __ada_raise(__ada_exc_end_error);
@@ -1652,21 +1856,22 @@ int64_t __ada_tio_get_i64_str(const char *src, int32_t first, int32_t len, int32
 }
 
 static char *format_f64_raw_alloc(double val, int32_t aft, int32_t exp_digits, int *len_out, int *before_dot_out) {
+    if (aft < 0 || exp_digits < 0) __ada_raise(__ada_exc_constraint_error);
     if (aft < 1) aft = 1;
     if (val == 0.0) val = 0.0; /* Ada 83 has no -0.0 in Float_IO/Fixed_IO Put */
     char *raw = NULL;
     int rlen = 0;
-    if (exp_digits <= 0) {
+    if (exp_digits == 0) {
         rlen = snprintf(NULL, 0, "%.*f", (int)aft, val);
-        if (rlen < 0) rlen = 0;
+        if (rlen < 0) __ada_raise(__ada_exc_storage_error);
         raw = (char *)malloc((size_t)rlen + 1u);
-        if (!raw) __ada_raise(__ada_exc_layout_error);
+        if (!raw) __ada_raise(__ada_exc_storage_error);
         snprintf(raw, (size_t)rlen + 1u, "%.*f", (int)aft, val);
     } else {
         int tlen = snprintf(NULL, 0, "%.*E", (int)aft, val);
-        if (tlen < 0) tlen = 0;
+        if (tlen < 0) __ada_raise(__ada_exc_storage_error);
         char *tmp = (char *)malloc((size_t)tlen + 1u);
-        if (!tmp) __ada_raise(__ada_exc_layout_error);
+        if (!tmp) __ada_raise(__ada_exc_storage_error);
         snprintf(tmp, (size_t)tlen + 1u, "%.*E", (int)aft, val);
         char *ep = strchr(tmp, 'E');
         if (ep) {
@@ -1675,9 +1880,9 @@ static char *format_f64_raw_alloc(double val, int32_t aft, int32_t exp_digits, i
             long ev = strtol(ep + 2, NULL, 10);
             int min_w = (exp_digits > 1) ? (int)(exp_digits - 1) : 1;
             rlen = snprintf(NULL, 0, "%sE%c%0*ld", tmp, sign, min_w, ev);
-            if (rlen < 0) rlen = 0;
+            if (rlen < 0) { free(tmp); __ada_raise(__ada_exc_storage_error); }
             raw = (char *)malloc((size_t)rlen + 1u);
-            if (!raw) { free(tmp); __ada_raise(__ada_exc_layout_error); }
+            if (!raw) { free(tmp); __ada_raise(__ada_exc_storage_error); }
             snprintf(raw, (size_t)rlen + 1u, "%sE%c%0*ld", tmp, sign, min_w, ev);
         } else {
             raw = tmp;
@@ -1693,7 +1898,8 @@ static char *format_f64_raw_alloc(double val, int32_t aft, int32_t exp_digits, i
 }
 
 void __ada_tio_put_f64(const int32_t *f_ptr, double val, int32_t fore, int32_t aft, int32_t exp_digits) {
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_output);
+    if (fore < 0 || aft < 0 || exp_digits < 0) __ada_raise(__ada_exc_constraint_error);
+    AdaFile *af = acquire_target_file(f_ptr, 1);
     if (af->mode != 1) __ada_raise(__ada_exc_mode_error);
     int rlen = 0, before_dot = 0;
     char *raw = format_f64_raw_alloc(val, aft, exp_digits, &rlen, &before_dot);
@@ -1709,6 +1915,7 @@ void __ada_tio_put_f64(const int32_t *f_ptr, double val, int32_t fore, int32_t a
     for (int64_t i = 0; i < pad; ++i) tio_put_one(af, ' ');
     for (int i = 0; i < rlen; ++i) tio_put_one(af, raw[i]);
     free(raw);
+    tio_flush_out(af);
     release_open_file(af);
 }
 
@@ -1726,15 +1933,14 @@ void __ada_tio_put_f64_str(char *dst, int32_t dst_len, double val, int32_t aft, 
 }
 
 double __ada_tio_get_f64(const int32_t *f_ptr, int32_t width) {
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_input);
+    if (width < 0) __ada_raise(__ada_exc_constraint_error);
+    AdaFile *af = acquire_target_file(f_ptr, 0);
     if (af->mode != 0) __ada_raise(__ada_exc_mode_error);
     double val = 0.0;
     if (width > 0) {
         char sbuf[256];
-        int cap = (width + 1 > (int)sizeof(sbuf)) ? (width + 1) : (int)sizeof(sbuf);
-        char *buf = (cap <= (int)sizeof(sbuf)) ? sbuf : (char *)malloc((size_t)cap);
-        if (!buf) { buf = sbuf; cap = (int)sizeof(sbuf); }
-        int n = lex_read_fixed_width(af, buf, cap, width);
+        char *buf = sbuf;
+        int32_t n = lex_read_fixed_width_alloc(af, width, sbuf, sizeof(sbuf), &buf);
         if (n < 0) {
             if (buf != sbuf) free(buf);
             __ada_raise(__ada_exc_end_error);
@@ -1767,7 +1973,8 @@ double __ada_tio_get_f64_str(const char *src, int32_t first, int32_t len, int32_
 }
 
 void __ada_tio_put_enum(const int32_t *f_ptr, const char *lit, int32_t width, int32_t lower_case) {
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_output);
+    if (width < 0) __ada_raise(__ada_exc_constraint_error);
+    AdaFile *af = acquire_target_file(f_ptr, 1);
     if (af->mode != 1) __ada_raise(__ada_exc_mode_error);
     int nlen = lit ? (int)strlen(lit) : 0;
     int is_char = (nlen == 3 && lit[0] == '\'' && lit[2] == '\'');
@@ -1785,6 +1992,7 @@ void __ada_tio_put_enum(const int32_t *f_ptr, const char *lit, int32_t width, in
         tio_put_one(af, c);
     }
     for (int64_t i = 0; i < pad; ++i) tio_put_one(af, ' ');
+    tio_flush_out(af);
     release_open_file(af);
 }
 
@@ -1801,15 +2009,18 @@ void __ada_tio_put_enum_str(char *dst, int32_t dst_len, const char *lit, int32_t
 }
 
 static int32_t lex_parse_enum_core(LexSrc *s, const char *const *table, int32_t count, int32_t is_char_type) {
-    char tok[256];
-    int n = 0;
+    char sbuf[256];
+    char *tok = sbuf;
+    size_t tok_cap = sizeof(sbuf);
+    size_t n = 0;
     int is_char = 0;
     int c = lex_peek(s);
     if (c == '\'') {
         is_char = 1;
         lex_get(s);
         int ch = lex_peek(s);
-        if (ch == EOF || ch == '\n' || ch == '\f') __ada_raise(__ada_exc_data_error);
+        /* LRM 2.5 & 14.3.9(5): character literal must be a graphic ASCII character (32..126) */
+        if (ch < 32 || ch > 126) __ada_raise(__ada_exc_data_error);
         lex_get(s);
         int cl = lex_peek(s);
         if (cl != '\'') __ada_raise(__ada_exc_data_error);
@@ -1820,53 +2031,74 @@ static int32_t lex_parse_enum_core(LexSrc *s, const char *const *table, int32_t 
         tok[3] = '\0';
         n = 3;
     } else if (ada_is_alpha(c)) {
-        int overflow = 0;
         for (;;) {
             c = lex_peek(s);
-            if (ada_is_alnum(c)) {
+            if (ada_is_alnum(c) || c == '_') {
                 lex_get(s);
-                if (n < (int)sizeof(tok) - 1) tok[n++] = (char)ada_upper(c);
-                else overflow = 1;
-            } else if (c == '_') {
-                lex_get(s);
-                if (n < (int)sizeof(tok) - 1) tok[n++] = '_';
-                else overflow = 1;
-                int nx = lex_peek(s);
-                if (!ada_is_alnum(nx)) __ada_raise(__ada_exc_data_error);
+                if (n + 1u >= tok_cap) {
+                    size_t ncap = tok_cap * 2u;
+                    char *nb = (tok == sbuf) ? (char *)malloc(ncap) : (char *)realloc(tok, ncap);
+                    if (!nb) {
+                        if (tok != sbuf) free(tok);
+                        __ada_raise(__ada_exc_storage_error);
+                    }
+                    if (tok == sbuf) memcpy(nb, sbuf, n);
+                    tok = nb;
+                    tok_cap = ncap;
+                }
+                if (c == '_') {
+                    tok[n++] = '_';
+                    int nx = lex_peek(s);
+                    if (!ada_is_alnum(nx)) {
+                        if (tok != sbuf) free(tok);
+                        __ada_raise(__ada_exc_data_error);
+                    }
+                } else {
+                    tok[n++] = (char)ada_upper(c);
+                }
             } else {
                 break;
             }
         }
         tok[n] = '\0';
-        if (overflow) __ada_raise(__ada_exc_data_error);
         /* LRM 14.3.9(8): ENUMERATION_IO(CHARACTER) only accepts graphic character literals, not NUL..DEL */
-        if (is_char_type) __ada_raise(__ada_exc_data_error);
+        if (is_char_type) {
+            if (tok != sbuf) free(tok);
+            __ada_raise(__ada_exc_data_error);
+        }
     } else {
         __ada_raise(__ada_exc_data_error);
     }
+    int32_t matched = -1;
     for (int32_t i = 0; i < count; ++i) {
         const char *lit = table[i];
         if (!lit) continue;
         if (is_char) {
-            if ((int)strlen(lit) == 3 && lit[0] == tok[0] && lit[1] == tok[1] && lit[2] == tok[2]) {
-                return i;
+            if (strlen(lit) == 3u && lit[0] == tok[0] && lit[1] == tok[1] && lit[2] == tok[2]) {
+                matched = i;
+                break;
             }
         } else {
-            if ((int)strlen(lit) == n) {
+            if (strlen(lit) == n) {
                 int eq = 1;
-                for (int k = 0; k < n; ++k) {
+                for (size_t k = 0; k < n; ++k) {
                     if (ada_upper((unsigned char)lit[k]) != tok[k]) { eq = 0; break; }
                 }
-                if (eq) return i;
+                if (eq) {
+                    matched = i;
+                    break;
+                }
             }
         }
     }
+    if (tok != sbuf) free(tok);
+    if (matched >= 0) return matched;
     __ada_raise(__ada_exc_data_error);
     return 0;
 }
 
 int32_t __ada_tio_get_enum(const int32_t *f_ptr, const char *const *table, int32_t count, int32_t is_char_type) {
-    AdaFile *af = acquire_open_file(f_ptr ? read_handle(f_ptr) : g_cur_input);
+    AdaFile *af = acquire_target_file(f_ptr, 0);
     if (af->mode != 0) __ada_raise(__ada_exc_mode_error);
     LexSrc s = { af, NULL, 0, 0 };
     if (!lex_skip_leading(&s)) __ada_raise(__ada_exc_end_error);
@@ -1893,10 +2125,13 @@ void __ada_bio_create(int32_t *f_ptr, int32_t kind, int32_t mode,
                       const char *form_p, int32_t form_len, int64_t elem_sz) {
     io_init();
     if (read_handle(f_ptr) != 0) __ada_raise(__ada_exc_status_error);
-    char cname[512], cform[256];
+    char cname[ADA_PATH_CAP], full_name[ADA_PATH_CAP], cform[256];
     copy_ada_name(cname, sizeof(cname), name_p, name_len);
+    if (form_len > 0) __ada_raise(__ada_exc_use_error);
     copy_ada_str(cform, sizeof(cform), form_p, form_len);
-    if (cform[0] != '\0') __ada_raise(__ada_exc_use_error);
+    if (cname[0] != '\0' && !store_full_name(full_name, sizeof(full_name), cname)) {
+        __ada_raise(__ada_exc_name_error);
+    }
     ensure_free_slot();
     FILE *fp = NULL;
     int is_temp = 0;
@@ -1904,6 +2139,11 @@ void __ada_bio_create(int32_t *f_ptr, int32_t kind, int32_t mode,
         fp = open_temp_file(cname, sizeof(cname));
         is_temp = 1;
         if (!fp) __ada_raise(__ada_exc_use_error);
+        if (!store_full_name(full_name, sizeof(full_name), cname)) {
+            fclose(fp);
+            unlink(cname);
+            __ada_raise(__ada_exc_use_error);
+        }
     } else {
         fp = fopen(cname, "w+b");
         if (!fp) {
@@ -1912,10 +2152,17 @@ void __ada_bio_create(int32_t *f_ptr, int32_t kind, int32_t mode,
         }
     }
     pthread_mutex_lock(&g_io_table_mtx);
+    if (f_ptr && *f_ptr != 0) {
+        pthread_mutex_unlock(&g_io_table_mtx);
+        fclose(fp);
+        if (is_temp && cname[0] != '\0') unlink(cname);
+        __ada_raise(__ada_exc_status_error);
+    }
     int32_t slot = alloc_slot_locked();
     if (slot == 0) {
         pthread_mutex_unlock(&g_io_table_mtx);
         fclose(fp);
+        if (is_temp && cname[0] != '\0') unlink(cname);
         __ada_raise(__ada_exc_use_error);
     }
     AdaFile *af = &g_files[slot];
@@ -1925,7 +2172,7 @@ void __ada_bio_create(int32_t *f_ptr, int32_t kind, int32_t mode,
     af->mode = mode;
     af->fp = fp;
     af->pb_len = 0;
-    store_full_name(af->name, sizeof(af->name), cname);
+    strcpy(af->name, full_name);
     strcpy(af->form, cform);
     af->dir_index = 1;
     af->dir_size = 0;
@@ -1939,21 +2186,32 @@ void __ada_bio_open(int32_t *f_ptr, int32_t kind, int32_t mode,
                     const char *form_p, int32_t form_len, int64_t elem_sz) {
     io_init();
     if (read_handle(f_ptr) != 0) __ada_raise(__ada_exc_status_error);
-    char cname[512], cform[256];
+    char cname[ADA_PATH_CAP], full_name[ADA_PATH_CAP], cform[256];
     copy_ada_name(cname, sizeof(cname), name_p, name_len);
+    if (form_len > 0) __ada_raise(__ada_exc_use_error);
     copy_ada_str(cform, sizeof(cform), form_p, form_len);
-    if (cform[0] != '\0') __ada_raise(__ada_exc_use_error);
-    if (cname[0] == '\0') __ada_raise(__ada_exc_name_error);
+    if (cname[0] == '\0' || !store_full_name(full_name, sizeof(full_name), cname)) {
+        __ada_raise(__ada_exc_name_error);
+    }
     flush_all_open_files();
-    if (access(cname, F_OK) != 0) __ada_raise(__ada_exc_name_error);
     ensure_free_slot();
-    const char *fmode = (mode == 0) ? "rb" : ((kind == ADA_FK_DIR && mode >= 1) ? "r+b" : "w+b");
-    FILE *fp = fopen(cname, fmode);
-    if (!fp) {
-        if (errno == ENOENT || errno == ENOTDIR || errno == EINVAL || errno == ENAMETOOLONG) __ada_raise(__ada_exc_name_error);
+    FILE *fp = open_existing_file_safe(cname, mode, kind);
+
+    off_t sz = 0;
+    if (fseeko(fp, 0, SEEK_END) == 0) {
+        sz = ftello(fp);
+        rewind(fp);
+    } else if (kind == ADA_FK_DIR) {
+        fclose(fp);
         __ada_raise(__ada_exc_use_error);
     }
+
     pthread_mutex_lock(&g_io_table_mtx);
+    if (f_ptr && *f_ptr != 0) {
+        pthread_mutex_unlock(&g_io_table_mtx);
+        fclose(fp);
+        __ada_raise(__ada_exc_status_error);
+    }
     int32_t slot = alloc_slot_locked();
     if (slot == 0) {
         pthread_mutex_unlock(&g_io_table_mtx);
@@ -1966,27 +2224,25 @@ void __ada_bio_open(int32_t *f_ptr, int32_t kind, int32_t mode,
     af->mode = mode;
     af->fp = fp;
     af->pb_len = 0;
-    store_full_name(af->name, sizeof(af->name), cname);
+    strcpy(af->name, full_name);
     strcpy(af->form, cform);
     af->dir_index = 1;
     af->elem_sz = elem_sz;
-    fseek(fp, 0, SEEK_END);
-    long sz = ftell(fp);
-    rewind(fp);
     af->dir_size = (elem_sz > 0 && sz > 0) ? ((int64_t)sz / elem_sz) : 0;
     *f_ptr = make_handle(slot, af->gen);
     pthread_mutex_unlock(&g_io_table_mtx);
 }
 
-/* P3-6.18: Safe temp-buffered fread so END_ERROR never partially corrupts OUT item */
+/* P3-6.18: Safe temp-buffered fread so END_ERROR/DEVICE_ERROR never partially corrupts OUT item */
 static void bio_read_into_safe(FILE *fp, void *item, int64_t elem_sz) {
     if (elem_sz <= 0) return;
     char stack_tmp[256];
     void *tmp = ((size_t)elem_sz <= sizeof(stack_tmp)) ? (void *)stack_tmp : malloc((size_t)elem_sz);
     if (!tmp) __ada_raise(__ada_exc_storage_error);
     if (fread(tmp, (size_t)elem_sz, 1u, fp) != 1u) {
+        int is_err = ferror(fp);
         if (tmp != stack_tmp) free(tmp);
-        __ada_raise(__ada_exc_end_error);
+        __ada_raise(is_err ? __ada_exc_device_error : __ada_exc_end_error);
     }
     memcpy(item, tmp, (size_t)elem_sz);
     if (tmp != stack_tmp) free(tmp);
@@ -2026,10 +2282,10 @@ void __ada_seq_read_framed(const int32_t *f_ptr, void *item, int64_t elem_sz) {
     clearerr(af->fp);
     int64_t file_sz = 0;
     if (fread(&file_sz, sizeof(file_sz), 1u, af->fp) != 1u) {
-        __ada_raise(__ada_exc_end_error);
+        __ada_raise(ferror(af->fp) ? __ada_exc_device_error : __ada_exc_end_error);
     }
     if (file_sz != elem_sz) {
-        if (file_sz > 0) (void)fseek(af->fp, (long)file_sz, SEEK_CUR);
+        if (file_sz > 0) (void)fseeko(af->fp, (off_t)file_sz, SEEK_CUR);
         __ada_raise(__ada_exc_data_error);
     }
     bio_read_into_safe(af->fp, item, elem_sz);
@@ -2056,18 +2312,27 @@ void __ada_seq_read_framed_nd(const int32_t *f_ptr, void *item, int32_t ndims, c
     if (af->mode != 0) __ada_raise(__ada_exc_mode_error);
     clearerr(af->fp);
     int32_t f_nd = 0;
-    int64_t f_lens[8] = {0};
+    if (fread(&f_nd, sizeof(f_nd), 1u, af->fp) != 1u) {
+        __ada_raise(ferror(af->fp) ? __ada_exc_device_error : __ada_exc_end_error);
+    }
+    if (f_nd <= 0 || f_nd > 1024) __ada_raise(__ada_exc_data_error);
+    int64_t f_lens_stack[16];
+    int64_t *f_lens = (f_nd <= 16) ? f_lens_stack : (int64_t *)malloc((size_t)f_nd * sizeof(int64_t));
+    if (!f_lens) __ada_raise(__ada_exc_storage_error);
     int64_t f_sz = 0;
-    if (fread(&f_nd, sizeof(f_nd), 1u, af->fp) != 1u) __ada_raise(__ada_exc_end_error);
-    if (f_nd <= 0 || f_nd > 8) __ada_raise(__ada_exc_data_error);
-    if (fread(f_lens, sizeof(int64_t), (size_t)f_nd, af->fp) != (size_t)f_nd) __ada_raise(__ada_exc_end_error);
-    if (fread(&f_sz, sizeof(f_sz), 1u, af->fp) != 1u) __ada_raise(__ada_exc_end_error);
-    int mismatch = (f_nd != ndims || f_sz != elem_sz);
+    if (fread(f_lens, sizeof(int64_t), (size_t)f_nd, af->fp) != (size_t)f_nd
+        || fread(&f_sz, sizeof(f_sz), 1u, af->fp) != 1u) {
+        int is_err = ferror(af->fp);
+        if (f_lens != f_lens_stack) free(f_lens);
+        __ada_raise(is_err ? __ada_exc_device_error : __ada_exc_data_error);
+    }
+    int mismatch = (f_nd != ndims || f_sz != elem_sz || !lens);
     for (int32_t i = 0; !mismatch && i < ndims; ++i) {
         if (f_lens[i] != lens[i]) mismatch = 1;
     }
+    if (f_lens != f_lens_stack) free(f_lens);
     if (mismatch) {
-        if (f_sz > 0) (void)fseek(af->fp, (long)f_sz, SEEK_CUR);
+        if (f_sz > 0) (void)fseeko(af->fp, (off_t)f_sz, SEEK_CUR);
         __ada_raise(__ada_exc_data_error);
     }
     bio_read_into_safe(af->fp, item, elem_sz);
@@ -2077,6 +2342,7 @@ void __ada_seq_read_framed_nd(const int32_t *f_ptr, void *item, int32_t ndims, c
 void __ada_seq_write_framed_nd(const int32_t *f_ptr, const void *item, int32_t ndims, const int64_t *lens, int64_t elem_sz) {
     AdaFile *af = acquire_open_file(read_handle(f_ptr));
     if (af->mode != 1) __ada_raise(__ada_exc_mode_error);
+    if (ndims <= 0 || !lens || elem_sz < 0) __ada_raise(__ada_exc_device_error);
     if (fwrite(&ndims, sizeof(ndims), 1u, af->fp) != 1u
         || fwrite(lens, sizeof(int64_t), (size_t)ndims, af->fp) != (size_t)ndims
         || fwrite(&elem_sz, sizeof(elem_sz), 1u, af->fp) != 1u) {
@@ -2118,11 +2384,11 @@ void __ada_dir_read(const int32_t *f_ptr, void *item, int64_t elem_sz, int64_t f
         idx = from;
     }
     if (idx < 1 || idx > af->dir_size) __ada_raise(__ada_exc_end_error);
-    if (elem_sz > 0 && (idx - 1) > (int64_t)(LONG_MAX / (uint64_t)elem_sz)) {
+    if (elem_sz > 0 && (uint64_t)(idx - 1) > (uint64_t)INT64_MAX / (uint64_t)elem_sz) {
         __ada_raise(__ada_exc_use_error);
     }
     clearerr(af->fp);
-    if (fseek(af->fp, (long)((idx - 1) * elem_sz), SEEK_SET) != 0) {
+    if (fseeko(af->fp, (off_t)((idx - 1) * elem_sz), SEEK_SET) != 0) {
         __ada_raise(__ada_exc_device_error);
     }
     bio_read_into_safe(af->fp, item, elem_sz);
@@ -2140,11 +2406,12 @@ void __ada_dir_write(const int32_t *f_ptr, const void *item, int64_t elem_sz, in
         idx = to;
     }
     if (idx < 1) __ada_raise(__ada_exc_constraint_error);
-    if (elem_sz > 0 && (idx - 1) > (int64_t)(LONG_MAX / (uint64_t)elem_sz)) {
+    if (idx > (int64_t)INT32_MAX) __ada_raise(__ada_exc_use_error);
+    if (elem_sz > 0 && (uint64_t)(idx - 1) > (uint64_t)INT64_MAX / (uint64_t)elem_sz) {
         __ada_raise(__ada_exc_use_error);
     }
     af->elem_sz = elem_sz;
-    if (fseek(af->fp, (long)((idx - 1) * elem_sz), SEEK_SET) != 0) {
+    if (fseeko(af->fp, (off_t)((idx - 1) * elem_sz), SEEK_SET) != 0) {
         __ada_raise(__ada_exc_device_error);
     }
     if (elem_sz > 0 && fwrite(item, (size_t)elem_sz, 1u, af->fp) != 1u) {

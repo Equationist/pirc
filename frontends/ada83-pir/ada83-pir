@@ -7,7 +7,17 @@
 # separate compilation (-c), and pure-Ada LRM Chapter 10 binding (ada83_bind).
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Resolve symlinks on $0 so SCRIPT_DIR works even when invoked via a symlink
+SCRIPT_PATH="$0"
+while [ -L "$SCRIPT_PATH" ]; do
+    LINK_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+    LINK_TGT="$(readlink "$SCRIPT_PATH")"
+    case "$LINK_TGT" in
+        /*) SCRIPT_PATH="$LINK_TGT" ;;
+        *)  SCRIPT_PATH="$LINK_DIR/$LINK_TGT" ;;
+    esac
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DIANA_BIN="$ROOT/frontends/diana/bin"
 DIANA2PIR="$SCRIPT_DIR/bin/diana2pir"
@@ -15,7 +25,11 @@ ADA83_BIND="$SCRIPT_DIR/bin/ada83_bind"
 RTL_IMG="$SCRIPT_DIR/build/rtl_lib"
 PIRC="${PIRC:-$ROOT/build/pirc}"
 
-TARGET="aarch64-apple-darwin"
+HOST_ARCH="$(uname -m 2>/dev/null || echo arm64)"
+case "$HOST_ARCH" in
+    x86_64|amd64) TARGET="x86_64-apple-darwin" ;;
+    *)            TARGET="aarch64-apple-darwin" ;;
+esac
 OPT="-O2"
 CHECKS_FLAG="--checks"
 EMIT_PIR=0
@@ -30,6 +44,7 @@ SRCS=()
 EXTRA_LINK=()
 
 usage() {
+    local code="${1:-1}"
     cat >&2 <<EOF
 Usage: ada83-pir [options] [file1.ada ...]
 Options:
@@ -46,32 +61,53 @@ Options:
   -S                  Emit assembly only (single input file)
   --interp            Run via pirc --interp (single input file, no C runtime I/O)
   --pirc=<path>       Override pirc binary path
+  -h | --help         Show this help message
 EOF
-    exit 1
+    exit "$code"
 }
 
+require_arg() {
+    local opt="$1"
+    local rem="$2"
+    if [ "$rem" -lt 2 ]; then
+        echo "ada83-pir: option '$opt' requires an argument" >&2
+        exit 1
+    fi
+}
+
+PARSING_OPTS=1
 while [ $# -gt 0 ]; do
+    if [ "$PARSING_OPTS" -eq 0 ]; then
+        case "$1" in
+            *.o|*.a) EXTRA_LINK+=("$1") ;;
+            *) SRCS+=("$1") ;;
+        esac
+        shift
+        continue
+    fi
     case "$1" in
-        -o) shift; OUTPUT="$1" ;;
-        -L|--lib) shift; LIB_DIR="$1" ;;
+        --) PARSING_OPTS=0 ;;
+        -o) require_arg "$1" "$#"; shift; OUTPUT="$1" ;;
+        -L|--lib) require_arg "$1" "$#"; shift; LIB_DIR="$1" ;;
         --lib=*) LIB_DIR="${1#--lib=}" ;;
         -c) COMPILE_ONLY=1 ;;
         --main=*) MAIN_UNIT="${1#--main=}" ;;
-        --main) shift; MAIN_UNIT="$1" ;;
-        --bind) shift; BIND_ONLY=1; MAIN_UNIT="$1" ;;
+        --main) require_arg "$1" "$#"; shift; MAIN_UNIT="$1" ;;
+        --bind) require_arg "$1" "$#"; shift; BIND_ONLY=1; MAIN_UNIT="$1" ;;
         --bind=*) BIND_ONLY=1; MAIN_UNIT="${1#--bind=}" ;;
         -O0|-O1|-O2) OPT="$1" ;;
         --target=*) TARGET="${1#--target=}" ;;
-        --target) shift; TARGET="$1" ;;
+        --target) require_arg "$1" "$#"; shift; TARGET="$1" ;;
         --no-checks) CHECKS_FLAG="--no-checks" ;;
         --checks) CHECKS_FLAG="--checks" ;;
         --emit-pir) EMIT_PIR=1 ;;
         -S) EMIT_ASM=1 ;;
         --interp) DO_INTERP=1 ;;
         --pirc=*) PIRC="${1#--pirc=}" ;;
+        --pirc) require_arg "$1" "$#"; shift; PIRC="$1" ;;
         -l*|-Wl,*) EXTRA_LINK+=("$1") ;;
-        -h|--help) usage ;;
-        -*) echo "ada83-pir: unknown option '$1'" >&2; usage ;;
+        -h|--help) usage 0 ;;
+        -*) echo "ada83-pir: unknown option '$1'" >&2; usage 1 ;;
         *.o|*.a) EXTRA_LINK+=("$1") ;;
         *) SRCS+=("$1") ;;
     esac
@@ -79,29 +115,64 @@ while [ $# -gt 0 ]; do
 done
 
 if [ ${#SRCS[@]} -eq 0 ] && [ "$BIND_ONLY" -eq 0 ]; then
-    usage
+    usage 1
 fi
 
+# Validate conflicting mode flags
+SINGLE_MODES=$((EMIT_PIR + EMIT_ASM + DO_INTERP))
+if [ "$SINGLE_MODES" -gt 1 ]; then
+    echo "ada83-pir: --emit-pir, -S, and --interp are mutually exclusive" >&2
+    exit 1
+fi
+if [ "$BIND_ONLY" -eq 1 ] && { [ "$COMPILE_ONLY" -eq 1 ] || [ "$SINGLE_MODES" -gt 0 ]; }; then
+    echo "ada83-pir: --bind cannot be combined with -c, --emit-pir, -S, or --interp" >&2
+    exit 1
+fi
+if [ "$SINGLE_MODES" -eq 1 ] && [ ${#SRCS[@]} -ne 1 ]; then
+    echo "ada83-pir: --emit-pir, -S, and --interp require exactly one source file" >&2
+    exit 1
+fi
+
+# Validate toolchain binaries and source files upfront
+for tool in "$DIANA_BIN/parphase" "$DIANA_BIN/libphase" "$DIANA_BIN/semphase" "$DIANA_BIN/errphase" "$DIANA2PIR" "$PIRC"; do
+    if [ ! -x "$tool" ]; then
+        echo "ada83-pir: required tool not found or not executable: $tool" >&2
+        exit 1
+    fi
+done
+if [ ${#SRCS[@]} -gt 0 ]; then
+    for s in "${SRCS[@]}"; do
+        if [ ! -f "$s" ]; then
+            echo "ada83-pir: source file not found: $s" >&2
+            exit 1
+        fi
+    done
+fi
+
+init_work_lib() {
+    local dir="$1"
+    cp "$RTL_IMG/PARSE.VM" "$dir/PARSE.VM"
+    cp "$RTL_IMG/PARSE.BIN" "$dir/PARSE.BIN"
+    cp "$RTL_IMG/DIANA.BIN" "$dir/DIANA.BIN"
+    cp "$RTL_IMG/ADA__LIB.CTL" "$dir/ADA__LIB.CTL"
+    mkdir -p "$dir/ADA__LIB" "$dir/objs"
+    cp -R "$RTL_IMG/ADA__LIB/." "$dir/ADA__LIB"
+    touch "$dir/.ready"
+}
+
 if [ -n "$LIB_DIR" ]; then
-    mkdir -p "$LIB_DIR"
-    WORK="$(cd "$LIB_DIR" && pwd)"
-    if [ ! -f "$WORK/PARSE.VM" ]; then
-        cp "$RTL_IMG/PARSE.VM" "$WORK/PARSE.VM"
-        cp "$RTL_IMG/PARSE.BIN" "$WORK/PARSE.BIN"
-        cp "$RTL_IMG/DIANA.BIN" "$WORK/DIANA.BIN"
-        cp "$RTL_IMG/ADA__LIB.CTL" "$WORK/ADA__LIB.CTL"
-        cp -R "$RTL_IMG/ADA__LIB" "$WORK/ADA__LIB"
+    mkdir -p -- "$LIB_DIR"
+    WORK="$(cd -- "$LIB_DIR" && pwd)"
+    if [ ! -f "$WORK/.ready" ] && [ ! -f "$WORK/PARSE.VM" ]; then
+        init_work_lib "$WORK"
     fi
     mkdir -p "$WORK/objs"
 else
     WORK="$(mktemp -d "${TMPDIR:-/tmp}/ada83_pir.XXXXXX")"
     trap 'rm -rf "$WORK"' EXIT
-    cp "$RTL_IMG/PARSE.VM" "$WORK/PARSE.VM"
-    cp "$RTL_IMG/PARSE.BIN" "$WORK/PARSE.BIN"
-    cp "$RTL_IMG/DIANA.BIN" "$WORK/DIANA.BIN"
-    cp "$RTL_IMG/ADA__LIB.CTL" "$WORK/ADA__LIB.CTL"
-    cp -R "$RTL_IMG/ADA__LIB" "$WORK/ADA__LIB"
-    mkdir -p "$WORK/objs"
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    init_work_lib "$WORK"
 fi
 
 USE_SINGLE_DIRECT=0
@@ -110,6 +181,22 @@ if [ "$EMIT_PIR" -eq 1 ] || [ "$EMIT_ASM" -eq 1 ] || [ "$DO_INTERP" -eq 1 ]; the
 elif [ -z "$LIB_DIR" ] && [ "$COMPILE_ONLY" -eq 0 ] && [ "$BIND_ONLY" -eq 0 ] && [ ${#SRCS[@]} -eq 1 ] && [ -z "$MAIN_UNIT" ]; then
     USE_SINGLE_DIRECT=1
 fi
+
+# Run errphase safely under `set -euo pipefail` (no piped SIGPIPE, anchored to errphase output)
+check_diana_errors() {
+    local err_log="$1"
+    local rc=0
+    "$DIANA_BIN/errphase" >"$err_log" 2>&1 || rc=$?
+    if [ "$rc" -ge 126 ]; then
+        cat "$err_log" >&2
+        return 1
+    fi
+    if awk '/^==>[[:space:]]*[0-9]+:/ && !/^==>[[:space:]]*[0-9]+:[[:space:]]*\(W\)/ { found=1 } END { exit !found }' "$err_log"; then
+        cat "$err_log" >&2
+        return 1
+    fi
+    return 0
+}
 
 # Monotonic object counter persisted in library
 SEQ_FILE="$WORK/objs/.seq"
@@ -120,16 +207,39 @@ fi
 
 SINGLE_OBJ=""
 for idx in "${!SRCS[@]}"; do
-    src_abs="$(cd "$(dirname "${SRCS[$idx]}")" && pwd)/$(basename "${SRCS[$idx]}")"
+    src_abs="$(cd -- "$(dirname -- "${SRCS[$idx]}")" && pwd)/$(basename -- "${SRCS[$idx]}")"
     OBJ_SEQ=$((OBJ_SEQ + 1))
     echo "$OBJ_SEQ" > "$SEQ_FILE"
     pir_out="$WORK/objs/unit_${OBJ_SEQ}.pir"
     obj_out="$WORK/objs/unit_${OBJ_SEQ}.o"
 
-    (
+    # Snapshot persistent library metadata before mutating so failures leave -L consistent
+    HAD_IDX=0
+    if [ "$USE_SINGLE_DIRECT" -eq 0 ]; then
+        cp "$WORK/ADA__LIB.CTL" "$WORK/ADA__LIB.CTL.bak"
+        if [ -f "$WORK/ADA__LIB/UNITS.IDX" ]; then
+            cp "$WORK/ADA__LIB/UNITS.IDX" "$WORK/UNITS.IDX.bak"
+            HAD_IDX=1
+        fi
+    fi
+
+    rollback_lib() {
+        if [ "$USE_SINGLE_DIRECT" -eq 0 ]; then
+            if [ -f "$WORK/ADA__LIB.CTL.bak" ]; then
+                mv -f "$WORK/ADA__LIB.CTL.bak" "$WORK/ADA__LIB.CTL"
+            fi
+            if [ "$HAD_IDX" -eq 1 ] && [ -f "$WORK/UNITS.IDX.bak" ]; then
+                mv -f "$WORK/UNITS.IDX.bak" "$WORK/ADA__LIB/UNITS.IDX"
+            elif [ "$HAD_IDX" -eq 0 ]; then
+                rm -f "$WORK/ADA__LIB/UNITS.IDX" "$WORK/UNITS.IDX.bak"
+            fi
+        fi
+    }
+
+    if ! (
         cd "$WORK"
         rm -f '$$$.TMP' '$$$PGM.TMP' SEMPHASE.TMP WRITELIB.TMP ADA__LIB.TMP
-        cp "$src_abs" '$$$PGM.TMP'
+        cp -- "$src_abs" '$$$PGM.TMP'
         cp PARSE.VM '$$$.TMP'
         chmod 644 '$$$.TMP'
 
@@ -141,6 +251,9 @@ for idx in "${!SRCS[@]}"; do
             "$DIANA_BIN/errphase" >&2 || cat "$WORK/par.log" >&2
             exit 1
         fi
+        if ! check_diana_errors "$WORK/err.log"; then
+            exit 1
+        fi
         if ! "$DIANA_BIN/libphase" >"$WORK/lib.log" 2>&1; then
             cat "$WORK/lib.log" >&2
             exit 1
@@ -150,10 +263,7 @@ for idx in "${!SRCS[@]}"; do
             "$DIANA_BIN/errphase" >&2 || cat "$WORK/sem.log" >&2
             exit 1
         fi
-        # Check for semantic errors (ignore '(W)' warning-only diagnostics)
-        "$DIANA_BIN/errphase" >"$WORK/err.log" 2>&1 || true
-        if grep '==>' "$WORK/err.log" | grep -qvE '==>[[:space:]]*[0-9]+:[[:space:]]*\(W\)'; then
-            cat "$WORK/err.log" >&2
+        if ! check_diana_errors "$WORK/err.log"; then
             exit 1
         fi
 
@@ -161,22 +271,24 @@ for idx in "${!SRCS[@]}"; do
             "$DIANA2PIR" --target="$TARGET" "$CHECKS_FLAG" --main -o "$pir_out"
         else
             "$DIANA2PIR" --target="$TARGET" "$CHECKS_FLAG" --no-main --lib="$WORK/ADA__LIB" --record-obj="$obj_out" -o "$pir_out"
+            # Save compiled unit to ADA__LIB for subsequent units (with clauses)
+            if [ -f ADA__LIB.TMP ]; then
+                mv ADA__LIB.TMP ADA__LIB.CTL
+            fi
+            cp '$$$.TMP' WRITELIB.TMP
+            if ! "$DIANA_BIN/writelib" >"$WORK/wlib.log" 2>&1; then
+                cat "$WORK/wlib.log" >&2
+                exit 1
+            fi
         fi
-
-        # Save compiled unit to ADA__LIB for subsequent units (with clauses)
-        if [ -f ADA__LIB.TMP ]; then
-            mv ADA__LIB.TMP ADA__LIB.CTL
-        fi
-        cp '$$$.TMP' WRITELIB.TMP
-        if ! "$DIANA_BIN/writelib" >"$WORK/wlib.log" 2>&1; then
-            cat "$WORK/wlib.log" >&2
-            exit 1
-        fi
-    )
+    ); then
+        rollback_lib
+        exit 1
+    fi
 
     if [ "$EMIT_PIR" -eq 1 ]; then
         if [ -n "$OUTPUT" ]; then
-            cp "$pir_out" "$OUTPUT"
+            cp -- "$pir_out" "$OUTPUT"
         else
             cat "$pir_out"
         fi
@@ -184,7 +296,8 @@ for idx in "${!SRCS[@]}"; do
     fi
 
     if [ "$DO_INTERP" -eq 1 ]; then
-        exec "$PIRC" --interp --target="$TARGET" "$OPT" "$pir_out"
+        "$PIRC" --interp --target="$TARGET" "$OPT" "$pir_out"
+        exit $?
     fi
 
     if [ "$EMIT_ASM" -eq 1 ]; then
@@ -197,16 +310,24 @@ for idx in "${!SRCS[@]}"; do
     fi
 
     if [ -f "$pir_out" ]; then
-        "$PIRC" --target="$TARGET" "$OPT" -c "$pir_out" -o "$obj_out"
+        if ! "$PIRC" --target="$TARGET" "$OPT" -c "$pir_out" -o "$obj_out"; then
+            rollback_lib
+            exit 1
+        fi
         SINGLE_OBJ="$obj_out"
     else
         for cu_pir in "$WORK/objs/unit_${OBJ_SEQ}__cu"*.pir; do
             [ -f "$cu_pir" ] || continue
             cu_obj="${cu_pir%.pir}.o"
-            "$PIRC" --target="$TARGET" "$OPT" -c "$cu_pir" -o "$cu_obj"
+            if ! "$PIRC" --target="$TARGET" "$OPT" -c "$cu_pir" -o "$cu_obj"; then
+                rollback_lib
+                exit 1
+            fi
             SINGLE_OBJ="$cu_obj"
         done
     fi
+
+    rm -f "$WORK/ADA__LIB.CTL.bak" "$WORK/UNITS.IDX.bak"
 done
 
 if [ "$COMPILE_ONLY" -eq 1 ]; then
@@ -217,6 +338,10 @@ OBJS=()
 if [ "$USE_SINGLE_DIRECT" -eq 1 ]; then
     OBJS+=("$SINGLE_OBJ")
 else
+    if [ ! -x "$ADA83_BIND" ]; then
+        echo "ada83-pir: binder not found or not executable: $ADA83_BIND" >&2
+        exit 1
+    fi
     # Run pure-Ada LRM Chapter 10 binder (ada83_bind)
     BIND_PIR="$WORK/objs/binder_main.pir"
     BIND_OBJ="$WORK/objs/binder_main.o"
@@ -227,7 +352,7 @@ else
     fi
     "$ADA83_BIND" "${BIND_ARGS[@]}"
     "$PIRC" --target="$TARGET" "$OPT" -c "$BIND_PIR" -o "$BIND_OBJ"
-    while IFS= read -r obj_line; do
+    while IFS= read -r obj_line || [ -n "$obj_line" ]; do
         [ -n "$obj_line" ] && OBJS+=("$obj_line")
     done < "$OBJS_TXT"
     OBJS+=("$BIND_OBJ")

@@ -62,7 +62,8 @@ package body NEWSNAM is
 		    H := H_IN;
 
 		-- else if declaration includes a constrained array definition
-		elsif KIND(DECL) /= DN_RENAMES_OBJ_DECL
+		elsif DECL /= CONST_VOID
+		and then KIND(DECL) /= DN_RENAMES_OBJ_DECL
                 and then KIND(D(AS_TYPE_DEF,DECL)) = DN_CONSTRAINED_ARRAY_DEF then
 
 		    -- make a new base type
@@ -105,7 +106,7 @@ package body NEWSNAM is
 
 			-- make a new base type
 			TYPE_SPEC
-				:= GET_BASE_TYPE(D(SM_TYPE_SPEC, SOURCE_NAME));
+				:= GET_BASE_TYPE(D(SM_OBJ_TYPE, SOURCE_NAME));
 			REPLACE_NODE(TYPE_SPEC, NODE_HASH);
 			SUBSTITUTE_ATTRIBUTES(TYPE_SPEC, NODE_HASH, H);
 
@@ -187,13 +188,11 @@ package body NEWSNAM is
 		    DEF := MAKE_DEF_FOR_ID(SOURCE_NAME, H);
 		    MAKE_DEF_VISIBLE(DEF);
 
-		    -- clear any forward reference to full type spec
+		    -- clear any forward reference to full type spec (on the copy after REPLACE_NODE, not template!)
 		    if KIND(TYPE_SPEC) in CLASS_CONSTRAINED then
 			TYPE_SPEC := D(SM_BASE_TYPE, TYPE_SPEC);
 		    end if;
-		    if KIND(TYPE_SPEC) = DN_INCOMPLETE then
-			D(XD_FULL_TYPE_SPEC, TYPE_SPEC, CONST_VOID);
-		    else
+		    if KIND(TYPE_SPEC) /= DN_INCOMPLETE then
 			TYPE_SPEC := GET_BASE_TYPE(TYPE_SPEC);
 		    end if;
 
@@ -206,8 +205,13 @@ package body NEWSNAM is
 		end if;
 
 		-- get and replace the type_spec node for the base type
-		TYPE_SPEC := GET_BASE_TYPE(TYPE_SPEC);
+		if KIND(TYPE_SPEC) /= DN_INCOMPLETE then
+		    TYPE_SPEC := GET_BASE_TYPE(TYPE_SPEC);
+		end if;
 		REPLACE_NODE(TYPE_SPEC, NODE_HASH);
+		if FIRST_NAME = SOURCE_NAME and then KIND(TYPE_SPEC) = DN_INCOMPLETE then
+		    D(XD_FULL_TYPE_SPEC, TYPE_SPEC, CONST_VOID);
+		end if;
 
 		-- if this type is (possibly) a declarative region
 		if KIND(TYPE_SPEC) = DN_RECORD
@@ -342,7 +346,8 @@ package body NEWSNAM is
 		SUBSTITUTE(HEADER, NODE_HASH, H);
 
 		-- make the def visible
-		if KIND(SOURCE_NAME) in CLASS_SUBPROG_NAME then
+		if KIND(SOURCE_NAME) in CLASS_SUBPROG_NAME
+		or else KIND(SOURCE_NAME) = DN_ENTRY_ID then
 		    MAKE_DEF_VISIBLE(DEF, HEADER);
 		else
 		    MAKE_DEF_VISIBLE(DEF);

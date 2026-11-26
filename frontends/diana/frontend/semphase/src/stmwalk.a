@@ -30,6 +30,10 @@ package body STMWALK is
     MAX_ACTIVE_LOOPS: constant NATURAL := 256;
     ACTIVE_LOOPS: array (1 .. MAX_ACTIVE_LOOPS) of TREE;
 
+    MAX_ACTIVE_ACCEPTS: constant NATURAL := 64;
+    ACTIVE_ACCEPTS: array (1 .. MAX_ACTIVE_ACCEPTS) of TREE;
+    ACCEPT_SP: NATURAL := 0;
+
     ------------------------------------------------------------------------
     --		Declare_Label_Block_Loop_Ids				  --
     ------------------------------------------------------------------------
@@ -685,7 +689,7 @@ package body STMWALK is
 				PFX: constant TREE := D(AS_NAME, BASE_N);
 				PT: TREE := CONST_VOID;
 			    begin
-				if PFX /= CONST_VOID then
+				if PFX /= CONST_VOID and then KIND(PFX) in CLASS_EXP then
 				    PT := D(SM_EXP_TYPE, PFX);
 				end if;
 				if PT /= CONST_VOID and then KIND(GET_BASE_STRUCT(PT)) = DN_ACCESS then
@@ -706,7 +710,8 @@ package body STMWALK is
 				    BAD_LHS := True;
 				    exit;
 				elsif DF /= CONST_VOID and then KIND(DF) = DN_COMPONENT_ID then
-				    if PFX /= CONST_VOID and then D(SM_EXP_TYPE, PFX) /= CONST_VOID
+				    if PFX /= CONST_VOID and then KIND(PFX) in CLASS_EXP
+				    and then D(SM_EXP_TYPE, PFX) /= CONST_VOID
 				    and then KIND(GET_BASE_STRUCT(D(SM_EXP_TYPE, PFX))) = DN_ACCESS then
 					exit; -- Implicit .all dereference of access-to-record is assignable
 				    end if;
@@ -734,7 +739,7 @@ package body STMWALK is
 				end if;
 			    end;
 			    exit;
-			when DN_FUNCTION_CALL | DN_NULLARY_CALL | DN_CONVERSION | DN_QUALIFIED | DN_ATTRIBUTE | DN_AGGREGATE | DN_NUMERIC_LITERAL | DN_STRING_LITERAL | DN_NULL_ACCESS =>
+			when DN_PARENTHESIZED | DN_FUNCTION_CALL | DN_NULLARY_CALL | DN_CONVERSION | DN_QUALIFIED | DN_ATTRIBUTE | DN_AGGREGATE | DN_NUMERIC_LITERAL | DN_STRING_LITERAL | DN_NULL_ACCESS =>
 			    BAD_LHS := True;
 			    exit;
 			when others =>
@@ -1475,21 +1480,13 @@ package body STMWALK is
 		    REMOVE_DEF_FROM_ENVIRONMENT(TEMP_ENTRY_DEF);
 		else
 		    D(SM_DEFN, DESIGNATOR, D(XD_SOURCE_NAME, PRIOR_ENTRY_DEF));
-		    -- LRM 9.5(8): cannot nest ACCEPT for the same entry
-		    declare
-			CHK_DEF: TREE := WALK_STM.H.REGION_DEF;
-		    begin
-			while CHK_DEF /= CONST_VOID
-			and then (KIND(D(XD_SOURCE_NAME, CHK_DEF)) = DN_BLOCK_LOOP_ID
-				  or else KIND(D(XD_SOURCE_NAME, CHK_DEF)) = DN_ENTRY_ID)
-			loop
-			    if CHK_DEF = PRIOR_ENTRY_DEF then
-				ERROR(D(LX_SRCPOS, STM), "Nested accept for same entry not allowed");
-				exit;
-			    end if;
-			    CHK_DEF := D(XD_REGION_DEF, CHK_DEF);
-			end loop;
-		    end;
+		    -- LRM 9.5(8): cannot nest ACCEPT for the same entry (even across intervening accepts/blocks/loops!)
+		    for AI in 1 .. ACCEPT_SP loop
+			if ACTIVE_ACCEPTS(AI) = PRIOR_ENTRY_DEF then
+			    ERROR(D(LX_SRCPOS, STM), "Nested accept for same entry not allowed");
+			    exit;
+			end if;
+		    end loop;
 		    CONFORM_PARAMETER_LISTS
 			    ( D(AS_PARAM_S
 				, D(SM_SPEC, D(XD_SOURCE_NAME,PRIOR_ENTRY_DEF)))
@@ -1505,12 +1502,18 @@ package body STMWALK is
 		    PREV_IN_HND:  constant BOOLEAN := IN_HANDLER;
 		    PREV_STM_B:   constant NATURAL := STM_BARRIER;
 		    PREV_LOOP_B:  constant NATURAL := LOOP_BARRIER;
+		    PREV_ACC_SP:  constant NATURAL := ACCEPT_SP;
 		begin
 		    CAN_RETURN := TRUE;
 		    -- LRM 11.3(3): bare raise; is allowed inside accept enclosed by an exception handler
 		    STM_BARRIER := STM_SP;
 		    LOOP_BARRIER := LOOP_SP;
+		    if ACCEPT_SP < MAX_ACTIVE_ACCEPTS then
+			ACCEPT_SP := ACCEPT_SP + 1;
+			ACTIVE_ACCEPTS(ACCEPT_SP) := PRIOR_ENTRY_DEF;
+		    end if;
 		    WALK_STM_S(STM_S, H);
+		    ACCEPT_SP := PREV_ACC_SP;
 		    CAN_RETURN := PREV_CAN_RET;
 		    IN_HANDLER := PREV_IN_HND;
 		    STM_BARRIER := PREV_STM_B;
@@ -1549,6 +1552,7 @@ package body STMWALK is
 			EVAL_NON_UNIVERSAL_DISCRETE_RANGE
 					( DISCRETE_RANGE
 					, RANGE_TYPESET );
+			REQUIRE_UNIQUE_TYPE(DISCRETE_RANGE, RANGE_TYPESET);
 			DISCRETE_RANGE := RESOLVE_DISCRETE_RANGE
 					( DISCRETE_RANGE
 					, GET_THE_TYPE(RANGE_TYPESET) );

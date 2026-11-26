@@ -171,7 +171,9 @@ package body PAGEMAN is
       RPG(I).VP := 0;
       RPG(I).AREA := 0;
       RPG(I).CHANGED := FALSE;
-      RPG(I).DATA := new SECTOR;
+      if RPG(I).DATA = null then
+        RPG(I).DATA := new SECTOR;
+      end if;
     end loop;
 
     for I in AREA_NBR loop

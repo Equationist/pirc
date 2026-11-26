@@ -158,7 +158,9 @@ procedure SEMPHASE is
 	DEFLIST := LIST(D(LX_SYMREP, DESIGNATOR));
 	while not IS_EMPTY(DEFLIST) loop
 	    POP(DEFLIST, DEF);
-	    if D(XD_REGION, D(XD_SOURCE_NAME, DEF))
+	    if D(XD_SOURCE_NAME, DEF) /= CONST_VOID
+	    and then KIND(D(XD_SOURCE_NAME, DEF)) in CLASS_SOURCE_NAME
+	    and then D(XD_REGION, D(XD_SOURCE_NAME, DEF))
 		    = D(XD_SOURCE_NAME, H.REGION_DEF)
 	    then
 		DEFN := D(XD_SOURCE_NAME, DEF);
@@ -289,20 +291,24 @@ procedure SEMPHASE is
 		while not IS_EMPTY(NAME_LIST) loop
 		    POP(NAME_LIST, NAME);
 
-		    -- find corresponding def
-		    NAME_DEFN := D(SM_DEFN, NAME);
-		    if NAME_DEFN /= CONST_VOID and then KIND(NAME_DEFN) /= DN_PACKAGE_ID then
-			ERROR(D(LX_SRCPOS, NAME), "Package name required in USE clause");
-		    elsif NAME_DEFN /= CONST_VOID then
-			NAME_DEF := GET_DEF_FOR_ID(NAME_DEFN);
+		    -- find corresponding def (guard against erroneous selected name in context USE)
+		    if KIND(NAME) = DN_USED_OBJECT_ID then
+			NAME_DEFN := D(SM_DEFN, NAME);
+			if NAME_DEFN /= CONST_VOID and then KIND(NAME_DEFN) /= DN_PACKAGE_ID then
+			    ERROR(D(LX_SRCPOS, NAME), "Package name required in USE clause");
+			elsif NAME_DEFN /= CONST_VOID then
+			    NAME_DEF := GET_DEF_FOR_ID(NAME_DEFN);
 
-			-- make it used
-			DB(XD_IS_USED, NAME_DEF, TRUE);
+			    -- make it used
+			    DB(XD_IS_USED, NAME_DEF, TRUE);
+			end if;
+
+			-- replace used_object_id with used_name_id
+			NEW_NAME := MAKE_USED_NAME_ID_FROM_OBJECT(NAME);
+			NEW_NAME_LIST := APPEND(NEW_NAME_LIST, NEW_NAME);
+		    else
+			NEW_NAME_LIST := APPEND(NEW_NAME_LIST, NAME);
 		    end if;
-
-		    -- replace used_object_id with used_name_id
-		    NEW_NAME := MAKE_USED_NAME_ID_FROM_OBJECT(NAME);
-		    NEW_NAME_LIST := APPEND(NEW_NAME_LIST, NEW_NAME);
 		end loop;
 
                 -- save new list of used_name_id's

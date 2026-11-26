@@ -2,6 +2,7 @@
 -- SPDX-License-Identifier: BSD-3-Clause
 
 with Ada.Containers.Hashed_Maps;
+with Ada.Containers.Hashed_Sets;
 with Ada.Containers.Vectors;
 with Ada.Strings.Unbounded; use Ada.Strings.Unbounded;
 with Interfaces; use Interfaces;
@@ -181,16 +182,45 @@ package Cg_State is
    -- Active secondary-stack marks in the current subprogram
    package Str_Vecs is new Ada.Containers.Vectors (Natural, Unbounded_String);
 
-   -- Pending generic instantiations (for instantiations appearing before generic body)
-   type Pending_Inst is record
-      Inst_Decl : TREE := (0, 0, 0);
-      Owner_Subp : Unsigned_32 := 0;
-   end record;
-
-   package Pending_Inst_Vecs is new Ada.Containers.Vectors (Natural, Pending_Inst);
-
    -- Captured variable list per subprogram
    package U32_Vecs is new Ada.Containers.Vectors (Natural, Unsigned_32);
+
+   package U32_Sets is new Ada.Containers.Hashed_Sets
+     (Element_Type        => Unsigned_32,
+      Hash                => Hash_U32,
+      Equivalent_Elements => "=");
+
+   package U32_Str_Maps is new Ada.Containers.Hashed_Maps
+     (Key_Type        => Unsigned_32,
+      Element_Type    => Unbounded_String,
+      Hash            => Hash_U32,
+      Equivalent_Keys => "=");
+
+   package U64_Str_Maps is new Ada.Containers.Hashed_Maps
+     (Key_Type        => Unsigned_64,
+      Element_Type    => Unbounded_String,
+      Hash            => Hash_U64,
+      Equivalent_Keys => "=");
+
+   package Str_Map_Maps is new Ada.Containers.Hashed_Maps
+     (Key_Type        => Unsigned_32,
+      Element_Type    => U32_Str_Maps.Map,
+      Hash            => Hash_U32,
+      Equivalent_Keys => "=",
+      "="             => U32_Str_Maps."=");
+
+   type Access_Master_Info is record
+      Local_Ptr  : Unbounded_String;
+      Global_Sym : Unbounded_String;
+      Owner_Subp : Unsigned_32 := 0;
+      Cap_Slot   : Integer := 0;
+   end record;
+
+   package Access_Master_Maps is new Ada.Containers.Hashed_Maps
+     (Key_Type        => Unsigned_32,
+      Element_Type    => Access_Master_Info,
+      Hash            => Hash_U32,
+      Equivalent_Keys => "=");
 
    -- Scalar out / in-out copy-out entries (Ada 83 LRM 6.2(7) by-copy semantics)
    type Copy_Out_Entry is record
@@ -285,13 +315,6 @@ package Cg_State is
       Equivalent_Keys => "=",
       "="             => Tree_Maps."=");
 
-   package Type_Map_Maps is new Ada.Containers.Hashed_Maps
-     (Key_Type        => Unsigned_32,
-      Element_Type    => Type_Maps.Map,
-      Hash            => Hash_U32,
-      Equivalent_Keys => "=",
-      "="             => Type_Maps."=");
-
    package Var_Map_Maps is new Ada.Containers.Hashed_Maps
      (Key_Type        => Unsigned_32,
       Element_Type    => Var_Maps.Map,
@@ -370,37 +393,47 @@ package Cg_State is
       Hash            => Hash_U32,
       Equivalent_Keys => "=");
 
+   type Accept_Frame is record
+      End_Label : Unbounded_String;
+      Mst_Depth : Natural := 0;
+      SS_Depth  : Natural := 0;
+      SP_Depth  : Natural := 0;
+   end record;
+
+   package Accept_Vecs is new Ada.Containers.Vectors (Natural, Accept_Frame);
+
    type Context is limited record
       E             : Pir_Emit.Emitter;
       Enable_Checks : Boolean := True;
       Emit_Main     : Boolean := True;
-      Main_Override : Unbounded_String;
+      Lib_Dir       : Unbounded_String := To_Unbounded_String ("ADA__LIB");
 
-      Types         : Type_Maps.Map;
-      Fields        : Field_Maps.Map;
-      Vars          : Var_Maps.Map;
-      Subps         : Subp_Maps.Map;
-      Tasks         : Task_Maps.Map;
-      Entries       : Entry_Maps.Map;
-      Generic_Decls : Tree_Maps.Map;
-      Generic_Body   : Tree_Maps.Map;
-      Gen_Subunits   : Tree_Maps.Map; -- separate subunit bodies belonging to generic templates (c94008d, ca3011a)
-      Generic_Env    : Tree_Map_Maps.Map; -- captured outer Generic_Subst for nested generics
-      Gen_Env_Exc    : Type_Map_Maps.Map; -- captured outer Gen_Local_Exc_Tags for nested generics
-      Gen_Env_Vars   : Var_Map_Maps.Map;  -- captured outer generic body Vars for nested generics
-      Gen_Env_Subps  : Subp_Map_Maps.Map; -- captured outer generic body Subps for nested generics
-      Gen_Env_Tasks  : Task_Map_Maps.Map; -- captured outer generic body Tasks for nested generics
-      Gen_Cap_Slots  : U64_Nat_Maps.Map;  -- (Inst_Key << 32 | Var_Key) -> parent frame slot for multi-inst local generics
+      Types            : Type_Maps.Map;
+      In_Progress_Recs : U32_Sets.Set; -- cycle guard for recursive access-to-record types
+      Fields           : Field_Maps.Map;
+      Vars             : Var_Maps.Map;
+      Subps            : Subp_Maps.Map;
+      Tasks            : Task_Maps.Map;
+      Entries          : Entry_Maps.Map;
+      Generic_Decls    : Tree_Maps.Map;
+      Generic_Body     : Tree_Maps.Map;
+      Gen_Subunits     : Tree_Maps.Map; -- separate subunit bodies belonging to generic templates (c94008d, ca3011a)
+      Generic_Env      : Tree_Map_Maps.Map; -- captured outer Generic_Subst for nested generics
+      Gen_Env_Exc      : Str_Map_Maps.Map; -- captured outer Gen_Local_Exc_Tags for nested generics
+      Gen_Env_Vars     : Var_Map_Maps.Map;  -- captured outer generic body Vars for nested generics
+      Gen_Env_Subps    : Subp_Map_Maps.Map; -- captured outer generic body Subps for nested generics
+      Gen_Env_Tasks    : Task_Map_Maps.Map; -- captured outer generic body Tasks for nested generics
+      Gen_Cap_Slots    : U64_Nat_Maps.Map;  -- (Inst_Key << 32 | Var_Key) -> parent frame slot for multi-inst local generics
       Gen_Body_Nested_Gens : U32_Vecs.Vector; -- nested generic keys registered during active outer generic body
-      Gen_Elab_Flags : Type_Maps.Map; -- generic key -> Pir_Type holds @ada_gelab_... global
-      Generic_Subst  : Tree_Maps.Map; -- active formal -> actual during generic emission
-      Subp_Renames  : Tree_Maps.Map; -- SID -> DN_RENAMES_UNIT (when instant.a leaves SM_UNIT_DESC void)
-      Gen_Inst_Tag  : Unbounded_String; -- per-instantiation disambiguator for local subps
-      In_Gen_Body     : Boolean := False; -- True while emitting a generic body (incl. nested packages inside it)
-      In_Subunit      : Boolean := False; -- True when emitting a DN_SUBUNIT compilation unit
-      In_Lib_Pkg_Body : Boolean := False; -- True when emitting a non-support library package body
-      Has_Stubs       : Boolean := False; -- True when emitting a unit that contains DN_STUB declarations
-      Exc_Tags      : Type_Maps.Map; -- reuse U32 -> Pir_Type holds tag symbol name
+      Gen_Elab_Flags   : U32_Str_Maps.Map; -- generic key -> @ada_gelab_... global
+      Generic_Subst    : Tree_Maps.Map; -- active formal -> actual during generic emission
+      Subp_Renames     : Tree_Maps.Map; -- SID -> DN_RENAMES_UNIT (when instant.a leaves SM_UNIT_DESC void)
+      Gen_Inst_Tag     : Unbounded_String; -- per-instantiation disambiguator for local subps
+      In_Gen_Body      : Boolean := False; -- True while emitting a generic body (incl. nested packages inside it)
+      In_Subunit       : Boolean := False; -- True when emitting a DN_SUBUNIT compilation unit
+      In_Lib_Pkg_Body  : Boolean := False; -- True when emitting a non-support library package body
+      Has_Stubs        : Boolean := False; -- True when emitting a unit that contains DN_STUB declarations
+      Exc_Tags         : U32_Str_Maps.Map; -- exception key -> @__ada_exc_... symbol name
 
       -- Current subprogram / task state
       Cur_Subp_Key      : Unsigned_32 := 0;
@@ -416,18 +449,17 @@ package Cg_State is
       Cur_Task_Exit_Lbl       : Unbounded_String;
       Cur_Task_Base_Mst_Depth : Natural := 0;
       Cur_Is_Func             : Boolean := False;
-      Uplevel_Cache     : Type_Maps.Map; -- cached entry-block uplevel var address regs per subprogram
-      Pkg_Task_Marks    : Type_Maps.Map; -- local package task marks (PID key -> mark reg in Pir_Type)
+      Uplevel_Cache     : U64_Str_Maps.Map; -- (Owner_Subp << 32 | Slot) -> entry-block uplevel var addr reg
       Pkg_Task_Groups   : I64_Maps.Map;  -- local package task group IDs (PID key -> group_id)
       Cur_Task_Group_Id : Integer_64 := 0;
       Next_Task_Group_Id : Integer_64 := 1;
       Renamed_Entries   : Renamed_Entry_Maps.Map; -- SID key -> pre-evaluated task/idx globals
-      Access_Masters    : Type_Maps.Map; -- access base type key -> @ada_accmst_... global sym in Pir_Type
+      Access_Masters    : Access_Master_Maps.Map; -- access base type key -> declaring master binding
       Saved_Type_Ranges : Saved_Range_Maps.Map; -- scalar subtype key -> pre-evaluated Lo/Hi allocas/globals
       Saved_Var_Ranges  : Saved_Range_Maps.Map; -- object ID key -> per-object frozen Lo/Hi (multi-object decls)
       Saved_Type_Discs  : Saved_Disc_Maps.Map;  -- constrained record key -> pre-evaluated disc allocas/globals
       Saved_Expr_Vals   : Saved_Expr_Maps.Map;  -- record comp constraint expr key -> pre-evaluated alloca/global
-      Gen_Local_Exc_Tags : Type_Maps.Map;       -- generic-local exception key -> tagged @__ada_exc_... sym
+      Gen_Local_Exc_Tags : U32_Str_Maps.Map;    -- generic-local exception key -> tagged @__ada_exc_... sym
 
       Loops             : Loop_Vecs.Vector;
       Handlers          : Handler_Vecs.Vector;
@@ -435,16 +467,10 @@ package Cg_State is
       SS_Marks          : Str_Vecs.Vector;
       SP_Marks          : Str_Vecs.Vector;
       Master_Stack      : Str_Vecs.Vector;
-      Accept_End_Lbls   : Str_Vecs.Vector;
-      Accept_Mst_Depths : U32_Vecs.Vector;
+      Accept_Frames     : Accept_Vecs.Vector;
       Label_Mst_Depths  : I64_Maps.Map;
       Label_SS_Depths   : I64_Maps.Map;
       Label_SP_Depths   : I64_Maps.Map;
-      Pending_Insts     : Pending_Inst_Vecs.Vector;
-
-      -- Withed user packages to elaborate in main
-      Elab_Funcs    : U32_Vecs.Vector;
-      Elab_Names    : Unbounded_String; -- pipe-delimited list of elab func symbols
    end record;
 
    procedure Init_Context

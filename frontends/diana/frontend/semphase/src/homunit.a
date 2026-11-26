@@ -115,7 +115,7 @@ package body HOMUNIT is
 			    AL := LIST(D(AS_GENERAL_ASSOC_S, DEF_E));
 			    while not IS_EMPTY(AL) loop
 				POP(AL, IT);
-				if KIND(IT) = DN_ASSOC or else KIND(IT) = DN_NAMED then
+				if KIND(IT) = DN_NAMED then
 				    CS := LIST(D(AS_CHOICE_S, IT));
 				    while not IS_EMPTY(CS) loop
 					POP(CS, CH);
@@ -238,7 +238,7 @@ package body HOMUNIT is
 					AL := LIST(D(AS_GENERAL_ASSOC_S, DEF_E));
 					while not IS_EMPTY(AL) loop
 					    POP(AL, IT);
-					    if KIND(IT) = DN_ASSOC or else KIND(IT) = DN_NAMED then
+					    if KIND(IT) = DN_NAMED then
 						CS := LIST(D(AS_CHOICE_S, IT));
 						while not IS_EMPTY(CS) loop
 						    POP(CS, CH);

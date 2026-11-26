@@ -1699,6 +1699,7 @@ package body NODWALK is
 		if PRIOR_DEF = CONST_VOID then
 		    MAKE_DEF_VISIBLE(SOURCE_DEF, HEADER);
 		    CHECK_EQUALITY_OPERATOR(SOURCE_NAME, H);
+		    RECORD_BODY(SOURCE_NAME);
 		else
 		    if KIND(FIRST_NAME) in CLASS_SUBPROG_NAME
 		    or KIND(FIRST_NAME) = DN_GENERIC_ID then
@@ -2735,8 +2736,12 @@ package body NODWALK is
 	    -- added wbe 9/21/90
 	    -- clear defn if wrong kind
 	    if KIND(NEW_NAME) = DN_SELECTED then
-		D(SM_DEFN, D(AS_DESIGNATOR, NEW_NAME), CONST_VOID);
-	    else
+		if KIND(D(AS_DESIGNATOR, NEW_NAME)) in CLASS_USED_NAME
+		or else KIND(D(AS_DESIGNATOR, NEW_NAME)) in CLASS_USED_OBJECT then
+		    D(SM_DEFN, D(AS_DESIGNATOR, NEW_NAME), CONST_VOID);
+		end if;
+	    elsif KIND(NEW_NAME) in CLASS_USED_NAME
+	    or else KIND(NEW_NAME) in CLASS_USED_OBJECT then
 		D(SM_DEFN, NEW_NAME, CONST_VOID);
 	    end if;
 	end if;
@@ -2750,9 +2755,18 @@ package body NODWALK is
 	NAME_DEFN: TREE := GET_NAME_DEFN(NEW_NAME);
     begin
 
-	if KIND(NAME_DEFN) not in CLASS_TYPE_NAME
-	and then NAME_DEFN /= CONST_VOID then
+	if NAME_DEFN /= CONST_VOID
+	and then KIND(NAME_DEFN) not in CLASS_TYPE_NAME then
             ERROR(D(LX_SRCPOS, NAME), "Type mark required");
+	    if KIND(NEW_NAME) = DN_SELECTED then
+		if KIND(D(AS_DESIGNATOR, NEW_NAME)) in CLASS_USED_NAME
+		or else KIND(D(AS_DESIGNATOR, NEW_NAME)) in CLASS_USED_OBJECT then
+		    D(SM_DEFN, D(AS_DESIGNATOR, NEW_NAME), CONST_VOID);
+		end if;
+	    elsif KIND(NEW_NAME) in CLASS_USED_NAME
+	    or else KIND(NEW_NAME) in CLASS_USED_OBJECT then
+		D(SM_DEFN, NEW_NAME, CONST_VOID);
+	    end if;
 	end if;
 
 	return NEW_NAME;

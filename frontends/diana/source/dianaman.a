@@ -27,9 +27,9 @@ package body DIANAMAN is
   WORDS_IN_PNAME: constant INTEGER := (MAX_STRING + 4) / 4;
   CONST_HASH:	  TREE;
 
-  RP:	       RPG_DES;     -- current real page
-  VP:	       VPG_DES;     -- current virt page
-  WVP:	       VPG_DES;     -- current virt page if changed
+  RP:	       RPG_DES := 1;     -- current real page
+  VP:	       VPG_DES := 0;     -- current virt page
+  WVP:	       VPG_DES := 0;     -- current virt page if changed
 
   type HD_PN is
     record
@@ -173,6 +173,9 @@ package body DIANAMAN is
 
   function  ARITY (T: in TREE)		    return ARITIES is
   begin
+    if INTEGER(T.TTY) > LAST_NODE then
+      return NULLARY;
+    end if;
     return N_SPEC(INTEGER(T.TTY)).NS_ARITY;
   end ARITY;
 
@@ -551,7 +554,11 @@ package body DIANAMAN is
   function STORETEXT(V: STRING) return TREE is
     PN: PNAME;
   begin
-    SET(PN, TO => V);
+    if V'LENGTH > MAX_STRING then
+      SET(PN, TO => V(V'FIRST .. V'FIRST + MAX_STRING - 1));
+    else
+      SET(PN, TO => V);
+    end if;
     return(STORETEXT(PN));
   end STORETEXT;
 
@@ -865,6 +872,7 @@ package body DIANAMAN is
     TEMP.TLN := BYTE(T_LN);
     AREA(AR).NLN := T_LN + LEN;
     RPG(RP).DATA(T_LN) := MAKE_TREE(C,0,LEN);
+    RPG(RP).CHANGED := TRUE;
     return TEMP;
   end MAKE;
 

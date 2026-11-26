@@ -2,12 +2,14 @@
 -- SPDX-License-Identifier: BSD-3-Clause
 
 with Ada.Command_Line;
+with Ada.Exceptions;
 with Ada.Strings.Unbounded; use Ada.Strings.Unbounded;
 with Ada.Text_IO;
 with USERPK; use USERPK;
 with DIANA; use DIANA;
 with DIANAMAN; use DIANAMAN;
 with DIANATTR; use DIANATTR;
+with Diana_Util;
 with Pir_Emit;
 with Cg_State;
 with Cg_Stmt;
@@ -20,6 +22,7 @@ procedure Diana2Pir is
    Lib_Dir       : Unbounded_String := To_Unbounded_String ("ADA__LIB");
    Enable_Checks : Boolean := True;
    Emit_Main     : Boolean := True;
+   Diana_Open    : Boolean := False;
 
    I : Natural := 1;
 begin
@@ -63,27 +66,43 @@ begin
    end loop;
 
    OPEN_DIANA;
+   Diana_Open := True;
    declare
-      User_Root : constant TREE := D (XD_USER_ROOT, CONST_ROOT);
-      Structure : constant TREE := D (XD_STRUCTURE, User_Root);
       Err_Cnt   : constant Integer := DI (XD_ERR_COUNT, CONST_ROOT);
+      User_Root : TREE;
+      Structure : TREE;
       Ctx       : Cg_State.Context;
    begin
       if Err_Cnt > 0 then
          Ada.Text_IO.Put_Line (Ada.Text_IO.Standard_Error,
            "diana2pir: aborting due to" & Integer'Image (Err_Cnt) & " frontend error(s)");
          CLOSE_DIANA;
+         Diana_Open := False;
+         Ada.Command_Line.Set_Exit_Status (Ada.Command_Line.Failure);
+         return;
+      end if;
+
+      User_Root := D (XD_USER_ROOT, CONST_ROOT);
+      if Diana_Util.Is_Void_Tree (User_Root) then
+         Ada.Text_IO.Put_Line (Ada.Text_IO.Standard_Error,
+           "diana2pir: empty or invalid DIANA tree (no user root)");
+         CLOSE_DIANA;
+         Diana_Open := False;
+         Ada.Command_Line.Set_Exit_Status (Ada.Command_Line.Failure);
+         return;
+      end if;
+
+      Structure := D (XD_STRUCTURE, User_Root);
+      if Diana_Util.Is_Void_Tree (Structure) or else KIND (Structure) /= DN_COMPILATION then
+         Ada.Text_IO.Put_Line (Ada.Text_IO.Standard_Error,
+           "diana2pir: empty or invalid DIANA compilation structure");
+         CLOSE_DIANA;
+         Diana_Open := False;
          Ada.Command_Line.Set_Exit_Status (Ada.Command_Line.Failure);
          return;
       end if;
 
       declare
-         function Trim_Img (N : Natural) return String is
-            S : constant String := Natural'Image (N);
-         begin
-            return S (S'First + 1 .. S'Last);
-         end Trim_Img;
-
          CU_Count : Natural := 0;
          SL_Cnt   : SEQ_TYPE := LIST (D (AS_COMPLTN_UNIT_S, Structure));
          Tmp_CU   : TREE;
@@ -96,8 +115,16 @@ begin
          -- P3-5.12: In library mode with multiple CUs in one source file, emit one .pir/.o per CU
          -- so partial superseding on later recompilation never causes duplicate-symbol link errors!
          if not Emit_Main and then Length (Record_Obj) > 0 and then CU_Count > 1 then
+            if Length (Output_Path) = 0 then
+               Ada.Text_IO.Put_Line (Ada.Text_IO.Standard_Error,
+                 "diana2pir: -o <path> is required when compiling multiple compilation units in library mode");
+               CLOSE_DIANA;
+               Diana_Open := False;
+               Ada.Command_Line.Set_Exit_Status (Ada.Command_Line.Failure);
+               return;
+            end if;
             declare
-               Out_S   : constant String := To_String (Output_Path);
+               Out_S    : constant String := To_String (Output_Path);
                Out_Base : constant String :=
                  (if Out_S'Length > 4 and then Out_S (Out_S'Last - 3 .. Out_S'Last) = ".pir"
                   then Out_S (Out_S'First .. Out_S'Last - 4) else Out_S);
@@ -111,8 +138,9 @@ begin
                         Target_Triple => To_String (Target_Triple),
                         Enable_Checks => Enable_Checks,
                         Emit_Main     => False);
+                     CU_Ctx.Lib_Dir := Lib_Dir;
                      Cg_Stmt.Emit_Compilation (CU_Ctx, Structure, Only_CU => CU_I);
-                     Pir_Emit.Write_Module (CU_Ctx.E, Out_Base & "__cu" & Trim_Img (CU_I) & ".pir");
+                     Pir_Emit.Write_Module (CU_Ctx.E, Out_Base & "__cu" & Pir_Emit.Img (CU_I) & ".pir");
                   end;
                end loop;
                Lib_Binder.Record_Compilation_Units (Structure, To_String (Record_Obj), To_String (Lib_Dir), Per_CU_Obj => True);
@@ -123,6 +151,7 @@ begin
                Target_Triple => To_String (Target_Triple),
                Enable_Checks => Enable_Checks,
                Emit_Main     => Emit_Main);
+            Ctx.Lib_Dir := Lib_Dir;
 
             Cg_Stmt.Emit_Compilation (Ctx, Structure);
             Pir_Emit.Write_Module (Ctx.E, To_String (Output_Path));
@@ -133,8 +162,18 @@ begin
       end;
    end;
    CLOSE_DIANA;
+   Diana_Open := False;
 exception
    when Cg_Stmt.Elab_Cycle_Error =>
-      CLOSE_DIANA;
+      if Diana_Open then
+         CLOSE_DIANA;
+      end if;
+      Ada.Command_Line.Set_Exit_Status (Ada.Command_Line.Failure);
+   when E : others =>
+      if Diana_Open then
+         CLOSE_DIANA;
+      end if;
+      Ada.Text_IO.Put_Line (Ada.Text_IO.Standard_Error,
+        "diana2pir: internal error: " & Ada.Exceptions.Exception_Information (E));
       Ada.Command_Line.Set_Exit_Status (Ada.Command_Line.Failure);
 end Diana2Pir;

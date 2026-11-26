@@ -165,7 +165,7 @@ package body REQUTIL is
 	end if;
 
 	-- $$$$ need a faster test for type deriv from predef character
-	ENUM_LIST := LIST(D(SM_LITERAL_S, TYPE_SPEC));
+	ENUM_LIST := LIST(D(SM_LITERAL_S, TYPE_STRUCT));
 	while not IS_EMPTY(ENUM_LIST) loop
 	    POP(ENUM_LIST, ENUM_ID);
 	    if KIND(ENUM_ID) = DN_CHARACTER_ID then
@@ -367,7 +367,8 @@ package body REQUTIL is
 	    end IS_NONLIMITED_COMP_LIST;
 
 	begin
-	    if TS = CONST_VOID or else DEPTH > 32 then
+	    if TS = CONST_VOID or else DEPTH > 32
+	    or else KIND(TS) not in CLASS_TYPE_SPEC then
 		return TRUE;
 	    end if;
 
@@ -408,17 +409,26 @@ package body REQUTIL is
 
     begin -- Is_Private_Type
 
+	if TYPE_SPEC = CONST_VOID or else KIND(TYPE_SPEC) not in CLASS_TYPE_SPEC then
+	    return FALSE;
+	end if;
         case CLASS_TYPE_SPEC'(KIND(TYPE_SPEC)) is
 	when DN_TASK_SPEC | DN_L_PRIVATE | DN_INCOMPLETE | DN_PRIVATE =>
 	    return TRUE;
 	when DN_ARRAY =>
-	    case CLASS_TYPE_SPEC(KIND
-			( GET_BASE_STRUCT(D(SM_COMP_TYPE,TYPE_SPEC)) )) is
-	    when DN_TASK_SPEC | DN_L_PRIVATE | DN_INCOMPLETE | DN_PRIVATE =>
-		return TRUE;
-	    when others =>
-		return FALSE;
-	    end case;
+	    declare
+		COMP_BS: constant TREE := GET_BASE_STRUCT(D(SM_COMP_TYPE,TYPE_SPEC));
+	    begin
+		if COMP_BS = CONST_VOID or else KIND(COMP_BS) not in CLASS_TYPE_SPEC then
+		    return FALSE;
+		end if;
+		case CLASS_TYPE_SPEC(KIND(COMP_BS)) is
+		when DN_TASK_SPEC | DN_L_PRIVATE | DN_INCOMPLETE | DN_PRIVATE =>
+		    return TRUE;
+		when others =>
+		    return FALSE;
+		end case;
+	    end;
 	when others =>
 	    return FALSE;
 	end case;

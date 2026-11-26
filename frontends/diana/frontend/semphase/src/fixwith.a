@@ -268,14 +268,18 @@ package body FIXWITH is
 				, SM_DEFN => SOURCE_NAME )
 			, AS_PARAM_S => MAKE_PARAM_S (LIST => MAKE) );
 		SOURCE_NAME_LIST := LIST(D(SM_LITERAL_S, BASE_STRUCT));
-		while not IS_EMPTY(SOURCE_NAME_LIST) loop
-		    POP(SOURCE_NAME_LIST, SOURCE_NAME);
-		    DEF := MAKE_DEF_IF_NEEDED
-				(SOURCE_NAME, H.REGION_DEF, H.IS_IN_SPEC);
-		    if DEF /= CONST_VOID then
-			D(XD_HEADER, DEF, HEADER);
-		    end if;
-		end loop;
+		declare
+		    LIT_DEF: TREE;
+		begin
+		    while not IS_EMPTY(SOURCE_NAME_LIST) loop
+			POP(SOURCE_NAME_LIST, SOURCE_NAME);
+			LIT_DEF := MAKE_DEF_IF_NEEDED
+				    (SOURCE_NAME, H.REGION_DEF, H.IS_IN_SPEC);
+			if LIT_DEF /= CONST_VOID then
+			    D(XD_HEADER, LIT_DEF, HEADER);
+			end if;
+		    end loop;
+		end;
 	    elsif KIND(BASE_STRUCT) = DN_RECORD then
 		FIX_WITH_COMP_LIST(D(SM_COMP_LIST, BASE_STRUCT), DEF);
 	    end if;

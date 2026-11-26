@@ -126,25 +126,38 @@ package body UNIVOPS is
   end SPREAD;
 
   procedure SPREAD(I: INTEGER; U:in out VECTOR) is
-      -- make vector from integer
+      -- make vector from full 32-bit signed integer
+      V: INTEGER;
+      IDX: INTEGER := 0;
   begin
-    U.L := 2;
-    if I < 0 then
-      if I < -32767 then
-	-- special case for max negative integer
-	U.D(2) := 3;
-	U.D(1) := 2768;
-      else
-	SPREAD(-I, U);
-      end if;
+    if I = INTEGER'FIRST then
+      -- -2147483648 in base 10000: 3648 + 4748*10^4 + 21*10^8
       U.S := -1;
+      U.L := 3;
+      U.D(1) := 3648;
+      U.D(2) := 4748;
+      U.D(3) := 21;
+      return;
+    end if;
+    if I < 0 then
+      U.S := -1;
+      V := -I;
     else
       U.S := +1;
-      U.L := 2;
-      U.D(2) := SHORT(I/10000);
-      U.D(1) := SHORT(I mod 10000);
-      NORMALIZE(U);
+      V := I;
     end if;
+    if V = 0 then
+      U.L := 1;
+      U.D(1) := 0;
+      return;
+    end if;
+    while V > 0 loop
+      IDX := IDX + 1;
+      U.D(IDX) := SHORT(V mod 10000);
+      V := V / 10000;
+    end loop;
+    U.L := IDX;
+    NORMALIZE(U);
   end SPREAD;
 
   procedure NORMALIZE(V: in out VECTOR) is
@@ -296,10 +309,12 @@ package body UNIVOPS is
       CARRY := H + L/10000;
     end loop;
     if CARRY > 0 then
-      if R.L < R.D'LAST then
-        R.L := R.L + 1;
-        R.D(R.L) := CARRY;
+      if R.L >= R.D'LAST then
+        raise ASSERTION_ERROR;
       end if;
+      R.L := R.L + 1;
+      R.D(R.L) := CARRY;
+      NORMALIZE(R);
     end if;
   end V_SCALE;
 
@@ -393,9 +408,15 @@ package body UNIVOPS is
     SIGN: INTEGER;
   begin
     if B.L = 1 and then B.D(1) = 1 then
+      if B.S < 0 then
+        A.S := -A.S;
+        B.S := +1;
+      end if;
       return;
     end if;
     if A.L = 1 and then A.D(1) = 0 then
+      A.S := +1;
+      B.S := +1;
       B.L := 1;
       B.D(1) := 1;
       return;
@@ -443,46 +464,15 @@ package body UNIVOPS is
   ----------------------------------------------------------------------------
 
   procedure DIGIT_MUL(A,B: in UDIGIT; H, L: out UDIGIT) is
-    A1, A2, B1, B2, LL, XX: UDIGIT;
+    PROD: constant INTEGER := INTEGER(A) * INTEGER(B);
   begin
-    A1 := A/100;
-    A2 := A mod 100;
-    B1 := B/100;
-    B2 := B mod 100;
-    XX := A1 * B2 + A2 * B1;
-    LL := A2 * B2 + (XX mod 100) * 100;
-    L := LL mod 10000;
-    H := A1 * B1 + LL/10000 + XX/100;
+    H := UDIGIT(PROD / 10000);
+    L := UDIGIT(PROD mod 10000);
   end DIGIT_MUL;
 
   function DIGIT_DIV (H, L, A: UDIGIT) return UDIGIT is
-    QUO: UDIGIT;
-    PH, PL: UDIGIT; -- trial product
   begin
-    -- must have H < A (otherwise overflow)
-
-    if H = 0 then
-	-- easy case; just integer division
-	return L / A;
-    elsif A < 100 then
-        -- force A >= 100
-        return DIGIT_DIV(H*100+L/100, (L mod 100)*100, A*100);
-    else
- 	-- always reduce to a simpler case
-	if H >= 100 then
-	    QUO := (H / ((A+99) / 100)) * 100;
-        else
-	    QUO := ((H*100) + (L/100)) / ((A+99) / 100);
-	end if;
-	-- Assert: QUO > 0
-        DIGIT_MUL(A, QUO, PH, PL);
-	-- Assert: H*10000 + L = QUO*A + PH*10000 + PL
-	if L >= PL then
-	    return QUO + DIGIT_DIV(H - PH, L - PL, A);
-	else
-	    return QUO + DIGIT_DIV(H - 1 - PH, L + 10000 - PL, A);
-	end if;
-    end if;
+    return UDIGIT((INTEGER(H) * 10000 + INTEGER(L)) / INTEGER(A));
   end DIGIT_DIV;
 
 end UNIVOPS;

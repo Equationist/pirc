@@ -6,6 +6,7 @@
 -- and emits binder_main.pir with topological elaboration order.
 
 with Ada.Command_Line;
+with Ada.Exceptions;
 with Ada.Strings.Unbounded; use Ada.Strings.Unbounded;
 with Ada.Text_IO;
 with Lib_Binder;
@@ -22,44 +23,73 @@ procedure Ada83_Bind is
    OK            : Boolean := False;
 
    I : Natural := 1;
+
+   procedure Print_Usage is
+   begin
+      Ada.Text_IO.Put_Line
+        (Ada.Text_IO.Standard_Error,
+         "Usage: ada83_bind [--lib=<dir>] [--main=<unit>] [--main-obj=<o>] " &
+         "[--target=<triple>] [--emit-pir=<pir>] [--objs-out=<txt>] [--check-only] [--skip-checks]");
+   end Print_Usage;
+
+   function Take_Opt_Arg (Opt_Name : String; Out_Val : out Unbounded_String) return Boolean is
+   begin
+      if I + 1 > Ada.Command_Line.Argument_Count then
+         Ada.Text_IO.Put_Line (Ada.Text_IO.Standard_Error, "ada83_bind: missing value for " & Opt_Name);
+         Ada.Command_Line.Set_Exit_Status (Ada.Command_Line.Failure);
+         Out_Val := Null_Unbounded_String;
+         return False;
+      end if;
+      I := I + 1;
+      Out_Val := To_Unbounded_String (Ada.Command_Line.Argument (I));
+      return True;
+   end Take_Opt_Arg;
 begin
    while I <= Ada.Command_Line.Argument_Count loop
       declare
          Arg : constant String := Ada.Command_Line.Argument (I);
       begin
-         if Arg = "--check-only" then
+         if Arg = "-h" or else Arg = "--help" then
+            Print_Usage;
+            Ada.Command_Line.Set_Exit_Status (Ada.Command_Line.Success);
+            return;
+         elsif Arg = "--check-only" then
             Check_Only := True;
          elsif Arg = "--skip-checks" then
             Skip_Checks := True;
-         elsif Arg = "--lib" and then I + 1 <= Ada.Command_Line.Argument_Count then
-            I := I + 1;
-            Lib_Dir := To_Unbounded_String (Ada.Command_Line.Argument (I));
-         elsif Arg'Length > 6 and then Arg (Arg'First .. Arg'First + 5) = "--lib=" then
+         elsif Arg = "--lib" then
+            if not Take_Opt_Arg ("--lib", Lib_Dir) then return; end if;
+         elsif Arg'Length >= 6 and then Arg (Arg'First .. Arg'First + 5) = "--lib=" then
+            if Arg'Length = 6 then
+               Ada.Text_IO.Put_Line (Ada.Text_IO.Standard_Error, "ada83_bind: empty value for --lib=");
+               Ada.Command_Line.Set_Exit_Status (Ada.Command_Line.Failure);
+               return;
+            end if;
             Lib_Dir := To_Unbounded_String (Arg (Arg'First + 6 .. Arg'Last));
-         elsif Arg = "--main" and then I + 1 <= Ada.Command_Line.Argument_Count then
-            I := I + 1;
-            Main_Unit := To_Unbounded_String (Ada.Command_Line.Argument (I));
-         elsif Arg'Length > 7 and then Arg (Arg'First .. Arg'First + 6) = "--main=" then
+         elsif Arg = "--main" then
+            if not Take_Opt_Arg ("--main", Main_Unit) then return; end if;
+         elsif Arg'Length >= 7 and then Arg (Arg'First .. Arg'First + 6) = "--main=" then
             Main_Unit := To_Unbounded_String (Arg (Arg'First + 7 .. Arg'Last));
-         elsif Arg = "--main-obj" and then I + 1 <= Ada.Command_Line.Argument_Count then
-            I := I + 1;
-            Main_Obj := To_Unbounded_String (Ada.Command_Line.Argument (I));
-         elsif Arg'Length > 11 and then Arg (Arg'First .. Arg'First + 10) = "--main-obj=" then
+         elsif Arg = "--main-obj" then
+            if not Take_Opt_Arg ("--main-obj", Main_Obj) then return; end if;
+         elsif Arg'Length >= 11 and then Arg (Arg'First .. Arg'First + 10) = "--main-obj=" then
             Main_Obj := To_Unbounded_String (Arg (Arg'First + 11 .. Arg'Last));
-         elsif Arg = "--target" and then I + 1 <= Ada.Command_Line.Argument_Count then
-            I := I + 1;
-            Target_Triple := To_Unbounded_String (Ada.Command_Line.Argument (I));
-         elsif Arg'Length > 9 and then Arg (Arg'First .. Arg'First + 8) = "--target=" then
+         elsif Arg = "--target" then
+            if not Take_Opt_Arg ("--target", Target_Triple) then return; end if;
+         elsif Arg'Length >= 9 and then Arg (Arg'First .. Arg'First + 8) = "--target=" then
+            if Arg'Length = 9 then
+               Ada.Text_IO.Put_Line (Ada.Text_IO.Standard_Error, "ada83_bind: empty value for --target=");
+               Ada.Command_Line.Set_Exit_Status (Ada.Command_Line.Failure);
+               return;
+            end if;
             Target_Triple := To_Unbounded_String (Arg (Arg'First + 9 .. Arg'Last));
-         elsif Arg = "--emit-pir" and then I + 1 <= Ada.Command_Line.Argument_Count then
-            I := I + 1;
-            Pir_Out := To_Unbounded_String (Ada.Command_Line.Argument (I));
-         elsif Arg'Length > 11 and then Arg (Arg'First .. Arg'First + 10) = "--emit-pir=" then
+         elsif Arg = "--emit-pir" then
+            if not Take_Opt_Arg ("--emit-pir", Pir_Out) then return; end if;
+         elsif Arg'Length >= 11 and then Arg (Arg'First .. Arg'First + 10) = "--emit-pir=" then
             Pir_Out := To_Unbounded_String (Arg (Arg'First + 11 .. Arg'Last));
-         elsif Arg = "--objs-out" and then I + 1 <= Ada.Command_Line.Argument_Count then
-            I := I + 1;
-            Objs_Out := To_Unbounded_String (Ada.Command_Line.Argument (I));
-         elsif Arg'Length > 11 and then Arg (Arg'First .. Arg'First + 10) = "--objs-out=" then
+         elsif Arg = "--objs-out" then
+            if not Take_Opt_Arg ("--objs-out", Objs_Out) then return; end if;
+         elsif Arg'Length >= 11 and then Arg (Arg'First .. Arg'First + 10) = "--objs-out=" then
             Objs_Out := To_Unbounded_String (Arg (Arg'First + 11 .. Arg'Last));
          else
             Ada.Text_IO.Put_Line (Ada.Text_IO.Standard_Error, "ada83_bind: unknown option: " & Arg);
@@ -84,4 +114,10 @@ begin
    if not OK then
       Ada.Command_Line.Set_Exit_Status (Ada.Command_Line.Failure);
    end if;
+exception
+   when E : others =>
+      Ada.Text_IO.Put_Line
+        (Ada.Text_IO.Standard_Error,
+         "ada83_bind: internal error: " & Ada.Exceptions.Exception_Information (E));
+      Ada.Command_Line.Set_Exit_Status (Ada.Command_Line.Failure);
 end Ada83_Bind;

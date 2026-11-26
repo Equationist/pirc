@@ -27,13 +27,35 @@ package body UARITH is
 	return EVALNUM(TXT);
     end U_VALUE;
 
-    -- return integer value for universal (must be in range)
+    -- return integer value for universal (must be in 32-bit signed range)
     function U_POS(A: TREE) return INTEGER is
+	V: VECTOR;
+	ACC: INTEGER := 0;
     begin
-	if A.TLN /= 0 then
+	if A = CONST_VOID or else KIND(A) /= DN_NUM_VAL then
 	    raise ASSERTION_ERROR;
 	end if;
-	return INTEGER(A.TPG);
+	if A.TLN = 0 then
+	    return INTEGER(A.TPG);
+	end if;
+	SPREAD(A, V);
+	if V.L > 3 then
+	    raise ASSERTION_ERROR;
+	end if;
+	if V.S < 0 and then V.L = 3 and then V.D(3) = 21 and then V.D(2) = 4748 and then V.D(1) = 3648 then
+	    return INTEGER'FIRST;
+	end if;
+	for I in reverse 1 .. V.L loop
+	    if ACC > (INTEGER'LAST - INTEGER(V.D(I))) / 10000 then
+		raise ASSERTION_ERROR;
+	    end if;
+	    ACC := ACC * 10000 + INTEGER(V.D(I));
+	end loop;
+	if V.S < 0 then
+	    return -ACC;
+	else
+	    return ACC;
+	end if;
     end U_POS;
 
     -- operators on universal values
@@ -44,7 +66,10 @@ package body UARITH is
     begin
 	if LEFT = CONST_VOID or RIGHT = CONST_VOID then
 	    return CONST_VOID;
-	elsif KIND(LEFT) = DN_NUM_VAL then
+	elsif KIND(LEFT) = DN_NUM_VAL and then KIND(RIGHT) = DN_NUM_VAL then
+	    if LEFT = RIGHT then
+		return U_VAL(1);
+	    end if;
 	    declare
 		L_SPREAD, R_SPREAD: VECTOR;
 	    begin
@@ -57,9 +82,15 @@ package body UARITH is
 		    return U_VAL(0);
 		end if;
 	    end;
-	else -- nust be real_val
-	    return U_EQUAL( D(XD_NUMER,LEFT) * D(XD_DENOM,RIGHT),
-			    D(XD_NUMER,RIGHT) * D(XD_DENOM,LEFT));
+	elsif KIND(LEFT) = DN_REAL_VAL and then KIND(RIGHT) = DN_REAL_VAL then
+	    if LEFT = RIGHT then
+		return U_VAL(1);
+	    end if;
+	    -- Rationals are canonicalized in lowest terms with positive denominator by U_REAL
+	    return U_EQUAL(D(XD_NUMER, LEFT), D(XD_NUMER, RIGHT))
+		   and U_EQUAL(D(XD_DENOM, LEFT), D(XD_DENOM, RIGHT));
+	else
+	    return CONST_VOID;
 	end if;
     end U_EQUAL;
 
@@ -72,7 +103,10 @@ package body UARITH is
     begin
 	if LEFT = CONST_VOID or RIGHT = CONST_VOID then
 	    return CONST_VOID;
-	elsif KIND(LEFT) = DN_NUM_VAL then
+	elsif KIND(LEFT) = DN_NUM_VAL and then KIND(RIGHT) = DN_NUM_VAL then
+	    if LEFT = RIGHT then
+		return U_VAL(0);
+	    end if;
 	    declare
 		L_SPREAD, R_SPREAD: VECTOR;
 	    begin
@@ -91,9 +125,99 @@ package body UARITH is
 		end if;
 		return U_VAL(0);
 	    end;
-	else -- must be real_val
-            return "<" ( D(XD_NUMER,LEFT) * D(XD_DENOM,RIGHT),
-			 D(XD_NUMER,RIGHT) * D(XD_DENOM,LEFT));
+	elsif KIND(LEFT) = DN_REAL_VAL and then KIND(RIGHT) = DN_REAL_VAL then
+	    if LEFT = RIGHT then
+		return U_VAL(0);
+	    end if;
+	    declare
+		LN, LD, RN, RD: VECTOR;
+		L_ZERO, R_ZERO: BOOLEAN;
+		LQ, RQ, LR, RR: VECTOR;
+		NEG_BOTH: BOOLEAN;
+		LESS_MAG: BOOLEAN;
+	    begin
+		SPREAD(D(XD_NUMER, LEFT), LN);
+		SPREAD(D(XD_DENOM, LEFT), LD);
+		SPREAD(D(XD_NUMER, RIGHT), RN);
+		SPREAD(D(XD_DENOM, RIGHT), RD);
+		L_ZERO := IS_ZERO(LN);
+		R_ZERO := IS_ZERO(RN);
+		if L_ZERO then
+		    if not R_ZERO and then RN.S > 0 then
+			return U_VAL(1);
+		    else
+			return U_VAL(0);
+		    end if;
+		elsif R_ZERO then
+		    if LN.S < 0 then
+			return U_VAL(1);
+		    else
+			return U_VAL(0);
+		    end if;
+		end if;
+		if LN.S < 0 and then RN.S > 0 then
+		    return U_VAL(1);
+		elsif LN.S > 0 and then RN.S < 0 then
+		    return U_VAL(0);
+		end if;
+		-- Same sign and non-zero
+		if LN.L + RD.L <= 250 and then RN.L + LD.L <= 250 then
+		    return "<" ( D(XD_NUMER,LEFT) * D(XD_DENOM,RIGHT),
+				 D(XD_NUMER,RIGHT) * D(XD_DENOM,LEFT));
+		end if;
+		-- Overflow-safe comparison via continued-fraction / quotient comparison
+		NEG_BOTH := (LN.S < 0);
+		LN.S := +1; LD.S := +1; RN.S := +1; RD.S := +1;
+		LESS_MAG := FALSE;
+		for STEP in 1 .. 64 loop
+		    V_COPY(LN, LR);
+		    V_DIV(LD, LR, LQ);
+		    V_COPY(RN, RR);
+		    V_DIV(RD, RR, RQ);
+		    if not V_EQUAL(LQ, RQ) then
+			LESS_MAG := V_LESS(LQ, RQ);
+			exit;
+		    end if;
+		    if IS_ZERO(LR) and then IS_ZERO(RR) then
+			return U_VAL(0);
+		    elsif IS_ZERO(LR) then
+			LESS_MAG := TRUE;
+			exit;
+		    elsif IS_ZERO(RR) then
+			LESS_MAG := FALSE;
+			exit;
+		    end if;
+		    -- Compare inverted fractions RD/RR vs LD/LR (flips inequality)
+		    V_COPY(LD, LN);
+		    V_COPY(LR, LD);
+		    V_COPY(RD, RN);
+		    V_COPY(RR, RD);
+		    NEG_BOTH := not NEG_BOTH;
+		    if LN.L + RD.L <= 250 and then RN.L + LD.L <= 250 then
+			declare
+			    P1, P2: VECTOR;
+			begin
+			    V_MUL(LN, RD, P1);
+			    V_MUL(RN, LD, P2);
+			    if V_EQUAL(P1, P2) then
+				return U_VAL(0);
+			    end if;
+			    LESS_MAG := V_LESS(P1, P2);
+			    exit;
+			end;
+		    end if;
+		end loop;
+		if NEG_BOTH then
+		    LESS_MAG := not LESS_MAG;
+		end if;
+		if LESS_MAG then
+		    return U_VAL(1);
+		else
+		    return U_VAL(0);
+		end if;
+	    end;
+	else
+	    return CONST_VOID;
 	end if;
     end "<";
 
@@ -114,7 +238,7 @@ package body UARITH is
 
     function U_MEMBER(VALUE, DISCRETE_RANGE: TREE) return TREE is
     begin
-	if VALUE = CONST_VOID then
+	if VALUE = CONST_VOID or else DISCRETE_RANGE = CONST_VOID then
 	    return CONST_VOID;
 	end if;
 
@@ -123,35 +247,52 @@ package body UARITH is
 	            and (VALUE <= GET_STATIC_VALUE(D(AS_EXP2,DISCRETE_RANGE)));
 
 	elsif KIND(DISCRETE_RANGE) = DN_RANGE_ATTRIBUTE then
-	    QUIT("$$$$ range attr discr subt");
 	    return CONST_VOID;
 
 	elsif KIND(DISCRETE_RANGE) = DN_DISCRETE_SUBTYPE then
 	    declare
 		SUBTYPE_INDICATION: constant TREE
 			:= D(AS_SUBTYPE_INDICATION, DISCRETE_RANGE);
-		NAME: constant TREE := D(AS_NAME, SUBTYPE_INDICATION);
-		CONSTRAINT: constant TREE
-			:= D(AS_CONSTRAINT, SUBTYPE_INDICATION);
+		NAME: TREE;
+		CONSTRAINT: TREE;
+		DEFN: TREE;
+		TS: TREE;
 	    begin
-	  	if KIND(CONSTRAINT) in CLASS_RANGE then
-		    return U_MEMBER(VALUE, CONSTRAINT);
-		elsif KIND(CONSTRAINT) in CLASS_REAL_CONSTRAINT
-		and then D(AS_RANGE,CONSTRAINT) /= CONST_VOID then
-		    return U_MEMBER(VALUE, D(AS_RANGE,CONSTRAINT));
-		elsif CONSTRAINT /= CONST_VOID then
-		    QUIT("$$$$ u_member: index/dscrmt constraint");
+		if SUBTYPE_INDICATION = CONST_VOID or else KIND(SUBTYPE_INDICATION) /= DN_SUBTYPE_INDICATION then
+		    return CONST_VOID;
+		end if;
+		NAME := D(AS_NAME, SUBTYPE_INDICATION);
+		CONSTRAINT := D(AS_CONSTRAINT, SUBTYPE_INDICATION);
+	  	if CONSTRAINT /= CONST_VOID then
+		    if KIND(CONSTRAINT) in CLASS_RANGE then
+			return U_MEMBER(VALUE, CONSTRAINT);
+		    elsif KIND(CONSTRAINT) in CLASS_REAL_CONSTRAINT
+		    and then D(AS_RANGE,CONSTRAINT) /= CONST_VOID then
+			return U_MEMBER(VALUE, D(AS_RANGE,CONSTRAINT));
+		    else
+			return CONST_VOID;
+		    end if;
 		end if;
 
-		if D(SM_DEFN,NAME) = CONST_VOID then
+		while NAME /= CONST_VOID and then KIND(NAME) = DN_SELECTED loop
+		    NAME := D(AS_DESIGNATOR, NAME);
+		end loop;
+		if NAME = CONST_VOID or else KIND(NAME) not in CLASS_USED_NAME then
+		    return CONST_VOID;
+		end if;
+		DEFN := D(SM_DEFN, NAME);
+		if DEFN = CONST_VOID or else KIND(DEFN) not in CLASS_TYPE_NAME then
 		    return CONST_VOID;
 		end if;
 
-		-- (better be a discrete subtype)
-		return U_MEMBER
-			( VALUE
-			, D(SM_RANGE,D(SM_TYPE_SPEC,D(SM_DEFN,NAME))) );
+		TS := D(SM_TYPE_SPEC, DEFN);
+		if TS = CONST_VOID or else KIND(TS) not in CLASS_SCALAR then
+		    return CONST_VOID;
+		end if;
+		return U_MEMBER(VALUE, D(SM_RANGE, TS));
 	    end;
+	else
+	    return CONST_VOID;
 	end if;
     end U_MEMBER;
 
@@ -341,6 +482,9 @@ package body UARITH is
 	    begin
 		SPREAD(LEFT, L_SPREAD);
 		SPREAD(RIGHT, R_SPREAD);
+		if IS_ZERO(L_SPREAD) or else IS_ZERO(R_SPREAD) then
+		    return U_VAL(0);
+		end if;
 		if L_SPREAD.L + R_SPREAD.L > 250 then
 		    return CONST_VOID;
 		end if;
@@ -455,6 +599,27 @@ package body UARITH is
 	-- Extract signed 32-bit exponent safely (supports exponents outside 16-bit range)
 	SPREAD(RIGHT, R_SPREAD);
 	EXP_NEG := (R_SPREAD.S < 0);
+	if KIND(LEFT) = DN_NUM_VAL then
+	    declare
+		L_SPREAD: VECTOR;
+	    begin
+		if EXP_NEG then
+		    return CONST_VOID; -- constraint error for negative integer exponent
+		end if;
+		SPREAD(LEFT, L_SPREAD);
+		if IS_ZERO(R_SPREAD) then
+		    return U_VAL(1);
+		elsif IS_ZERO(L_SPREAD) then
+		    return U_VAL(0);
+		elsif L_SPREAD.L = 1 and then L_SPREAD.D(1) = 1 then
+		    if L_SPREAD.S < 0 and then (INTEGER(R_SPREAD.D(1)) mod 2 = 1) then
+			return U_VAL(-1);
+		    else
+			return U_VAL(1);
+		    end if;
+		end if;
+	    end;
+	end if;
 	if R_SPREAD.L > 3 then
 	    return CONST_VOID;
 	end if;

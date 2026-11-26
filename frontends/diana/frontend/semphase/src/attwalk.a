@@ -940,6 +940,7 @@ package body ATTWALK is
                                 = DN_RECORD
                             or else KIND(GET_BASE_STRUCT(PREFIX_TYPE))
                                 in CLASS_PRIVATE_SPEC )
+                    and then D(SM_DISCRIMINANT_S, GET_BASE_STRUCT(PREFIX_TYPE)) /= CONST_VOID
                     and then not IS_EMPTY(LIST(D(SM_DISCRIMINANT_S
                                 , GET_BASE_STRUCT(PREFIX_TYPE) ))) )
             or else ( KIND(PREFIX_ID) in CLASS_TYPE_NAME
@@ -1279,13 +1280,15 @@ package body ATTWALK is
                 PREFIX_ERROR := TRUE;
             end if;
         when VAL | VALUE =>
-            if IS_DISCRETE_TYPE(GET_BASE_TYPE(PREFIX_ID)) then
+            if KIND(PREFIX_ID) in CLASS_TYPE_NAME
+            and then IS_DISCRETE_TYPE(GET_BASE_TYPE(PREFIX_ID)) then
                 ATTRIBUTE_SUBTYPE := D(SM_TYPE_SPEC, PREFIX_ID);
             else
                 PREFIX_ERROR := TRUE;
             end if;
         when WIDTH =>
-            if IS_DISCRETE_TYPE(GET_BASE_TYPE(PREFIX_ID)) then
+            if KIND(PREFIX_ID) in CLASS_TYPE_NAME
+            and then IS_DISCRETE_TYPE(GET_BASE_TYPE(PREFIX_ID)) then
                 PREFIX_SUBSTRUCT := GET_SUBSTRUCT(PREFIX_TYPE);
                 if IS_STATIC_SUBTYPE(PREFIX_SUBSTRUCT) then
                     ATTRIBUTE_VALUE := U_VAL(GET_WIDTH(PREFIX_SUBSTRUCT));
@@ -1402,7 +1405,12 @@ package body ATTWALK is
                         ERROR(D(LX_SRCPOS,PARAMETER)
                                     , "Parameter must be static");
                     else
-                        WHICH_SUBSCRIPT := U_POS(GET_STATIC_VALUE(PARAMETER));
+                        begin
+                            WHICH_SUBSCRIPT := U_POS(GET_STATIC_VALUE(PARAMETER));
+                        exception
+                            when ASSERTION_ERROR =>
+                                WHICH_SUBSCRIPT := 0;
+                        end;
                     end if;
                 end if;
             when others =>
@@ -1482,6 +1490,11 @@ package body ATTWALK is
                     PREFIX_SUBSTRUCT := GET_BASE_STRUCT(PREFIX_SUBSTRUCT);
                     if KIND(PREFIX_SUBSTRUCT) = DN_ARRAY then
                         INDEX_LIST := LIST(D(SM_INDEX_S, PREFIX_SUBSTRUCT));
+                        if WHICH_SUBSCRIPT <= 0 then
+                            ERROR(D(LX_SRCPOS, PARAMETER),
+                                    "Parameter not within array dimension");
+                            ATTRIBUTE_SUBTYPE := CONST_VOID;
+                        else
                         loop
                             if IS_EMPTY(INDEX_LIST) then
                                 ERROR(D(LX_SRCPOS,PARAMETER),
@@ -1500,6 +1513,7 @@ package body ATTWALK is
                                 end if;
                             end if;
                         end loop;
+                        end if;
                     elsif PREFIX_SUBSTRUCT /= CONST_VOID then
                         ERROR(D(LX_SRCPOS,ATTRIBUTE_NODE),
                                 "Array type required");

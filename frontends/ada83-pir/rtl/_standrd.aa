@@ -13,9 +13,9 @@ package _standrd is
     type LONG_INTEGER is range - 16#8000_0000_0000_0000# .. 16#7FFF_FFFF_FFFF_FFFF#;
 
     type FLOAT is digits 6 range
-	- 16#1.FFFF_FE# * 2**126 .. 16#1.FFFF_FE# * 2**126;
+	- 16#1.FFFF_FE# * 2**127 .. 16#1.FFFF_FE# * 2**127;
     type LONG_FLOAT is digits 15 range
-	- 16#1.FFFF_FFFF_FFFF_F# * 2**1022 .. 16#1.FFFF_FFFF_FFFF_F# * 2**1022;
+	- 16#1.FFFF_FFFF_FFFF_F# * 2**1023 .. 16#1.FFFF_FFFF_FFFF_F# * 2**1023;
 
     type CHARACTER is
 

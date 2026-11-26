@@ -315,6 +315,12 @@ procedure LIBPHASE is
 	  -- subprogram body overrides instantiation or [generic] package
 	  -- ... or a previously compiled subprogram body
 	  UNIT := CONST_VOID;
+	elsif UNIT_KIND = DN_PACKAGE_BODY
+	and then KIND(D(AS_ALL_DECL,UNIT)) /= DN_PACKAGE_DECL
+	and then not (KIND(D(AS_ALL_DECL,UNIT)) = DN_GENERIC_DECL
+		and then KIND(D(AS_HEADER,D(AS_ALL_DECL,UNIT))) = DN_PACKAGE_SPEC)
+	then
+	  UNIT := CONST_VOID;
 	end if;
       end if;
       if UNIT /= CONST_VOID then
@@ -523,9 +529,7 @@ procedure LIBPHASE is
 	USE_ID_LIST := LIST(D(AS_NAME_S, USE_CLAUSE));
 	while not IS_EMPTY(USE_ID_LIST) loop
 	  POP(USE_ID_LIST, USE_ID);
-	  if KIND(USE_ID) = DN_USED_OBJECT_ID then
-	    CHECK_ONE_USE_ID(CONTEXT_LIST_IN, CONTEXT_ITEM, USE_ID);
-	  end if;
+	  CHECK_ONE_USE_ID(CONTEXT_LIST_IN, CONTEXT_ITEM, USE_ID);
 	end loop;
       end if;
     end loop;
@@ -546,6 +550,7 @@ procedure LIBPHASE is
 
     if KIND(USE_ID) /= DN_USED_OBJECT_ID then
       ERROR(D(LX_SRCPOS, USE_ID), "Only simple names allowed in context use");
+      return;
     end if;
 
     SYMREP := D(LX_SYMREP, USE_ID);

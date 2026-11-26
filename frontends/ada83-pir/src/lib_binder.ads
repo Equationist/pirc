@@ -31,7 +31,7 @@ package Lib_Binder is
    --   * Performs LRM 10.5 circular elaboration dependency detection
    --   * Selects live (non-superseded, non-obsoleted) .o files -> Objs_Out_Path
    --   * Emits binder_main.pir with topological elaboration order -> Pir_Out_Path
-   -- Returns True on success; on failure writes a diagnostic to Err_Msg (and stderr).
+   -- Sets Success := True on success; on failure writes a diagnostic to stderr.
    procedure Bind_Library
      (Lib_Dir       : String;
       Main_Unit     : String;

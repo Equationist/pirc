@@ -264,9 +264,17 @@ package body REDSUBP is
             PUT(NODE_REP(EXP)); PUT(" "); PUT_LINE(NODE_REP(TYPE_SPEC));
 	end if;
 
-	-- if slice, resolve and return slice
+	-- if slice, resolve and return slice (guard against Type_Mark(1..5)!)
 	if not IS_EMPTY(LIST(GENERAL_ASSOC_S))
 	and then KIND(HEAD(LIST(GENERAL_ASSOC_S))) in CLASS_DISCRETE_RANGE then
+	    if KIND(NAME) = DN_SELECTED or else KIND(NAME) in CLASS_DESIGNATOR then
+		DEFSET := FETCH_DEFSET(NAME);
+		if not IS_EMPTY(DEFSET) and then IS_TYPE_DEF(GET_DEF(HEAD(DEFSET))) then
+		    ERROR(D(LX_SRCPOS, EXP), "Slice prefix cannot be a type mark");
+		    D(SM_EXP_TYPE, EXP, CONST_VOID);
+		    return EXP;
+		end if;
+	    end if;
 	    return RESOLVE_SLICE(NAME, HEAD(LIST(GENERAL_ASSOC_S)), TYPE_SPEC);
 	end if;
 
@@ -1595,7 +1603,7 @@ package body REDSUBP is
 			    exit;
 			when DN_PARENTHESIZED | DN_FUNCTION_CALL | DN_NULLARY_CALL | DN_QUALIFIED
 			   | DN_ATTRIBUTE | DN_AGGREGATE | DN_NUMERIC_LITERAL | DN_STRING_LITERAL | DN_NULL_ACCESS
-			   | DN_USED_CHAR | DN_AND_THEN | DN_OR_ELSE | DN_RANGE_MEMBERSHIP | DN_TYPE_MEMBERSHIP
+			   | DN_USED_CHAR | DN_SHORT_CIRCUIT | DN_RANGE_MEMBERSHIP | DN_TYPE_MEMBERSHIP
 			   | DN_QUALIFIED_ALLOCATOR | DN_SUBTYPE_ALLOCATOR =>
 			    BAD_VAR := TRUE;
 			    exit;
@@ -1988,7 +1996,7 @@ package body REDSUBP is
 			end loop;
 		    end;
 		end if;
-	    when DN_AND_THEN | DN_OR_ELSE =>
+	    when DN_SHORT_CIRCUIT =>
 		WALK_E(D(AS_EXP1, E), DEPTH + 1);
 		WALK_E(D(AS_EXP2, E), DEPTH + 1);
 	    when CLASS_MEMBERSHIP =>

@@ -22,7 +22,7 @@ package body DIANA is
   function  KIND     (T: in TREE)	    return NODE_NAME is
   begin
     if T.TPG >= 0
-    or else T.TTY = NODE_NAME'POS(DN_NUM_VAL) then
+    or else (T.TTY = NODE_NAME'POS(DN_NUM_VAL) and then T.TLN = 0) then
       return NODE_NAME'VAL(T.TTY);
     else
       QUIT("KIND: T.TPG < 0");

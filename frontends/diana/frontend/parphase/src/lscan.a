@@ -454,6 +454,7 @@ package body LSCAN is
   <<SCAN_DEC_E>>
     if W_COL >= LINE_LENGTH then
       TTYPE := ERROR;
+      W_COL := W_COL + 1;
       goto ACCEPT_TOKEN;
     end if;
     CHR := SL.BDY (W_COL + 1);
@@ -472,6 +473,7 @@ package body LSCAN is
       -- goto SCAN_EXPONENT;
     else
       TTYPE := ERROR;
+      W_COL := W_COL + 1;
       goto ACCEPT_TOKEN;
     end if;
 
@@ -611,8 +613,8 @@ package body LSCAN is
     case CHR is
     when ' ' | 'A' .. 'Z' | 'a' .. 'z' | '0' .. '9'
          | '&' | ''' | '(' | ')' | '*' | '+' | ','
-         | '-' | '.' | '/' | ':' | '<' | '='
-         | '>' | '|' | '!' | '%' | HT =>
+         | '-' | '.' | '/' | ':' | ';' | '<' | '='
+         | '>' | '|' | '!' | '%' | '"' | HT | ASCII.CR | ASCII.LF =>
       goto ACCEPT_TOKEN;
     when others =>
       if CHR not in ' ' .. CHARACTER'VAL(127) then

@@ -123,6 +123,8 @@ procedure PARPHASE is
 
     OPEN (IFILE, IN_FILE, TO_STRING(INFILE_NAME));
     LINE_COUNT := 0;
+    SLINE.LEN := 0;
+    LAST := 0;
   end OPEN_IFILE;
 
   procedure READ_PARSE_TABLES is
@@ -157,7 +159,7 @@ procedure PARPHASE is
 	STATE:		POSITIVE;
 	SRCPOS: 	TREE;
       end record;
-    STACK: array(1 .. STACK_MAX) of STACK_TYPE;
+    STACK: array(INTEGER range 1 .. STACK_MAX + 1) of STACK_TYPE;
 
     STATE:		POSITIVE;
     AP: 		INTEGER;
@@ -257,6 +259,10 @@ procedure PARPHASE is
 	  end if;
 	  exit;
 	end if;
+	if SP >= STACK_MAX then
+	  ERROR(SOURCEPOS, "Parser stack overflow");
+	  exit;
+	end if;
 	SP := SP + 1;
 	STATE := ACTION;
 	STACK(SP).STATE := ACTION;
@@ -265,8 +271,25 @@ procedure PARPHASE is
 	GET_TOKEN;
       elsif ACTION = 0 then
 	-- syntax error encountered
-	PUT_LINE(SLINE.BDY(1 .. SLINE.LEN));
-	ERROR(SOURCEPOS,"Syntax error - " & TTEXT);
+	if SLINE.LEN > 0 then
+	  PUT_LINE(SLINE.BDY(1 .. SLINE.LEN));
+	end if;
+	if SOURCEPOS = CONST_VOID then
+	  SOURCELINE := MAKE(DN_SOURCELINE);
+	  DI(XD_NUMBER, SOURCELINE, 1);
+	  LIST(SOURCELINE, MAKE);
+	  SOURCE_LIST := APPEND(SOURCE_LIST, SOURCELINE);
+	  SOURCEPOS := MAKE_SOURCE_POSITION(SOURCELINE, 1);
+	end if;
+	declare
+	  TSTR: constant STRING := TO_STRING(TTEXT);
+	begin
+	  if TSTR'LENGTH > 200 then
+	    ERROR(SOURCEPOS, "Syntax error - " & TSTR(TSTR'FIRST .. TSTR'FIRST + 199));
+	  else
+	    ERROR(SOURCEPOS, "Syntax error - " & TSTR);
+	  end if;
+	end;
 	exit;
       else
 	-- semantic and reduce actions
@@ -317,6 +340,10 @@ procedure PARPHASE is
 		when INTEGER(ASYM) = ACTION;
 	    end loop;
 	    STATE := integer(AC_TBL(AP));
+	    if SP >= STACK_MAX then
+	      ERROR(SOURCEPOS, "Parser stack overflow");
+	      exit;
+	    end if;
 	    SP := SP + 1;
 	    STACK(SP).STATE := STATE;
 	    if NBR_OF_SYLS = 0 then
@@ -367,6 +394,9 @@ procedure PARPHASE is
       -- get first atom on line
       LEX_SCAN(SLINE, COL, F_COL, TTYPE, TTEXT);
       if LAST > 200 or else (LAST = MAX_STRING and then not END_OF_LINE(IFILE)) then
+	if LAST = MAX_STRING and then not END_OF_LINE(IFILE) then
+	  SKIP_LINE(IFILE);
+	end if;
 	SOURCELINE := MAKE(DN_SOURCELINE);
 	DI(XD_NUMBER, SOURCELINE, LINE_COUNT);
 	LIST(SOURCELINE, MAKE);

@@ -8,19 +8,27 @@ package body CHKSTAT is
 
     function IS_STATIC_RANGE(A: TREE) return BOOLEAN is
     begin
-	return KIND(A) = DN_RANGE
+	return A /= CONST_VOID
+		and then KIND(A) = DN_RANGE
 		and then GET_STATIC_VALUE(D(AS_EXP1, A)) /= CONST_VOID
 		and then GET_STATIC_VALUE(D(AS_EXP2, A)) /= CONST_VOID;
     end IS_STATIC_RANGE;
 
 
     function IS_STATIC_SUBTYPE(A: TREE) return BOOLEAN is
+	R: TREE;
+	PARENT_TS: TREE;
     begin
+	if A = CONST_VOID then
+	    return FALSE;
+	end if;
 	if KIND(A) in CLASS_PRIVATE_SPEC then
 	    return KIND(GET_BASE_STRUCT(A)) in CLASS_SCALAR
+		    and then D(SM_TYPE_SPEC, A) /= CONST_VOID
 		    and then IS_STATIC_SUBTYPE(D(SM_TYPE_SPEC,A));
 	elsif KIND(A) = DN_INCOMPLETE then
 	    return KIND(GET_BASE_STRUCT(A)) in CLASS_SCALAR
+		    and then D(XD_FULL_TYPE_SPEC, A) /= CONST_VOID
 		    and then IS_STATIC_SUBTYPE(D(XD_FULL_TYPE_SPEC,A));
 	end if;
 
@@ -38,15 +46,29 @@ package body CHKSTAT is
 	    end if;
 	    return TRUE;
 	else
-	    -- this a subtype, not a base type
-	    return IS_STATIC_RANGE(D(SM_RANGE, A))
-		    and then IS_STATIC_SUBTYPE(D(SM_TYPE_SPEC,D(SM_RANGE,A)));
+	    -- this is a subtype, not a base type
+	    if KIND(A) in DN_FLOAT .. DN_FIXED
+	    and then D(SM_ACCURACY, A) = CONST_VOID then
+		return FALSE;
+	    end if;
+	    R := D(SM_RANGE, A);
+	    if not IS_STATIC_RANGE(R) then
+		return FALSE;
+	    end if;
+	    PARENT_TS := D(SM_TYPE_SPEC, R);
+	    if PARENT_TS = A or else PARENT_TS = CONST_VOID then
+		return IS_STATIC_SUBTYPE(D(SM_BASE_TYPE, A));
+	    end if;
+	    return IS_STATIC_SUBTYPE(PARENT_TS);
 	end if;
     end IS_STATIC_SUBTYPE;
 
 
     function IS_STATIC_DISCRETE_RANGE(A: TREE) return BOOLEAN is
     begin
+	if A = CONST_VOID then
+	    return FALSE;
+	end if;
 	case KIND(A) is
 	when DN_DISCRETE_SUBTYPE =>
 	    return IS_STATIC_DISCRETE_RANGE(D(AS_SUBTYPE_INDICATION,A));
@@ -91,8 +113,7 @@ package body CHKSTAT is
 	    ARRAY_TYPE_SPEC := D(XD_FULL_TYPE_SPEC,ARRAY_TYPE_SPEC);
 	end if;
 
-	if KIND(ARRAY_TYPE_SPEC) = DN_CONSTRAINED_ARRAY then
-	    -- $$$$ should not happen [RM 3.6.1/3]
+	if ARRAY_TYPE_SPEC = CONST_VOID or else KIND(ARRAY_TYPE_SPEC) /= DN_ARRAY then
 	    return FALSE;
 	end if;
 

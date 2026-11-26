@@ -219,6 +219,41 @@ run_c_iface_case() {
     echo "  PASS $name"
 }
 
+run_p4_driver_case() {
+    # P4-2: Test driver CLI hardening & atomic -L rollback on failed compilation
+    if "$ADA_CC" --help >/dev/null 2>&1; then
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL [p4_driver_help] --help did not exit 0"
+        FAIL=$((FAIL + 1))
+    fi
+    if "$ADA_CC" -o >/dev/null 2>&1; then
+        echo "FAIL [p4_driver_missing_arg] -o with missing arg did not fail"
+        FAIL=$((FAIL + 1))
+    else
+        PASS=$((PASS + 1))
+    fi
+    local rdir="$TMP/p4_rollback_lib"
+    mkdir -p "$rdir"
+    if "$ADA_CC" --pirc="$PIRC" --target="aarch64-apple-darwin" -O0 -L "$rdir" -c "$TDIR/multi/multi_sep_pkg.ads" 2>/dev/null &&
+       "$ADA_CC" --pirc="$PIRC" --target="aarch64-apple-darwin" -O0 -L "$rdir" -c "$TDIR/multi/multi_sep_pkg.adb" 2>/dev/null &&
+       "$ADA_CC" --pirc="$PIRC" --target="aarch64-apple-darwin" -O0 -L "$rdir" -c "$TDIR/multi/multi_sep_subunits.adb" 2>/dev/null &&
+       "$ADA_CC" --pirc="$PIRC" --target="aarch64-apple-darwin" -O0 -L "$rdir" -c "$TDIR/multi/multi_sep_main.adb" 2>/dev/null; then
+        "$ADA_CC" --pirc="$PIRC" --target="aarch64-apple-darwin" -O0 -L "$rdir" -c "$TDIR/neg/n53_multi_error_sigpipe.ada" >/dev/null 2>&1 || true
+        if "$ADA_CC" --pirc="$PIRC" --target="aarch64-apple-darwin" -O0 -L "$rdir" --bind multi_sep_main -o "$TMP/rb_bin" 2>/dev/null &&
+           "$TMP/rb_bin" | grep -qx "MULTI_SEP_OK"; then
+            PASS=$((PASS + 1))
+        else
+            echo "FAIL [p4_lib_rollback] failed compile corrupted persistent -L library!"
+            FAIL=$((FAIL + 1))
+        fi
+    else
+        echo "FAIL [p4_lib_rollback] setup failed"
+        FAIL=$((FAIL + 1))
+    fi
+    echo "  PASS p4_driver"
+}
+
 echo "=== Ada 83 -> DIANA -> PIR Conformance Suite (PIRC=$PIRC, WITH_GNAT=$WITH_GNAT) ==="
 run_case "01_exc"     "$TDIR/01_checked_arith_and_exceptions.ada"
 run_case "02_nested"  "$TDIR/02_nested_subprograms_static_link.ada"
@@ -241,8 +276,12 @@ run_case "18_p3s4"    "$TDIR/18_pass3_stage4_tasks_select_shared.ada"
 run_case "19_p3s5"    "$TDIR/19_pass3_stage5_generics_exc.ada"
 run_case "20_p3s6"    "$TDIR/20_pass3_stage6_rep_interface_io.ada"
 run_case "21_p3s7"    "$TDIR/21_pass3_stage7_frontend_valid.ada"
+run_case "23_p4_rt"   "$TDIR/23_pass4_rt_task_io_core.ada"
+run_case "24_p4_expr" "$TDIR/24_pass4_expr_checks_rep.ada"
+run_case "25_p4_stmt" "$TDIR/25_pass4_stmt_task.ada"
 run_multi_sep_case
 run_c_iface_case
+run_p4_driver_case
 
 NEG_OK=0
 NEG_FAIL_BEFORE=$FAIL

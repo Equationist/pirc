@@ -109,13 +109,6 @@ package body GENSUBS is
 	H: H_TYPE renames H_IN;
     begin
 
-	-- $$$$ for testing -- avoid runaway substitution
-	if node_hash.limit > 0 then
-	    node_hash.limit := node_hash.limit - 1;
-	else
-	    quit("Runaway loop in generic substitution");
-	end if;
-
 	-- check for node with no attributes
 	if NODE.TPG <= 0 or else NODE.TLN = 0 then
 	    return;
@@ -130,6 +123,13 @@ package body GENSUBS is
 
 	    -- return result from hash table
 	    return;
+	end if;
+
+	-- avoid runaway substitution on newly visited nodes
+	if node_hash.limit > 0 then
+	    node_hash.limit := node_hash.limit - 1;
+	else
+	    quit("Runaway loop in generic substitution");
 	end if;
 
 

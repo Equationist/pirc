@@ -5,8 +5,9 @@ function EVALNUM(TXT: STRING) return TREE is
 
   MAXCOL: constant INTEGER := TXT'LAST;
   COL: INTEGER := TXT'FIRST;
-  CHR : CHARACTER := TXT(TXT'FIRST);
-  SCALEFACTOR : INTEGER := INTEGER'LAST;
+  CHR : CHARACTER := ' ';
+  IS_REAL : BOOLEAN := FALSE;
+  SCALEFACTOR : INTEGER := 0;
   VNUMER: VECTOR;
   VDENOM: VECTOR;
   RADIX:  INTEGER := 10;
@@ -20,35 +21,65 @@ function EVALNUM(TXT: STRING) return TREE is
 
   function MAIN return TREE is
   begin
+    if TXT'LENGTH = 0 then
+      return CONST_VOID;
+    end if;
+    CHR := TXT(TXT'FIRST);
     V_CLEAR(VNUMER);
+    V_CLEAR(VDENOM);
+    VDENOM.D(1) := 1;
     -- get integer val or radix
-    while CHR in '0' .. '9' or else CHR = '.' or else CHR = '_' loop
+    while (CHR in '0' .. '9' or else CHR = '.' or else CHR = '_') and then COL <= MAXCOL loop
       if CHR = '.' then
+	IS_REAL := TRUE;
 	SCALEFACTOR := 0;
       elsif CHR /= '_' then
         V_INCREMENT (CHARACTER'POS(CHR) - CHARACTER'POS('0'), VNUMER);
-	SCALEFACTOR := SCALEFACTOR - 1;
+	if IS_REAL then
+	  SCALEFACTOR := SCALEFACTOR - 1;
+	end if;
       end if;
       NEXT_CHR;
     end loop;
     if CHR = '#' or else CHR = ':' then
+      if VNUMER.L > 1 then
+        return CONST_VOID;
+      end if;
       RADIX := INTEGER(VNUMER.D(1));
-      VNUMER.D(1) := 0;
+      if RADIX < 2 or else RADIX > 16 then
+        return CONST_VOID;
+      end if;
+      V_CLEAR(VNUMER);
       NEXT_CHR;
-      while CHR /= '#' and then CHR /= ':' loop
+      while CHR /= '#' and then CHR /= ':' and then COL <= MAXCOL loop
         if CHR = '.' then
+	  IS_REAL := TRUE;
 	  SCALEFACTOR := 0;
         elsif CHR = '_' then
 	  null;
-        elsif CHR <= '9' then
+        elsif CHR in '0' .. '9' then
           V_INCREMENT (CHARACTER'POS(CHR) - CHARACTER'POS('0'), VNUMER);
-	  SCALEFACTOR := SCALEFACTOR - 1;
-	else
+	  if IS_REAL then
+	    SCALEFACTOR := SCALEFACTOR - 1;
+	  end if;
+        elsif CHR in 'A' .. 'F' then
           V_INCREMENT (CHARACTER'POS(CHR) - CHARACTER'POS('A') + 10, VNUMER);
-	  SCALEFACTOR := SCALEFACTOR - 1;
+	  if IS_REAL then
+	    SCALEFACTOR := SCALEFACTOR - 1;
+	  end if;
+        elsif CHR in 'a' .. 'f' then
+          V_INCREMENT (CHARACTER'POS(CHR) - CHARACTER'POS('a') + 10, VNUMER);
+	  if IS_REAL then
+	    SCALEFACTOR := SCALEFACTOR - 1;
+	  end if;
+	else
+	  return CONST_VOID;
 	end if;
 	NEXT_CHR;
       end loop;
+      if CHR /= '#' and then CHR /= ':' then
+        return CONST_VOID;
+      end if;
       NEXT_CHR;
 
     end if;
@@ -60,13 +91,17 @@ function EVALNUM(TXT: STRING) return TREE is
 	NEXT_CHR;
 	EXPONENT_POSITIVE := FALSE;
       end if;
-      while CHR /= ' ' loop
-        if CHR /= '_' then
+      while CHR /= ' ' and then COL <= MAXCOL loop
+        if CHR = '_' then
+          null;
+        elsif CHR in '0' .. '9' then
 	  if EXPONENT > 3275 then
 	    EXPONENT := 1_000_000;
 	  else
             EXPONENT := EXPONENT * 10 + CHARACTER'POS(CHR) - CHARACTER'POS('0');
 	  end if;
+        else
+          return CONST_VOID;
         end if;
 	NEXT_CHR;
       end loop;
@@ -74,10 +109,11 @@ function EVALNUM(TXT: STRING) return TREE is
 	EXPONENT := - EXPONENT;
       end if;
     end if;
-    if SCALEFACTOR < 0 then
+    if IS_REAL then
       EXPONENT := EXPONENT + SCALEFACTOR;
-      V_CLEAR(VDENOM);
-      VDENOM.D(1) := 1;
+    elsif EXPONENT < 0 then
+      -- Integer literal with negative exponent is illegal
+      return CONST_VOID;
     end if;
 
     if not (VNUMER.L = 1 and then VNUMER.D(1) = 0) then
@@ -99,7 +135,7 @@ function EVALNUM(TXT: STRING) return TREE is
       end if;
     end if;
 
-    if SCALEFACTOR >= 0 then
+    if not IS_REAL then
       if VNUMER.L < VNUMER.D'LAST then
         VNUMER.D(VNUMER.L+1) := 0;
       end if;
@@ -114,6 +150,9 @@ function EVALNUM(TXT: STRING) return TREE is
       end if;
       return U_REAL(VNUMER, VDENOM);
     end if;
+  exception
+    when ASSERTION_ERROR =>
+      return CONST_VOID;
   end;
 
   procedure V_CLEAR(ARG: out VECTOR) is
@@ -148,6 +187,9 @@ function EVALNUM(TXT: STRING) return TREE is
       V.D(I) := TEMP;
     end loop;
     if CARRY > 0 then
+      if V.L >= V.D'LAST then
+        raise ASSERTION_ERROR;
+      end if;
       V.L := V.L + 1;
       V.D(V.L) := CARRY;
       NORMALIZE(V); -- to check for overflow
