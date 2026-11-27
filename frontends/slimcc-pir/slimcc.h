@@ -1078,6 +1078,7 @@ extern bool opt_E;
 extern bool opt_dM;
 extern bool opt_P;
 extern bool opt_reuse_stack;
+extern int uneval_depth;
 extern bool opt_g;
 extern bool opt_werror;
 extern StdVer opt_std;

@@ -173,7 +173,7 @@ static FuncContext *fnctx;
 static bool *eval_recover;
 static bool eval_strict;
 static int parse_depth = 0;
-static int uneval_depth = 0;
+int uneval_depth = 0;
 static bool is_lvalue_expr(Node *n);
 static void strip_proto_vla_exprs(Type *ty);
 
@@ -4069,6 +4069,8 @@ static bool is_ice_expr_syntax(Node *n) {
       return false;
     return is_ice_expr_syntax(n->m.lhs);
   case ND_CAST:
+    if (!n->ty || !is_integer(n->ty))
+      return false;
     if (n->m.lhs && n->m.lhs->ty && is_ptr(n->m.lhs->ty))
       return false;
     if (n->m.lhs && n->m.lhs->ty && is_flonum(n->m.lhs->ty))
@@ -4120,6 +4122,16 @@ static int64_t eval2(Node *node, EvalContext *ctx) {
   int64_t r = eval2_inner(node, ctx);
   eval2_depth--;
   return r;
+}
+
+static int64_t eval_sub_no_label(Node *n, EvalContext *ctx) {
+  if (ctx->kind != EV_LABEL)
+    return eval(n);
+  EvalContext sub = {.kind = EV_LABEL};
+  int64_t v = eval2(n, &sub);
+  if (sub.var)
+    return eval_error(n);
+  return v;
 }
 
 static int64_t eval2_inner(Node *node, EvalContext *ctx) {
@@ -4185,8 +4197,8 @@ static int64_t eval2_inner(Node *node, EvalContext *ctx) {
     return eval_sign_extend(ty, (uint64_t)lval - (uint64_t)rval);
   }
   case ND_MUL: {
-    int64_t lval = eval(lhs);
-    int64_t rval = eval(rhs);
+    int64_t lval = eval_sub_no_label(lhs, ctx);
+    int64_t rval = eval_sub_no_label(rhs, ctx);
     if (strict_iso && is_integer(ty) && !ty->is_unsigned) {
       if (ty->size == 4) {
         int32_t res;
@@ -4201,11 +4213,8 @@ static int64_t eval2_inner(Node *node, EvalContext *ctx) {
     return eval_sign_extend(ty, (uint64_t)lval * (uint64_t)rval);
   }
   case ND_DIV: {
-    EvalContext lctx = {.kind = ctx->kind};
-    int64_t lval = (ctx->kind == EV_LABEL) ? eval2(lhs, &lctx) : eval(lhs);
-    if (lctx.var)
-      return eval_error(lhs);
-    int64_t rval = eval(rhs);
+    int64_t lval = eval_sub_no_label(lhs, ctx);
+    int64_t rval = eval_sub_no_label(rhs, ctx);
     if (!rval)
       return eval_error2(rhs, "division by zero during constant evaluation");
     if (ty->is_unsigned)
@@ -4219,8 +4228,8 @@ static int64_t eval2_inner(Node *node, EvalContext *ctx) {
     return lval / rval;
   }
   case ND_REM: {
-    int64_t lval = eval(lhs);
-    int64_t rval = eval(rhs);
+    int64_t lval = eval_sub_no_label(lhs, ctx);
+    int64_t rval = eval_sub_no_label(rhs, ctx);
     if (!rval)
       return eval_error2(rhs, "remainder by zero during constant evaluation");
     if (ty->is_unsigned)
@@ -4233,21 +4242,21 @@ static int64_t eval2_inner(Node *node, EvalContext *ctx) {
     }
     return lval % rval;
   }
-  case ND_POS:    return eval(lhs);
+  case ND_POS:    return eval_sub_no_label(lhs, ctx);
   case ND_NEG: {
-    int64_t lval = eval(lhs);
+    int64_t lval = eval_sub_no_label(lhs, ctx);
     if (strict_iso && is_integer(ty) && !ty->is_unsigned &&
         ((ty->size == 4 && lval == INT32_MIN) || (ty->size == 8 && lval == INT64_MIN)))
       return eval_error2(node, "integer overflow in constant expression");
     return eval_sign_extend(ty, -(uint64_t)lval);
   }
-  case ND_BITAND: return eval(lhs) & eval(rhs);
-  case ND_BITOR:  return eval(lhs) | eval(rhs);
-  case ND_BITXOR: return eval(lhs) ^ eval(rhs);
+  case ND_BITAND: return eval_sub_no_label(lhs, ctx) & eval_sub_no_label(rhs, ctx);
+  case ND_BITOR:  return eval_sub_no_label(lhs, ctx) | eval_sub_no_label(rhs, ctx);
+  case ND_BITXOR: return eval_sub_no_label(lhs, ctx) ^ eval_sub_no_label(rhs, ctx);
   case ND_SHL:
   case ND_SHR:
   case ND_SAR: {
-    int64_t lval = eval(lhs);
+    int64_t lval = eval_sub_no_label(lhs, ctx);
     int64_t rval = 0;
     bool r_oob = false;
     if (rhs->kind == ND_CAST && rhs->m.lhs->ty->kind == TY_BITINT &&
@@ -4267,7 +4276,7 @@ static int64_t eval2_inner(Node *node, EvalContext *ctx) {
       rval = (int64_t)rb->as64;
       free(rb);
     } else {
-      rval = eval(rhs);
+      rval = eval_sub_no_label(rhs, ctx);
       if (rval < 0 || rval >= ty->size * 8)
         r_oob = true;
     }
@@ -5316,9 +5325,11 @@ static Node *assign_inner(Token **rest, Token *tok) {
 }
 
 static Node *vla_cond_result_len2(Type *ty) {
-  if (!ty->vla_len_expr || !ty->vla_len_val)
+  if (!ty->vla_len_expr)
     return NULL;
-  return new_var_node(ty->vla_len_val, ty->vla_len_expr->tok);
+  if (ty->vla_len_val)
+    return new_var_node(ty->vla_len_val, ty->vla_len_expr->tok);
+  return ty->vla_len_expr;
 }
 
 Type *vla_cond_result_len(Type *ty1, Type *ty2, Type *base, Node **cond, Obj **cond_var) {
@@ -5328,6 +5339,8 @@ Type *vla_cond_result_len(Type *ty1, Type *ty2, Type *base, Node **cond, Obj **c
   Node *len1 = vla_cond_result_len2(ty1);
   Node *len2 = vla_cond_result_len2(ty2);
 
+  if (!len1 && !len2)
+    return array_of(base, -1);
   if (!len1 + !len2 == 1)
     return vla_of(base, len1 ? len1 : len2, 0);
 
@@ -6397,13 +6410,14 @@ static Node *generic_selection(Token **rest, Token *tok) {
   } else {
     uneval_depth++;
     Node *ctrl = assign(&tok, tok);
-    uneval_depth--;
     add_type(ctrl);
+    uneval_depth--;
     chk_not_register_array(ctrl);
     t1 = unqual(ptr_decay(ctrl->ty));
   }
   Node *ret = NULL;
-  Token *def_tok = NULL;
+  Node *def = NULL;
+  bool has_def = false;
 
   struct {
     Type **data;
@@ -6413,23 +6427,19 @@ static Node *generic_selection(Token **rest, Token *tok) {
 
   while (comma_list(rest, &tok, TK_RPAREN, true)) {
     if (tok->kind == TK_default) {
-      if (def_tok)
+      if (has_def)
         error_tok(tok, "duplicate default generic association");
+      has_def = true;
 
-      tok = skip_tk(tok->next, TK_COLON);
-      def_tok = tok;
-      /* Skip over the default expression without parsing it yet so we parse it
-       * exactly once (in its true evaluated or unevaluated context) after matching. */
-      int depth = 0;
-      while (tok->kind != TK_EOF) {
-        if (depth == 0 && (tok->kind == TK_COMMA || tok->kind == TK_RPAREN))
-          break;
-        if (tok->kind == TK_LPAREN || tok->kind == TK_LBRACK || tok->kind == TK_LCURLY)
-          depth++;
-        else if (tok->kind == TK_RPAREN || tok->kind == TK_RBRACK || tok->kind == TK_RCURLY)
-          depth--;
-        tok = tok->next;
-      }
+      /* Parse default: in lexical order (exactly once) so tag/enum declarations
+       * enter scope at their lexical position (C17 6.2.1p7). */
+      bool spec_uneval = (ret != NULL) || (is_iso_std && fnctx && is_const_context());
+      if (spec_uneval)
+        uneval_depth++;
+      def = assign(&tok, skip_tk(tok->next, TK_COLON));
+      add_type(def);
+      if (spec_uneval)
+        uneval_depth--;
       continue;
     }
 
@@ -6441,7 +6451,7 @@ static Node *generic_selection(Token **rest, Token *tok) {
     declarator3(basety, t2, true, false);
 
     if (t2->kind == TY_VOID || t2->kind == TY_FUNC || t2->size < 0 ||
-        is_variably_modified(t2))
+        is_vm_ty(t2))
       error_tok(ty_tok, "'_Generic' association type must be a complete object type");
 
     for (int32_t i = 0; i < types.len; i++)
@@ -6456,9 +6466,9 @@ static Node *generic_selection(Token **rest, Token *tok) {
     if (!matched)
       uneval_depth++;
     Node *node = assign(&tok, skip_tk(tok, TK_COLON));
+    add_type(node);
     if (!matched)
       uneval_depth--;
-    add_type(node);
     if (matched) {
       if (ret)
         error_tok(start, "controlling expression compatible with multiple generic associations");
@@ -6468,21 +6478,10 @@ static Node *generic_selection(Token **rest, Token *tok) {
 
   free(types.data);
 
-  if (def_tok) {
-    Token *def_end = NULL;
-    if (ret)
-      uneval_depth++;
-    Node *def = assign(&def_end, def_tok);
-    if (ret)
-      uneval_depth--;
-    add_type(def);
-    if (def_end->kind != TK_COMMA && def_end->kind != TK_RPAREN)
-      error_tok(def_end, "expected ',' or ')'");
-    if (!ret)
-      return def;
-  }
   if (ret)
     return ret;
+  if (def)
+    return def;
   error_tok(start, "controlling type not compatible with any association type");
 }
 
@@ -6537,7 +6536,7 @@ static Node *compound_literal(Token **rest, Token *tok) {
 
   tok = skip_tk(tok, TK_RPAREN);
 
-  if ((!uneval_depth && is_const_context()) || (attr.strg & SC_STATIC)) {
+  if (!fnctx || (!uneval_depth && is_const_context()) || (attr.strg & SC_STATIC)) {
     if (is_iso_std && fnctx && !uneval_depth && is_const_context() && !(attr.strg & SC_STATIC) &&
         !start->file->is_syshdr)
       error_tok(start, "block-scope compound literal is not a constant expression");
@@ -6998,7 +6997,7 @@ static Node *parse_typedef(Token **rest, Token *tok, Type *basety, VarAttr *attr
       else
         vsc->type_def = ty;
       chain_expr(&node, calc_vla(ty, tok));
-      if (fnctx && is_variably_modified(ty))
+      if (fnctx && is_vm_ty(ty))
         new_defr(DF_VM_BARRIER);
     }
   }
@@ -7078,7 +7077,8 @@ static void chk_param_ty(Type *fn, Type *ty, int idx, Token *tok) {
   int i = 0;
   for (Obj *p = fn->param_list; p; p = p->param_next, i++) {
     if (i == idx) {
-      if (!is_compatible(p->ty, ty))
+      if (!!(p->ty->qual & Q_ATOMIC) != !!(ty->qual & Q_ATOMIC) ||
+          !is_compatible(p->ty, ty))
         error_tok(tok, "mismatched parameter type");
       return;
     }
@@ -7129,9 +7129,9 @@ static Node *func_old_style_param(Token **rest, Token *tok, Type *prot_ty, Type 
 
       Type *promoted = NULL;
       if (is_integer(ty) && ty->size < ty_int->size)
-        promoted = ty_int;
+        promoted = (ty->qual & Q_ATOMIC) ? add_qual(Q_ATOMIC, ty_int, NULL) : ty_int;
       else if (ty->kind == TY_FLOAT)
-        promoted = ty_double;
+        promoted = (ty->qual & Q_ATOMIC) ? add_qual(Q_ATOMIC, ty_double, NULL) : ty_double;
 
       if (!prot_ty->is_oldstyle)
         chk_param_ty(prot_ty, promoted ? promoted : ty, idx, name);
@@ -7141,7 +7141,7 @@ static Node *func_old_style_param(Token **rest, Token *tok, Type *prot_ty, Type 
         var->is_register = !!(attr.strg & SC_REGISTER);
         push_var_name(name, var);
       } else {
-        var->ty = promoted;
+        var->ty = (ty->qual & Q_ATOMIC) ? promoted : unqual(promoted);
         Node *lhs = new_var_node(new_lvar2(ty, decl_scope()), name);
         lhs->m.var->is_register = !!(attr.strg & SC_REGISTER);
         push_var_name(name, lhs->m.var);
@@ -7199,24 +7199,19 @@ static void func_definition(Token **rest, Token *tok, Obj *fn, Type *ty) {
     error_tok(tok, "function cannot have qualified 'void' return type");
   fn->is_definition = true;
 
-  Type *prot_ty = fn->compat_ty ? fn->compat_ty : fn->ty;
-  if (prot_ty && prot_ty != ty && prot_ty->kind == TY_FUNC) {
-    ty->return_ty = composite_type(prot_ty->return_ty, ty->return_ty);
-    if (!prot_ty->is_oldstyle && !ty->is_oldstyle) {
-      for (Obj *p1 = prot_ty->param_list, *p2 = ty->param_list; p1 && p2;
-           p1 = p1->param_next, p2 = p2->param_next) {
-        QualMask q = p2->ty->qual;
-        Type *ct = composite_type(unqual(p1->ty), unqual(p2->ty));
-        p2->ty = q ? new_derived_type(copy_type(ct), q, ct) : ct;
-      }
-    } else if (!prot_ty->is_oldstyle && ty->is_oldstyle && !ty->scopes) {
-      if (prot_ty->param_list)
-        error_tok(tok, "parameter count mismatch");
+  Type *vis_ty = fn->ty;
+  Type *compat_prot = fn->compat_ty ? fn->compat_ty : vis_ty;
+  if (vis_ty && vis_ty != ty && vis_ty->kind == TY_FUNC) {
+    ty->return_ty = composite_type(vis_ty->return_ty, ty->return_ty);
+  }
+  if (compat_prot && compat_prot != ty && compat_prot->kind == TY_FUNC &&
+      !compat_prot->is_oldstyle && ty->is_oldstyle && !ty->scopes) {
+    if (compat_prot->param_list)
+      error_tok(tok, "parameter count mismatch");
+    if (vis_ty && !vis_ty->is_oldstyle)
       ty->is_oldstyle = false;
-    }
   }
   fn->ty = ty;
-  fn->compat_ty = (prot_ty && prot_ty != ty) ? composite_type(prot_ty, ty) : ty;
 
   fnctx = &(FuncContext){.fn = fn};
 
@@ -7230,12 +7225,16 @@ static void func_definition(Token **rest, Token *tok, Obj *fn, Type *ty) {
     scope = ty->scopes;
 
     if (ty->is_oldstyle) {
-      precalc = func_old_style_param(&tok, tok, prot_ty, ty);
+      bool vis_was_old = (!vis_ty || vis_ty->is_oldstyle);
+      precalc = func_old_style_param(&tok, tok, compat_prot, ty);
+      if (vis_was_old)
+        ty->is_oldstyle = true;
       ty->is_oldstyle_def = true;
     } else {
       precalc = ty->pre_calc;
     }
   }
+  fn->compat_ty = (compat_prot && compat_prot != ty) ? composite_type(compat_prot, ty) : ty;
 
   fn->body = compound_stmt2(rest, skip_tk(tok, TK_LCURLY), ND_BLOCK);
 
@@ -7255,6 +7254,9 @@ static void func_definition(Token **rest, Token *tok, Obj *fn, Type *ty) {
     resolve_gotos(fn->body);
 
   emit_text(fn);
+
+  if (!ty->is_oldstyle && vis_ty && vis_ty != ty)
+    fn->ty = vis_ty;
 
   fnctx = NULL;
 }
@@ -7294,7 +7296,7 @@ static Type *merge_external_decl_type(Token *name, Obj *obj, Type *ty,
     error_tok(name, "incompatible redeclaration");
   obj->compat_ty = composite_type(cty, ty);
   if (scope->parent && !is_def)
-    return obj->has_file_decl ? composite_type(obj->ty, ty) : ty;
+    return ty;
   obj->ty = obj->has_file_decl ? composite_type(obj->ty, ty) : ty;
   obj->has_file_decl = true;
   return NULL;
@@ -7506,9 +7508,23 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
     if (attr->strg & SC_CONSTEXPR) {
       var->has_real_def = true;
       constexpr_initializer(&tok, skip_tk(tok, TK_EQ), var, var);
+      if (var->compat_ty && var->compat_ty != var->ty) {
+        if (!is_compatible2(var->compat_ty, var->ty))
+          error_tok(name, "incompatible redeclaration");
+        var->compat_ty = composite_type(var->compat_ty, var->ty);
+      } else {
+        var->compat_ty = var->ty;
+      }
     } else if (tok->kind == TK_EQ) {
       var->has_real_def = true;
       gvar_initializer(&tok, tok->next, var);
+      if (var->compat_ty && var->compat_ty != var->ty) {
+        if (!is_compatible2(var->compat_ty, var->ty))
+          error_tok(name, "incompatible redeclaration");
+        var->compat_ty = composite_type(var->compat_ty, var->ty);
+      } else {
+        var->compat_ty = var->ty;
+      }
     } else if (is_iso_std && var->is_static && var->ty->size < 0)
       error_tok(name, "tentative definition with internal linkage has incomplete type");
   }

@@ -986,6 +986,8 @@ static void print_tokens(Token *tok, FILE *out) {
   bool after_tok = false;
   Token *prev = NULL;
   for (; tok->kind != TK_EOF; tok = tok->next) {
+    if (tok->kind == TK_PMARK)
+      continue;
     if (tok->kind == TK_FMARK) {
       if (tok->display_file_no == tok->next->display_file_no && tok->next->kind != TK_EOF)
         continue;

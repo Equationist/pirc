@@ -262,6 +262,8 @@ Type *add_qual(QualMask msk, Type *ty, Token *tok) {
 bool chk_qual_type(QualMask qual, Type *ty) {
   if (ty->kind == TY_AUTO)
     return false;
+  if (((qual | ty->qual) & (Q_RESTRICT | Q_ATOMIC)) == (Q_RESTRICT | Q_ATOMIC))
+    return true;
   if (qual & Q_RESTRICT)
     if (ty->kind != TY_PTR || ty->base->kind == TY_FUNC || ty->base->kind == TY_FUNC_INCMP)
       return true;
@@ -609,6 +611,8 @@ bool is_compatible(Type *t1, Type *t2) {
         Obj *po = old->param_list;
         Obj *pp = proto->param_list;
         for (; po && pp; po = po->param_next, pp = pp->param_next) {
+          if (!!(po->ty->qual & Q_ATOMIC) != !!(pp->ty->qual & Q_ATOMIC))
+            return false;
           Type *ot = unqual(po->ty);
           Type *pt = unqual(pp->ty);
           if ((is_integer(pt) && pt->size < ty_int->size) || pt->kind == TY_FLOAT)
@@ -730,10 +734,41 @@ Type *composite_type(Type *t1, Type *t2) {
     if (t1->is_oldstyle && !t2->is_oldstyle) {
       Type *res = copy_type(t2);
       res->return_ty = ret;
+      if (t1->is_oldstyle_def) {
+        Obj head = {0};
+        Obj *cur = &head;
+        for (Obj *p1 = t1->param_list, *p2 = t2->param_list; p1 && p2;
+             p1 = p1->param_next, p2 = p2->param_next) {
+          Obj *np = arena_calloc(&cc1_arena, sizeof(Obj));
+          *np = *p2;
+          np->ty = composite_type(p1->ty, p2->ty);
+          np->param_next = NULL;
+          cur = cur->param_next = np;
+        }
+        res->param_list = head.param_next;
+      }
       return res;
     }
     if (!t1->is_oldstyle && t2->is_oldstyle) {
       Type *res = copy_type(t1);
+      res->return_ty = ret;
+      if (t2->is_oldstyle_def) {
+        Obj head = {0};
+        Obj *cur = &head;
+        for (Obj *p1 = t1->param_list, *p2 = t2->param_list; p1 && p2;
+             p1 = p1->param_next, p2 = p2->param_next) {
+          Obj *np = arena_calloc(&cc1_arena, sizeof(Obj));
+          *np = *p1;
+          np->ty = composite_type(p1->ty, p2->ty);
+          np->param_next = NULL;
+          cur = cur->param_next = np;
+        }
+        res->param_list = head.param_next;
+      }
+      return res;
+    }
+    if (t1->is_oldstyle && t2->is_oldstyle && !t1->is_oldstyle_def && t2->is_oldstyle_def) {
+      Type *res = copy_type(t2);
       res->return_ty = ret;
       return res;
     }
@@ -1280,7 +1315,7 @@ void _add_type(Node *node) {
     add_type(node->m.lhs);
     if (!node->m.lhs->ty->base)
       error_tok(node->tok, "invalid pointer dereference");
-    if (is_iso_std && node->m.lhs->ty->base->kind == TY_VOID &&
+    if (is_iso_std && !uneval_depth && node->m.lhs->ty->base->kind == TY_VOID &&
         (!node->tok || !node->tok->file || !node->tok->file->is_syshdr))
       error_tok(node->tok, "dereferencing 'void *' pointer");
 

@@ -21,6 +21,7 @@ typedef struct {
     SysvClass cls[2];
     uint32_t  f32_cnt[2];
     uint32_t  f64_cnt[2];
+    bool      f32_hi[2];
     bool      unaligned;
     bool      single_v128;
     PirType   v128_ty;
@@ -62,7 +63,11 @@ static void walk_sysv(const PirModule *mod, const PirTargetSpec *target,
             w->cls[0] = merge_cls(w->cls[0], EB_INT);
             w->cls[1] = merge_cls(w->cls[1], EB_INT);
         } else if (ty.u.scalar == PIR_SCALAR_F32) {
-            if (eb < 2u) { w->cls[eb] = merge_cls(w->cls[eb], EB_SSE); w->f32_cnt[eb]++; }
+            if (eb < 2u) {
+                w->cls[eb] = merge_cls(w->cls[eb], EB_SSE);
+                w->f32_cnt[eb]++;
+                if ((base_off % 8u) >= 4u) w->f32_hi[eb] = true;
+            }
         } else if (ty.u.scalar == PIR_SCALAR_F64) {
             if (eb < 2u) { w->cls[eb] = merge_cls(w->cls[eb], EB_SSE); w->f64_cnt[eb]++; }
         } else {
@@ -231,7 +236,8 @@ static void classify_sysv_agg(const PirModule *mod, const PirTargetSpec *target,
         out->reg_offsets[out->reg_count] = (uint64_t)i * 8u;
         if (w.cls[i] == EB_SSE || w.cls[i] == EB_SSEUP) {
             PirType st = pir_type_scalar(PIR_SCALAR_F64);
-            if (w.f64_cnt[i] == 0u && w.f32_cnt[i] >= 1u && ((uint64_t)i * 8u + 4u >= ly.size)) {
+            if (w.f64_cnt[i] == 0u && w.f32_cnt[i] >= 1u &&
+                (((uint64_t)i * 8u + 4u >= ly.size) || !w.f32_hi[i])) {
                 st = pir_type_scalar(PIR_SCALAR_F32);
             } else if (w.f64_cnt[i] == 0u && w.f32_cnt[i] >= 2u) {
                 st = (target->caps.max_simd_bits >= 64u)

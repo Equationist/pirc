@@ -69,6 +69,22 @@ static bool rv32_needs_sym_quote(const char *s) {
     return false;
 }
 
+static bool rv32_is_bare_call_sym(const char *s) {
+    if (!s || !s[0]) return false;
+    unsigned char c0 = (unsigned char)s[0];
+    if (!((c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z') || c0 == '_' || c0 == '.')) {
+        return false;
+    }
+    for (const char *p = s + 1; *p; ++p) {
+        unsigned char c = (unsigned char)*p;
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '$')) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void rv32_emit_sym(FILE *out, const PirTargetSpec *target, const char *name) {
     pir_asm_emit_sym(out, target, name, NULL, rv32_needs_sym_quote);
 }
@@ -483,11 +499,20 @@ static void emit_inst(Rv32AsmCtx *ctx, const MFunc *mf, const MInst *ins) {
                      redir_blk(ctx, ins->ops[3].u.block_id));
             return;
 
-        case MI_RV32_CALL:
-            fputs("\tcall ", out);
-            rv32_emit_sym(out, target, ins->ops[0].u.sym.name);
-            fputc('\n', out);
+        case MI_RV32_CALL: {
+            const char *cname = ins->ops[0].u.sym.name;
+            if (rv32_is_bare_call_sym(cname)) {
+                fprintf(out, "\tcall %s\n", cname);
+            } else {
+                uint32_t seq = ctx->local_seq++;
+                fprintf(out, "%sC%u_%u:\n", lp, mf->fn_index, seq);
+                fputs("\tauipc ra, %pcrel_hi(", out);
+                rv32_emit_sym(out, target, cname);
+                fputs(")\n", out);
+                fprintf(out, "\tjalr ra, %%pcrel_lo(%sC%u_%u)(ra)\n", lp, mf->fn_index, seq);
+            }
             return;
+        }
 
         case MI_RV32_CALL_IND:
             fprintf(out, "\tjalr ra, 0(%s)\n", gp_name(ins->ops[0].u.preg));

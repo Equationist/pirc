@@ -1164,6 +1164,8 @@ static LocalInfo *register_local(Obj *var, bool is_param) {
   } else {
     li->pir_ty = pir_scalar_ty_name(var->ty);
     int32_t min_al = pir_scalar_align(var->ty);
+    if ((var->ty->qual & Q_ATOMIC) && li->size > 1 && li->size <= 8 && min_al < (int32_t)li->size)
+      min_al = (int32_t)li->size;
     if (al < min_al)
       al = min_al;
     li->align = al;
@@ -1754,6 +1756,10 @@ static int32_t effective_lval_align(Node *n) {
   case ND_CHAIN:
     return effective_lval_align(n->m.rhs);
   case ND_ASSIGN:
+    if (n->m.lhs && n->m.lhs->ty &&
+        (is_mem_val_ty(n->m.lhs->ty) || n->m.lhs->ty->kind == TY_ARRAY) &&
+        ((n->m.lhs->ty->qual & Q_ATOMIC) || (get_elem(n->m.lhs->ty)->qual & Q_VOLATILE)))
+      return effective_lval_align(n->m.rhs);
     return effective_lval_align(n->m.lhs);
   case ND_CAST:
     if (is_mem_val_ty(n->ty) || is_array(n->ty))
@@ -1762,6 +1768,15 @@ static int32_t effective_lval_align(Node *n) {
   default:
     return align_floor_pow2(al);
   }
+}
+
+static int32_t cap_align_by_offset(int32_t a, uint64_t u) {
+  if (u != 0u) {
+    uint64_t low = u & (UINT64_C(0) - u);
+    if (low < (uint64_t)a)
+      a = (int32_t)low;
+  }
+  return a;
 }
 
 static int32_t effective_ptr_target_align(Node *ptr_expr, int32_t fallback_al) {
@@ -1791,19 +1806,34 @@ static int32_t effective_ptr_target_align(Node *ptr_expr, int32_t fallback_al) {
                         ? ptr_expr->m.rhs : NULL);
     if (ptr_op) {
       int32_t a = effective_ptr_target_align(ptr_op, fb);
-      int64_t step = (ptr_op->ty->base && ptr_op->ty->base->size > 0)
-                     ? ptr_op->ty->base->size : 1;
+      uint64_t step = (ptr_op->ty->base && ptr_op->ty->base->size > 0)
+                      ? (uint64_t)ptr_op->ty->base->size : UINT64_C(1);
       Node *idx_op = (ptr_op == ptr_expr->m.lhs) ? ptr_expr->m.rhs : ptr_expr->m.lhs;
-      int64_t delta = (idx_op && idx_op->kind == ND_NUM) ? (idx_op->num.val * step) : step;
-      if (delta != 0) {
-        int64_t low = delta & -delta;
-        if (low < a)
-          a = (int32_t)low;
-      }
+      uint64_t delta = (idx_op && idx_op->kind == ND_NUM) ? (uint64_t)idx_op->num.val : step;
+      a = cap_align_by_offset(a, delta);
       return align_floor_pow2(a < fb ? a : fb);
     }
     return fb;
   }
+  case ND_ARITH_ASSIGN:
+    if (ptr_expr->m.lhs && ptr_expr->m.lhs->ty && is_ptr(ptr_expr->m.lhs->ty)) {
+      int32_t a = effective_ptr_target_align(ptr_expr->m.lhs, fb);
+      uint64_t step = (ptr_expr->m.lhs->ty->base && ptr_expr->m.lhs->ty->base->size > 0)
+                      ? (uint64_t)ptr_expr->m.lhs->ty->base->size : UINT64_C(1);
+      a = cap_align_by_offset(a, step);
+      return align_floor_pow2(a < fb ? a : fb);
+    }
+    return fb;
+  case ND_ASSIGN:
+    return effective_ptr_target_align(ptr_expr->m.rhs, fb);
+  case ND_STMT_EXPR:
+    if (ptr_expr->blk.result && ptr_expr->blk.result->m.lhs)
+      return effective_ptr_target_align(ptr_expr->blk.result->m.lhs, fb);
+    if (ptr_expr->ty && is_ptr(ptr_expr->ty) && ptr_expr->ty->base && ptr_expr->ty->base->align > 0) {
+      int32_t ba = align_floor_pow2(ptr_expr->ty->base->align);
+      return ba < fb ? ba : fb;
+    }
+    return fb;
   case ND_COND: {
     int32_t ta = effective_ptr_target_align(ptr_expr->ctrl.then, fb);
     int32_t ea = effective_ptr_target_align(ptr_expr->ctrl.els, fb);
@@ -1817,6 +1847,11 @@ static int32_t effective_ptr_target_align(Node *ptr_expr, int32_t fallback_al) {
     if (ptr_expr->ty && is_array(ptr_expr->ty)) {
       int32_t a = effective_lval_align(ptr_expr);
       return align_floor_pow2(a < fb ? a : fb);
+    }
+    if (ptr_expr->ty && is_ptr(ptr_expr->ty) && ptr_expr->ty->base &&
+        ptr_expr->ty->base->kind != TY_VOID && ptr_expr->ty->base->align > 0) {
+      int32_t ba = align_floor_pow2(ptr_expr->ty->base->align);
+      return ba < fb ? ba : fb;
     }
     return fb;
   }
@@ -2582,11 +2617,19 @@ static PirVal gen_expr(Node *node) {
       }
       int slot = emit_entry_alloca(node->ty->size, node->ty->align);
       int32_t cnt = (int32_t)((node->ty->bit_cnt + 63) / 64);
+      int32_t total_q = (int32_t)((node->ty->size + 7) / 8);
       int p = new_tid();
       sb_printf(&fc->body_sb, "    %%t%d = ptr_add.i64 %%loc_%d, 0\n", p, slot);
-      for (int32_t i = 0; i < cnt; i++) {
-        uint64_t w = node->num.bitint_data ? (&node->num.bitint_data->as64)[i]
-                                           : (i == 0 ? (uint64_t)node->num.val : 0);
+      uint64_t last_w = 0;
+      for (int32_t i = 0; i < total_q; i++) {
+        uint64_t w;
+        if (i < cnt) {
+          w = node->num.bitint_data ? (&node->num.bitint_data->as64)[i]
+                                    : (i == 0 ? (uint64_t)node->num.val : 0);
+          last_w = w;
+        } else {
+          w = (!node->ty->is_unsigned && ((int64_t)last_w < 0)) ? ~UINT64_C(0) : 0;
+        }
         PirVal cp = emit_ptr_add_imm((PirVal){p, "ptr"}, i * 8);
         PirVal cw = emit_const_int("i64", w);
         sb_printf(&fc->body_sb, "    store.i64 %%t%d, %%t%d, align 8\n", cw.id, cp.id);

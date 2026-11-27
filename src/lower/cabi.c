@@ -62,6 +62,11 @@ static bool build_plan(const PirModule *mod, const PirTargetSpec *target,
         if (vbits > mbits && !(mbits == 128u && vbits == 256u)) {
             st.gp_used += 1u;
         }
+    } else if (target->arch == PIR_ARCH_RV32 &&
+               ((ret_type.kind == PIR_TYPE_SCALAR && ret_type.u.scalar == PIR_SCALAR_I128) ||
+                ret_type.kind == PIR_TYPE_VECTOR)) {
+        /* Match i128.c & simd.c: RV32 i128 and vector returns prepend a hidden sret ptr in a0. */
+        st.gp_used += 1u;
     }
 
     if (param_count > 0u) {
@@ -570,7 +575,8 @@ static bool rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
                         }
                     }
                 }
-            } else if (target->arch == PIR_ARCH_RV32 && vinfo.kind == PIR_ABI_DIRECT) {
+            } else if (target->arch == PIR_ARCH_RV32 && vinfo.kind == PIR_ABI_DIRECT &&
+                       vinfo.reg_count > 0u) {
                 /* RISC-V ILP32D variadic byval: always passed in GP registers/stack (never fa0..fa7),
                  * packed into 1..2 i32 words (or indirect if > 8B, already classified above). */
                 PirTypeLayout vly = pir_type_layout(mod, target, vpd.abi_type);

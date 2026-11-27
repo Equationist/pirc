@@ -426,9 +426,12 @@ static Token *exec_pragma_op(Token *tok) {
     }
     Token *eol = calloc(1, sizeof(Token));
     eol->kind = TK_PMARK;
+    eol->loc = "";
     eol->at_bol = true;
     eol->file = hash->file;
     eol->line_no = hash->line_no;
+    eol->display_line_no = hash->display_line_no;
+    eol->display_file_no = hash->display_file_no;
     eol->is_root = true;
     *pp_root_cur = (*pp_root_cur)->next = eol;
   }
@@ -837,7 +840,7 @@ static MacroContext read_macro_args(Token *tok, Macro *m) {
   return ctx;
 }
 
-static Token *expand_tok(Token *tok) {
+static Token *expand_tok_ex(Token *tok, bool defer_pragma) {
   Token head = {0};
   Token *cur = &head;
   Macro *start_m = locked_macros;
@@ -847,8 +850,55 @@ static Token *expand_tok(Token *tok) {
       tok = handle_incl_end(tok);
       continue;
     }
-    if (try_expand_nonroot(&tok))
-      continue;
+    if (!defer_pragma) {
+      if (try_expand_nonroot(&tok))
+        continue;
+    } else if (tok->kind == TK_IDENT && !tok->dont_expand) {
+      Macro *m = hashmap_get2(&macros, tok->loc, tok->len);
+      if (m && m->handler == &pragma_macro) {
+        /* C17 6.10.3.4p3 / 6.10.9: Do not execute _Pragma(...) eagerly during
+         * macro argument prescan; validate syntax (catching bare _Pragma) and
+         * keep it in the expanded argument tokens for rescanning. */
+        Token *pstart = tok;
+        cur = cur->next = copy_token(tok);
+        tok = tok->next;
+        Token *lp = NULL;
+        Token *str_tok = NULL;
+        for (int progress = 0;;) {
+          if (tok->kind == TK_EOF)
+            error_tok(pstart, "unterminated _Pragma sequence");
+          pop_macro_lock(tok);
+          if (try_expand_nonroot(&tok))
+            continue;
+          switch (progress++) {
+          case 0:
+            if (tok->kind != TK_LPAREN)
+              error_tok(tok, "expected '('");
+            lp = tok;
+            cur = cur->next = copy_token(lp);
+            tok = tok->next;
+            continue;
+          case 1:
+            if (tok->kind != TK_STR)
+              error_tok(tok, "expected string literal");
+            str_tok = tok;
+            cur = cur->next = copy_token(str_tok);
+            tok = tok->next;
+            continue;
+          case 2:
+            if (tok->kind != TK_RPAREN)
+              error_tok(tok, "expected ')'");
+            cur = cur->next = copy_token(tok);
+            tok = tok->next;
+            break;
+          }
+          break;
+        }
+        continue;
+      }
+      if (m && expand_macro(&tok, tok, m, false))
+        continue;
+    }
 
     cur = cur->next = copy_token(tok);
     tok = tok->next;
@@ -860,11 +910,15 @@ static Token *expand_tok(Token *tok) {
   return head.next;
 }
 
+static Token *expand_tok(Token *tok) {
+  return expand_tok_ex(tok, false);
+}
+
 static Token *expand_arg(MacroArg *arg) {
   if (arg->expanded)
     return arg->expanded;
 
-  return arg->expanded = expand_tok(arg->tok);
+  return arg->expanded = expand_tok_ex(arg->tok, true);
 }
 
 static bool has_non_empty_va_arg(MacroContext *ctx, MacroArg **arg_p) {
@@ -1435,12 +1489,19 @@ static char *read_filename(Token **rest, Token *tok, const char **dir) {
     if (*p != '>')
       error_tok(tok, "expected '>'");
     filename = arena_copy_string(&cc1_arena, start->loc + 1, (size_t)(p - (start->loc + 1)));
-    while (tok->kind != TK_EOF && tok->file == start->file &&
-           tok->loc + tok->len <= p)
+    while (tok->kind != TK_EOF && tok->file == start->file) {
+      const char *tloc = tok->ucn_loc ? tok->ucn_loc : tok->loc;
+      int tlen = tok->ucn_loc ? tok->ucn_len : tok->len;
+      if (tloc < start->loc || tloc + tlen > p)
+        break;
       tok = tok->next;
-    if (tok->kind != TK_EOF && tok->file == start->file &&
-        tok->loc <= p && tok->loc + tok->len > p + 1)
-      error_tok(tok, "extra token");
+    }
+    if (tok->kind != TK_EOF && tok->file == start->file) {
+      const char *tloc = tok->ucn_loc ? tok->ucn_loc : tok->loc;
+      int tlen = tok->ucn_loc ? tok->ucn_len : tok->len;
+      if (tloc >= start->loc && tloc <= p && tloc + tlen > p + 1)
+        error_tok(tok, "extra token");
+    }
   } else if (tok->kind == TK_LANGLE) {
     // Pattern 2 (macro-expanded): #include FOO -> <...>
     Token *start = tok;
@@ -1613,7 +1674,10 @@ static void read_line_marker(Token **rest, Token *tok, bool is_line_dir) {
   if (is_iso_std && is_line_dir && (line_no <= 0 || line_no > 2147483647) && !start->file->is_syshdr)
     error_tok(tok, "invalid line marker");
 
-  start->file->line_delta = line_no - start->line_no - 1;
+  int64_t next_phys = (*rest && (*rest)->file == start->file)
+                          ? ((int64_t)(*rest)->line_no + (int64_t)(*rest)->display_line_no)
+                          : ((int64_t)start->line_no + (int64_t)start->display_line_no + 1);
+  start->file->line_delta = line_no - next_phys;
 
   tok = tok->next;
   if (tok->kind == TK_EOF)
@@ -1630,7 +1694,7 @@ static void read_line_marker(Token **rest, Token *tok, bool is_line_dir) {
     error_tok(tok->next, "extra tokens at end of #line directive");
 
   start->file->display_file_no = add_display_file(tok->str);
-  *rest = add_fmark2(*rest, start->line_no + 1);
+  *rest = add_fmark2(*rest, next_phys);
 }
 
 static void finalize_tok2(Token *tok, Token *orig) {
@@ -1890,7 +1954,7 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
 
   if (is_root) {
     if (equal(tok, "pragma")) {
-      if (equal(tok->next, "once")) {
+      if (!tok->next->at_bol && equal(tok->next, "once")) {
         Token *orig = tok->origin ? tok->origin : tok;
         if (orig->file && !orig->file->is_placeholder && strcmp(orig->file->name, "-") != 0) {
           char realpathbuf[PATH_MAX];
@@ -1899,7 +1963,7 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
         }
         return skip_line(tok->next->next);
       }
-      if (equal(tok->next, "pack") && !tok->next->next->at_bol) {
+      if (!tok->next->at_bol && equal(tok->next, "pack") && !tok->next->next->at_bol) {
         Token *rest = NULL;
         Token *args = expand_tok(split_line(&rest, tok->next->next));
         Token *pack_tok = tok->next;
@@ -2540,6 +2604,10 @@ static Token *preprocess3(Token *tok) {
     }
 
     if (Is_hash(tok) && (!tok->origin || tok->is_pragma_op) && consume(&tok, tok->next, "pragma")) {
+      if (tok->at_bol) {
+        to_freelist(start, start->next);
+        continue;
+      }
       if (equal(tok, "pack")) {
         Token *lp = tok->next;
         Token *end = NULL;

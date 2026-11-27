@@ -258,7 +258,12 @@ static Token *read_ident(const char *p) {
     }
     if ((unsigned char)*p >= 128) {
       const char *pos;
-      uint32_t c = decode_utf8(&pos, p);
+      uint32_t c;
+      if (!try_decode_utf8(&pos, p, &c)) {
+        if (p == start)
+          return new_token(TK_INVALID, start, p + 1);
+        break;
+      }
       if (!(p == start ? is_ident1(c) : is_ident2(c))) {
         if (p == start)
           return new_token(TK_INVALID, start, pos);
@@ -715,7 +720,13 @@ static Token *read_utf16_string_literal(const char *start, const char *quote) {
         is_non_ucn_esc = true;
       }
     } else {
-      c = decode_utf8(&p, p);
+      const char *q;
+      if (!try_decode_utf8(&q, p, &c) || q > end) {
+        invalid = true;
+        p++;
+        continue;
+      }
+      p = q;
     }
 
     if (c < 0x10000) {
@@ -756,10 +767,19 @@ static Token *read_utf32_string_literal(const char *start, const char *quote, Ty
   bool invalid = false;
 
   for (const char *p = quote + 1; p < end;) {
-    if (*p == '\\')
+    if (*p == '\\') {
       buf[len++] = read_escape_seq(&p, p + 1, &invalid);
-    else
-      buf[len++] = decode_utf8(&p, p);
+    } else {
+      const char *q;
+      uint32_t c;
+      if (!try_decode_utf8(&q, p, &c) || q > end) {
+        invalid = true;
+        p++;
+      } else {
+        buf[len++] = c;
+        p = q;
+      }
+    }
   }
   Token *tok = new_token(TK_STR, start, end + 1);
   if (invalid) {
@@ -799,7 +819,13 @@ static Token *read_char_literal(const char *start) {
         lim = 256;
       }
     } else {
-      c = decode_utf8(&p, p);
+      const char *q;
+      if (!try_decode_utf8(&q, p, &c)) {
+        invalid = true;
+        c = (unsigned char)*p++;
+      } else {
+        p = q;
+      }
       lim = 128;
     }
     val = (val << 8) | c;
@@ -841,10 +867,18 @@ static Token *read_unicode_char_literal(const char *start, const char *quote, Ty
 
   uint32_t c;
   bool is_hex_oct = (*p == '\\' && (Inrange(p[1], '0', '7') || p[1] == 'x' || p[1] == 'o'));
-  if (*p == '\\')
+  if (*p == '\\') {
     c = read_escape_seq(&p, p + 1, &invalid);
-  else
-    c = decode_utf8(&p, p);
+  } else {
+    const char *q;
+    if (!try_decode_utf8(&q, p, &c)) {
+      invalid = true;
+      c = 0;
+      p++;
+    } else {
+      p = q;
+    }
+  }
 
   if (*p != '\'') {
     while (*p && *p != '\'' && *p != '\n') {
@@ -911,7 +945,8 @@ static Token *new_pp_number(const char *start, const char *p) {
     }
     if ((unsigned char)*p >= 128) {
       const char *q = p;
-      if (is_ident2(decode_utf8(&q, p))) {
+      uint32_t c;
+      if (try_decode_utf8(&q, p, &c) && is_ident2(c)) {
         p = q;
         after_ucn = false;
         continue;

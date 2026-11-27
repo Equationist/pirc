@@ -266,6 +266,7 @@ static PirFuncId ensure_di3_helper(PirModule *mod, const char *name,
 
 static bool legalize_i64_func(PirModule *mod, const PirTargetSpec *target, PirFuncId fi,
                               const bool *fn_ret_i64, const bool *sig_ret_i64,
+                              const uint32_t *fn_orig_params, const uint32_t *sig_orig_params,
                               uint32_t orig_funcs, PirDiag *diag) {
     PirFunction *fn = &mod->funcs.data[fi];
     if (!fn->is_defined) return true;
@@ -445,12 +446,12 @@ static bool legalize_i64_func(PirModule *mod, const PirTargetSpec *target, PirFu
                     const PirFunction *cal = &mod->funcs.data[copy.operands[0].u.sym.id];
                     call_ret_i64 = fn_ret_i64[copy.operands[0].u.sym.id];
                     call_is_var  = cal->is_variadic;
-                    fixed_n      = cal->param_count;
+                    fixed_n      = fn_orig_params[copy.operands[0].u.sym.id];
                 } else if (copy.op == PIR_OP_CALL_INDIRECT && copy.sig_id < mod->sigs.len) {
                     const PirSigDef *sig = &mod->sigs.data[copy.sig_id];
                     call_ret_i64 = sig_ret_i64[copy.sig_id];
                     call_is_var  = sig->is_variadic;
-                    fixed_n      = sig->param_count;
+                    fixed_n      = sig_orig_params[copy.sig_id];
                 }
                 bool has_i64_arg = false;
                 for (uint32_t k = 1u; k < copy.operand_count; ++k) {
@@ -1419,21 +1420,26 @@ bool pir_legalize_i64(PirModule *mod, const PirTargetSpec *target, PirDiag *diag
 
     uint32_t orig_funcs = mod->funcs.len;
     uint32_t orig_sigs  = mod->sigs.len;
-    bool *fn_ret_i64  = (bool *)calloc(orig_funcs + 1u, sizeof(bool));
-    bool *sig_ret_i64 = (bool *)calloc(orig_sigs + 1u, sizeof(bool));
-    if (!fn_ret_i64 || !sig_ret_i64) abort();
+    bool     *fn_ret_i64      = (bool *)calloc(orig_funcs + 1u, sizeof(bool));
+    bool     *sig_ret_i64     = (bool *)calloc(orig_sigs + 1u, sizeof(bool));
+    uint32_t *fn_orig_params  = (uint32_t *)calloc(orig_funcs + 1u, sizeof(uint32_t));
+    uint32_t *sig_orig_params = (uint32_t *)calloc(orig_sigs + 1u, sizeof(uint32_t));
+    if (!fn_ret_i64 || !sig_ret_i64 || !fn_orig_params || !sig_orig_params) abort();
 
     for (uint32_t fi = 0u; fi < orig_funcs; ++fi) {
-        fn_ret_i64[fi] = is_i64(mod->funcs.data[fi].ret_type);
+        fn_ret_i64[fi]     = is_i64(mod->funcs.data[fi].ret_type);
+        fn_orig_params[fi] = mod->funcs.data[fi].param_count;
     }
     for (uint32_t si = 0u; si < orig_sigs; ++si) {
-        sig_ret_i64[si] = is_i64(mod->sigs.data[si].ret_type);
+        sig_ret_i64[si]     = is_i64(mod->sigs.data[si].ret_type);
+        sig_orig_params[si] = mod->sigs.data[si].param_count;
     }
 
     bool ok = true;
     for (uint32_t fi = 0u; fi < orig_funcs; ++fi) {
         if (mod->funcs.data[fi].is_defined) {
-            if (!legalize_i64_func(mod, target, fi, fn_ret_i64, sig_ret_i64, orig_funcs, diag)) {
+            if (!legalize_i64_func(mod, target, fi, fn_ret_i64, sig_ret_i64,
+                                   fn_orig_params, sig_orig_params, orig_funcs, diag)) {
                 ok = false;
             }
         } else {
@@ -1445,6 +1451,8 @@ bool pir_legalize_i64(PirModule *mod, const PirTargetSpec *target, PirDiag *diag
     if (!ok) {
         free(fn_ret_i64);
         free(sig_ret_i64);
+        free(fn_orig_params);
+        free(sig_orig_params);
         return false;
     }
     for (uint32_t si = 0u; si < orig_sigs; ++si) {
@@ -1496,5 +1504,7 @@ bool pir_legalize_i64(PirModule *mod, const PirTargetSpec *target, PirDiag *diag
 
     free(fn_ret_i64);
     free(sig_ret_i64);
+    free(fn_orig_params);
+    free(sig_orig_params);
     return true;
 }

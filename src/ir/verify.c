@@ -56,6 +56,7 @@ typedef struct {
     PirSymSet            ref_syms;
     PirSymSet            tls_syms;
     PirSymSet            elf_secs;
+    PirSymSet            macho_zf_secs;
 } Verifier;
 
 static const char *type_str(const PirModule *mod, PirType ty, char *buf, size_t n) {
@@ -387,6 +388,7 @@ static void verify_params_and_ret(Verifier *v, const char *owner, uint32_t line,
             if (cabi_ret->reg_count < 2u || cabi_ret->reg_count > 4u) {
                 pir_diag_error(v->diag, line, 0u, "'%s': multi_ret requires 2..4 registers", owner);
             } else {
+                bool pad_regs = (v->target && v->target->arch == PIR_ARCH_RV32);
                 for (uint32_t r = 0u; r < cabi_ret->reg_count; ++r) {
                     PirType rt = cabi_ret->regs[r];
                     check_ssa_type(v, rt, line, "multi_ret register");
@@ -404,17 +406,34 @@ static void verify_params_and_ret(Verifier *v, const char *owner, uint32_t line,
                         pir_diag_error(v->diag, line, 0u,
                                        "'%s': multi_ret vector register exceeds target max_simd_bits", owner);
                     }
-                    uint64_t rsz = v->target
-                                   ? pir_type_layout(v->mod, v->target, rt).size
-                                   : (uint64_t)(pir_type_bits(rt, ptr_b) / 8u);
+                    PirTypeLayout rly;
+                    if (v->target) {
+                        rly = pir_type_layout(v->mod, v->target, rt);
+                    } else {
+                        rly.size  = (uint64_t)(pir_type_bits(rt, ptr_b) / 8u);
+                        rly.align = (uint32_t)(rly.size > 0u ? rly.size : 1u);
+                    }
+                    if (pad_regs && rly.align > 1u) {
+                        uint64_t m = (uint64_t)rly.align - 1u;
+                        total_sz = (total_sz + m) & ~m;
+                    }
                     if (r + 1u == cabi_ret->reg_count) prev_sz = total_sz;
-                    total_sz += rsz;
+                    total_sz += rly.size;
                 }
                 PirType last_rt = cabi_ret->regs[cabi_ret->reg_count - 1u];
-                if (cabi_ret->agg_size == 0u || cabi_ret->agg_size > total_sz ||
+                uint64_t max_agg_sz = total_sz;
+                if (pad_regs && align_valid_u32(cabi_ret->agg_align)) {
+                    uint64_t m = (uint64_t)cabi_ret->agg_align - 1u;
+                    max_agg_sz = (total_sz + m) & ~m;
+                } else if (v->target && v->target->arch == PIR_ARCH_X86_64 &&
+                           last_rt.kind == PIR_TYPE_SCALAR && last_rt.u.scalar == PIR_SCALAR_F32) {
+                    /* SysV packed struct { <8B>, f32, pad 1..3 }: trailing pad bytes after f32. */
+                    max_agg_sz = prev_sz + 8u;
+                }
+                if (cabi_ret->agg_size == 0u || cabi_ret->agg_size > max_agg_sz ||
                     cabi_ret->agg_size <= prev_sz) {
                     pir_diag_error(v->diag, line, 0u, "'%s': multi_ret size %" PRIu64 " is invalid for register capacity %" PRIu64,
-                                   owner, cabi_ret->agg_size, total_sz);
+                                   owner, cabi_ret->agg_size, max_agg_sz);
                 } else if (cabi_ret->agg_size < total_sz &&
                            (last_rt.kind == PIR_TYPE_VECTOR || pir_type_is_float(last_rt))) {
                     pir_diag_error(v->diag, line, 0u, "'%s': multi_ret partial size %" PRIu64 " invalid for non-integer final register",
@@ -1427,6 +1446,11 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
             if (!align_valid_u32(inst->align)) {
                 pir_diag_error(v->diag, inst->src_line, 0u,
                                "alignment %u is not a valid power of two", inst->align);
+            } else if (inst->op == PIR_OP_ALLOCA_PTR && inst->align > 16u &&
+                       inst->imm_u64 > max_obj_bytes(v->target) - (uint64_t)(inst->align - 16u)) {
+                pir_diag_error(v->diag, inst->src_line, 0u,
+                               "overaligned alloca.ptr size %" PRIu64 " (align %u) exceeds maximum",
+                               inst->imm_u64, inst->align);
             }
             break;
 
@@ -1445,6 +1469,11 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
             if (!align_valid_u32(inst->align)) {
                 pir_diag_error(v->diag, inst->src_line, 0u,
                                "alignment %u is not a valid power of two", inst->align);
+            } else if (inst->op == PIR_OP_ALLOCA_PTR && inst->align > 16u &&
+                       inst->imm_u64 > max_obj_bytes(v->target) - (uint64_t)(inst->align - 16u)) {
+                pir_diag_error(v->diag, inst->src_line, 0u,
+                               "overaligned alloca.ptr size %" PRIu64 " (align %u) exceeds maximum",
+                               inst->imm_u64, inst->align);
             }
             break;
 
@@ -1539,6 +1568,11 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
             if (!align_valid_u32(inst->align)) {
                 pir_diag_error(v->diag, inst->src_line, 0u,
                                "alignment %u is not a valid power of two", inst->align);
+            } else if (inst->op == PIR_OP_ALLOCA_PTR && inst->align > 16u &&
+                       inst->imm_u64 > max_obj_bytes(v->target) - (uint64_t)(inst->align - 16u)) {
+                pir_diag_error(v->diag, inst->src_line, 0u,
+                               "overaligned alloca.ptr size %" PRIu64 " (align %u) exceeds maximum",
+                               inst->imm_u64, inst->align);
             }
             break;
 
@@ -1554,6 +1588,11 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
             if (!align_valid_u32(inst->align)) {
                 pir_diag_error(v->diag, inst->src_line, 0u,
                                "alignment %u is not a valid power of two", inst->align);
+            } else if (inst->op == PIR_OP_ALLOCA_PTR && inst->align > 16u &&
+                       inst->imm_u64 > max_obj_bytes(v->target) - (uint64_t)(inst->align - 16u)) {
+                pir_diag_error(v->diag, inst->src_line, 0u,
+                               "overaligned alloca.ptr size %" PRIu64 " (align %u) exceeds maximum",
+                               inst->imm_u64, inst->align);
             }
             break;
 
@@ -1581,6 +1620,11 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
             if (!align_valid_u32(inst->align)) {
                 pir_diag_error(v->diag, inst->src_line, 0u,
                                "alignment %u is not a valid power of two", inst->align);
+            } else if (inst->op == PIR_OP_ALLOCA_PTR && inst->align > 16u &&
+                       inst->imm_u64 > max_obj_bytes(v->target) - (uint64_t)(inst->align - 16u)) {
+                pir_diag_error(v->diag, inst->src_line, 0u,
+                               "overaligned alloca.ptr size %" PRIu64 " (align %u) exceeds maximum",
+                               inst->imm_u64, inst->align);
             }
             break;
 
@@ -2302,10 +2346,9 @@ static void verify_scalar_global_item(Verifier *v, const PirGlobal *g, PirScalar
                 pir_diag_error(v->diag, g->src_line, 0u,
                                "128-bit integer initializer invalid for float global '@%s'", g->name);
             } else if (gi->int_neg && gi->int_lo == 0u &&
-                       v->target && v->target->os != PIR_OS_MACOS && v->target->os != PIR_OS_WINDOWS &&
-                       g->section && (strcmp(g->section, ".bss") == 0 || strcmp(g->section, ".tbss") == 0)) {
+                       pir_target_section_is_nobits(v->target, g->section)) {
                 pir_diag_error(v->diag, g->src_line, 0u,
-                               "global '@%s' in nobits section '%s' cannot have -0.0 float initializer",
+                               "global '@%s' in nobits/zerofill section '%s' cannot have -0.0 float initializer",
                                g->name, g->section);
             }
         } else if (pir_scalar_is_int(sk)) {
@@ -2427,7 +2470,7 @@ static void check_elf_symbol_name(Verifier *v, const char *name, PirLinkage link
         pir_diag_error(v->diag, line, 0u,
                        "symbol '@%s' uses reserved ELF compiler label prefix '.L__pir_'", name);
     }
-    if (pir_target_elf_builtin_section_dir(name) != NULL || pir_symset_contains(&v->elf_secs, name)) {
+    if (pir_target_is_elf_reserved_sym(v->target, name) || pir_symset_contains(&v->elf_secs, name)) {
         pir_diag_error(v->diag, line, 0u,
                        "symbol '@%s' collides with ELF section name", name);
     }
@@ -2457,6 +2500,8 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
     v.diag   = diag;
     pir_symset_init(&v.ref_syms, mod->globals.len + mod->funcs.len + 1u);
     pir_symset_init(&v.elf_secs, 16u);
+    pir_symset_init(&v.macho_zf_secs, 8u);
+    PIR_VEC(char *) macho_zf_bufs = {0};
     for (uint32_t i = 0u; i < mod->globals.len; ++i) {
         pir_symset_insert(&v.ref_syms, mod->globals.data[i].name);
         if (mod->globals.data[i].seg == PIR_GSEG_TLS) {
@@ -2464,6 +2509,18 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
         }
         if (mod->globals.data[i].section) {
             pir_symset_insert(&v.elf_secs, mod->globals.data[i].section);
+            if (target && target->os == PIR_OS_MACOS &&
+                pir_target_section_is_nobits(target, mod->globals.data[i].section)) {
+                char key[40];
+                if (pir_target_macho_seg_sec_key(mod->globals.data[i].section, key, sizeof(key))) {
+                    size_t klen = strlen(key) + 1u;
+                    char *kcopy = (char *)malloc(klen);
+                    if (!kcopy) abort();
+                    memcpy(kcopy, key, klen);
+                    PIR_VEC_PUSH(&macho_zf_bufs, kcopy);
+                    pir_symset_insert(&v.macho_zf_secs, kcopy);
+                }
+            }
         }
     }
     for (uint32_t i = 0u; i < mod->funcs.len; ++i) {
@@ -2577,7 +2634,15 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
             if (!g->is_zeroinit && g->item_count == 0u) {
                 pir_diag_error(diag, g->src_line, 0u, "global '@%s' requires an initializer", g->name);
             }
-            if (pir_target_section_is_nobits(target, g->section) && !pir_global_is_all_zero(g)) {
+            bool is_nb = pir_target_section_is_nobits(target, g->section);
+            if (!is_nb && target && target->os == PIR_OS_MACOS && g->section) {
+                char key[40];
+                if (pir_target_macho_seg_sec_key(g->section, key, sizeof(key)) &&
+                    pir_symset_contains(&v.macho_zf_secs, key)) {
+                    is_nb = true;
+                }
+            }
+            if (is_nb && !pir_global_is_all_zero(g)) {
                 pir_diag_error(diag, g->src_line, 0u,
                                "global '@%s' in nobits/zerofill section '%s' cannot have non-zero initializer",
                                g->name, g->section);
@@ -2740,7 +2805,15 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
         check_unique_symbol(&v, fn->name, fn->src_line, &seen);
         check_elf_symbol_name(&v, fn->name, fn->linkage, fn->src_line);
         check_section_name(&v, fn->section, fn->src_line);
-        if (pir_target_section_is_nobits(target, fn->section)) {
+        bool fn_nb = pir_target_section_is_nobits(target, fn->section);
+        if (!fn_nb && target && target->os == PIR_OS_MACOS && fn->section) {
+            char key[40];
+            if (pir_target_macho_seg_sec_key(fn->section, key, sizeof(key)) &&
+                pir_symset_contains(&v.macho_zf_secs, key)) {
+                fn_nb = true;
+            }
+        }
+        if (fn_nb) {
             pir_diag_error(diag, fn->src_line, 0u,
                            "function '@%s' cannot be placed in nobits/zerofill section '%s'",
                            fn->name, fn->section);
@@ -2749,6 +2822,11 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
     }
 
     pir_symset_destroy(&seen);
+    pir_symset_destroy(&v.macho_zf_secs);
+    for (uint32_t i = 0u; i < macho_zf_bufs.len; ++i) {
+        free(macho_zf_bufs.data[i]);
+    }
+    PIR_VEC_FREE(&macho_zf_bufs);
     pir_symset_destroy(&v.elf_secs);
     pir_symset_destroy(&v.tls_syms);
     pir_symset_destroy(&v.ref_syms);
