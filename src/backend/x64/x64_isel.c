@@ -1527,7 +1527,10 @@ static void emit_call_inst(X64ISelCtx *c, const PirInst *inst, uint32_t loc) {
             if (alocs[i].byval_size > (uint64_t)UINT32_MAX) {
                 pir_diag_error(c->diag, inst->src_line, 0u,
                                "x86-64 outgoing byval_size exceeds 32-bit copy limit");
-                break;
+                free(avregs);
+                free(arg_tys);
+                free(alocs);
+                return;
             }
             MInst cp = minst_make(MI_COPY_OUTARG_MEM, 8u, loc);
             cp.aux_id   = (uint32_t)alocs[i].byval_size;
@@ -3996,5 +3999,5 @@ bool pir_x64_isel_func(const PirModule *mod, const PirFunction *fn, uint32_t fn_
     free(ctx.val_uses);
     free(ctx.inst_fused);
     pir_cfg_destroy(&cfg);
-    return ok;
+    return ok && !pir_diag_has_errors(diag);
 }

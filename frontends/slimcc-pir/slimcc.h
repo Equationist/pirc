@@ -418,6 +418,8 @@ struct Token {
   bool str_invalid : 1;
   int len;         // Token length
   const char *loc; // Token location
+  const char *ucn_loc; // Raw UCN spelling before UTF-8 conversion (if any)
+  int ucn_len;
   File *file;
   Token *origin; // If this is expanded from a macro, the original token
   int line_no;   // Line number
@@ -490,6 +492,7 @@ struct Obj {
   Obj *next;
   char *name;
   Type *ty;
+  Type *compat_ty; // TU-wide composite type across all (including block-scope) decls
   ObjKind kind;
   bool is_live;
   bool is_used;
@@ -986,6 +989,7 @@ void init_ty_lp64(void);
 Type *copy_type(Type *ty);
 Type *pointer_to(Type *base);
 Type *ptr_decay(Type *ty);
+void chk_not_register_array(Node *node);
 void ptr_convert(Node **node);
 void unqual_rtn_ty(Type *ty, Token *tok);
 Type *func_type(TypeKind kind, Type *return_ty);
@@ -1035,6 +1039,7 @@ void emit_text(Obj *fn);
 //
 
 int encode_utf8(char *buf, uint32_t c);
+bool try_decode_utf8(const char **new_pos, const char *p, uint32_t *out);
 uint32_t decode_utf8(const char **new_pos, const char *p);
 bool is_ident1(uint32_t c);
 bool is_ident2(uint32_t c);

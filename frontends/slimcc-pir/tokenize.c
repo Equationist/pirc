@@ -236,20 +236,34 @@ static Token *read_ident(const char *p) {
       continue;
     }
     if (*p == '\\') {
-      const char *ucn_pos = p;
+      const char *q = p;
       uint32_t c = 0;
-      if (read_ucn(&p, p + 1, &c, &invalid)) {
-        if (!invalid && (c < 0xA0 || !(ucn_pos == start ? is_ident1(c) : is_ident2(c))))
+      bool ucn_inv = false;
+      if (read_ucn(&q, p + 1, &c, &ucn_inv)) {
+        if (ucn_inv) {
+          if (p == start)
+            return NULL;
+          break;
+        }
+        if (c < 0xA0 || !(p == start ? is_ident1(c) : is_ident2(c))) {
+          if (p == start)
+            return new_token(TK_INVALID, start, q);
           invalid = true;
+        }
+        p = q;
         has_ucn = true;
         continue;
       }
+      break;
     }
     if ((unsigned char)*p >= 128) {
       const char *pos;
       uint32_t c = decode_utf8(&pos, p);
-      if (!(p == start ? is_ident1(c) : is_ident2(c)))
-        invalid = true;
+      if (!(p == start ? is_ident1(c) : is_ident2(c))) {
+        if (p == start)
+          return new_token(TK_INVALID, start, pos);
+        break;
+      }
       p = pos;
       continue;
     }
@@ -652,6 +666,18 @@ static Token *read_string_literal(const char *start, const char *quote, Type *ty
       buf[len++] = (uint8_t)c;
       continue;
     }
+    if ((unsigned char)*p >= 128) {
+      const char *q;
+      uint32_t c;
+      if (!try_decode_utf8(&q, p, &c) || q > end) {
+        invalid = true;
+        buf[len++] = *p++;
+      } else {
+        while (p < q)
+          buf[len++] = *p++;
+      }
+      continue;
+    }
     buf[len++] = *p++;
   }
   Token *tok = new_token(TK_STR, start, end + 1);
@@ -857,17 +883,20 @@ static Token *read_unicode_char_literal(const char *start, const char *quote, Ty
 // "pp-number" token first and then converted to a regular number
 // token after preprocessing.
 static Token *new_pp_number(const char *start, const char *p) {
+  bool after_ucn = false;
   for (;;) {
     if (Is_c_ident(*p) || *p == '.') {
       p++;
+      after_ucn = false;
       continue;
     }
-    if ((*p == '+' || *p == '-') && (Casecmp(p[-1], 'e') || Casecmp(p[-1], 'p'))) {
+    if (!after_ucn && (*p == '+' || *p == '-') && (Casecmp(p[-1], 'e') || Casecmp(p[-1], 'p'))) {
       p++;
       continue;
     }
     if (*p == '\'' && (Isalnum(p[1]) || p[1] == '_') && opt_std >= STD_C23) {
       p += 2;
+      after_ucn = false;
       continue;
     }
     if (*p == '\\' && (p[1] == 'u' || p[1] == 'U')) {
@@ -876,6 +905,7 @@ static Token *new_pp_number(const char *start, const char *p) {
       bool inv = false;
       if (read_ucn(&q, p + 1, &c, &inv) && !inv && c >= 0xA0 && is_ident2(c)) {
         p = q;
+        after_ucn = true;
         continue;
       }
     }
@@ -883,6 +913,7 @@ static Token *new_pp_number(const char *start, const char *p) {
       const char *q = p;
       if (is_ident2(decode_utf8(&q, p))) {
         p = q;
+        after_ucn = false;
         continue;
       }
     }
@@ -1205,7 +1236,7 @@ void tokenize_string_literal(Token *tok, Type *basety) {
 static void convert_ucn_ident_impl(Token *tok, bool strict) {
   const char *p = tok->loc;
   const char *end = p + tok->len;
-  char *buf = calloc(1, tok->len + 1);
+  char *buf = arena_calloc(&cc1_arena, (size_t)tok->len + 1);
   char *q = buf;
 
   while (p < end) {
@@ -1217,19 +1248,16 @@ static void convert_ucn_ident_impl(Token *tok, bool strict) {
     uint32_t c;
     if (!read_ucn(&p, p + 1, &c, &invalid) || invalid || c < 0xA0 ||
         !(q == buf ? is_ident1(c) : is_ident2(c)) || p > end) {
-      free(buf);
       if (strict)
         error_tok(tok, "invalid universal character name");
       return;
     }
     q += encode_utf8(q, c);
   }
-  Token *orig = tok->origin;
-  if (!orig) {
-    orig = malloc(sizeof(Token));
-    *orig = *tok;
+  if (!tok->ucn_loc) {
+    tok->ucn_loc = tok->loc;
+    tok->ucn_len = tok->len;
   }
-  tok->origin = orig;
   tok->loc = buf;
   tok->len = q - buf;
   tok->has_ucn = false;
@@ -1469,7 +1497,7 @@ Token *tokenize_file_ex(const char *path, Token *tok, Token **end, bool is_syshd
   fflush(out);
   if (buflen > 0 && memchr(buf, '\0', buflen))
     error("%s: embedded null character in input", path);
-  bool appended_nl = (buflen == 0 || buf[buflen - 1] != '\n');
+  bool appended_nl = (buflen == 0 || (buf[buflen - 1] != '\n' && buf[buflen - 1] != '\r'));
   if (appended_nl)
     fputc('\n', out);
   fputc('\0', out);

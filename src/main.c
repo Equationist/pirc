@@ -345,6 +345,10 @@ int main(int argc, char **argv) {
             rc = 1;
             goto cleanup;
         }
+        /* Native ARM64 (NEON) and x86-64 (SSE2) backends support up to 128-bit SIMD vectors. */
+        if ((do_emit_asm || do_emit_obj) && tspec.caps.max_simd_bits > 128u) {
+            tspec.caps.max_simd_bits = 128u;
+        }
         target_ptr = &tspec;
     } else {
         if (target_override || (do_print && triple)) {
@@ -384,10 +388,6 @@ int main(int argc, char **argv) {
             fprintf(stderr, "pirc: x86_64-pc-windows-msvc native codegen is not yet supported\n");
             rc = 1;
             goto cleanup;
-        }
-        /* Native ARM64 (NEON) and x86-64 (SSE2) backends support up to 128-bit SIMD vectors. */
-        if ((do_emit_asm || do_emit_obj) && target_ptr && tspec.caps.max_simd_bits > 128u) {
-            tspec.caps.max_simd_bits = 128u;
         }
         if (!target_ptr || !pir_lower_module(&mod, target_ptr, &diag)) {
             rc = 1;

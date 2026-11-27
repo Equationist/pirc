@@ -634,9 +634,7 @@ bool is_compatible(Type *t1, Type *t2) {
     Obj *p1 = t1->param_list;
     Obj *p2 = t2->param_list;
     for (; p1 && p2; p1 = p1->param_next, p2 = p2->param_next) {
-      if (!!(p1->ty->qual & Q_ATOMIC) != !!(p2->ty->qual & Q_ATOMIC) &&
-          (p1->ty->size != p2->ty->size || p1->ty->align != p2->ty->align ||
-           p1->ty->kind == TY_STRUCT || p1->ty->kind == TY_UNION))
+      if (!!(p1->ty->qual & Q_ATOMIC) != !!(p2->ty->qual & Q_ATOMIC))
         return false;
       if (!is_compatible(p1->ty, p2->ty))
         return false;
@@ -673,19 +671,37 @@ Type *ptr_decay(Type *ty) {
   return ty;
 }
 
+void chk_not_register_array(Node *node) {
+  if (!is_iso_std || !node || !node->ty || !is_array(node->ty))
+    return;
+  Node *base = node;
+  while (base->kind == ND_MEMBER)
+    base = base->m.lhs;
+  if (base->kind == ND_VAR && base->m.var->is_register)
+    error_tok(node->tok, "cannot compute address of register array");
+}
+
 void ptr_convert(Node **node) {
   add_type(*node);
   Type *orig = (*node)->ty;
-  if (is_iso_std && is_array(orig)) {
-    Node *base = *node;
-    while (base->kind == ND_MEMBER)
-      base = base->m.lhs;
-    if (base->kind == ND_VAR && base->m.var->is_register)
-      error_tok((*node)->tok, "cannot compute address of register array");
-  }
+  chk_not_register_array(*node);
   Type *ty = ptr_decay(orig);
   if (ty != orig)
     *node = new_cast(*node, ty);
+}
+
+static Type *rebind_ptr_base(Type *ptr_ty, Type *new_base) {
+  Type *res = copy_type(ptr_ty);
+  res->base = new_base;
+  if (res->qual) {
+    Type *u = copy_type(res);
+    u->qual = 0;
+    u->origin = NULL;
+    res->origin = u;
+  } else {
+    res->origin = NULL;
+  }
+  return res;
 }
 
 Type *composite_type(Type *t1, Type *t2) {
@@ -707,19 +723,8 @@ Type *composite_type(Type *t1, Type *t2) {
     }
     return array_of(base, -1);
   }
-  if (t1->kind == TY_PTR && t2->kind == TY_PTR) {
-    Type *res = copy_type(t1);
-    res->base = composite_type(t1->base, t2->base);
-    if (res->qual) {
-      Type *u = copy_type(res);
-      u->qual = 0;
-      u->origin = NULL;
-      res->origin = u;
-    } else {
-      res->origin = NULL;
-    }
-    return res;
-  }
+  if (t1->kind == TY_PTR && t2->kind == TY_PTR)
+    return rebind_ptr_base(t1, composite_type(t1->base, t2->base));
   if (t1->kind == TY_FUNC && t2->kind == TY_FUNC) {
     Type *ret = composite_type(t1->return_ty, t2->return_ty);
     if (t1->is_oldstyle && !t2->is_oldstyle) {
@@ -952,28 +957,25 @@ void int_promotion(Node **node) {
 static Type *cond_ptr_conv2(Type *ty1, Type *ty2, Node **cond, Obj **cond_var) {
   if (is_array(ty1)) {
     Type *base = cond_ptr_conv2(ty1->base, ty2->base, cond, cond_var);
-    int64_t *len;
-    if ((len = get_arr_len(ty1)) || (len = get_arr_len(ty2))) {
+    if ((ty1->kind == TY_ARRAY && ty1->size >= 0) || (ty2->kind == TY_ARRAY && ty2->size >= 0)) {
+      int64_t alen = (ty1->kind == TY_ARRAY && ty1->size >= 0) ? ty1->array_len : ty2->array_len;
       if (base->kind == TY_VLA)
-        return vla_of(base, NULL, *len);
-      return array_of(base, *len);
+        return vla_of(base, NULL, alen);
+      return array_of(base, alen);
     }
     if (ty1->vla_len_expr || ty2->vla_len_expr)
       return vla_cond_result_len(ty1, ty2, base, cond, cond_var);
+    if (ty1->kind == TY_VLA || ty2->kind == TY_VLA) {
+      Type *src = (ty1->kind == TY_VLA) ? ty1 : ty2;
+      Type *v = vla_of(base, NULL, src->array_len);
+      v->vla_len_val = src->vla_len_val;
+      return v;
+    }
 
     return array_of(base, -1);
   }
   if (ty1->kind == TY_PTR) {
-    Type *newty = copy_type(ty1);
-    newty->base = cond_ptr_conv2(ty1->base, ty2->base, cond, cond_var);
-    if (newty->qual) {
-      Type *u = copy_type(newty);
-      u->qual = 0;
-      u->origin = NULL;
-      newty->origin = u;
-    } else {
-      newty->origin = NULL;
-    }
+    Type *newty = rebind_ptr_base(ty1, cond_ptr_conv2(ty1->base, ty2->base, cond, cond_var));
     return add_qual(ty2->qual, newty, NULL);
   }
   if (ty1->kind == TY_FUNC) {
@@ -1381,6 +1383,7 @@ void _add_type(Node *node) {
     case ND_BITXOR:
     case ND_SHL:
     case ND_SHR:
+    case ND_SAR:
       if (!is_int_class(lt) || !is_int_class(rt))
         error_tok(node->tok, "invalid operands");
       break;

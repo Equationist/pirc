@@ -475,6 +475,7 @@ static bool invalid_cast(Node *node, Type *to) {
 
 Node *new_cast(Node *expr, Type *ty) {
   add_type(expr);
+  chk_not_register_array(expr);
   ty = unqual(ty);
 
   if (invalid_cast(expr, ty))
@@ -1160,6 +1161,10 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr, StorageClass ctx)
     tyspec_attr(tok, attr, TK_BATTR);
 
   for (;;) {
+    if (tok->kind == TK_PRAGMA) {
+      pragma_pack(&tok, tok);
+      continue;
+    }
     if (tok->attr_next)
       tyspec_attr(tok, attr, TK_ATTR);
 
@@ -1388,7 +1393,7 @@ static Type *param_declarator(Type *basety, Type *ty, Token *tok, bool is_fndef)
         (ty->kind == TY_VLA && ty->vla_len_expr && ty->vla_len_expr->kind == ND_UNKNOWN))
       error_tok(tok, "'static' requires an array size");
 
-  ty = add_qual(arr_qual, ptr_decay(ty), tok);
+  ty = add_qual(arr_qual & ~Q_ATOMIC, ptr_decay(ty), tok);
 
   if (ty->kind == TY_VOID || (ty->size < 0 && is_fndef))
     error_tok(tok, "invalid parameter type");
@@ -1620,6 +1625,8 @@ static Type *type_suffix(Token **rest, Token *tok, Type *ty) {
 static Type *declarator2(Token **rest, Token *tok, Type *ty, Token **name_tok, bool allow_abstract) {
   if (++parse_depth > 256)
     error_tok(tok, "declarator nesting depth exceeded");
+  while (tok->kind == TK_PRAGMA)
+    pragma_pack(&tok, tok);
   while (consume_tk(&tok, tok, TK_MUL)) {
     QualMask q = pointer_qualifiers(&tok, tok);
     ty = add_qual(q, pointer_to(ty), tok);
@@ -2077,6 +2084,8 @@ static Node *declaration2(Token **rest, Token *tok, Type *basety, VarAttr *attr,
       error_tok(name, "non-const static local variable in external inline function");
 
     Obj *var = new_static_lvar(ty);
+    if (is_vm_ty(ty))
+      new_defr(DF_VM_BARRIER);
     push_var_name(name, var);
 
     if (attr->strg & SC_THREAD)
@@ -2229,9 +2238,11 @@ static Node *declaration_sc(Token **rest, Token *tok, StorageClass allow_sc, boo
 
   if (tok->kind == TK_SEMI) {
     chk_inline(&attr, tok);
-    if (for_init && is_iso_std && !tok->file->is_syshdr)
+    if (for_init && is_iso_user_tok(tok))
       error_tok(start, "'for' loop initial declaration must declare an object");
-    if (is_iso_std && !tok->file->is_syshdr &&
+    if ((attr.strg & SC_TYPEDEF) && is_iso_user_tok(tok))
+      error_tok(start, "typedef requires a name");
+    if (is_iso_user_tok(tok) &&
         basety->kind != TY_STRUCT && basety->kind != TY_UNION &&
         (!basety->is_enum || !has_lcurly_before(start, tok)))
       error_tok(start, "declaration does not declare anything");
@@ -3536,6 +3547,8 @@ static Node *stmt(Token **rest, Token *tok, Token *label_list) {
 }
 
 static Node *stmt_inner(Token **rest, Token *tok, Token *label_list) {
+  while (tok->kind == TK_PRAGMA)
+    pragma_pack(&tok, tok);
   if (tok->kind == TK_return) {
     if (fnctx->defr_ctx)
       error_tok(tok, "return in defer block");
@@ -3610,7 +3623,10 @@ static Node *stmt_inner(Token **rest, Token *tok, Token *label_list) {
     Node *node = new_node(ND_FOR, tok);
     tok = skip_tk(tok->next, TK_LPAREN);
 
-    if (is_typename(tok)) {
+    if (tok->kind == TK_static_assert) {
+      eval_static_assert(&tok, tok->next);
+      tok = skip_tk(tok, TK_SEMI);
+    } else if (is_typename(tok)) {
       StorageClass for_sc = is_iso_std
           ? (SC_AUTO | SC_REGISTER | (opt_std >= STD_C23 ? SC_CONSTEXPR : SC_NONE))
           : (SC_ALL | SC_INLINE);
@@ -5277,16 +5293,6 @@ static Node *assign_inner(Token **rest, Token *tok) {
 
     switch (tk) {
     case TK_EQ:
-      // Convert A = B to (tmp = B, atomic_exchange(&A, tmp), tmp)
-      if (node->ty->qual & Q_ATOMIC) {
-        Node *tmp = new_var_node(new_lvar(node->ty->origin), tok);
-        Node *expr = new_binary(ND_ASSIGN, tmp, rhs, tok);
-        chain_expr(&expr, new_binary(ND_EXCH, new_unary(ND_ADDR, node, tok), tmp, tok));
-        chain_expr(&expr, tmp);
-        expr->is_nonlval = true;
-        return expr;
-      }
-
       node = new_binary(ND_ASSIGN, node, rhs, tok);
       node->is_nonlval = true;
       return node;
@@ -6393,13 +6399,10 @@ static Node *generic_selection(Token **rest, Token *tok) {
     Node *ctrl = assign(&tok, tok);
     uneval_depth--;
     add_type(ctrl);
-    if (is_iso_std && is_array(ctrl->ty) && ctrl->kind == ND_VAR &&
-        ctrl->m.var->is_register && !start->file->is_syshdr)
-      error_tok(ctrl->tok, "cannot convert 'register' array to pointer");
+    chk_not_register_array(ctrl);
     t1 = unqual(ptr_decay(ctrl->ty));
   }
   Node *ret = NULL;
-  Node *def = NULL;
   Token *def_tok = NULL;
 
   struct {
@@ -6410,15 +6413,23 @@ static Node *generic_selection(Token **rest, Token *tok) {
 
   while (comma_list(rest, &tok, TK_RPAREN, true)) {
     if (tok->kind == TK_default) {
-      if (def)
+      if (def_tok)
         error_tok(tok, "duplicate default generic association");
 
       tok = skip_tk(tok->next, TK_COLON);
       def_tok = tok;
-      uneval_depth++;
-      def = assign(&tok, tok);
-      uneval_depth--;
-      add_type(def);
+      /* Skip over the default expression without parsing it yet so we parse it
+       * exactly once (in its true evaluated or unevaluated context) after matching. */
+      int depth = 0;
+      while (tok->kind != TK_EOF) {
+        if (depth == 0 && (tok->kind == TK_COMMA || tok->kind == TK_RPAREN))
+          break;
+        if (tok->kind == TK_LPAREN || tok->kind == TK_LBRACK || tok->kind == TK_LCURLY)
+          depth++;
+        else if (tok->kind == TK_RPAREN || tok->kind == TK_RBRACK || tok->kind == TK_RCURLY)
+          depth--;
+        tok = tok->next;
+      }
       continue;
     }
 
@@ -6457,16 +6468,22 @@ static Node *generic_selection(Token **rest, Token *tok) {
 
   free(types.data);
 
+  if (def_tok) {
+    Token *def_end = NULL;
+    if (ret)
+      uneval_depth++;
+    Node *def = assign(&def_end, def_tok);
+    if (ret)
+      uneval_depth--;
+    add_type(def);
+    if (def_end->kind != TK_COMMA && def_end->kind != TK_RPAREN)
+      error_tok(def_end, "expected ',' or ')'");
+    if (!ret)
+      return def;
+  }
   if (ret)
     return ret;
-  if (!def)
-    error_tok(start, "controlling type not compatible with any association type");
-  if (def_tok) {
-    Token *dummy;
-    def = assign(&dummy, def_tok);
-    add_type(def);
-  }
-  return def;
+  error_tok(start, "controlling type not compatible with any association type");
 }
 
 static Node *checked_arith(Token **rest, Token *tok, NodeKind kind) {
@@ -6970,7 +6987,7 @@ static Node *parse_typedef(Token **rest, Token *tok, Type *basety, VarAttr *attr
         error_tok(name, "redeclaration of '%.*s'", name->len, name->loc);
       if (is_iso_std ? !is_same_typedef_ty(ty, vsc->type_def) : !is_compatible2(ty, vsc->type_def))
         error_tok(name, "incompatible redeclaration");
-      if (is_vm_ty(ty) || is_vm_ty(vsc->type_def))
+      if (is_variably_modified(ty) || is_variably_modified(vsc->type_def))
         error_tok(name, "redefining typedef of variably-modified type");
       if (align > vsc->type_def->align)
         vsc->type_def = aligned_type(align, vsc->type_def);
@@ -6981,7 +6998,7 @@ static Node *parse_typedef(Token **rest, Token *tok, Type *basety, VarAttr *attr
       else
         vsc->type_def = ty;
       chain_expr(&node, calc_vla(ty, tok));
-      if (fnctx && is_vm_ty(ty))
+      if (fnctx && is_variably_modified(ty))
         new_defr(DF_VM_BARRIER);
     }
   }
@@ -7182,7 +7199,7 @@ static void func_definition(Token **rest, Token *tok, Obj *fn, Type *ty) {
     error_tok(tok, "function cannot have qualified 'void' return type");
   fn->is_definition = true;
 
-  Type *prot_ty = fn->ty;
+  Type *prot_ty = fn->compat_ty ? fn->compat_ty : fn->ty;
   if (prot_ty && prot_ty != ty && prot_ty->kind == TY_FUNC) {
     ty->return_ty = composite_type(prot_ty->return_ty, ty->return_ty);
     if (!prot_ty->is_oldstyle && !ty->is_oldstyle) {
@@ -7199,6 +7216,7 @@ static void func_definition(Token **rest, Token *tok, Obj *fn, Type *ty) {
     }
   }
   fn->ty = ty;
+  fn->compat_ty = (prot_ty && prot_ty != ty) ? composite_type(prot_ty, ty) : ty;
 
   fnctx = &(FuncContext){.fn = fn};
 
@@ -7289,8 +7307,10 @@ static Obj *func_prototype(Token *tok, Token *name, Type *ty, VarAttr *attr, boo
   Type *scoped_fn_ty = NULL;
   VarScope *prev_vsc = scope->parent ? find_var(name) : NULL;
   if (fn) {
-    if (!is_compatible(fn->ty, ty))
+    Type *cty = fn->compat_ty ? fn->compat_ty : fn->ty;
+    if (!is_compatible(cty, ty))
       error_tok(name, "incompatible redeclaration");
+    fn->compat_ty = composite_type(cty, ty);
     if (scope->parent && !is_def) {
       scoped_fn_ty = fn->has_file_decl ? composite_type(fn->ty, ty) : ty;
     } else {
@@ -7322,6 +7342,7 @@ static Obj *func_prototype(Token *tok, Token *name, Type *ty, VarAttr *attr, boo
     }
   } else {
     fn = ent->val = new_gvar(get_ident(&cc1_arena, name), ty);
+    fn->compat_ty = ty;
     fn->is_static = attr->strg & SC_STATIC;
     fn->has_file_decl = !scope->parent;
     if (scope->parent && !is_def)
@@ -7362,7 +7383,8 @@ static void func_exportness(Obj *fn, VarAttr *attr, bool is_def) {
 
 static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) {
   if (tok->kind == TK_SEMI) {
-    if (is_iso_std && scope->parent && !tok->file->is_syshdr &&
+    chk_inline(attr, tok);
+    if (is_iso_user_tok(tok) && scope->parent &&
         basety->kind != TY_STRUCT && basety->kind != TY_UNION && !basety->is_enum)
       error_tok(tok, "declaration does not declare anything");
     *rest = tok->next;
@@ -7421,7 +7443,8 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
     VarScope *prev_vsc = scope->parent ? find_var(name) : NULL;
     bool existed = (var != NULL);
     if (var) {
-      if (!is_compatible2(var->ty, ty))
+      Type *cty = var->compat_ty ? var->compat_ty : var->ty;
+      if (!is_compatible2(cty, ty))
         error_tok(name, "incompatible redeclaration");
       if ((!var->is_static && !!(attr->strg & SC_STATIC)) ||
           (var->is_static && !(attr->strg & (SC_STATIC | SC_EXTERN))))
@@ -7429,6 +7452,7 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
       if ((var->kind == OBJ_TLS) != !!(attr->strg & SC_THREAD))
         error_tok(name, "redeclaration with%s thread local",
                   var->kind == OBJ_TLS ? "out" : "");
+      var->compat_ty = composite_type(cty, ty);
       if (scope->parent) {
         scoped_ty = var->has_file_decl ? composite_type(var->ty, ty) : ty;
       } else {
@@ -7437,6 +7461,7 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
       }
     } else {
       var = ent->val = new_gvar(get_ident(&cc1_arena, name), ty);
+      var->compat_ty = ty;
       var->is_static = (attr->strg & SC_STATIC) || (attr->strg & SC_CONSTEXPR);
       var->has_file_decl = !scope->parent;
       if (scope->parent)
@@ -7568,7 +7593,9 @@ Obj *parse(Token *tok) {
 
     if (tok->kind == TK_SEMI) {
       chk_inline(&attr, tok);
-      if (is_iso_std && !decl_start->file->is_syshdr &&
+      if ((attr.strg & SC_TYPEDEF) && is_iso_user_tok(decl_start))
+        error_tok(decl_start, "typedef requires a name");
+      if (is_iso_user_tok(decl_start) &&
           basety->kind != TY_STRUCT && basety->kind != TY_UNION &&
           (!basety->is_enum || !has_lcurly_before(decl_start, tok)))
         error_tok(decl_start, "declaration does not declare anything");

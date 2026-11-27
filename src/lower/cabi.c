@@ -21,8 +21,8 @@ typedef struct {
 
 static bool build_plan(const PirModule *mod, const PirTargetSpec *target,
                        PirCallingConv cc, const PirParamDecl *params,
-                       uint32_t param_count, PirDiag *diag, uint32_t line,
-                       CabiPlan *plan) {
+                       uint32_t param_count, PirType ret_type,
+                       PirDiag *diag, uint32_t line, CabiPlan *plan) {
     memset(plan, 0, sizeof(*plan));
     plan->orig_param_count = param_count;
     if (cc != PIR_CC_C) return true;
@@ -53,6 +53,15 @@ static bool build_plan(const PirModule *mod, const PirTargetSpec *target,
             st.gp_used += plan->ret_info.gp_used;
         }
         start_p = 1u;
+    } else if (target->arch == PIR_ARCH_X86_64 && target->os != PIR_OS_WINDOWS &&
+               ret_type.kind == PIR_TYPE_VECTOR) {
+        uint16_t vbits = pir_vec_bits(ret_type.u.vec);
+        uint16_t mbits = target->caps.max_simd_bits;
+        /* Match simd.c:set_simd_sret_cabi: oversized vector returns lowered to sret_rax
+         * prepend a hidden ptr parameter in rdi, consuming 1 GP register before params. */
+        if (vbits > mbits && !(mbits == 128u && vbits == 256u)) {
+            st.gp_used += 1u;
+        }
     }
 
     if (param_count > 0u) {
@@ -348,12 +357,13 @@ static void pack_byval_arg(PirModule *mod, const PirTargetSpec *target,
     PirOperand load_base = src_ptr;
     if (ly.size < reg_bytes || ly.align < max_al || has_gap) {
         uint64_t stg_sz = (ly.size > reg_bytes) ? ly.size : reg_bytes;
+        uint32_t stg_al = (ly.align > max_al) ? ly.align : max_al;
         PirValueId stg_v = pir_fn_emit_entry_alloca(mod, fn, "byv_st",
-                                                    stg_sz, max_al, ln, lc, entry_allocas);
+                                                    stg_sz, stg_al, ln, lc, entry_allocas);
 
         if (ly.size < reg_bytes) {
             PirInst ms = pir_make_inst(PIR_OP_MEMSET, pir_type_scalar(PIR_SCALAR_VOID), ln, lc);
-            ms.align = max_al; ms.operand_count = 3u; ms.operands = pir_alloc_ops(mod, 3u);
+            ms.align = stg_al; ms.operand_count = 3u; ms.operands = pir_alloc_ops(mod, 3u);
             ms.operands[0] = pir_op_val(stg_v, tptr);
             ms.operands[1] = pir_op_imm_i(0u, false, ti8);
             ms.operands[2] = pir_op_imm_i(stg_sz, false, idx_ty);
@@ -474,6 +484,7 @@ static bool rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
             vpd.type     = tptr;
             PirAbiArgInfo vinfo;
             PirAbiRegState darwin_va_st = { 0u, 0u };
+            PirAbiRegState saved_va_st  = va_st;
             PirAbiRegState *va_st_ptr = (target->arch == PIR_ARCH_ARM64 && target->os == PIR_OS_MACOS)
                                         ? &darwin_va_st : &va_st;
             if (!pir_abi_classify_param(mod, target, &vpd, va_st_ptr, &vinfo)) {
@@ -503,7 +514,9 @@ static bool rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
                 PirTypeLayout vly = pir_type_layout(mod, target, vpd.abi_type);
                 if (vly.size > 16u) {
                     /* SysV AMD64 §3.5.7: aggregates > 16 bytes (including 256-bit vector wrappers
-                     * under AVX) in variadic positions ALWAYS pass in overflow_arg_area. */
+                     * under AVX) in variadic positions ALWAYS pass in overflow_arg_area.
+                     * Restore va_st so no GP/FP register is falsely consumed. */
+                    va_st = saved_va_st;
                     memset(&vinfo, 0, sizeof(vinfo));
                     vinfo.kind              = PIR_ABI_INDIRECT;
                     vinfo.stack_byval_size  = vly.size;
@@ -970,7 +983,7 @@ static bool call_has_va_special(const PirInst *inst, uint32_t fixed_params) {
         const PirOperand *op = &inst->operands[k];
         if (op->call_abi == PIR_PARAM_BYVAL ||
             (op->type.kind == PIR_TYPE_SCALAR && op->type.u.scalar == PIR_SCALAR_I128) ||
-            (op->type.kind == PIR_TYPE_VECTOR && pir_vec_bits(op->type.u.vec) >= 128u)) {
+            op->type.kind == PIR_TYPE_VECTOR) {
             return true;
         }
     }
@@ -986,11 +999,13 @@ bool pir_lower_cabi(PirModule *mod, const PirTargetSpec *target, PirDiag *diag) 
     bool ok = true;
     for (uint32_t i = 0u; i < mod->funcs.len && ok; ++i) {
         const PirFunction *f = &mod->funcs.data[i];
-        ok = build_plan(mod, target, f->cc, f->params, f->param_count, diag, f->src_line, &fn_plans[i]);
+        ok = build_plan(mod, target, f->cc, f->params, f->param_count, f->ret_type,
+                        diag, f->src_line, &fn_plans[i]);
     }
     for (uint32_t i = 0u; i < mod->sigs.len && ok; ++i) {
         const PirSigDef *s = &mod->sigs.data[i];
-        ok = build_plan(mod, target, s->cc, s->params, s->param_count, diag, s->src_line, &sig_plans[i]);
+        ok = build_plan(mod, target, s->cc, s->params, s->param_count, s->ret_type,
+                        diag, s->src_line, &sig_plans[i]);
     }
     if (!ok) goto cleanup;
 

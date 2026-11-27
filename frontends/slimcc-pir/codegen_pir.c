@@ -1572,14 +1572,17 @@ static PirVal emit_bitfield_load(PirVal addr, Member *mem, bool is_vol) {
     error("wide _BitInt(>64) bit-field is not yet supported in PIR backend");
   ensure_open_block();
   const char *vsuf = is_vol ? " [volatile]" : "";
-  int32_t fp = bitfield_footprint(mem);
+  int32_t byte_skip = mem->bit_offset / 8;
+  int32_t eff_off = mem->bit_offset % 8;
+  int32_t fp = (eff_off + mem->bit_width + 7) / 8;
   int32_t lo_bytes = fp > 8 ? 8 : fp;
+  addr = emit_ptr_add_imm(addr, byte_skip);
   int acc = emit_load_le_bytes(addr, lo_bytes, vsuf);
 
-  /* Shift out bit_offset, merge 9th byte if bitfield crosses 64-bit boundary */
-  if (mem->bit_offset > 0) {
+  /* Shift out eff_off, merge 9th byte if bitfield crosses 64-bit boundary */
+  if (eff_off > 0) {
     int s = new_tid();
-    sb_printf(&fc->body_sb, "    %%t%d = shr.i64 %%t%d, %d [mask]\n", s, acc, mem->bit_offset);
+    sb_printf(&fc->body_sb, "    %%t%d = shr.i64 %%t%d, %d [mask]\n", s, acc, eff_off);
     acc = s;
   }
   if (fp > 8) {
@@ -1590,7 +1593,7 @@ static PirVal emit_bitfield_load(PirVal addr, Member *mem, bool is_vol) {
     int nacc = new_tid();
     sb_printf(&fc->body_sb, "    %%t%d = load.i8 %%t%d, align 1%s\n", b, bp8.id, vsuf);
     sb_printf(&fc->body_sb, "    %%t%d = zext.i64 %%t%d\n", b64, b);
-    sb_printf(&fc->body_sb, "    %%t%d = shl.i64 %%t%d, %d [mask]\n", sh, b64, 64 - mem->bit_offset);
+    sb_printf(&fc->body_sb, "    %%t%d = shl.i64 %%t%d, %d [mask]\n", sh, b64, 64 - eff_off);
     sb_printf(&fc->body_sb, "    %%t%d = or.i64 %%t%d, %%t%d\n", nacc, acc, sh);
     acc = nacc;
   }
@@ -1634,27 +1637,38 @@ static PirVal emit_bitfield_store(PirVal val, PirVal addr, Member *mem, bool is_
     sb_printf(&fc->body_sb, "    %%t%d = zext.i64 %%t%d\n", v64, nb);
   }
 
-  int32_t fp = bitfield_footprint(mem);
+  int32_t byte_skip = mem->bit_offset / 8;
+  int32_t eff_off = mem->bit_offset % 8;
+  int32_t fp = (eff_off + mem->bit_width + 7) / 8;
   int32_t lo_bytes = fp > 8 ? 8 : fp;
-  /* Read current low bytes (0..lo_bytes-1) into i64 */
-  int old = emit_load_le_bytes(addr, lo_bytes, vsuf);
+  addr = emit_ptr_add_imm(addr, byte_skip);
 
   uint64_t val_mask = (mem->bit_width >= 64) ? ~UINT64_C(0) : ((UINT64_C(1) << mem->bit_width) - 1);
-  uint64_t field_mask = val_mask << mem->bit_offset;
-  uint64_t clear_mask = ~field_mask;
+  int merged;
+  if (eff_off == 0 && (mem->bit_width % 8) == 0) {
+    /* Byte-aligned whole-byte bit-field: overwrites all touched bytes without RMW. */
+    merged = new_tid();
+    sb_printf(&fc->body_sb, "    %%t%d = and.i64 %%t%d, 0x%" PRIx64 "\n", merged, v64, val_mask);
+  } else {
+    /* Read current low bytes (0..lo_bytes-1) into i64 */
+    int old = emit_load_le_bytes(addr, lo_bytes, vsuf);
 
-  int cleared = new_tid();
-  sb_printf(&fc->body_sb, "    %%t%d = and.i64 %%t%d, 0x%" PRIx64 "\n", cleared, old, clear_mask);
-  int masked = new_tid();
-  sb_printf(&fc->body_sb, "    %%t%d = and.i64 %%t%d, 0x%" PRIx64 "\n", masked, v64, val_mask);
-  int shifted = masked;
-  if (mem->bit_offset > 0) {
-    shifted = new_tid();
-    sb_printf(&fc->body_sb, "    %%t%d = shl.i64 %%t%d, %d [mask]\n",
-              shifted, masked, mem->bit_offset);
+    uint64_t field_mask = val_mask << eff_off;
+    uint64_t clear_mask = ~field_mask;
+
+    int cleared = new_tid();
+    sb_printf(&fc->body_sb, "    %%t%d = and.i64 %%t%d, 0x%" PRIx64 "\n", cleared, old, clear_mask);
+    int masked = new_tid();
+    sb_printf(&fc->body_sb, "    %%t%d = and.i64 %%t%d, 0x%" PRIx64 "\n", masked, v64, val_mask);
+    int shifted = masked;
+    if (eff_off > 0) {
+      shifted = new_tid();
+      sb_printf(&fc->body_sb, "    %%t%d = shl.i64 %%t%d, %d [mask]\n",
+                shifted, masked, eff_off);
+    }
+    merged = new_tid();
+    sb_printf(&fc->body_sb, "    %%t%d = or.i64 %%t%d, %%t%d\n", merged, cleared, shifted);
   }
-  int merged = new_tid();
-  sb_printf(&fc->body_sb, "    %%t%d = or.i64 %%t%d, %%t%d\n", merged, cleared, shifted);
 
   /* Store `lo_bytes` bytes back */
   for (int32_t i = 0; i < lo_bytes; i++) {
@@ -1671,7 +1685,7 @@ static PirVal emit_bitfield_store(PirVal val, PirVal addr, Member *mem, bool is_
 
   /* If bitfield spans into 9th byte, update byte 8 */
   if (fp > 8) {
-    int hi_bits = mem->bit_offset + mem->bit_width - 64;
+    int hi_bits = eff_off + mem->bit_width - 64;
     uint32_t hi_mask = (1u << hi_bits) - 1u;
     PirVal bp8 = emit_ptr_add_imm(addr, 8);
     int ob8 = new_tid();
@@ -1682,7 +1696,7 @@ static PirVal emit_bitfield_store(PirVal val, PirVal addr, Member *mem, bool is_
     int nb8 = new_tid();
     sb_printf(&fc->body_sb, "    %%t%d = load.i8 %%t%d, align 1%s\n", ob8, bp8.id, vsuf);
     sb_printf(&fc->body_sb, "    %%t%d = and.i8 %%t%d, 0x%x\n", cb8, ob8, (~hi_mask) & 0xffu);
-    sb_printf(&fc->body_sb, "    %%t%d = shr.i64 %%t%d, %d [mask]\n", vhi, masked, 64 - mem->bit_offset);
+    sb_printf(&fc->body_sb, "    %%t%d = shr.i64 %%t%d, %d [mask]\n", vhi, v64, 64 - eff_off);
     sb_printf(&fc->body_sb, "    %%t%d = trunc.i8 %%t%d\n", vhi8, vhi);
     sb_printf(&fc->body_sb, "    %%t%d = and.i8 %%t%d, 0x%x\n", mhi8, vhi8, hi_mask & 0xffu);
     sb_printf(&fc->body_sb, "    %%t%d = or.i8 %%t%d, %%t%d\n", nb8, cb8, mhi8);
@@ -1722,6 +1736,8 @@ static const char *atomic_int_ty_for_size(int64_t sz) {
   }
 }
 
+static int32_t effective_ptr_target_align(Node *ptr_expr, int32_t fallback_al);
+
 static int32_t effective_lval_align(Node *n) {
   if (!n || !n->ty)
     return 1;
@@ -1741,27 +1757,8 @@ static int32_t effective_lval_align(Node *n) {
     }
     return align_floor_pow2(al);
   }
-  case ND_DEREF: {
-    Node *p = n->m.lhs;
-    while (p && p->kind == ND_CAST && is_ptr(p->ty))
-      p = p->m.lhs;
-    if (p && p->kind == ND_ADDR)
-      return effective_lval_align(p->m.lhs);
-    if (p && (p->kind == ND_ADD || p->kind == ND_SUB)) {
-      Node *ptr_op = is_ptr(p->m.lhs->ty) ? p->m.lhs : (is_ptr(p->m.rhs->ty) ? p->m.rhs : NULL);
-      if (ptr_op) {
-        Node *base = ptr_op;
-        while (base && base->kind == ND_CAST && is_ptr(base->ty))
-          base = base->m.lhs;
-        if (base && base->kind == ND_ADDR)
-          base = base->m.lhs;
-        int32_t base_al = effective_lval_align(base);
-        if (base_al < al)
-          al = base_al;
-      }
-    }
-    return align_floor_pow2(al);
-  }
+  case ND_DEREF:
+    return effective_ptr_target_align(n->m.lhs, al);
   case ND_COND: {
     int32_t ta = effective_lval_align(n->ctrl.then);
     int32_t ea = effective_lval_align(n->ctrl.els);
@@ -1774,7 +1771,7 @@ static int32_t effective_lval_align(Node *n) {
   case ND_ASSIGN:
     return effective_lval_align(n->m.lhs);
   case ND_CAST:
-    if (is_mem_val_ty(n->ty))
+    if (is_mem_val_ty(n->ty) || is_array(n->ty))
       return effective_lval_align(n->m.lhs);
     return align_floor_pow2(al);
   default:
@@ -1783,12 +1780,52 @@ static int32_t effective_lval_align(Node *n) {
 }
 
 static int32_t effective_ptr_target_align(Node *ptr_expr, int32_t fallback_al) {
-  Node *p = ptr_expr;
-  while (p && p->kind == ND_CAST && is_ptr(p->ty))
-    p = p->m.lhs;
-  if (p && p->kind == ND_ADDR)
-    return effective_lval_align(p->m.lhs);
-  return align_floor_pow2(fallback_al > 0 ? fallback_al : 1);
+  int32_t fb = align_floor_pow2(fallback_al > 0 ? fallback_al : 1);
+  if (!ptr_expr)
+    return fb;
+  switch (ptr_expr->kind) {
+  case ND_CAST:
+    if (is_ptr(ptr_expr->ty)) {
+      if (ptr_expr->m.lhs && ptr_expr->m.lhs->ty && is_array(ptr_expr->m.lhs->ty)) {
+        int32_t a = effective_lval_align(ptr_expr->m.lhs);
+        return align_floor_pow2(a < fb ? a : fb);
+      }
+      if (ptr_expr->m.lhs && ptr_expr->m.lhs->ty && is_ptr(ptr_expr->m.lhs->ty))
+        return effective_ptr_target_align(ptr_expr->m.lhs, fb);
+    }
+    return fb;
+  case ND_ADDR: {
+    int32_t a = effective_lval_align(ptr_expr->m.lhs);
+    return align_floor_pow2(a < fb ? a : fb);
+  }
+  case ND_ADD:
+  case ND_SUB: {
+    Node *ptr_op = (ptr_expr->m.lhs && ptr_expr->m.lhs->ty && is_ptr(ptr_expr->m.lhs->ty))
+                 ? ptr_expr->m.lhs
+                 : ((ptr_expr->m.rhs && ptr_expr->m.rhs->ty && is_ptr(ptr_expr->m.rhs->ty))
+                        ? ptr_expr->m.rhs : NULL);
+    if (ptr_op) {
+      int32_t a = effective_ptr_target_align(ptr_op, fb);
+      return align_floor_pow2(a < fb ? a : fb);
+    }
+    return fb;
+  }
+  case ND_COND: {
+    int32_t ta = effective_ptr_target_align(ptr_expr->ctrl.then, fb);
+    int32_t ea = effective_ptr_target_align(ptr_expr->ctrl.els, fb);
+    int32_t ma = ta < ea ? ta : ea;
+    return align_floor_pow2(ma < fb ? ma : fb);
+  }
+  case ND_COMMA:
+  case ND_CHAIN:
+    return effective_ptr_target_align(ptr_expr->m.rhs, fb);
+  default:
+    if (ptr_expr->ty && is_array(ptr_expr->ty)) {
+      int32_t a = effective_lval_align(ptr_expr);
+      return align_floor_pow2(a < fb ? a : fb);
+    }
+    return fb;
+  }
 }
 
 static int64_t atomic_unqual_size(Type *atomic_ty) {
@@ -2363,7 +2400,8 @@ static PirVal gen_ckd_arith(Node *node) {
   int trunc_v = new_tid();
   sb_printf(&fc->body_sb, "    %%t%d = trunc.%s %%t%d\n", trunc_v, rt, exact);
   PirVal store_v = emit_bitint_norm((PirVal){trunc_v, rt}, res_ty);
-  emit_store_scalar(store_v, dst_ptr, res_ty, res_ty->align);
+  int32_t dst_al = effective_ptr_target_align(node->m.target, res_ty->align);
+  emit_store_scalar(store_v, dst_ptr, res_ty, dst_al);
 
   int back128 = new_tid();
   sb_printf(&fc->body_sb, "    %%t%d = %s.i128 %%t%d\n",

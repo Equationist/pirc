@@ -368,18 +368,18 @@ int encode_utf8(char *buf, uint32_t c) {
 // encoded in one to four bytes. One byte UTF-8 code points are
 // identical to ASCII. Non-ASCII characters are encoded using more
 // than one byte.
-uint32_t decode_utf8(const char **new_pos, const char *p) {
+bool try_decode_utf8(const char **new_pos, const char *p, uint32_t *out) {
   if ((unsigned char)*p < 128) {
     *new_pos = p + 1;
-    return *p;
+    *out = (uint32_t)(unsigned char)*p;
+    return true;
   }
 
-  const char *start = p;
   int len;
   uint32_t c;
 
   if ((unsigned char)*p >= 0xF8) {
-    error_at(start, "invalid UTF-8 sequence");
+    return false;
   } else if ((unsigned char)*p >= MASK2(4, 4)) {
     len = 4;
     c = *p & MASK(3);
@@ -390,20 +390,28 @@ uint32_t decode_utf8(const char **new_pos, const char *p) {
     len = 2;
     c = *p & MASK(5);
   } else {
-    error_at(start, "invalid UTF-8 sequence");
+    return false;
   }
 
   for (int i = 1; i < len; i++) {
     if ((unsigned char)p[i] >> 6 != MASK2(1, 1))
-      error_at(start, "invalid UTF-8 sequence");
+      return false;
     c = (c << 6) | (p[i] & MASK(6));
   }
 
   if ((len == 2 && c < 0x80) || (len == 3 && c < 0x800) || (len == 4 && c < 0x10000) ||
       (c >= 0xD800 && c <= 0xDFFF) || c > 0x10FFFF)
-    error_at(start, "invalid UTF-8 sequence");
+    return false;
 
   *new_pos = p + len;
+  *out = c;
+  return true;
+}
+
+uint32_t decode_utf8(const char **new_pos, const char *p) {
+  uint32_t c = 0;
+  if (!try_decode_utf8(new_pos, p, &c))
+    error_at(p, "invalid UTF-8 sequence");
   return c;
 }
 
@@ -424,20 +432,43 @@ static bool in_range(uint32_t c, const UTF32Range *range, size_t len) {
   return false;
 }
 
-static bool is_c17_d1_extra(uint32_t c) {
-  return c == 0x00A8 || c == 0x00AD || c == 0x00AF ||
-         (c >= 0x00B2 && c <= 0x00B4) ||
-         (c >= 0x00B7 && c <= 0x00B9) ||
-         (c >= 0x00BC && c <= 0x00BE);
-}
+// ISO/IEC 9899:2018 (C17) Annex D.1: Universal character names for identifiers
+static const UTF32Range c17_d1[] = {
+  {0x00A8, 0x00A8}, {0x00AA, 0x00AA}, {0x00AD, 0x00AD}, {0x00AF, 0x00AF},
+  {0x00B2, 0x00B5}, {0x00B7, 0x00BA}, {0x00BC, 0x00BE}, {0x00C0, 0x00D6},
+  {0x00D8, 0x00F6}, {0x00F8, 0x00FF}, {0x0100, 0x167F}, {0x1681, 0x180D},
+  {0x180F, 0x1FFF}, {0x200B, 0x200D}, {0x202A, 0x202E}, {0x203F, 0x2040},
+  {0x2054, 0x2054}, {0x2060, 0x206F}, {0x2070, 0x218F}, {0x2460, 0x24FF},
+  {0x2776, 0x2793}, {0x2C00, 0x2DFF}, {0x2E80, 0x2FFF}, {0x3004, 0x3007},
+  {0x3021, 0x302F}, {0x3031, 0x303F}, {0x3040, 0xD7FF}, {0xF900, 0xFD3D},
+  {0xFD40, 0xFDCF}, {0xFDF0, 0xFE44}, {0xFE47, 0xFFFD},
+  {0x10000, 0x1FFFD}, {0x20000, 0x2FFFD}, {0x30000, 0x3FFFD}, {0x40000, 0x4FFFD},
+  {0x50000, 0x5FFFD}, {0x60000, 0x6FFFD}, {0x70000, 0x7FFFD}, {0x80000, 0x8FFFD},
+  {0x90000, 0x9FFFD}, {0xA0000, 0xAFFFD}, {0xB0000, 0xBFFFD}, {0xC0000, 0xCFFFD},
+  {0xD0000, 0xDFFFD}, {0xE0000, 0xEFFFD},
+};
+
+// ISO/IEC 9899:2018 (C17) Annex D.2: Characters disallowed as initial identifier character
+static const UTF32Range c17_d2[] = {
+  {0x0300, 0x036F}, {0x1DC0, 0x1DFF}, {0x20D0, 0x20FF}, {0xFE20, 0xFE2F},
+};
 
 bool is_ident1(uint32_t c) {
+  if (opt_std < STD_C23) {
+    if (in_range(c, c17_d1, sizeof(c17_d1) / sizeof(UTF32Range)) &&
+        !in_range(c, c17_d2, sizeof(c17_d2) / sizeof(UTF32Range)))
+      return true;
+    return !is_iso_std && in_range(c, math_start, sizeof(math_start) / sizeof(UTF32Range));
+  }
   return in_range(c, xid_start, sizeof(xid_start) / sizeof(UTF32Range)) ||
-         (opt_std < STD_C23 && is_c17_d1_extra(c)) ||
          (!is_iso_std && in_range(c, math_start, sizeof(math_start) / sizeof(UTF32Range)));
 }
 
 bool is_ident2(uint32_t c) {
+  if (opt_std < STD_C23) {
+    return in_range(c, c17_d1, sizeof(c17_d1) / sizeof(UTF32Range)) ||
+           (!is_iso_std && in_range(c, math_cont, sizeof(math_cont) / sizeof(UTF32Range)));
+  }
   return is_ident1(c) ||
          in_range(c, xid_cont, sizeof(xid_cont) / sizeof(UTF32Range)) ||
          (!is_iso_std && in_range(c, math_cont, sizeof(math_cont) / sizeof(UTF32Range)));

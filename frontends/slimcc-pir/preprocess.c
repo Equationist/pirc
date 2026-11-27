@@ -404,6 +404,39 @@ static Token *handle_incl_end(Token *tok) {
   return tok->next;
 }
 
+static Token **pp_root_cur;
+static Token *directives(Token **cur, Token *start, bool is_root);
+
+static Token *exec_pragma_op(Token *tok) {
+  Token *hash = pragma_macro(tok);
+  Token emit_head = {0};
+  Token *emit_cur = &emit_head;
+  tok = directives(&emit_cur, hash, true);
+  if (pp_root_cur && emit_head.next) {
+    emit_cur->next = NULL;
+    for (Token *t = emit_head.next; t; t = t->next) {
+      Token *cp = malloc(sizeof(Token));
+      *cp = *t;
+      cp->next = NULL;
+      cp->alloc_next = NULL;
+      cp->origin = NULL;
+      cp->is_root = true;
+      t->is_root = false;
+      *pp_root_cur = (*pp_root_cur)->next = cp;
+    }
+    Token *eol = calloc(1, sizeof(Token));
+    eol->kind = TK_PMARK;
+    eol->at_bol = true;
+    eol->file = hash->file;
+    eol->line_no = hash->line_no;
+    eol->is_root = true;
+    *pp_root_cur = (*pp_root_cur)->next = eol;
+  }
+  if (tok->kind == TK_PMARK)
+    tok = tok->next;
+  return tok;
+}
+
 static Token *read_pp_const_expr(Token *tok) {
   Token head = {0};
   Token *cur = &head;
@@ -417,11 +450,7 @@ static Token *read_pp_const_expr(Token *tok) {
     if (tok->kind == TK_IDENT && !tok->dont_expand) {
       Macro *m = hashmap_get2(&macros, tok->loc, tok->len);
       if (m && m->handler == &pragma_macro) {
-        tok = m->handler(tok)->next;
-        while (!tok->at_bol)
-          tok = tok->next;
-        if (tok->kind == TK_PMARK)
-          tok = tok->next;
+        tok = exec_pragma_op(tok);
         continue;
       }
       if (m && expand_macro(&tok, tok, m, false))
@@ -543,9 +572,11 @@ static Macro *new_funclike_macro(char *name, Token **rest, Token *tok) {
   Token *cur = &head;
   Macro *m = new_macro(name, false);
 
-  while (!consume_tk(rest, tok, TK_RPAREN)) {
+  for (;;) {
     if (tok->at_bol || tok->kind == TK_EOF)
       error_tok(tok, "unterminated macro parameter list");
+    if (consume_tk(rest, tok, TK_RPAREN))
+      break;
     if (m->arg_cnt++) {
       tok = skip_tk(tok, TK_COMMA);
       if (tok->at_bol || tok->kind == TK_EOF)
@@ -565,11 +596,11 @@ static Macro *new_funclike_macro(char *name, Token **rest, Token *tok) {
       m->has_va_arg = true;
       break;
     }
-    if (is_iso_std && !tok->file->is_syshdr && equal(tok, "__VA_ARGS__"))
+    if (is_iso_user_tok(tok) && equal(tok, "__VA_ARGS__"))
       error_tok(tok, "'__VA_ARGS__' cannot be used as a macro parameter name");
     if (opt_std >= STD_C23 && equal(tok, "__VA_OPT__"))
       error_tok(tok, "'__VA_OPT__' cannot be used as a macro parameter name");
-    if (tok->next->kind == TK_DOT3) {
+    if (!tok->next->at_bol && tok->next->kind == TK_DOT3) {
       if (is_iso_std && !tok->file->is_syshdr)
         error_tok(tok, "named variadic macros are a GNU extension");
       if (tok->next->next->at_bol)
@@ -811,6 +842,10 @@ static Token *expand_tok(Token *tok) {
     }
     if (tok->kind == TK_IDENT && !tok->dont_expand) {
       Macro *m = hashmap_get2(&macros, tok->loc, tok->len);
+      if (m && m->handler == &pragma_macro) {
+        tok = exec_pragma_op(tok);
+        continue;
+      }
       if (m && expand_macro(&tok, tok, m, false))
         continue;
     }
@@ -889,22 +924,22 @@ static char *join_tokens(Token *tok, Token *end, bool is_stringize) {
     if (t->has_space && t != tok)
       len++;
 
-    const Token *src = (is_stringize && t->kind == TK_IDENT && t->origin && t->origin->has_ucn)
-                           ? t->origin : t;
+    const char *sloc = (is_stringize && t->kind == TK_IDENT && t->ucn_loc) ? t->ucn_loc : t->loc;
+    int slen = (is_stringize && t->kind == TK_IDENT && t->ucn_loc) ? t->ucn_len : t->len;
     if (is_stringize) {
       if (t->kind == TK_STR || t->kind == TK_CHAR_LIT) {
-        for (int i = 0; i < src->len; i++) {
-          if (src->loc[i] == '\\' || src->loc[i] == '"')
+        for (int i = 0; i < slen; i++) {
+          if (sloc[i] == '\\' || sloc[i] == '"')
             len++;
           len++;
         }
         continue;
       }
     }
-    len += src->len;
+    len += slen;
   }
 
-  char *buf = malloc(len);
+  char *buf = arena_malloc(&cc1_arena, len);
   size_t pos = 0;
   if (is_stringize)
     buf[pos++] = '"';
@@ -913,20 +948,20 @@ static char *join_tokens(Token *tok, Token *end, bool is_stringize) {
     if (t->has_space && t != tok)
       buf[pos++] = ' ';
 
-    const Token *src = (is_stringize && t->kind == TK_IDENT && t->origin && t->origin->has_ucn)
-                           ? t->origin : t;
+    const char *sloc = (is_stringize && t->kind == TK_IDENT && t->ucn_loc) ? t->ucn_loc : t->loc;
+    int slen = (is_stringize && t->kind == TK_IDENT && t->ucn_loc) ? t->ucn_len : t->len;
     if (is_stringize) {
       if (t->kind == TK_STR || t->kind == TK_CHAR_LIT) {
-        for (int i = 0; i < src->len; i++) {
-          if (src->loc[i] == '\\' || src->loc[i] == '"')
+        for (int i = 0; i < slen; i++) {
+          if (sloc[i] == '\\' || sloc[i] == '"')
             buf[pos++] = '\\';
-          buf[pos++] = src->loc[i];
+          buf[pos++] = sloc[i];
         }
         continue;
       }
     }
-    memcpy(buf + pos, src->loc, src->len);
-    pos += src->len;
+    memcpy(buf + pos, sloc, slen);
+    pos += slen;
   }
 
   if (is_stringize)
@@ -1391,30 +1426,29 @@ static char *read_filename(Token **rest, Token *tok, const char **dir) {
     // So we don't want to use token->str.
     filename = arena_copy_string(&cc1_arena, tok->loc + 1, tok->len - 2);
     *dir = (tok->origin ? tok->origin : tok)->file->name;
-  } else if (tok->kind == TK_LANGLE ||
-             (!is_expanded && tok->kind == TK_LBRACK && tok->len == 2 &&
-              tok->loc[0] == '<' && tok->loc[1] == ':')) {
-    // Pattern 2: #include <foo.h>
-    // Reconstruct a filename from between "<" and ">".
+  } else if (!is_expanded && tok->loc && tok->loc[0] == '<') {
+    // Pattern 2 (raw source): scan <h-char-sequence> directly to first '>' before newline.
+    Token *start = tok;
+    const char *p = start->loc + 1;
+    while (*p && *p != '>' && *p != '\n')
+      p++;
+    if (*p != '>')
+      error_tok(tok, "expected '>'");
+    filename = arena_copy_string(&cc1_arena, start->loc + 1, (size_t)(p - (start->loc + 1)));
+    while (tok->kind != TK_EOF && tok->file == start->file &&
+           tok->loc + tok->len <= p)
+      tok = tok->next;
+    if (tok->kind != TK_EOF && tok->file == start->file &&
+        tok->loc <= p && tok->loc + tok->len > p + 1)
+      error_tok(tok, "extra token");
+  } else if (tok->kind == TK_LANGLE) {
+    // Pattern 2 (macro-expanded): #include FOO -> <...>
     Token *start = tok;
     tok = tok->next;
-
-    // Find closing ">" (or ":>" digraph when lexed from raw source).
-    for (;; tok = tok->next) {
-      if (tok->kind == TK_RANGLE)
-        break;
-      if (!is_expanded && tok->kind == TK_RBRACK && tok->len == 2 &&
-          tok->loc[0] == ':' && tok->loc[1] == '>')
-        break;
+    for (; tok->kind != TK_RANGLE; tok = tok->next)
       if (tok->kind == TK_EOF)
         error_tok(tok, "expected '>'");
-    }
-
-    const char *end_loc = (tok->kind == TK_RBRACK) ? (tok->loc + 1) : tok->loc;
-    if (!is_expanded && start->file == tok->file && start->loc < end_loc)
-      filename = arena_copy_string(&cc1_arena, start->loc + 1, end_loc - start->loc - 1);
-    else
-      filename = join_tokens(start->next, tok, false);
+    filename = join_tokens(start->next, tok, false);
   }
 
   if (filename && *filename != '\0') {
@@ -1623,6 +1657,8 @@ static void finalize_tok(Token *tok) {
 
 void preprocess2(Token *tok, Token **cur) {
   Macro *start_m = locked_macros;
+  Token **saved_root_cur = pp_root_cur;
+  pp_root_cur = cur;
 
   for (; tok->kind != TK_EOF; pop_macro_lock(tok)) {
     if (tok->kind == TK_INCL_END) {
@@ -1653,6 +1689,7 @@ void preprocess2(Token *tok, Token **cur) {
 
   if (start_m != locked_macros)
     internal_error();
+  pp_root_cur = saved_root_cur;
 }
 
 static Token *pass_line(Token **cur, Token *tok) {
@@ -2043,6 +2080,10 @@ static Token *pragma_macro(Token *start) {
 
     if (tok->kind == TK_IDENT && !tok->dont_expand) {
       Macro *m = hashmap_get2(&macros, tok->loc, tok->len);
+      if (m && m->handler == &pragma_macro) {
+        tok = exec_pragma_op(tok);
+        continue;
+      }
       if (m && expand_macro(&tok, tok, m, false))
         continue;
     }
