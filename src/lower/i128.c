@@ -313,8 +313,8 @@ static bool legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                     fn->cabi_ret.reg_count = 0u;
                     fn->cabi_ret.agg_size  = 0u;
                     fn->cabi_ret.agg_align = 0u;
-                } else if (target->arch == PIR_ARCH_RV32) {
-                    /* RV32 ILP32D: 16B i128 returned via hidden sret pointer in a0 (normal param 0). */
+                } else if (target->arch == PIR_ARCH_RV32 || target->arch == PIR_ARCH_PPC32) {
+                    /* 32-bit targets: 16B i128 returned via hidden sret pointer (normal param 0). */
                     fn->cabi_ret.kind      = PIR_CABI_RET_NONE;
                     fn->cabi_ret.reg_count = 0u;
                     fn->cabi_ret.agg_size  = 0u;
@@ -1254,7 +1254,7 @@ static void split_i128_decl(PirModule *mod, const PirTargetSpec *target, PirCall
                 cabi_ret_io->reg_count = 0u;
                 cabi_ret_io->agg_size  = 0u;
                 cabi_ret_io->agg_align = 0u;
-            } else if (target->arch == PIR_ARCH_RV32) {
+            } else if (target->arch == PIR_ARCH_RV32 || target->arch == PIR_ARCH_PPC32) {
                 cabi_ret_io->kind      = PIR_CABI_RET_NONE;
                 cabi_ret_io->reg_count = 0u;
                 cabi_ret_io->agg_size  = 0u;

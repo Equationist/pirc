@@ -842,6 +842,25 @@ static void emit_inst(X64AsmCtx *ctx, const MFunc *mf, const MInst *ins) {
         case MI_RV32_FCVT_W_F: case MI_RV32_FCVT_WU_F:
         case MI_RV32_J: case MI_RV32_BCC: case MI_RV32_CALL: case MI_RV32_CALL_IND:
         case MI_RV32_SWITCH_TBL: case MI_RV32_RET: case MI_RV32_UNIMP:
+        case MI_PPC_LI: case MI_PPC_MR: case MI_PPC_SYM_ADDR: case MI_PPC_TLS_ADDR:
+        case MI_PPC_LD: case MI_PPC_ST: case MI_PPC_STWU: case MI_PPC_FLD: case MI_PPC_FST:
+        case MI_PPC_MOV_SP: case MI_PPC_MFLR: case MI_PPC_MTLR:
+        case MI_PPC_ADD: case MI_PPC_ADDI: case MI_PPC_SUB:
+        case MI_PPC_MULLW: case MI_PPC_MULHW: case MI_PPC_MULHWU:
+        case MI_PPC_DIVW: case MI_PPC_DIVWU:
+        case MI_PPC_AND: case MI_PPC_ANDI: case MI_PPC_OR: case MI_PPC_ORI:
+        case MI_PPC_XOR: case MI_PPC_XORI:
+        case MI_PPC_SLW: case MI_PPC_SLWI: case MI_PPC_SRW: case MI_PPC_SRWI:
+        case MI_PPC_SRAW: case MI_PPC_SRAWI: case MI_PPC_EXTSB: case MI_PPC_EXTSH:
+        case MI_PPC_CMPW: case MI_PPC_CMPWI: case MI_PPC_CMPLW: case MI_PPC_CMPLWI:
+        case MI_PPC_SETCC:
+        case MI_PPC_SYNC: case MI_PPC_ATOMIC_RMW: case MI_PPC_ATOMIC_CAS:
+        case MI_PPC_FMR: case MI_PPC_LOAD_IMM_FP:
+        case MI_PPC_FADD: case MI_PPC_FSUB: case MI_PPC_FMUL: case MI_PPC_FDIV:
+        case MI_PPC_FNEG: case MI_PPC_FABS: case MI_PPC_FSQRT:
+        case MI_PPC_FRSP: case MI_PPC_FCMPU: case MI_PPC_FCTIWZ:
+        case MI_PPC_B: case MI_PPC_BC: case MI_PPC_CALL: case MI_PPC_CALL_IND:
+        case MI_PPC_SWITCH_TBL: case MI_PPC_RET: case MI_PPC_TRAP:
             fprintf(stderr, "internal error: unexpected MIR op %u in x64_asm\n", (unsigned)ins->op);
             abort();
     }

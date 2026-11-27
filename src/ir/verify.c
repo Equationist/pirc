@@ -367,7 +367,8 @@ static void verify_params_and_ret(Verifier *v, const char *owner, uint32_t line,
                 pir_diag_error(v->diag, line, 0u, "'%s': sret_rax is only valid on x86-64 targets", owner);
             }
             if (cabi_ret->kind == PIR_CABI_RET_MULTI_REG &&
-                (v->target->arch == PIR_ARCH_X86_64 || v->target->arch == PIR_ARCH_RV32) &&
+                (v->target->arch == PIR_ARCH_X86_64 || v->target->arch == PIR_ARCH_RV32 ||
+                 v->target->arch == PIR_ARCH_PPC32) &&
                 cabi_ret->reg_count > 2u) {
                 pir_diag_error(v->diag, line, 0u, "'%s': multi_ret supports at most 2 registers on this target", owner);
             }

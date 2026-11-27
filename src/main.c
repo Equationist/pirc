@@ -147,6 +147,20 @@ static bool assemble_to_obj(const char *asm_path, const char *obj_path,
             snprintf(target_flag, sizeof(target_flag), "--target=%s", target->triple);
             execlp(rv_cc, rv_cc, target_flag, "-march=rv32imafd", "-mabi=ilp32d",
                    "-x", "assembler", "-c", asm_path, "-o", obj_path, (char *)NULL);
+        } else if (target && target->arch == PIR_ARCH_PPC32) {
+            const char *ppc_cc = getenv("PIRC_PPC32_CC");
+            if (!ppc_cc || !ppc_cc[0]) {
+                if (access("/opt/homebrew/opt/llvm/bin/clang", X_OK) == 0)
+                    ppc_cc = "/opt/homebrew/opt/llvm/bin/clang";
+                else if (access("/usr/local/opt/llvm/bin/clang", X_OK) == 0)
+                    ppc_cc = "/usr/local/opt/llvm/bin/clang";
+                else
+                    ppc_cc = "clang";
+            }
+            char target_flag[128];
+            snprintf(target_flag, sizeof(target_flag), "--target=%s", target->triple);
+            execlp(ppc_cc, ppc_cc, target_flag,
+                   "-x", "assembler", "-c", asm_path, "-o", obj_path, (char *)NULL);
         } else if (target && target->triple) {
             char target_flag[128];
             snprintf(target_flag, sizeof(target_flag), "--target=%s", target->triple);

@@ -223,10 +223,41 @@ bool pir_interp_mem_write(PirInterp *it, PirPtr p, const void *src, size_t size,
     return true;
 }
 
+static void bswap_inplace(uint8_t *buf, size_t sz) {
+    for (size_t i = 0u; i < sz / 2u; ++i) {
+        uint8_t t = buf[i];
+        buf[i] = buf[sz - 1u - i];
+        buf[sz - 1u - i] = t;
+    }
+}
+
+static bool interp_is_be(const PirInterp *it) {
+    return it->target && it->target->is_big_endian;
+}
+
+static void interp_endian_conv(const PirInterp *it, uint8_t *buf, PirType ty) {
+    if (!interp_is_be(it)) return;
+    if (ty.kind == PIR_TYPE_SCALAR) {
+        size_t sz = (size_t)(pir_scalar_bits(ty.u.scalar, it->ptr_bytes) / 8u);
+        if (sz > 1u && sz <= 16u) bswap_inplace(buf, sz);
+    } else if (ty.kind == PIR_TYPE_VECTOR) {
+        uint32_t lanes = pir_vec_lanes(ty.u.vec);
+        size_t esz = (size_t)(pir_scalar_bits(pir_vec_elem_scalar(ty.u.vec), it->ptr_bytes) / 8u);
+        if (esz > 1u) {
+            for (uint32_t l = 0u; l < lanes; ++l) {
+                bswap_inplace(buf + (size_t)l * esz, esz);
+            }
+        }
+    }
+}
+
 bool pir_interp_mem_write_ptr(PirInterp *it, PirPtr p, PirPtr val, uint32_t align) {
     uint8_t pb = it->ptr_bytes;
     uint64_t addr = pir_interp_ptr_to_int(it, val);
-    if (!pir_interp_mem_write(it, p, &addr, pb, align)) return false;
+    uint8_t raw[8];
+    memcpy(raw, &addr, 8u);
+    if (interp_is_be(it) && pb > 1u) bswap_inplace(raw, pb);
+    if (!pir_interp_mem_write(it, p, raw, pb, align)) return false;
     PirAlloc *a = &it->allocs.data[p.alloc_id];
     PirPtrTag tag = { (size_t)p.offset, val };
     PIR_VEC_PUSH(&a->ptr_tags, tag);
@@ -235,8 +266,12 @@ bool pir_interp_mem_write_ptr(PirInterp *it, PirPtr p, PirPtr val, uint32_t alig
 
 bool pir_interp_mem_read_ptr(PirInterp *it, PirPtr p, PirPtr *out, uint32_t align) {
     uint8_t pb = it->ptr_bytes;
+    uint8_t raw[8];
+    memset(raw, 0, sizeof(raw));
+    if (!pir_interp_mem_read(it, p, raw, pb, align)) return false;
+    if (interp_is_be(it) && pb > 1u) bswap_inplace(raw, pb);
     uint64_t addr = 0u;
-    if (!pir_interp_mem_read(it, p, &addr, pb, align)) return false;
+    memcpy(&addr, raw, pb);
     const PirAlloc *a = &it->allocs.data[p.alloc_id];
     size_t off = (size_t)p.offset;
     for (uint32_t i = 0u; i < a->ptr_tags.len; ++i) {
@@ -1278,7 +1313,10 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                     if (inst->ty.kind == PIR_TYPE_SCALAR && inst->ty.u.scalar == PIR_SCALAR_PTR) {
                         pir_interp_mem_read_ptr(it, p.ptr, &r0.ptr, inst->align);
                     } else {
-                        pir_interp_mem_read(it, p.ptr, r0.bytes, type_byte_size(inst->ty, it->ptr_bytes), inst->align);
+                        size_t sz = type_byte_size(inst->ty, it->ptr_bytes);
+                        if (pir_interp_mem_read(it, p.ptr, r0.bytes, sz, inst->align)) {
+                            interp_endian_conv(it, r0.bytes, inst->ty);
+                        }
                     }
                     break;
                 }
@@ -1289,7 +1327,11 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                     if (inst->ty.kind == PIR_TYPE_SCALAR && inst->ty.u.scalar == PIR_SCALAR_PTR) {
                         pir_interp_mem_write_ptr(it, p.ptr, val.ptr, inst->align);
                     } else {
-                        pir_interp_mem_write(it, p.ptr, val.bytes, type_byte_size(inst->ty, it->ptr_bytes), inst->align);
+                        size_t sz = type_byte_size(inst->ty, it->ptr_bytes);
+                        uint8_t tmp[32];
+                        memcpy(tmp, val.bytes, sz);
+                        interp_endian_conv(it, tmp, inst->ty);
+                        pir_interp_mem_write(it, p.ptr, tmp, sz, inst->align);
                     }
                     break;
                 }
@@ -1300,7 +1342,9 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                     if (inst->ty.u.scalar == PIR_SCALAR_PTR) {
                         pir_interp_mem_read_ptr(it, p.ptr, &r0.ptr, nat);
                     } else {
-                        pir_interp_mem_read(it, p.ptr, r0.bytes, nat, nat);
+                        if (pir_interp_mem_read(it, p.ptr, r0.bytes, nat, nat)) {
+                            interp_endian_conv(it, r0.bytes, inst->ty);
+                        }
                     }
                     break;
                 }
@@ -1312,7 +1356,10 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                     if (inst->ty.u.scalar == PIR_SCALAR_PTR) {
                         pir_interp_mem_write_ptr(it, p.ptr, val.ptr, nat);
                     } else {
-                        pir_interp_mem_write(it, p.ptr, val.bytes, nat, nat);
+                        uint8_t tmp[16];
+                        memcpy(tmp, val.bytes, nat);
+                        interp_endian_conv(it, tmp, inst->ty);
+                        pir_interp_mem_write(it, p.ptr, tmp, nat, nat);
                     }
                     break;
                 }
@@ -1330,6 +1377,7 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                         }
                     } else {
                         if (!pir_interp_mem_read(it, p.ptr, r0.bytes, nat, nat)) break;
+                        interp_endian_conv(it, r0.bytes, inst->ty);
                         unsigned bits = nat * 8u;
                         uint64_t old_v = pir_val_get_u64(&r0);
                         uint64_t arg_v = pir_val_get_u64(&val);
@@ -1344,7 +1392,10 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                         }
                         PirVal nv;
                         pir_val_set_u64(&nv, inst->ty, nxt & width_mask(bits));
-                        pir_interp_mem_write(it, p.ptr, nv.bytes, nat, nat);
+                        uint8_t tmp[16];
+                        memcpy(tmp, nv.bytes, nat);
+                        interp_endian_conv(it, tmp, inst->ty);
+                        pir_interp_mem_write(it, p.ptr, tmp, nat, nat);
                     }
                     break;
                 }
@@ -1362,8 +1413,14 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                         pir_val_set_u64(&r1, pir_type_scalar(PIR_SCALAR_I8), eq ? 1u : 0u);
                     } else {
                         if (!pir_interp_mem_read(it, p.ptr, r0.bytes, nat, nat)) break;
+                        interp_endian_conv(it, r0.bytes, inst->ty);
                         bool eq = (memcmp(r0.bytes, expv.bytes, nat) == 0);
-                        if (eq) pir_interp_mem_write(it, p.ptr, newv.bytes, nat, nat);
+                        if (eq) {
+                            uint8_t tmp[16];
+                            memcpy(tmp, newv.bytes, nat);
+                            interp_endian_conv(it, tmp, inst->ty);
+                            pir_interp_mem_write(it, p.ptr, tmp, nat, nat);
+                        }
                         pir_val_set_u64(&r1, pir_type_scalar(PIR_SCALAR_I8), eq ? 1u : 0u);
                     }
                     break;
@@ -1380,6 +1437,7 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                                            it->target->os != PIR_OS_MACOS);
                     bool is_darwin_arm64 = (it->target && it->target->arch == PIR_ARCH_ARM64 &&
                                             it->target->os == PIR_OS_MACOS);
+                    bool is_sysv_ppc32   = (it->target && it->target->arch == PIR_ARCH_PPC32);
 
                     if (is_sysv_x64) {
                         uint32_t gp_used = 0u, fp_used = 0u;
@@ -1585,6 +1643,112 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                         pir_interp_mem_write_ptr(it, p16, vr_top, 1u);
                         pir_interp_mem_write(it, p24, &init_gr, 4u, 1u);
                         pir_interp_mem_write(it, p28, &init_vr, 4u, 1u);
+                    } else if (is_sysv_ppc32) {
+                        uint32_t gp_used = 0u, fp_used = 0u;
+                        for (uint32_t k = 0u; k < fn->param_count; ++k) {
+                            if (k == 0u && fn->cabi_ret.kind == PIR_CABI_RET_MULTI_REG) continue;
+                            if (fn->params[k].abi_force_stack) continue;
+                            PirType pt = fn->params[k].type;
+                            if (pir_type_is_float(pt)) {
+                                if (fp_used < 8u) fp_used++;
+                            } else {
+                                if (fn->params[k].abi_stack_align >= 8u && (gp_used & 1u) != 0u && gp_used < 8u) {
+                                    gp_used++;
+                                }
+                                if (gp_used < 8u) gp_used++;
+                            }
+                        }
+                        uint8_t init_gp = (uint8_t)gp_used;
+                        uint8_t init_fp = (uint8_t)fp_used;
+                        uint32_t rsa_aid = pir_interp_alloc_new(it, 96u, 8u, false, false, false, true);
+                        size_t oaa_cap = 64u + (size_t)fr.vararg_count * 16u;
+                        uint32_t oaa_aid = pir_interp_alloc_new(it, oaa_cap, 8u, false, false, false, true);
+                        if (rsa_aid == 0u || oaa_aid == 0u) break;
+                        PIR_VEC_PUSH(&fr.stack_allocs, rsa_aid);
+                        PIR_VEC_PUSH(&fr.stack_allocs, oaa_aid);
+
+                        uint32_t cur_gp = gp_used;
+                        uint32_t cur_fp = fp_used;
+                        size_t oaa_off = 0u;
+                        for (uint32_t k = 0u; k < fr.vararg_count; ++k) {
+                            const PirVal *va = &fr.varargs[k];
+                            const PirCallArgMeta *mt = fr.vararg_meta ? &fr.vararg_meta[k] : NULL;
+                            bool is_fp  = pir_type_is_float(va->ty);
+                            bool is_f32 = (va->ty.kind == PIR_TYPE_SCALAR && va->ty.u.scalar == PIR_SCALAR_F32 &&
+                                           !(mt && mt->no_f32_promote));
+                            if (is_fp) {
+                                PirPtr dst;
+                                if (cur_fp < 8u) {
+                                    dst.alloc_id = rsa_aid;
+                                    dst.offset   = (int64_t)(32u + cur_fp * 8u);
+                                    cur_fp++;
+                                } else {
+                                    oaa_off = (oaa_off + 7u) & ~(size_t)7u;
+                                    dst.alloc_id = oaa_aid;
+                                    dst.offset   = (int64_t)oaa_off;
+                                    oaa_off += 8u;
+                                }
+                                uint8_t tmp[8];
+                                if (is_f32) {
+                                    float fv = 0.0f;
+                                    memcpy(&fv, va->bytes, 4u);
+                                    double dv = (double)fv;
+                                    memcpy(tmp, &dv, 8u);
+                                } else {
+                                    memcpy(tmp, va->bytes, 8u);
+                                }
+                                bswap_inplace(tmp, 8u);
+                                pir_interp_mem_write(it, dst, tmp, 8u, 1u);
+                            } else {
+                                bool need_align8 = (mt && mt->stack_align >= 8u);
+                                PirPtr dst;
+                                if (need_align8) {
+                                    /* Split 64-bit integer: aligns cur_gp to even; if >= 7, both halves go to oaa */
+                                    if ((cur_gp & 1u) != 0u && cur_gp < 8u) cur_gp++;
+                                    if (cur_gp + 2u <= 8u) {
+                                        dst.alloc_id = rsa_aid;
+                                        dst.offset   = (int64_t)(cur_gp * 4u);
+                                        cur_gp++;
+                                    } else {
+                                        cur_gp = 8u;
+                                        oaa_off = (oaa_off + 7u) & ~(size_t)7u;
+                                        dst.alloc_id = oaa_aid;
+                                        dst.offset   = (int64_t)oaa_off;
+                                        oaa_off += 4u;
+                                    }
+                                } else if (cur_gp < 8u) {
+                                    dst.alloc_id = rsa_aid;
+                                    dst.offset   = (int64_t)(cur_gp * 4u);
+                                    cur_gp++;
+                                } else {
+                                    dst.alloc_id = oaa_aid;
+                                    dst.offset   = (int64_t)oaa_off;
+                                    oaa_off += 4u;
+                                }
+                                if (va->ty.kind == PIR_TYPE_SCALAR && va->ty.u.scalar == PIR_SCALAR_PTR) {
+                                    pir_interp_mem_write_ptr(it, dst, va->ptr, 1u);
+                                } else {
+                                    uint32_t w32 = (uint32_t)pir_val_get_u64(va);
+                                    uint8_t tmp[4];
+                                    memcpy(tmp, &w32, 4u);
+                                    bswap_inplace(tmp, 4u);
+                                    pir_interp_mem_write(it, dst, tmp, 4u, 1u);
+                                }
+                            }
+                        }
+                        PirPtr p0 = ap.ptr, p1, p2, p4, p8;
+                        if (!pir_ptr_offset_checked(it, ap.ptr, 1, &p1) ||
+                            !pir_ptr_offset_checked(it, ap.ptr, 2, &p2) ||
+                            !pir_ptr_offset_checked(it, ap.ptr, 4, &p4) ||
+                            !pir_ptr_offset_checked(it, ap.ptr, 8, &p8)) break;
+                        uint16_t z16 = 0u;
+                        PirPtr oaa_ptr = { oaa_aid, 0 };
+                        PirPtr rsa_ptr = { rsa_aid, 0 };
+                        pir_interp_mem_write(it, p0, &init_gp, 1u, 1u);
+                        pir_interp_mem_write(it, p1, &init_fp, 1u, 1u);
+                        pir_interp_mem_write(it, p2, &z16, 2u, 1u);
+                        pir_interp_mem_write_ptr(it, p4, oaa_ptr, 1u);
+                        pir_interp_mem_write_ptr(it, p8, rsa_ptr, 1u);
                     } else {
                         size_t slot_sz = (it->ptr_bytes == 4u) ? 4u : 8u;
                         size_t cap = 32u + (size_t)fr.vararg_count * 64u;
@@ -1912,24 +2076,35 @@ static bool init_globals(PirInterp *it) {
             for (uint32_t k = 0u; k < g->item_count && off + esz <= total_sz; ++k) {
                 const PirGlobalItem *gi = &g->items[k];
                 PirPtr dst = { aid, (int64_t)off };
+                uint8_t tmp[8];
                 if (gi->kind == PIR_GITEM_INT && esz <= 8u) {
                     if (elem == PIR_SCALAR_F32) {
                         float fv = gi->int_neg ? -(float)gi->int_lo : (float)gi->int_lo;
-                        pir_interp_mem_write(it, dst, &fv, 4u, 1u);
+                        memcpy(tmp, &fv, 4u);
+                        if (interp_is_be(it)) bswap_inplace(tmp, 4u);
+                        pir_interp_mem_write(it, dst, tmp, 4u, 1u);
                     } else if (elem == PIR_SCALAR_F64) {
                         double dv = gi->int_neg ? -(double)gi->int_lo : (double)gi->int_lo;
-                        pir_interp_mem_write(it, dst, &dv, 8u, 1u);
+                        memcpy(tmp, &dv, 8u);
+                        if (interp_is_be(it)) bswap_inplace(tmp, 8u);
+                        pir_interp_mem_write(it, dst, tmp, 8u, 1u);
                     } else {
                         uint64_t x = gi->int_neg ? (UINT64_C(0) - gi->int_lo) : gi->int_lo;
-                        pir_interp_mem_write(it, dst, &x, esz, 1u);
+                        memcpy(tmp, &x, esz);
+                        if (interp_is_be(it) && esz > 1u) bswap_inplace(tmp, esz);
+                        pir_interp_mem_write(it, dst, tmp, esz, 1u);
                     }
                 } else if (gi->kind == PIR_GITEM_FLOAT && esz <= 8u) {
                     if (elem == PIR_SCALAR_F32) {
                         uint32_t fb32 = (uint32_t)gi->float_bits;
-                        pir_interp_mem_write(it, dst, &fb32, 4u, 1u);
+                        memcpy(tmp, &fb32, 4u);
+                        if (interp_is_be(it)) bswap_inplace(tmp, 4u);
+                        pir_interp_mem_write(it, dst, tmp, 4u, 1u);
                     } else {
                         uint64_t fb = gi->float_bits;
-                        pir_interp_mem_write(it, dst, &fb, 8u, 1u);
+                        memcpy(tmp, &fb, 8u);
+                        if (interp_is_be(it)) bswap_inplace(tmp, 8u);
+                        pir_interp_mem_write(it, dst, tmp, 8u, 1u);
                     }
                 }
                 off += esz;
@@ -1937,18 +2112,25 @@ static bool init_globals(PirInterp *it) {
         } else if (g->has_type && g->type.kind == PIR_TYPE_SCALAR && !g->is_zeroinit && g->item_count == 1u) {
             const PirGlobalItem *gi = &g->items[0];
             size_t sz = type_byte_size(g->type, it->ptr_bytes);
+            uint8_t tmp[8];
             if (gi->kind == PIR_GITEM_INT) {
                 uint64_t x = gi->int_neg ? (UINT64_C(0) - gi->int_lo) : gi->int_lo;
                 if (g->type.u.scalar == PIR_SCALAR_PTR) {
                     pir_interp_mem_write_ptr(it, base, pir_interp_int_to_ptr(it, x), 1u);
                 } else if (g->type.u.scalar == PIR_SCALAR_F32) {
                     float fv = gi->int_neg ? -(float)gi->int_lo : (float)gi->int_lo;
-                    pir_interp_mem_write(it, base, &fv, 4u, 1u);
+                    memcpy(tmp, &fv, 4u);
+                    if (interp_is_be(it)) bswap_inplace(tmp, 4u);
+                    pir_interp_mem_write(it, base, tmp, 4u, 1u);
                 } else if (g->type.u.scalar == PIR_SCALAR_F64) {
                     double dv = gi->int_neg ? -(double)gi->int_lo : (double)gi->int_lo;
-                    pir_interp_mem_write(it, base, &dv, 8u, 1u);
+                    memcpy(tmp, &dv, 8u);
+                    if (interp_is_be(it)) bswap_inplace(tmp, 8u);
+                    pir_interp_mem_write(it, base, tmp, 8u, 1u);
                 } else if (sz <= sizeof(x)) {
-                    pir_interp_mem_write(it, base, &x, sz, 1u);
+                    memcpy(tmp, &x, sz);
+                    if (interp_is_be(it) && sz > 1u) bswap_inplace(tmp, sz);
+                    pir_interp_mem_write(it, base, tmp, sz, 1u);
                 } else {
                     pir_interp_fail(it, PIR_INTERP_ERR, "invalid scalar integer global size %zu", sz);
                     return false;
@@ -1956,23 +2138,27 @@ static bool init_globals(PirInterp *it) {
             } else if (gi->kind == PIR_GITEM_FLOAT) {
                 if (sz == 4u) {
                     uint32_t fb32 = (uint32_t)gi->float_bits;
-                    pir_interp_mem_write(it, base, &fb32, 4u, 1u);
+                    memcpy(tmp, &fb32, 4u);
+                    if (interp_is_be(it)) bswap_inplace(tmp, 4u);
+                    pir_interp_mem_write(it, base, tmp, 4u, 1u);
                 } else if (sz <= sizeof(gi->float_bits)) {
-                    pir_interp_mem_write(it, base, &gi->float_bits, sz, 1u);
+                    memcpy(tmp, &gi->float_bits, sz);
+                    if (interp_is_be(it) && sz > 1u) bswap_inplace(tmp, sz);
+                    pir_interp_mem_write(it, base, tmp, sz, 1u);
                 } else {
                     pir_interp_fail(it, PIR_INTERP_ERR, "invalid scalar float global size %zu", sz);
                     return false;
                 }
             } else if (gi->kind == PIR_GITEM_RELOC) {
-                PirOperand tmp;
-                memset(&tmp, 0, sizeof(tmp));
-                tmp.kind = PIR_OPER_SYM;
-                tmp.type = pir_type_scalar(PIR_SCALAR_PTR);
-                tmp.u.sym.name   = gi->sym_name;
-                tmp.u.sym.offset = gi->sym_offset;
+                PirOperand tmp_op;
+                memset(&tmp_op, 0, sizeof(tmp_op));
+                tmp_op.kind = PIR_OPER_SYM;
+                tmp_op.type = pir_type_scalar(PIR_SCALAR_PTR);
+                tmp_op.u.sym.name   = gi->sym_name;
+                tmp_op.u.sym.offset = gi->sym_offset;
                 CallFrame dummy;
                 memset(&dummy, 0, sizeof(dummy));
-                PirVal rv = eval_operand(it, &dummy, &tmp);
+                PirVal rv = eval_operand(it, &dummy, &tmp_op);
                 pir_interp_mem_write_ptr(it, base, rv.ptr, 1u);
             }
         } else if (!g->is_zeroinit) {
@@ -1996,10 +2182,14 @@ static bool init_globals(PirInterp *it) {
                         off += 1u;
                         break;
                     }
-                    case PIR_GITEM_FLOAT:
-                        pir_interp_mem_write(it, dst, &gi->float_bits, 8u, 1u);
+                    case PIR_GITEM_FLOAT: {
+                        uint8_t fb[8];
+                        memcpy(fb, &gi->float_bits, 8u);
+                        if (interp_is_be(it)) bswap_inplace(fb, 8u);
+                        pir_interp_mem_write(it, dst, fb, 8u, 1u);
                         off += 8u;
                         break;
+                    }
                     case PIR_GITEM_RELOC: {
                         PirOperand tmp;
                         memset(&tmp, 0, sizeof(tmp));

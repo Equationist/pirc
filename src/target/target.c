@@ -85,6 +85,25 @@ bool pir_target_from_triple(const char *triple, PirTargetSpec *out) {
         out->caps.has_switch    = true;
         return true;
     }
+    if (strcmp(triple, "powerpc-unknown-elf") == 0 ||
+        strcmp(triple, "powerpc-unknown-linux-gnu") == 0 ||
+        strcmp(triple, "powerpc-linux-gnu") == 0 ||
+        strcmp(triple, "ppc32-unknown-elf") == 0) {
+        out->arch               = PIR_ARCH_PPC32;
+        out->os                 = strstr(triple, "linux") ? PIR_OS_LINUX : PIR_OS_BAREMETAL;
+        out->ptr_bytes          = 4u;
+        out->is_big_endian      = true;
+        out->va_list_size       = 12u;
+        out->va_list_align      = 4u;
+        out->caps.max_simd_bits = 0u;
+        out->caps.max_int_bits  = 32u;
+        out->caps.has_mul_wide  = true;  /* PPC32 mullw + mulhw/mulhwu (32x32->64) */
+        out->caps.has_add_carry = false;
+        out->caps.has_ovf_ops   = false;
+        out->caps.has_bitops    = false;
+        out->caps.has_switch    = true;
+        return true;
+    }
     if (strcmp(triple, "wasm32-unknown-unknown") == 0 ||
         strcmp(triple, "i386-unknown-linux-gnu") == 0 ||
         strcmp(triple, "i686-unknown-linux-gnu") == 0) {
@@ -405,6 +424,9 @@ bool pir_abi_classify_param(const PirModule *mod, const PirTargetSpec *target,
     if (target->arch == PIR_ARCH_RV32) {
         return pir_abi_rv32_param(mod, target, pd, st, out);
     }
+    if (target->arch == PIR_ARCH_PPC32) {
+        return pir_abi_ppc32_param(mod, target, pd, st, out);
+    }
     return false;
 }
 
@@ -422,6 +444,9 @@ bool pir_abi_classify_retbuf(const PirModule *mod, const PirTargetSpec *target,
     }
     if (target->arch == PIR_ARCH_RV32) {
         return pir_abi_rv32_retbuf(mod, target, agg_ty, out);
+    }
+    if (target->arch == PIR_ARCH_PPC32) {
+        return pir_abi_ppc32_retbuf(mod, target, agg_ty, out);
     }
     return false;
 }
@@ -515,8 +540,8 @@ void pir_abi_plan_va_arg(const PirModule *mod, const PirTargetSpec *target,
         if (stk_al > 8u) out->mem_align = (stk_al > 16u) ? 16u : stk_al;
     } else if (is_darwin_a64 && !out->is_indirect) {
         if (out->align > 8u) out->mem_align = (out->align > 16u) ? 16u : out->align;
-    } else if (target->arch == PIR_ARCH_RV32 && !out->is_indirect) {
-        /* RISC-V ILP32D: 2*XLEN (8B) aligned variadic args align cursor to 8 bytes. */
+    } else if ((target->arch == PIR_ARCH_RV32 || target->arch == PIR_ARCH_PPC32) && !out->is_indirect) {
+        /* 32-bit RISC-V ILP32D & SysV PPC32: 8B aligned variadic args align cursor to 8 bytes. */
         if (out->align >= 8u) out->mem_align = 8u;
     }
 

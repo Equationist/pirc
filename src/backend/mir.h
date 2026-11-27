@@ -144,6 +144,49 @@ static inline uint32_t rv32_reg_num(MPReg r) {
     return (r >= 32u) ? (uint32_t)(r - 32u) : (uint32_t)r;
 }
 
+/* PowerPC 32-bit Big-Endian (SysV SVR4) physical register numbering:
+ *   0..31  : r0..r31 (r0=non-base tmp, r1=sp, r2=tp, r3..r10=args, r11..r12=scratch,
+ *                     r13=sda, r14..r29=callee-saved, r30=callee-saved scratch2, r31=fp)
+ *   32..63 : f0..f31 (f0=asm tmp, f1..f8=args, f9..f10=caller-saved, f11..f13=scratch,
+ *                     f14..f31=callee-saved)
+ */
+#define PPC_GP(n)    ((MPReg)(n))
+#define PPC_FP(n)    ((MPReg)(32u + (n)))
+#define PPC_R0       PPC_GP(0u)
+#define PPC_SP       PPC_GP(1u)
+#define PPC_R2       PPC_GP(2u)
+#define PPC_R3       PPC_GP(3u)
+#define PPC_R4       PPC_GP(4u)
+#define PPC_R5       PPC_GP(5u)
+#define PPC_R6       PPC_GP(6u)
+#define PPC_R7       PPC_GP(7u)
+#define PPC_R8       PPC_GP(8u)
+#define PPC_R9       PPC_GP(9u)
+#define PPC_R10      PPC_GP(10u)
+#define PPC_R11      PPC_GP(11u)
+#define PPC_R12      PPC_GP(12u)
+#define PPC_R13      PPC_GP(13u)
+#define PPC_R30      PPC_GP(30u)
+#define PPC_FP_REG   PPC_GP(31u)
+#define PPC_F0       PPC_FP(0u)
+#define PPC_F1       PPC_FP(1u)
+
+/* Dedicated PPC32 scratch registers (ALL non-r0 so all are valid base registers!). */
+#define PPC_SCRATCH_GP0 PPC_R11
+#define PPC_SCRATCH_GP1 PPC_R12
+#define PPC_SCRATCH_GP2 PPC_R30 /* callee-saved; saved when touched by 3-way spill or frame */
+#define PPC_SCRATCH_FP0 PPC_FP(11u)
+#define PPC_SCRATCH_FP1 PPC_FP(12u)
+#define PPC_SCRATCH_FP2 PPC_FP(13u)
+
+static inline bool ppc_is_fp_preg(MPReg r) {
+    return r >= 32u && r < 64u;
+}
+
+static inline uint32_t ppc_reg_num(MPReg r) {
+    return (r >= 32u) ? (uint32_t)(r - 32u) : (uint32_t)r;
+}
+
 static inline uint32_t mreg_num(MPReg r) {
     return (r >= 32u) ? (uint32_t)(r - 32u) : (uint32_t)r;
 }
@@ -564,7 +607,78 @@ typedef enum {
     MI_RV32_CALL_IND,       /* jalr ra, 0(rs) */
     MI_RV32_SWITCH_TBL,     /* PC-relative jump table dispatch */
     MI_RV32_RET,            /* epilogue marker before frame pass */
-    MI_RV32_UNIMP           /* unimp (deterministic trap) */
+    MI_RV32_UNIMP,          /* unimp (deterministic trap) */
+
+    /* PowerPC 32-bit (SysV SVR4 Big-Endian) Data Movement, Memory & Addressing */
+    MI_PPC_LI,              /* li/lis+ori dst, imm32 */
+    MI_PPC_MR,              /* mr dst, src */
+    MI_PPC_SYM_ADDR,        /* lis dst, sym@ha; addi dst, dst, sym@l */
+    MI_PPC_TLS_ADDR,        /* addis dst, 2, sym@tprel@ha; addi dst, dst, sym@tprel@l */
+    MI_PPC_LD,              /* lbz(+extsb)/lhz/lha/lwz dst, disp16(base) */
+    MI_PPC_ST,              /* stb/sth/stw src, disp16(base) */
+    MI_PPC_STWU,            /* stwu 1, disp16(1) */
+    MI_PPC_FLD,             /* lfs/lfd dst_fp, disp16(base) */
+    MI_PPC_FST,             /* stfs/stfd src_fp, disp16(base) */
+    MI_PPC_MOV_SP,          /* aux_id=0: mr dst, 1; aux_id=1: mr 1, src */
+    MI_PPC_MFLR,            /* mflr dst */
+    MI_PPC_MTLR,            /* mtlr src */
+
+    /* PPC32 Integer ALU */
+    MI_PPC_ADD,
+    MI_PPC_ADDI,
+    MI_PPC_SUB,             /* sub dst, lhs, rhs (subf dst, rhs, lhs) */
+    MI_PPC_MULLW,
+    MI_PPC_MULHW,
+    MI_PPC_MULHWU,
+    MI_PPC_DIVW,
+    MI_PPC_DIVWU,
+    MI_PPC_AND,
+    MI_PPC_ANDI,            /* andi. dst, src, uimm16 */
+    MI_PPC_OR,
+    MI_PPC_ORI,             /* ori dst, src, uimm16 */
+    MI_PPC_XOR,
+    MI_PPC_XORI,            /* xori dst, src, uimm16 */
+    MI_PPC_SLW,
+    MI_PPC_SLWI,
+    MI_PPC_SRW,
+    MI_PPC_SRWI,
+    MI_PPC_SRAW,
+    MI_PPC_SRAWI,
+    MI_PPC_EXTSB,
+    MI_PPC_EXTSH,
+    MI_PPC_CMPW,
+    MI_PPC_CMPWI,
+    MI_PPC_CMPLW,
+    MI_PPC_CMPLWI,
+    MI_PPC_SETCC,           /* extract CR0 bit into 0/1 in dst_gp */
+
+    /* PPC32 Atomics & Fences */
+    MI_PPC_SYNC,
+    MI_PPC_ATOMIC_RMW,      /* dst_old, ptr, val (width=1/2/4, aux_id=rmw_op) */
+    MI_PPC_ATOMIC_CAS,      /* dst_old, dst_ok, ptr, exp, des (width=1/2/4) */
+
+    /* PPC32 Floating-Point */
+    MI_PPC_FMR,
+    MI_PPC_LOAD_IMM_FP,     /* dst_fp, imm (width=4/8 via .rodata pool) */
+    MI_PPC_FADD,
+    MI_PPC_FSUB,
+    MI_PPC_FMUL,
+    MI_PPC_FDIV,
+    MI_PPC_FNEG,
+    MI_PPC_FABS,
+    MI_PPC_FSQRT,
+    MI_PPC_FRSP,
+    MI_PPC_FCMPU,
+    MI_PPC_FCTIWZ,
+
+    /* PPC32 Control Flow */
+    MI_PPC_B,
+    MI_PPC_BC,
+    MI_PPC_CALL,            /* bl sym (aux_id=1 emits creqv 6,6,6) */
+    MI_PPC_CALL_IND,        /* mtctr rs; bctrl (aux_id=1 emits creqv 6,6,6) */
+    MI_PPC_SWITCH_TBL,      /* jump table dispatch */
+    MI_PPC_RET,             /* blr (epilogue marker before frame pass) */
+    MI_PPC_TRAP             /* trap (tw 31,0,0) */
 } MOpcode;
 
 /* =========================================================================
@@ -702,6 +816,7 @@ typedef struct {
     int64_t               linux_gr_top_off;     /* Negative fp offset for Linux ARM64 va_start */
     int64_t               linux_vr_top_off;
     int64_t               x64_reg_save_off;     /* Negative rbp offset for SysV x64 va_start */
+    int64_t               ppc_reg_save_off;     /* Negative r31 offset for SysV PPC32 va_start (96B) */
 } MFunc;
 
 /* =========================================================================

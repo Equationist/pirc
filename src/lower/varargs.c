@@ -69,13 +69,19 @@ static void emit_va_arg_materialize(PirModule *mod, const PirTargetSpec *target,
         fn->values.data[orig->results[0]].def_block = dst_blk;
         pir_fn_append_inst(fn, out, ft);
     } else {
+        PirValueId ld_ptr = src_ptr;
+        if (target->is_big_endian && !plan->is_indirect && plan->size > 0u && plan->size < ptr_al) {
+            /* Big-endian variadic sub-word ints (i8/i16) are promoted and right-aligned in 4B slot. */
+            ld_ptr = va_padd(mod, fn, dst_blk, out, pir_op_val(src_ptr, tptr),
+                             (uint64_t)(ptr_al - plan->size), idx_ty, ln, lc);
+        }
         uint32_t ld_align = plan->is_indirect
                             ? (plan->align > 0u ? plan->align : 1u)
                             : (plan->align < ptr_al ? plan->align : ptr_al);
         PirInst ld = pir_make_inst(PIR_OP_LOAD, plan->arg_ty, ln, lc);
         ld.align = ld_align;
         ld.operand_count = 1u; ld.operands = pir_alloc_ops(mod, 1u);
-        ld.operands[0] = pir_op_val(src_ptr, tptr);
+        ld.operands[0] = pir_op_val(ld_ptr, tptr);
         ld.results[0]  = orig->results[0];
         fn->values.data[orig->results[0]].def_block = dst_blk;
         pir_fn_append_inst(fn, out, ld);
@@ -788,11 +794,208 @@ static void va_split_vec_spec(PirVecType vt, uint16_t max_bits, PirType *out_pie
     *out_cnt   = (uint32_t)(bits / 64u);
 }
 
+/* SysV PPC32 va_list (12B): { uint8_t gpr @0, uint8_t fpr @1, uint16_t pad @2,
+ *                             void *overflow_arg_area @4, void *reg_save_area @8 }.
+ * reg_save_area layout: r3..r10 at [0..31] (4B each), f1..f8 at [32..95] (8B each). */
+static void lower_va_arg_ppc32(PirModule *mod, const PirTargetSpec *target,
+                               PirFunction *fn, PirBlockId b, uint32_t j,
+                               PirInstIdVec *head, const PirInst *inst) {
+    PirType tptr  = pir_type_scalar(PIR_SCALAR_PTR);
+    PirType ti8   = pir_type_scalar(PIR_SCALAR_I8);
+    PirType ti32  = pir_type_scalar(PIR_SCALAR_I32);
+    PirType tvoid = pir_type_scalar(PIR_SCALAR_VOID);
+    uint32_t ln = inst->src_line, lc = inst->loc_idx;
+
+    bool is_buf = (inst->op == PIR_OP_VA_ARG_BUF);
+    PirOperand ap = is_buf ? inst->operands[1] : inst->operands[0];
+    PirType arg_ty = is_buf ? inst->aux_type : inst->ty;
+
+    PirVaArgPlan plan;
+    pir_abi_plan_va_arg(mod, target, arg_ty, is_buf, &plan);
+
+    if (plan.is_empty) {
+        PirBlockId cont_blk = split_block_tail(mod, fn, b, j, head, ln, NULL);
+        PirInst jc = pir_make_inst(PIR_OP_JMP, tvoid, ln, lc);
+        jc.targets[0].target = cont_blk;
+        pir_fn_append_inst(fn, &fn->blocks.data[b].insts, jc);
+        return;
+    }
+
+    PirBlockId reg_blk = pir_fn_new_block(mod, fn, "va_reg", ln);
+    PirBlockId mem_blk = pir_fn_new_block(mod, fn, "va_mem", ln);
+    PirValueId arg_ptr_param = PIR_INVALID_ID;
+    PirBlockId cont_blk = split_block_tail(mod, fn, b, j, head, ln, &arg_ptr_param);
+
+    bool use_fpr  = plan.is_fp;
+    bool need_2gp = (!use_fpr && !plan.is_indirect && plan.size > 4u); /* i64 -> 2 GP regs aligned even */
+    uint64_t idx_off = use_fpr ? 1u : 0u;
+    uint32_t reg_cnt = need_2gp ? 2u : 1u;
+    uint32_t reg_lim = 8u - reg_cnt; /* valid if aligned_idx <= reg_lim */
+
+    PirInstIdVec *cur = &fn->blocks.data[b].insts;
+    PirValueId idx_p = va_padd(mod, fn, b, cur, ap, idx_off, ti32, ln, lc);
+    PirInst li8 = pir_make_inst(PIR_OP_LOAD, ti8, ln, lc);
+    li8.align = 1u; li8.operand_count = 1u; li8.operands = pir_alloc_ops(mod, 1u);
+    li8.operands[0] = pir_op_val(idx_p, tptr);
+    li8.results[0]  = pir_fn_new_val(mod, fn, "vaidx8", ti8, b, PIR_INVALID_ID, 0u);
+    pir_fn_append_inst(fn, cur, li8);
+
+    PirInst zx = pir_make_inst(PIR_OP_ZEXT, ti32, ln, lc);
+    zx.operand_count = 1u; zx.operands = pir_alloc_ops(mod, 1u);
+    zx.operands[0] = pir_op_val(li8.results[0], ti8);
+    zx.results[0]  = pir_fn_new_val(mod, fn, "vaidx", ti32, b, PIR_INVALID_ID, 0u);
+    pir_fn_append_inst(fn, cur, zx);
+
+    PirValueId cur_idx = zx.results[0];
+    if (need_2gp) {
+        /* Align gpr index to even: (idx + 1) & ~1 */
+        PirInst a1 = pir_make_inst(PIR_OP_ADD, ti32, ln, lc);
+        a1.operand_count = 2u; a1.operands = pir_alloc_ops(mod, 2u);
+        a1.operands[0] = pir_op_val(cur_idx, ti32);
+        a1.operands[1] = pir_op_imm_i(1u, false, ti32);
+        a1.results[0]  = pir_fn_new_val(mod, fn, "vaa1", ti32, b, PIR_INVALID_ID, 0u);
+        pir_fn_append_inst(fn, cur, a1);
+
+        PirInst m2 = pir_make_inst(PIR_OP_AND, ti32, ln, lc);
+        m2.operand_count = 2u; m2.operands = pir_alloc_ops(mod, 2u);
+        m2.operands[0] = pir_op_val(a1.results[0], ti32);
+        m2.operands[1] = pir_op_imm_i(UINT64_C(0xFFFFFFFE), false, ti32);
+        m2.results[0]  = pir_fn_new_val(mod, fn, "vaai", ti32, b, PIR_INVALID_ID, 0u);
+        pir_fn_append_inst(fn, cur, m2);
+        cur_idx = m2.results[0];
+    }
+
+    PirInst cmp = pir_make_inst(PIR_OP_CMP_LE_U, ti32, ln, lc);
+    cmp.operand_count = 2u; cmp.operands = pir_alloc_ops(mod, 2u);
+    cmp.operands[0] = pir_op_val(cur_idx, ti32);
+    cmp.operands[1] = pir_op_imm_i(reg_lim, false, ti32);
+    cmp.results[0]  = pir_fn_new_val(mod, fn, "vainr", ti8, b, PIR_INVALID_ID, 0u);
+    pir_fn_append_inst(fn, cur, cmp);
+
+    PirInst br = pir_make_inst(PIR_OP_BR, tvoid, ln, lc);
+    br.operand_count = 1u; br.operands = pir_alloc_ops(mod, 1u);
+    br.operands[0] = pir_op_val(cmp.results[0], ti8);
+    br.targets[0].target = reg_blk;
+    br.targets[1].target = mem_blk;
+    pir_fn_append_inst(fn, cur, br);
+
+    /* reg_blk: ptr = reg_save_area + (use_fpr ? 32 + idx*8 : idx*4); idx += reg_cnt */
+    PirInstIdVec *rb = &fn->blocks.data[reg_blk].insts;
+    PirValueId rsa_p = va_padd(mod, fn, reg_blk, rb, ap, 8u, ti32, ln, lc);
+    PirInst lrsa = pir_make_inst(PIR_OP_LOAD, tptr, ln, lc);
+    lrsa.align = 4u; lrsa.operand_count = 1u; lrsa.operands = pir_alloc_ops(mod, 1u);
+    lrsa.operands[0] = pir_op_val(rsa_p, tptr);
+    lrsa.results[0]  = pir_fn_new_val(mod, fn, "varsa", tptr, reg_blk, PIR_INVALID_ID, 0u);
+    pir_fn_append_inst(fn, rb, lrsa);
+
+    PirInst sh = pir_make_inst(PIR_OP_SHL, ti32, ln, lc);
+    sh.flags = PIR_FLAG_MASK; sh.operand_count = 2u; sh.operands = pir_alloc_ops(mod, 2u);
+    sh.operands[0] = pir_op_val(cur_idx, ti32);
+    sh.operands[1] = pir_op_imm_i(use_fpr ? 3u : 2u, false, ti32);
+    sh.results[0]  = pir_fn_new_val(mod, fn, "vaboff", ti32, reg_blk, PIR_INVALID_ID, 0u);
+    pir_fn_append_inst(fn, rb, sh);
+
+    PirValueId boff = sh.results[0];
+    if (use_fpr) {
+        PirInst a32 = pir_make_inst(PIR_OP_ADD, ti32, ln, lc);
+        a32.operand_count = 2u; a32.operands = pir_alloc_ops(mod, 2u);
+        a32.operands[0] = pir_op_val(boff, ti32);
+        a32.operands[1] = pir_op_imm_i(32u, false, ti32);
+        a32.results[0]  = pir_fn_new_val(mod, fn, "vafbo", ti32, reg_blk, PIR_INVALID_ID, 0u);
+        pir_fn_append_inst(fn, rb, a32);
+        boff = a32.results[0];
+    }
+
+    PirInst rslot = pir_make_inst(PIR_OP_PTR_ADD, ti32, ln, lc);
+    rslot.operand_count = 2u; rslot.operands = pir_alloc_ops(mod, 2u);
+    rslot.operands[0] = pir_op_val(lrsa.results[0], tptr);
+    rslot.operands[1] = pir_op_val(boff, ti32);
+    rslot.results[0]  = pir_fn_new_val(mod, fn, "varsl", tptr, reg_blk, PIR_INVALID_ID, 0u);
+    pir_fn_append_inst(fn, rb, rslot);
+
+    PirInst ni = pir_make_inst(PIR_OP_ADD, ti32, ln, lc);
+    ni.operand_count = 2u; ni.operands = pir_alloc_ops(mod, 2u);
+    ni.operands[0] = pir_op_val(cur_idx, ti32);
+    ni.operands[1] = pir_op_imm_i(reg_cnt, false, ti32);
+    ni.results[0]  = pir_fn_new_val(mod, fn, "vani", ti32, reg_blk, PIR_INVALID_ID, 0u);
+    pir_fn_append_inst(fn, rb, ni);
+
+    PirInst ni8 = pir_make_inst(PIR_OP_TRUNC, ti8, ln, lc);
+    ni8.operand_count = 1u; ni8.operands = pir_alloc_ops(mod, 1u);
+    ni8.operands[0] = pir_op_val(ni.results[0], ti32);
+    ni8.results[0]  = pir_fn_new_val(mod, fn, "vani8", ti8, reg_blk, PIR_INVALID_ID, 0u);
+    pir_fn_append_inst(fn, rb, ni8);
+
+    PirInst si8 = pir_make_inst(PIR_OP_STORE, ti8, ln, lc);
+    si8.align = 1u; si8.operand_count = 2u; si8.operands = pir_alloc_ops(mod, 2u);
+    si8.operands[0] = pir_op_val(ni8.results[0], ti8);
+    si8.operands[1] = pir_op_val(idx_p, tptr);
+    pir_fn_append_inst(fn, rb, si8);
+
+    PirInst jr = pir_make_inst(PIR_OP_JMP, tvoid, ln, lc);
+    jr.targets[0].target    = cont_blk;
+    jr.targets[0].arg_count = 1u;
+    jr.targets[0].args      = pir_alloc_ops(mod, 1u);
+    jr.targets[0].args[0]   = pir_op_val(rslot.results[0], tptr);
+    pir_fn_append_inst(fn, rb, jr);
+
+    /* mem_blk: mark gpr/fpr exhausted (8), consume from overflow_arg_area (@4) */
+    PirInstIdVec *mb = &fn->blocks.data[mem_blk].insts;
+    PirInst s8 = pir_make_inst(PIR_OP_STORE, ti8, ln, lc);
+    s8.align = 1u; s8.operand_count = 2u; s8.operands = pir_alloc_ops(mod, 2u);
+    s8.operands[0] = pir_op_imm_i(8u, false, ti8);
+    s8.operands[1] = pir_op_val(idx_p, tptr);
+    pir_fn_append_inst(fn, mb, s8);
+
+    PirValueId oaa_p = va_padd(mod, fn, mem_blk, mb, ap, 4u, ti32, ln, lc);
+    PirInst loaa = pir_make_inst(PIR_OP_LOAD, tptr, ln, lc);
+    loaa.align = 4u; loaa.operand_count = 1u; loaa.operands = pir_alloc_ops(mod, 1u);
+    loaa.operands[0] = pir_op_val(oaa_p, tptr);
+    loaa.results[0]  = pir_fn_new_val(mod, fn, "vaoaa", tptr, mem_blk, PIR_INVALID_ID, 0u);
+    pir_fn_append_inst(fn, mb, loaa);
+
+    PirValueId mslot = loaa.results[0];
+    if (plan.mem_align > 4u) {
+        mslot = pir_emit_align_ptr(mod, fn, mem_blk, mb, mslot, plan.mem_align, target, ln, lc);
+    }
+
+    PirInst noaa = pir_make_inst(PIR_OP_PTR_ADD, ti32, ln, lc);
+    noaa.operand_count = 2u; noaa.operands = pir_alloc_ops(mod, 2u);
+    noaa.operands[0] = pir_op_val(mslot, tptr);
+    noaa.operands[1] = pir_op_imm_i(plan.mem_step, false, ti32);
+    noaa.results[0]  = pir_fn_new_val(mod, fn, "vanoaa", tptr, mem_blk, PIR_INVALID_ID, 0u);
+    pir_fn_append_inst(fn, mb, noaa);
+
+    PirInst soaa = pir_make_inst(PIR_OP_STORE, tptr, ln, lc);
+    soaa.align = 4u; soaa.operand_count = 2u; soaa.operands = pir_alloc_ops(mod, 2u);
+    soaa.operands[0] = pir_op_val(noaa.results[0], tptr);
+    soaa.operands[1] = pir_op_val(oaa_p, tptr);
+    pir_fn_append_inst(fn, mb, soaa);
+
+    PirInst jm = pir_make_inst(PIR_OP_JMP, tvoid, ln, lc);
+    jm.targets[0].target    = cont_blk;
+    jm.targets[0].arg_count = 1u;
+    jm.targets[0].args      = pir_alloc_ops(mod, 1u);
+    jm.targets[0].args[0]   = pir_op_val(mslot, tptr);
+    pir_fn_append_inst(fn, mb, jm);
+
+    /* Prepend materialization in cont_blk. */
+    PirInstIdVec mat = {0};
+    emit_va_arg_materialize(mod, target, fn, cont_blk, &mat, inst, &plan, arg_ptr_param);
+    PirBlock *cb = &fn->blocks.data[cont_blk];
+    for (uint32_t k = 0u; k < cb->insts.len; ++k) {
+        PIR_VEC_PUSH(&mat, cb->insts.data[k]);
+    }
+    PIR_VEC_FREE(&cb->insts);
+    cb->insts = mat;
+}
+
 bool pir_lower_varargs(PirModule *mod, const PirTargetSpec *target, PirDiag *diag) {
     (void)diag;
     bool is_sysv_x64     = (target->arch == PIR_ARCH_X86_64 && target->os != PIR_OS_WINDOWS);
     bool is_aapcs64_lin  = (target->arch == PIR_ARCH_ARM64  && target->os != PIR_OS_MACOS);
-    bool is_ptr_cursor   = !is_sysv_x64 && !is_aapcs64_lin; /* Darwin ARM64, Win64, 32-bit */
+    bool is_sysv_ppc32   = (target->arch == PIR_ARCH_PPC32);
+    bool is_ptr_cursor   = !is_sysv_x64 && !is_aapcs64_lin && !is_sysv_ppc32; /* Darwin ARM64, Win64, RV32 */
     PirType tptr   = pir_type_scalar(PIR_SCALAR_PTR);
     PirType idx_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
     PirType tvoid  = pir_type_scalar(PIR_SCALAR_VOID);
@@ -1065,6 +1268,10 @@ bool pir_lower_varargs(PirModule *mod, const PirTargetSpec *target, PirDiag *dia
                         lower_va_arg_ptr_cursor(mod, target, fn, b, &out, &copy);
                     } else if (is_sysv_x64) {
                         lower_va_arg_sysv(mod, target, fn, b, j, &out, &copy);
+                        split = true;
+                        break;
+                    } else if (is_sysv_ppc32) {
+                        lower_va_arg_ppc32(mod, target, fn, b, j, &out, &copy);
                         split = true;
                         break;
                     } else {

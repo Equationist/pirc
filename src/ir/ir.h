@@ -591,6 +591,7 @@ typedef enum {
     PIR_ARCH_X86_64,
     PIR_ARCH_ARM64,
     PIR_ARCH_RV32,
+    PIR_ARCH_PPC32,
     PIR_ARCH_CUSTOM
 } PirArch;
 

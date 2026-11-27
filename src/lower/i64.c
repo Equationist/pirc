@@ -370,12 +370,19 @@ static bool legalize_i64_func(PirModule *mod, const PirTargetSpec *target, PirFu
         }
         for (uint32_t i = 0u; i < fn->param_count; ++i) {
             if (is_i64(fn->params[i].type)) {
+                PirValueId lo_id = fn->params[i].val_id;
+                PirValueId hi_id = map[lo_id].hi;
                 PirParamDecl p0 = fn->params[i];
                 PirParamDecl p1 = fn->params[i];
                 p0.type = t32;
                 p1.type = t32;
+                if (target->arch == PIR_ARCH_PPC32 && fn->cc == PIR_CC_C && p0.abi_stack_align < 8u) {
+                    p0.abi_stack_align = 8u;
+                }
                 p1.abi_stack_align = 0u;
-                p1.val_id = map[p0.val_id].hi;
+                p0.val_id = target->is_big_endian ? hi_id : lo_id;
+                p0.name   = fn->values.data[p0.val_id].name;
+                p1.val_id = target->is_big_endian ? lo_id : hi_id;
                 p1.name   = fn->values.data[p1.val_id].name;
                 PIR_VEC_PUSH(&nfp, p0);
                 PIR_VEC_PUSH(&nfp, p1);
@@ -440,17 +447,20 @@ static bool legalize_i64_func(PirModule *mod, const PirTargetSpec *target, PirFu
             if (copy.op == PIR_OP_CALL || copy.op == PIR_OP_CALL_INDIRECT) {
                 bool call_ret_i64 = false;
                 bool call_is_var  = false;
+                bool call_is_c    = false;
                 uint32_t fixed_n  = 0u;
                 if (copy.op == PIR_OP_CALL && copy.operands[0].u.sym.is_func &&
                     copy.operands[0].u.sym.id < orig_funcs) {
                     const PirFunction *cal = &mod->funcs.data[copy.operands[0].u.sym.id];
                     call_ret_i64 = fn_ret_i64[copy.operands[0].u.sym.id];
                     call_is_var  = cal->is_variadic;
+                    call_is_c    = (cal->cc == PIR_CC_C);
                     fixed_n      = fn_orig_params[copy.operands[0].u.sym.id];
                 } else if (copy.op == PIR_OP_CALL_INDIRECT && copy.sig_id < mod->sigs.len) {
                     const PirSigDef *sig = &mod->sigs.data[copy.sig_id];
                     call_ret_i64 = sig_ret_i64[copy.sig_id];
                     call_is_var  = sig->is_variadic;
+                    call_is_c    = (sig->cc == PIR_CC_C);
                     fixed_n      = sig_orig_params[copy.sig_id];
                 }
                 bool has_i64_arg = false;
@@ -472,18 +482,25 @@ static bool legalize_i64_func(PirModule *mod, const PirTargetSpec *target, PirFu
                         if (is_i64(copy.operands[k].type)) {
                             PirOperand lo, hi;
                             operand_to_pair32(&copy.operands[k], map, &lo, &hi);
-                            lo.call_stack_align = copy.operands[k].call_stack_align;
-                            lo.call_force_stack = copy.operands[k].call_force_stack;
-                            hi.call_force_stack = copy.operands[k].call_force_stack;
+                            PirOperand first  = target->is_big_endian ? hi : lo;
+                            PirOperand second = target->is_big_endian ? lo : hi;
+                            first.call_stack_align  = copy.operands[k].call_stack_align;
+                            second.call_stack_align = 0u;
+                            first.call_force_stack  = copy.operands[k].call_force_stack;
+                            second.call_force_stack = copy.operands[k].call_force_stack;
+                            if (target->arch == PIR_ARCH_PPC32 && call_is_c && first.call_stack_align < 8u) {
+                                first.call_stack_align = 8u;
+                            }
                             if (call_is_var && (k - 1u) >= fixed_n) {
-                                lo.has_explicit_type = true;
-                                hi.has_explicit_type = true;
-                                if (target->arch == PIR_ARCH_RV32 && lo.call_stack_align < 8u) {
-                                    lo.call_stack_align = 8u;
+                                first.has_explicit_type  = true;
+                                second.has_explicit_type = true;
+                                if ((target->arch == PIR_ARCH_RV32 || target->arch == PIR_ARCH_PPC32) &&
+                                    first.call_stack_align < 8u) {
+                                    first.call_stack_align = 8u;
                                 }
                             }
-                            PIR_VEC_PUSH(&nargs, lo);
-                            PIR_VEC_PUSH(&nargs, hi);
+                            PIR_VEC_PUSH(&nargs, first);
+                            PIR_VEC_PUSH(&nargs, second);
                         } else {
                             PIR_VEC_PUSH(&nargs, copy.operands[k]);
                         }
@@ -941,8 +958,10 @@ static bool legalize_i64_func(PirModule *mod, const PirTargetSpec *target, PirFu
                 hc.operand_count = 6u; hc.operands = pir_alloc_ops(mod, 6u);
                 hc.operands[0] = pir_op_sym_func(mod->funcs.data[hid].name, hid);
                 hc.operands[1] = pir_op_val(obuf, tptr);
-                hc.operands[2] = alo; hc.operands[3] = ahi;
-                hc.operands[4] = call_blo; hc.operands[5] = call_bhi;
+                hc.operands[2] = target->is_big_endian ? ahi : alo;
+                hc.operands[3] = target->is_big_endian ? alo : ahi;
+                hc.operands[4] = target->is_big_endian ? call_bhi : call_blo;
+                hc.operands[5] = target->is_big_endian ? call_blo : call_bhi;
                 pir_fn_append_inst(fn, &new_insts, hc);
 
                 bool wrap_sel = (is_s && (copy.flags & PIR_FLAG_WRAP) && is_min_m1 != PIR_INVALID_ID);
@@ -1362,7 +1381,7 @@ static bool legalize_i64_func(PirModule *mod, const PirTargetSpec *target, PirFu
     return true;
 }
 
-static void split_i64_decl(PirModule *mod, PirCallingConv cc,
+static void split_i64_decl(PirModule *mod, const PirTargetSpec *target, PirCallingConv cc,
                            PirParamDecl **params_io, uint32_t *count_io,
                            PirType *ret_ty_io, PirCabiRetInfo *cabi_ret_io) {
     PirParamDecl *old_p = *params_io;
@@ -1399,6 +1418,9 @@ static void split_i64_decl(PirModule *mod, PirCallingConv cc,
             PirParamDecl p0 = old_p[i];
             PirParamDecl p1 = old_p[i];
             p0.type = t32; p1.type = t32;
+            if (target->arch == PIR_ARCH_PPC32 && cc == PIR_CC_C && p0.abi_stack_align < 8u) {
+                p0.abi_stack_align = 8u;
+            }
             p1.abi_stack_align = 0u;
             p1.name = NULL; p1.val_id = PIR_INVALID_ID;
             PIR_VEC_PUSH(&np, p0);
@@ -1443,7 +1465,7 @@ bool pir_legalize_i64(PirModule *mod, const PirTargetSpec *target, PirDiag *diag
                 ok = false;
             }
         } else {
-            split_i64_decl(mod, mod->funcs.data[fi].cc,
+            split_i64_decl(mod, target, mod->funcs.data[fi].cc,
                            &mod->funcs.data[fi].params, &mod->funcs.data[fi].param_count,
                            &mod->funcs.data[fi].ret_type, &mod->funcs.data[fi].cabi_ret);
         }
@@ -1456,7 +1478,7 @@ bool pir_legalize_i64(PirModule *mod, const PirTargetSpec *target, PirDiag *diag
         return false;
     }
     for (uint32_t si = 0u; si < orig_sigs; ++si) {
-        split_i64_decl(mod, mod->sigs.data[si].cc,
+        split_i64_decl(mod, target, mod->sigs.data[si].cc,
                        &mod->sigs.data[si].params, &mod->sigs.data[si].param_count,
                        &mod->sigs.data[si].ret_type, &mod->sigs.data[si].cabi_ret);
     }
