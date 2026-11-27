@@ -1447,25 +1447,42 @@ static void emit_atomic_align_end(const AtomicAlignBlocks *ab, const char *pfx,
   fc->terminated = false;
 }
 
+static void emit_atomic_scalar_load_raw(int dst_tid, const char *pt, const char *addr_expr) {
+  if (!strcmp(pt, "f32") || !strcmp(pt, "f64")) {
+    const char *it = !strcmp(pt, "f32") ? "i32" : "i64";
+    int raw = new_tid();
+    sb_printf(&fc->body_sb, "    %%t%d = atomic_load.%s %s [seq_cst]\n", raw, it, addr_expr);
+    sb_printf(&fc->body_sb, "    %%t%d = bitcast.%s %%t%d\n", dst_tid, pt, raw);
+  } else {
+    sb_printf(&fc->body_sb, "    %%t%d = atomic_load.%s %s [seq_cst]\n", dst_tid, pt, addr_expr);
+  }
+}
+
+static void emit_atomic_scalar_store_raw(const char *pt, int val_tid, const char *addr_expr) {
+  if (!strcmp(pt, "f32") || !strcmp(pt, "f64")) {
+    const char *it = !strcmp(pt, "f32") ? "i32" : "i64";
+    int raw = new_tid();
+    sb_printf(&fc->body_sb, "    %%t%d = bitcast.%s %%t%d\n", raw, it, val_tid);
+    sb_printf(&fc->body_sb, "    atomic_store.%s %%t%d, %s [seq_cst]\n", it, raw, addr_expr);
+  } else {
+    sb_printf(&fc->body_sb, "    atomic_store.%s %%t%d, %s [seq_cst]\n", pt, val_tid, addr_expr);
+  }
+}
+
 static PirVal emit_load_scalar(PirVal addr, Type *ty, int32_t align_hint) {
   ensure_open_block();
   const char *pt = pir_scalar_ty_name(ty);
   int32_t al = align_hint > 0 ? align_hint : pir_scalar_align(ty);
   int32_t p2 = align_floor_pow2(al);
   int r = new_tid();
+  char abuf[32];
+  snprintf(abuf, sizeof(abuf), "%%t%d", addr.id);
   if (ty->qual & Q_ATOMIC) {
     int64_t sz = ty->size > 0 ? ty->size : (pir_ty_bits(pt) / 8);
     if (sz > 1 && sz <= 8) {
       AtomicAlignBlocks ab = emit_atomic_align_begin(addr, sz, "at");
       int rf = new_tid();
-      if (!strcmp(pt, "f32") || !strcmp(pt, "f64")) {
-        const char *it = !strcmp(pt, "f32") ? "i32" : "i64";
-        int raw = new_tid();
-        sb_printf(&fc->body_sb, "    %%t%d = atomic_load.%s %%t%d [seq_cst]\n", raw, it, addr.id);
-        sb_printf(&fc->body_sb, "    %%t%d = bitcast.%s %%t%d\n", rf, pt, raw);
-      } else {
-        sb_printf(&fc->body_sb, "    %%t%d = atomic_load.%s %%t%d [seq_cst]\n", rf, pt, addr.id);
-      }
+      emit_atomic_scalar_load_raw(rf, pt, abuf);
       emit_atomic_align_slow(&ab, "at", rf);
       int slot = emit_entry_scalar_alloca(pt, sz, (int32_t)sz);
       int tp = new_tid(), sz_id = new_tid(), rs = new_tid();
@@ -1474,18 +1491,12 @@ static PirVal emit_load_scalar(PirVal addr, Type *ty, int32_t align_hint) {
       sb_printf(&fc->body_sb, "    call @__pir_atomic_load_n(%%t%d, %%t%d, %%t%d)\n", tp, addr.id, sz_id);
       sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %" PRIi64 "\n", rs, pt, tp, sz);
       emit_atomic_align_end(&ab, "at", rs, r, pt);
-    } else if (!strcmp(pt, "f32") || !strcmp(pt, "f64")) {
-      const char *it = !strcmp(pt, "f32") ? "i32" : "i64";
-      int raw = new_tid();
-      sb_printf(&fc->body_sb, "    %%t%d = atomic_load.%s %%t%d [seq_cst]\n", raw, it, addr.id);
-      sb_printf(&fc->body_sb, "    %%t%d = bitcast.%s %%t%d\n", r, pt, raw);
     } else {
-      sb_printf(&fc->body_sb, "    %%t%d = atomic_load.%s %%t%d [seq_cst]\n", r, pt, addr.id);
+      emit_atomic_scalar_load_raw(r, pt, abuf);
     }
-  } else if (ty->qual & Q_VOLATILE) {
-    sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d [volatile]\n", r, pt, addr.id, p2);
   } else {
-    sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", r, pt, addr.id, p2);
+    sb_printf(&fc->body_sb, "    %%t%d = load.%s %s, align %d%s\n",
+              r, pt, abuf, p2, (ty->qual & Q_VOLATILE) ? " [volatile]" : "");
   }
   PirVal res = {r, pt};
   return emit_bitint_norm(res, ty);
@@ -1496,18 +1507,13 @@ static void emit_store_scalar(PirVal val, PirVal addr, Type *ty, int32_t align_h
   const char *pt = pir_scalar_ty_name(ty);
   int32_t al = align_hint > 0 ? align_hint : pir_scalar_align(ty);
   int32_t p2 = align_floor_pow2(al);
+  char abuf[32];
+  snprintf(abuf, sizeof(abuf), "%%t%d", addr.id);
   if (ty->qual & Q_ATOMIC) {
     int64_t sz = ty->size > 0 ? ty->size : (pir_ty_bits(pt) / 8);
     if (sz > 1 && sz <= 8) {
       AtomicAlignBlocks ab = emit_atomic_align_begin(addr, sz, "at");
-      if (!strcmp(pt, "f32") || !strcmp(pt, "f64")) {
-        const char *it = !strcmp(pt, "f32") ? "i32" : "i64";
-        int raw = new_tid();
-        sb_printf(&fc->body_sb, "    %%t%d = bitcast.%s %%t%d\n", raw, it, val.id);
-        sb_printf(&fc->body_sb, "    atomic_store.%s %%t%d, %%t%d [seq_cst]\n", it, raw, addr.id);
-      } else {
-        sb_printf(&fc->body_sb, "    atomic_store.%s %%t%d, %%t%d [seq_cst]\n", pt, val.id, addr.id);
-      }
+      emit_atomic_scalar_store_raw(pt, val.id, abuf);
       emit_atomic_align_slow(&ab, "at", -1);
       int slot = emit_entry_scalar_alloca(pt, sz, (int32_t)sz);
       int tp = new_tid(), sz_id = new_tid();
@@ -1516,20 +1522,12 @@ static void emit_store_scalar(PirVal val, PirVal addr, Type *ty, int32_t align_h
       sb_printf(&fc->body_sb, "    %%t%d = const.i64 %" PRIi64 "\n", sz_id, sz);
       sb_printf(&fc->body_sb, "    call @__pir_atomic_store_n(%%t%d, %%t%d, %%t%d)\n", addr.id, tp, sz_id);
       emit_atomic_align_end(&ab, "at", -1, -1, NULL);
-    } else if (!strcmp(pt, "f32") || !strcmp(pt, "f64")) {
-      const char *it = !strcmp(pt, "f32") ? "i32" : "i64";
-      int raw = new_tid();
-      sb_printf(&fc->body_sb, "    %%t%d = bitcast.%s %%t%d\n", raw, it, val.id);
-      sb_printf(&fc->body_sb, "    atomic_store.%s %%t%d, %%t%d [seq_cst]\n", it, raw, addr.id);
     } else {
-      sb_printf(&fc->body_sb, "    atomic_store.%s %%t%d, %%t%d [seq_cst]\n", pt, val.id, addr.id);
+      emit_atomic_scalar_store_raw(pt, val.id, abuf);
     }
-  } else if (ty->qual & Q_VOLATILE) {
-    sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d [volatile]\n",
-              pt, val.id, addr.id, p2);
   } else {
-    sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d\n",
-              pt, val.id, addr.id, p2);
+    sb_printf(&fc->body_sb, "    store.%s %%t%d, %s, align %d%s\n",
+              pt, val.id, abuf, p2, (ty->qual & Q_VOLATILE) ? " [volatile]" : "");
   }
 }
 
@@ -1548,18 +1546,10 @@ static PirVal emit_ptr_add_imm(PirVal base, int64_t off) {
  * 8. Bitfield Load / Store Lowering (Aligned & Unaligned)
  * ========================================================================= */
 
-static PirVal emit_bitfield_load(PirVal addr, Member *mem, bool is_vol) {
-  if (is_bitint_mem(mem->ty) || mem->bit_width > 64)
-    error("wide _BitInt(>64) bit-field is not yet supported in PIR backend");
-  ensure_open_block();
-  const char *vsuf = is_vol ? " [volatile]" : "";
-  int32_t fp = bitfield_footprint(mem);
-  int32_t lo_bytes = fp > 8 ? 8 : fp;
+static int emit_load_le_bytes(PirVal addr, int32_t count, const char *vsuf) {
   int acc = new_tid();
   sb_printf(&fc->body_sb, "    %%t%d = const.i64 0\n", acc);
-
-  /* Read first min(fp, 8) bytes little-endian into an i64 accumulator */
-  for (int32_t i = 0; i < lo_bytes; i++) {
+  for (int32_t i = 0; i < count; i++) {
     PirVal bp = emit_ptr_add_imm(addr, i);
     int b = new_tid();
     int b64 = new_tid();
@@ -1574,6 +1564,17 @@ static PirVal emit_bitfield_load(PirVal addr, Member *mem, bool is_vol) {
     sb_printf(&fc->body_sb, "    %%t%d = or.i64 %%t%d, %%t%d\n", nacc, acc, sh);
     acc = nacc;
   }
+  return acc;
+}
+
+static PirVal emit_bitfield_load(PirVal addr, Member *mem, bool is_vol) {
+  if (is_bitint_mem(mem->ty) || mem->bit_width > 64)
+    error("wide _BitInt(>64) bit-field is not yet supported in PIR backend");
+  ensure_open_block();
+  const char *vsuf = is_vol ? " [volatile]" : "";
+  int32_t fp = bitfield_footprint(mem);
+  int32_t lo_bytes = fp > 8 ? 8 : fp;
+  int acc = emit_load_le_bytes(addr, lo_bytes, vsuf);
 
   /* Shift out bit_offset, merge 9th byte if bitfield crosses 64-bit boundary */
   if (mem->bit_offset > 0) {
@@ -1636,23 +1637,7 @@ static PirVal emit_bitfield_store(PirVal val, PirVal addr, Member *mem, bool is_
   int32_t fp = bitfield_footprint(mem);
   int32_t lo_bytes = fp > 8 ? 8 : fp;
   /* Read current low bytes (0..lo_bytes-1) into i64 */
-  int old = new_tid();
-  sb_printf(&fc->body_sb, "    %%t%d = const.i64 0\n", old);
-  for (int32_t i = 0; i < lo_bytes; i++) {
-    PirVal bp = emit_ptr_add_imm(addr, i);
-    int b = new_tid();
-    int b64 = new_tid();
-    sb_printf(&fc->body_sb, "    %%t%d = load.i8 %%t%d, align 1%s\n", b, bp.id, vsuf);
-    sb_printf(&fc->body_sb, "    %%t%d = zext.i64 %%t%d\n", b64, b);
-    int sh = b64;
-    if (i > 0) {
-      sh = new_tid();
-      sb_printf(&fc->body_sb, "    %%t%d = shl.i64 %%t%d, %d [mask]\n", sh, b64, i * 8);
-    }
-    int nold = new_tid();
-    sb_printf(&fc->body_sb, "    %%t%d = or.i64 %%t%d, %%t%d\n", nold, old, sh);
-    old = nold;
-  }
+  int old = emit_load_le_bytes(addr, lo_bytes, vsuf);
 
   uint64_t val_mask = (mem->bit_width >= 64) ? ~UINT64_C(0) : ((UINT64_C(1) << mem->bit_width) - 1);
   uint64_t field_mask = val_mask << mem->bit_offset;
@@ -1827,6 +1812,26 @@ static PirVal emit_stage_padded_atomic_src(PirVal src, int64_t src_sz, int64_t d
   return v;
 }
 
+static void emit_volatile_copy_chunks(PirVal dst, PirVal src, int64_t sz, int32_t align,
+                                      bool vol_load, bool vol_store) {
+  const char *lsuf = vol_load ? " [volatile]" : "";
+  const char *ssuf = vol_store ? " [volatile]" : "";
+  int64_t off = 0;
+  while (off < sz) {
+    int64_t rem = sz - off;
+    int32_t step = (rem >= 8 && align >= 8) ? 8
+                 : (rem >= 4 && align >= 4) ? 4
+                 : (rem >= 2 && align >= 2) ? 2 : 1;
+    const char *ct = (step == 8) ? "i64" : (step == 4) ? "i32" : (step == 2) ? "i16" : "i8";
+    PirVal sp = emit_ptr_add_imm(src, off);
+    PirVal dp = emit_ptr_add_imm(dst, off);
+    int lv = new_tid();
+    sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d%s\n", lv, ct, sp.id, step, lsuf);
+    sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d%s\n", ct, lv, dp.id, step, ssuf);
+    off += step;
+  }
+}
+
 static PirVal emit_load_node(Node *node, PirVal addr) {
   if (is_bitfield(node)) {
     bool is_vol = ((node->ty->qual & Q_VOLATILE) != 0) ||
@@ -1882,20 +1887,7 @@ static PirVal emit_load_node(Node *node, PirVal addr) {
     int slot = emit_entry_alloca(node->ty->size, al);
     int tmp = new_tid();
     sb_printf(&fc->body_sb, "    %%t%d = ptr_add.i64 %%loc_%d, 0\n", tmp, slot);
-    int64_t off = 0;
-    while (off < node->ty->size) {
-      int64_t rem = node->ty->size - off;
-      int32_t step = (rem >= 8 && al >= 8) ? 8
-                   : (rem >= 4 && al >= 4) ? 4
-                   : (rem >= 2 && al >= 2) ? 2 : 1;
-      const char *ct = (step == 8) ? "i64" : (step == 4) ? "i32" : (step == 2) ? "i16" : "i8";
-      PirVal sp = emit_ptr_add_imm(addr, off);
-      PirVal dp = emit_ptr_add_imm((PirVal){tmp, "ptr"}, off);
-      int lv = new_tid();
-      sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d [volatile]\n", lv, ct, sp.id, step);
-      sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d\n", ct, lv, dp.id, step);
-      off += step;
-    }
+    emit_volatile_copy_chunks((PirVal){tmp, "ptr"}, addr, node->ty->size, al, true, false);
     PirVal v = {tmp, "ptr"};
     return v;
   }
@@ -1965,20 +1957,7 @@ static PirVal emit_store_node(Node *lhs, PirVal val, PirVal addr, Node *rhs_node
       int32_t src_al = rhs_node ? effective_lval_align(rhs_node) : dst_al;
       int32_t p2 = dst_al < src_al ? dst_al : src_al;
       if (is_vol) {
-        int64_t off = 0;
-        while (off < copy_sz) {
-          int64_t rem = copy_sz - off;
-          int32_t step = (rem >= 8 && p2 >= 8) ? 8
-                       : (rem >= 4 && p2 >= 4) ? 4
-                       : (rem >= 2 && p2 >= 2) ? 2 : 1;
-          const char *ct = (step == 8) ? "i64" : (step == 4) ? "i32" : (step == 2) ? "i16" : "i8";
-          PirVal sp = emit_ptr_add_imm(val, off);
-          PirVal dp = emit_ptr_add_imm(addr, off);
-          int lv = new_tid();
-          sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", lv, ct, sp.id, step);
-          sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d [volatile]\n", ct, lv, dp.id, step);
-          off += step;
-        }
+        emit_volatile_copy_chunks(addr, val, copy_sz, p2, false, true);
       } else {
         sb_printf(&fc->body_sb, "    memmove %%t%d, %%t%d, %" PRIi64 ", align %d\n",
                   addr.id, val.id, copy_sz, p2);
@@ -2417,19 +2396,13 @@ static PirVal emit_load_local_slot(LocalInfo *li, Type *ty) {
   int32_t al = li->align > 0 ? li->align : pir_scalar_align(ty);
   int32_t p2 = align_floor_pow2(al);
   int r = new_tid();
+  char lbuf[32];
+  snprintf(lbuf, sizeof(lbuf), "%%loc_%d", li->slot_id);
   if (ty->qual & Q_ATOMIC) {
-    if (!strcmp(pt, "f32") || !strcmp(pt, "f64")) {
-      const char *it = !strcmp(pt, "f32") ? "i32" : "i64";
-      int raw = new_tid();
-      sb_printf(&fc->body_sb, "    %%t%d = atomic_load.%s %%loc_%d [seq_cst]\n", raw, it, li->slot_id);
-      sb_printf(&fc->body_sb, "    %%t%d = bitcast.%s %%t%d\n", r, pt, raw);
-    } else {
-      sb_printf(&fc->body_sb, "    %%t%d = atomic_load.%s %%loc_%d [seq_cst]\n", r, pt, li->slot_id);
-    }
-  } else if (ty->qual & Q_VOLATILE) {
-    sb_printf(&fc->body_sb, "    %%t%d = load.%s %%loc_%d, align %d [volatile]\n", r, pt, li->slot_id, p2);
+    emit_atomic_scalar_load_raw(r, pt, lbuf);
   } else {
-    sb_printf(&fc->body_sb, "    %%t%d = load.%s %%loc_%d, align %d\n", r, pt, li->slot_id, p2);
+    sb_printf(&fc->body_sb, "    %%t%d = load.%s %s, align %d%s\n",
+              r, pt, lbuf, p2, (ty->qual & Q_VOLATILE) ? " [volatile]" : "");
   }
   PirVal res = {r, pt};
   return emit_bitint_norm(res, ty);
@@ -2440,20 +2413,61 @@ static void emit_store_local_slot(PirVal val, LocalInfo *li, Type *ty) {
   const char *pt = pir_scalar_ty_name(ty);
   int32_t al = li->align > 0 ? li->align : pir_scalar_align(ty);
   int32_t p2 = align_floor_pow2(al);
+  char lbuf[32];
+  snprintf(lbuf, sizeof(lbuf), "%%loc_%d", li->slot_id);
   if (ty->qual & Q_ATOMIC) {
-    if (!strcmp(pt, "f32") || !strcmp(pt, "f64")) {
-      const char *it = !strcmp(pt, "f32") ? "i32" : "i64";
-      int raw = new_tid();
-      sb_printf(&fc->body_sb, "    %%t%d = bitcast.%s %%t%d\n", raw, it, val.id);
-      sb_printf(&fc->body_sb, "    atomic_store.%s %%t%d, %%loc_%d [seq_cst]\n", it, raw, li->slot_id);
-    } else {
-      sb_printf(&fc->body_sb, "    atomic_store.%s %%t%d, %%loc_%d [seq_cst]\n", pt, val.id, li->slot_id);
-    }
-  } else if (ty->qual & Q_VOLATILE) {
-    sb_printf(&fc->body_sb, "    store.%s %%t%d, %%loc_%d, align %d [volatile]\n", pt, val.id, li->slot_id, p2);
+    emit_atomic_scalar_store_raw(pt, val.id, lbuf);
   } else {
-    sb_printf(&fc->body_sb, "    store.%s %%t%d, %%loc_%d, align %d\n", pt, val.id, li->slot_id, p2);
+    sb_printf(&fc->body_sb, "    store.%s %%t%d, %s, align %d%s\n",
+              pt, val.id, lbuf, p2, (ty->qual & Q_VOLATILE) ? " [volatile]" : "");
   }
+}
+
+static int emit_cas_inline_attempt(PirVal addr, PirVal old_ptr, PirVal eff_old, PirVal eff_new,
+                                   Node *new_node, const char *it, bool is_agg_cas, bool is_fp,
+                                   bool pad_old, bool pad_new, int64_t old_sz, int32_t stage_al,
+                                   int32_t p2_old, const char *done_pfx, int done_bid,
+                                   bool pass_ok_arg) {
+  int exp_id = new_tid();
+  sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", exp_id, it, eff_old.id, p2_old);
+  int new_id = eff_new.id;
+  if (is_agg_cas) {
+    int32_t new_al = pad_new ? stage_al : effective_lval_align(new_node);
+    int32_t p2_new = align_floor_pow2(new_al);
+    new_id = new_tid();
+    sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", new_id, it, eff_new.id, p2_new);
+  } else if (is_fp) {
+    new_id = new_tid();
+    sb_printf(&fc->body_sb, "    %%t%d = bitcast.%s %%t%d\n", new_id, it, eff_new.id);
+  }
+  int actual = new_tid(), ok = new_tid();
+  sb_printf(&fc->body_sb,
+            "    %%t%d, %%t%d = atomic_cmpxchg.%s %%t%d, %%t%d, %%t%d [seq_cst, seq_cst]\n",
+            actual, ok, it, addr.id, exp_id, new_id);
+  int b_fail = new_bid();
+  if (pass_ok_arg) {
+    sb_printf(&fc->body_sb, "    br %%t%d, .%s_%d(%%t%d), .cas_fail_%d\n",
+              ok, done_pfx, done_bid, ok, b_fail);
+  } else {
+    sb_printf(&fc->body_sb, "    br %%t%d, .%s_%d, .cas_fail_%d\n",
+              ok, done_pfx, done_bid, b_fail);
+  }
+  fc->terminated = true;
+
+  sb_printf(&fc->body_sb, "\n.cas_fail_%d:\n", b_fail);
+  fc->terminated = false;
+  sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d\n", it, actual, eff_old.id, p2_old);
+  if (pad_old) {
+    sb_printf(&fc->body_sb, "    memcpy %%t%d, %%t%d, %" PRIi64 ", align 1\n",
+              old_ptr.id, eff_old.id, old_sz);
+  }
+  if (pass_ok_arg) {
+    sb_printf(&fc->body_sb, "    jmp .%s_%d(%%t%d)\n", done_pfx, done_bid, ok);
+  } else {
+    sb_printf(&fc->body_sb, "    jmp .%s_%d\n", done_pfx, done_bid);
+  }
+  fc->terminated = true;
+  return ok;
 }
 
 static void name_labels(Node *lbl);
@@ -3011,36 +3025,9 @@ static PirVal gen_expr(Node *node) {
     if (cas_sz > 1 && cas_sz <= 8) {
       AtomicAlignBlocks ab = emit_atomic_align_begin(addr, cas_sz, "cas");
       int b_slow = ab.b_slow, b_done = ab.b_done;
-      int exp_id = new_tid();
-      sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", exp_id, it, eff_old.id, p2_old);
-      int new_id = eff_new.id;
-      if (is_agg_cas) {
-        int32_t new_al = pad_new ? stage_al : effective_lval_align(node->cas.new_val);
-        int32_t p2_new = align_floor_pow2(new_al);
-        new_id = new_tid();
-        sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", new_id, it, eff_new.id, p2_new);
-      } else if (is_fp) {
-        new_id = new_tid();
-        sb_printf(&fc->body_sb, "    %%t%d = bitcast.%s %%t%d\n", new_id, it, eff_new.id);
-      }
-      int actual = new_tid(), ok_fast = new_tid();
-      sb_printf(&fc->body_sb,
-                "    %%t%d, %%t%d = atomic_cmpxchg.%s %%t%d, %%t%d, %%t%d [seq_cst, seq_cst]\n",
-                actual, ok_fast, it, addr.id, exp_id, new_id);
-      int b_fail = new_bid();
-      sb_printf(&fc->body_sb, "    br %%t%d, .cas_merge_%d(%%t%d), .cas_fail_%d\n",
-                ok_fast, b_done, ok_fast, b_fail);
-      fc->terminated = true;
-
-      sb_printf(&fc->body_sb, "\n.cas_fail_%d:\n", b_fail);
-      fc->terminated = false;
-      sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d\n", it, actual, eff_old.id, p2_old);
-      if (pad_old) {
-        sb_printf(&fc->body_sb, "    memcpy %%t%d, %%t%d, %" PRIi64 ", align 1\n",
-                  old_ptr.id, eff_old.id, old_sz);
-      }
-      sb_printf(&fc->body_sb, "    jmp .cas_merge_%d(%%t%d)\n", b_done, ok_fast);
-      fc->terminated = true;
+      (void)emit_cas_inline_attempt(addr, old_ptr, eff_old, eff_new, node->cas.new_val,
+                                    it, is_agg_cas, is_fp, pad_old, pad_new, old_sz,
+                                    stage_al, p2_old, "cas_merge", b_done, true);
 
       sb_printf(&fc->body_sb, "\n.cas_slow_%d:\n", b_slow);
       fc->terminated = false;
@@ -3083,40 +3070,10 @@ static PirVal gen_expr(Node *node) {
       return v;
     }
 
-    int exp_id = new_tid();
-    sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", exp_id, it, eff_old.id, p2_old);
-    int new_id = eff_new.id;
-    if (is_agg_cas) {
-      int32_t new_al = pad_new ? stage_al : effective_lval_align(node->cas.new_val);
-      int32_t p2_new = align_floor_pow2(new_al);
-      new_id = new_tid();
-      sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", new_id, it, eff_new.id, p2_new);
-    } else if (is_fp) {
-      new_id = new_tid();
-      sb_printf(&fc->body_sb, "    %%t%d = bitcast.%s %%t%d\n", new_id, it, eff_new.id);
-    }
-
-    int actual = new_tid();
-    int ok = new_tid();
-    sb_printf(&fc->body_sb,
-              "    %%t%d, %%t%d = atomic_cmpxchg.%s %%t%d, %%t%d, %%t%d [seq_cst, seq_cst]\n",
-              actual, ok, it, addr.id, exp_id, new_id);
-
-    int b_fail = new_bid();
     int b_done = new_bid();
-    sb_printf(&fc->body_sb, "    br %%t%d, .cas_ok_%d, .cas_fail_%d\n", ok, b_done, b_fail);
-    fc->terminated = true;
-
-    sb_printf(&fc->body_sb, "\n.cas_fail_%d:\n", b_fail);
-    fc->terminated = false;
-    sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d\n", it, actual, eff_old.id, p2_old);
-    if (pad_old) {
-      sb_printf(&fc->body_sb, "    memcpy %%t%d, %%t%d, %" PRIi64 ", align 1\n",
-                old_ptr.id, eff_old.id, old_sz);
-    }
-    sb_printf(&fc->body_sb, "    jmp .cas_ok_%d\n", b_done);
-    fc->terminated = true;
-
+    int ok = emit_cas_inline_attempt(addr, old_ptr, eff_old, eff_new, node->cas.new_val,
+                                     it, is_agg_cas, is_fp, pad_old, pad_new, old_sz,
+                                     stage_al, p2_old, "cas_ok", b_done, false);
     sb_printf(&fc->body_sb, "\n.cas_ok_%d:\n", b_done);
     fc->terminated = false;
     PirVal v = {ok, "i8"};

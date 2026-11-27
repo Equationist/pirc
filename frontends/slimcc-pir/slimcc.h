@@ -1077,6 +1077,10 @@ extern bool opt_g;
 extern bool opt_werror;
 extern StdVer opt_std;
 extern bool is_iso_std;
+
+static inline bool is_iso_user_tok(const Token *tok) {
+  return is_iso_std && (!tok || !tok->file || !tok->file->is_syshdr);
+}
 extern bool opt_fdefer_ts;
 extern bool opt_short_enums;
 extern bool opt_gnu_keywords;

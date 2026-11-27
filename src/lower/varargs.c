@@ -109,6 +109,42 @@ static PirBlockId split_block_tail(PirModule *mod, PirFunction *fn, PirBlockId b
     return cont;
 }
 
+/* Load SysV va_list->overflow_arg_area (@8), align up if mem_align > 8, advance by mem_step,
+ * store updated overflow_arg_area back, and return the aligned argument pointer. */
+static PirValueId emit_sysv_oaa_consume(PirModule *mod, const PirTargetSpec *target,
+                                        PirFunction *fn, PirBlockId blk, PirInstIdVec *insts,
+                                        PirOperand ap, uint64_t mem_align, uint64_t mem_step,
+                                        uint32_t ln, uint32_t lc) {
+    PirType tptr = pir_type_scalar(PIR_SCALAR_PTR);
+    PirType ti64 = pir_type_scalar(PIR_SCALAR_I64);
+
+    PirValueId oaa_p = va_padd(mod, fn, blk, insts, ap, 8u, ti64, ln, lc);
+    PirInst loaa = pir_make_inst(PIR_OP_LOAD, tptr, ln, lc);
+    loaa.align = 8u; loaa.operand_count = 1u; loaa.operands = pir_alloc_ops(mod, 1u);
+    loaa.operands[0] = pir_op_val(oaa_p, tptr);
+    loaa.results[0]  = pir_fn_new_val(mod, fn, "vaoaa", tptr, blk, PIR_INVALID_ID, 0u);
+    pir_fn_append_inst(fn, insts, loaa);
+
+    PirValueId cur_oaa = loaa.results[0];
+    if (mem_align > 8u) {
+        cur_oaa = pir_emit_align_ptr(mod, fn, blk, insts, cur_oaa, mem_align, target, ln, lc);
+    }
+
+    PirInst noaa = pir_make_inst(PIR_OP_PTR_ADD, ti64, ln, lc);
+    noaa.operand_count = 2u; noaa.operands = pir_alloc_ops(mod, 2u);
+    noaa.operands[0] = pir_op_val(cur_oaa, tptr);
+    noaa.operands[1] = pir_op_imm_i(mem_step, false, ti64);
+    noaa.results[0]  = pir_fn_new_val(mod, fn, "vanoaa", tptr, blk, PIR_INVALID_ID, 0u);
+    pir_fn_append_inst(fn, insts, noaa);
+
+    PirInst soaa = pir_make_inst(PIR_OP_STORE, tptr, ln, lc);
+    soaa.align = 8u; soaa.operand_count = 2u; soaa.operands = pir_alloc_ops(mod, 2u);
+    soaa.operands[0] = pir_op_val(noaa.results[0], tptr);
+    soaa.operands[1] = pir_op_val(oaa_p, tptr);
+    pir_fn_append_inst(fn, insts, soaa);
+    return cur_oaa;
+}
+
 static PirBlockId lower_va_arg_sysv_agg(PirModule *mod, const PirTargetSpec *target,
                                         PirFunction *fn, PirBlockId b, uint32_t j,
                                         PirInstIdVec *head, const PirInst *inst) {
@@ -295,20 +331,10 @@ static PirBlockId lower_va_arg_sysv_agg(PirModule *mod, const PirTargetSpec *tar
         pir_fn_append_inst(fn, rb, jr);
     }
 
-    /* mem_blk: load overflow_arg_area (@8), align up if align > 8, copy to dst_buf, advance */
+    /* mem_blk: load overflow_arg_area (@8), align up if align > 8, advance, copy to dst_buf */
     PirInstIdVec *mb = &fn->blocks.data[mem_blk].insts;
-    PirValueId oaa_p = va_padd(mod, fn, mem_blk, mb, ap, 8u, ti64, ln, lc);
-    PirInst loaa = pir_make_inst(PIR_OP_LOAD, tptr, ln, lc);
-    loaa.align = 8u; loaa.operand_count = 1u; loaa.operands = pir_alloc_ops(mod, 1u);
-    loaa.operands[0] = pir_op_val(oaa_p, tptr);
-    loaa.results[0]  = pir_fn_new_val(mod, fn, "vaoaa", tptr, mem_blk, PIR_INVALID_ID, 0u);
-    pir_fn_append_inst(fn, mb, loaa);
-
-    PirValueId cur_oaa = loaa.results[0];
-    if (plan.mem_align > 8u) {
-        cur_oaa = pir_emit_align_ptr(mod, fn, mem_blk, mb, cur_oaa, plan.mem_align, target, ln, lc);
-    }
-
+    PirValueId cur_oaa = emit_sysv_oaa_consume(mod, target, fn, mem_blk, mb, ap,
+                                               plan.mem_align, plan.mem_step, ln, lc);
     if (plan.size > 0u) {
         PirInst mc = pir_make_inst(PIR_OP_MEMCPY, tvoid, ln, lc);
         mc.align = plan.align < 8u ? plan.align : 8u;
@@ -318,19 +344,6 @@ static PirBlockId lower_va_arg_sysv_agg(PirModule *mod, const PirTargetSpec *tar
         mc.operands[2] = pir_op_imm_i(plan.size, false, ti64);
         pir_fn_append_inst(fn, mb, mc);
     }
-
-    PirInst noaa = pir_make_inst(PIR_OP_PTR_ADD, ti64, ln, lc);
-    noaa.operand_count = 2u; noaa.operands = pir_alloc_ops(mod, 2u);
-    noaa.operands[0] = pir_op_val(cur_oaa, tptr);
-    noaa.operands[1] = pir_op_imm_i(plan.mem_step, false, ti64);
-    noaa.results[0]  = pir_fn_new_val(mod, fn, "vanoaa", tptr, mem_blk, PIR_INVALID_ID, 0u);
-    pir_fn_append_inst(fn, mb, noaa);
-
-    PirInst soaa = pir_make_inst(PIR_OP_STORE, tptr, ln, lc);
-    soaa.align = 8u; soaa.operand_count = 2u; soaa.operands = pir_alloc_ops(mod, 2u);
-    soaa.operands[0] = pir_op_val(noaa.results[0], tptr);
-    soaa.operands[1] = pir_op_val(oaa_p, tptr);
-    pir_fn_append_inst(fn, mb, soaa);
 
     PirInst jm = pir_make_inst(PIR_OP_JMP, tvoid, ln, lc);
     jm.targets[0].target = cont_blk;
@@ -438,30 +451,8 @@ static PirBlockId lower_va_arg_sysv(PirModule *mod, const PirTargetSpec *target,
 
     /* mem_blk: load overflow_arg_area (@8), align if > 8B, advance by step */
     PirInstIdVec *mb = &fn->blocks.data[mem_blk].insts;
-    PirValueId oaa_p = va_padd(mod, fn, mem_blk, mb, ap, 8u, ti64, ln, lc);
-    PirInst loaa = pir_make_inst(PIR_OP_LOAD, tptr, ln, lc);
-    loaa.align = 8u; loaa.operand_count = 1u; loaa.operands = pir_alloc_ops(mod, 1u);
-    loaa.operands[0] = pir_op_val(oaa_p, tptr);
-    loaa.results[0]  = pir_fn_new_val(mod, fn, "vaoaa", tptr, mem_blk, PIR_INVALID_ID, 0u);
-    pir_fn_append_inst(fn, mb, loaa);
-
-    PirValueId arg_mem = loaa.results[0];
-    if (plan.mem_align > 8u) {
-        arg_mem = pir_emit_align_ptr(mod, fn, mem_blk, mb, arg_mem, plan.mem_align, target, ln, lc);
-    }
-
-    PirInst noaa = pir_make_inst(PIR_OP_PTR_ADD, ti64, ln, lc);
-    noaa.operand_count = 2u; noaa.operands = pir_alloc_ops(mod, 2u);
-    noaa.operands[0] = pir_op_val(arg_mem, tptr);
-    noaa.operands[1] = pir_op_imm_i(plan.mem_step, false, ti64);
-    noaa.results[0]  = pir_fn_new_val(mod, fn, "vanoaa", tptr, mem_blk, PIR_INVALID_ID, 0u);
-    pir_fn_append_inst(fn, mb, noaa);
-
-    PirInst soaa = pir_make_inst(PIR_OP_STORE, tptr, ln, lc);
-    soaa.align = 8u; soaa.operand_count = 2u; soaa.operands = pir_alloc_ops(mod, 2u);
-    soaa.operands[0] = pir_op_val(noaa.results[0], tptr);
-    soaa.operands[1] = pir_op_val(oaa_p, tptr);
-    pir_fn_append_inst(fn, mb, soaa);
+    PirValueId arg_mem = emit_sysv_oaa_consume(mod, target, fn, mem_blk, mb, ap,
+                                               plan.mem_align, plan.mem_step, ln, lc);
 
     PirInst jm = pir_make_inst(PIR_OP_JMP, tvoid, ln, lc);
     jm.targets[0].target = cont_blk; jm.targets[0].arg_count = 1u;

@@ -2183,6 +2183,74 @@ static bool parse_global_item(Parser *p, PirType hint_ty, PirGlobalItem *out) {
     return false;
 }
 
+typedef PIR_VEC(PirGlobalItem) PirGlobalItemVec;
+
+static bool parse_global_braced_items(Parser *p, PirType hint_ty, PirGlobalItemVec *items) {
+    advance_tok(p); /* '{' */
+    skip_newlines(p);
+    while (p->cur.kind != TOK_RBRACE && p->cur.kind != TOK_EOF) {
+        PirGlobalItem it;
+        if (!parse_global_item(p, hint_ty, &it)) return false;
+        PIR_VEC_PUSH(items, it);
+        skip_newlines(p);
+        if (match_tok(p, TOK_COMMA)) {
+            skip_newlines(p);
+        } else if (p->cur.kind != TOK_RBRACE) {
+            pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected ',' or '}' in global initializer");
+            return false;
+        }
+    }
+    return expect_tok(p, TOK_RBRACE, "'}'");
+}
+
+static bool parse_global_typed_init(Parser *p, PirGlobal *g, PirGlobalItemVec *items) {
+    if (!match_tok(p, TOK_EQ)) return true;
+    if (is_ident(p, "zeroinit")) {
+        g->is_zeroinit = true;
+        advance_tok(p);
+        return true;
+    }
+    if (p->cur.kind == TOK_LBRACE) {
+        g->is_braced = true;
+        return parse_global_braced_items(p, g->type, items);
+    }
+    PirGlobalItem it;
+    if (!parse_global_item(p, g->type, &it)) return false;
+    PIR_VEC_PUSH(items, it);
+    return true;
+}
+
+static bool parse_global_clauses(Parser *p, PirGlobal *g, bool allow_comma) {
+    for (;;) {
+        bool had_comma = allow_comma && match_tok(p, TOK_COMMA);
+        if (is_ident(p, "align")) {
+            if (g->align != 0u) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'align' clause");
+                return false;
+            }
+            if (!parse_align_clause(p, &g->align)) return false;
+        } else if (is_ident(p, "section")) {
+            if (g->section != NULL) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'section' clause");
+                return false;
+            }
+            advance_tok(p);
+            if (p->cur.kind != TOK_STRING || token_has_nul(&p->cur) || token_has_newline(&p->cur)) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected valid section string");
+                return false;
+            }
+            g->section = p->cur.text;
+            advance_tok(p);
+        } else {
+            if (had_comma) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected 'align' or 'section' after ','");
+                return false;
+            }
+            return true;
+        }
+    }
+}
+
 static bool parse_global_decl(Parser *p, PirLinkage linkage, bool is_weak_extern) {
     uint32_t line = p->cur.line;
     PirGlobal g;
@@ -2204,52 +2272,15 @@ static bool parse_global_decl(Parser *p, PirLinkage linkage, bool is_weak_extern
     }
     advance_tok(p);
 
-    for (;;) {
-        if (is_ident(p, "align")) {
-            if (g.align != 0u) {
-                pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'align' clause");
-                return false;
-            }
-            if (!parse_align_clause(p, &g.align)) return false;
-        } else if (is_ident(p, "section")) {
-            if (g.section != NULL) {
-                pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'section' clause");
-                return false;
-            }
-            advance_tok(p);
-            if (p->cur.kind != TOK_STRING || token_has_nul(&p->cur) || token_has_newline(&p->cur)) {
-                pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected valid section string");
-                return false;
-            }
-            g.section = p->cur.text;
-            advance_tok(p);
-        } else {
-            break;
-        }
-    }
+    if (!parse_global_clauses(p, &g, false)) return false;
 
-    PIR_VEC(PirGlobalItem) items = {0};
+    PirGlobalItemVec items = {0};
     if (p->cur.kind == TOK_LBRACE) {
         g.is_braced = true;
-        advance_tok(p);
-        skip_newlines(p);
-        while (p->cur.kind != TOK_RBRACE && p->cur.kind != TOK_EOF) {
-            PirGlobalItem it;
-            if (!parse_global_item(p, pir_type_scalar(PIR_SCALAR_F64), &it)) {
-                PIR_VEC_FREE(&items);
-                return false;
-            }
-            PIR_VEC_PUSH(&items, it);
-            skip_newlines(p);
-            if (match_tok(p, TOK_COMMA)) {
-                skip_newlines(p);
-            } else if (p->cur.kind != TOK_RBRACE) {
-                PIR_VEC_FREE(&items);
-                pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected ',' or '}' in global initializer");
-                return false;
-            }
+        if (!parse_global_braced_items(p, pir_type_scalar(PIR_SCALAR_F64), &items)) {
+            PIR_VEC_FREE(&items);
+            return false;
         }
-        if (!expect_tok(p, TOK_RBRACE, "'}'")) { PIR_VEC_FREE(&items); return false; }
     } else if (p->cur.kind == TOK_LBRACKET) {
         /* Distinguish flattened LIR `global [<bytes>] = zeroinit` from HIR `[N x T]`. */
         uint32_t bline = p->cur.line;
@@ -2294,130 +2325,14 @@ static bool parse_global_decl(Parser *p, PirLinkage linkage, bool is_weak_extern
             if (!expect_tok(p, TOK_RBRACKET, "']'")) { PIR_VEC_FREE(&items); return false; }
             g.has_type = true;
             g.type = pir_type_agg(intern_anon_array(p, alen, elem, bline));
-            if (match_tok(p, TOK_EQ)) {
-                if (is_ident(p, "zeroinit")) {
-                    g.is_zeroinit = true;
-                    advance_tok(p);
-                } else if (p->cur.kind == TOK_LBRACE) {
-                    g.is_braced = true;
-                    advance_tok(p);
-                    skip_newlines(p);
-                    while (p->cur.kind != TOK_RBRACE && p->cur.kind != TOK_EOF) {
-                        PirGlobalItem it;
-                        if (!parse_global_item(p, g.type, &it)) { PIR_VEC_FREE(&items); return false; }
-                        PIR_VEC_PUSH(&items, it);
-                        skip_newlines(p);
-                        if (match_tok(p, TOK_COMMA)) {
-                            skip_newlines(p);
-                        } else if (p->cur.kind != TOK_RBRACE) {
-                            PIR_VEC_FREE(&items);
-                            pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected ',' or '}' in global initializer");
-                            return false;
-                        }
-                    }
-                    if (!expect_tok(p, TOK_RBRACE, "'}'")) { PIR_VEC_FREE(&items); return false; }
-                } else {
-                    PirGlobalItem it;
-                    if (!parse_global_item(p, g.type, &it)) { PIR_VEC_FREE(&items); return false; }
-                    PIR_VEC_PUSH(&items, it);
-                }
-            }
+            if (!parse_global_typed_init(p, &g, &items)) { PIR_VEC_FREE(&items); return false; }
         }
-        for (;;) {
-            bool had_comma = match_tok(p, TOK_COMMA);
-            if (is_ident(p, "align")) {
-                if (g.align != 0u) {
-                    PIR_VEC_FREE(&items);
-                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'align' clause");
-                    return false;
-                }
-                if (!parse_align_clause(p, &g.align)) { PIR_VEC_FREE(&items); return false; }
-            } else if (is_ident(p, "section")) {
-                if (g.section != NULL) {
-                    PIR_VEC_FREE(&items);
-                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'section' clause");
-                    return false;
-                }
-                advance_tok(p);
-                if (p->cur.kind != TOK_STRING || token_has_nul(&p->cur) || token_has_newline(&p->cur)) {
-                    PIR_VEC_FREE(&items);
-                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected valid section string");
-                    return false;
-                }
-                g.section = p->cur.text;
-                advance_tok(p);
-            } else {
-                if (had_comma) {
-                    PIR_VEC_FREE(&items);
-                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected 'align' or 'section' after ','");
-                    return false;
-                }
-                break;
-            }
-        }
+        if (!parse_global_clauses(p, &g, true)) { PIR_VEC_FREE(&items); return false; }
     } else {
         g.has_type = true;
         if (!parse_type(p, &g.type)) { PIR_VEC_FREE(&items); return false; }
-        if (match_tok(p, TOK_EQ)) {
-            if (is_ident(p, "zeroinit")) {
-                g.is_zeroinit = true;
-                advance_tok(p);
-            } else if (p->cur.kind == TOK_LBRACE) {
-                g.is_braced = true;
-                advance_tok(p);
-                skip_newlines(p);
-                while (p->cur.kind != TOK_RBRACE && p->cur.kind != TOK_EOF) {
-                    PirGlobalItem it;
-                    if (!parse_global_item(p, g.type, &it)) { PIR_VEC_FREE(&items); return false; }
-                    PIR_VEC_PUSH(&items, it);
-                    skip_newlines(p);
-                    if (match_tok(p, TOK_COMMA)) {
-                        skip_newlines(p);
-                    } else if (p->cur.kind != TOK_RBRACE) {
-                        PIR_VEC_FREE(&items);
-                        pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected ',' or '}' in global initializer");
-                        return false;
-                    }
-                }
-                if (!expect_tok(p, TOK_RBRACE, "'}'")) { PIR_VEC_FREE(&items); return false; }
-            } else {
-                PirGlobalItem it;
-                if (!parse_global_item(p, g.type, &it)) { PIR_VEC_FREE(&items); return false; }
-                PIR_VEC_PUSH(&items, it);
-            }
-        }
-        for (;;) {
-            bool had_comma = match_tok(p, TOK_COMMA);
-            if (is_ident(p, "align")) {
-                if (g.align != 0u) {
-                    PIR_VEC_FREE(&items);
-                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'align' clause");
-                    return false;
-                }
-                if (!parse_align_clause(p, &g.align)) { PIR_VEC_FREE(&items); return false; }
-            } else if (is_ident(p, "section")) {
-                if (g.section != NULL) {
-                    PIR_VEC_FREE(&items);
-                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'section' clause");
-                    return false;
-                }
-                advance_tok(p);
-                if (p->cur.kind != TOK_STRING || token_has_nul(&p->cur) || token_has_newline(&p->cur)) {
-                    PIR_VEC_FREE(&items);
-                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected valid section string");
-                    return false;
-                }
-                g.section = p->cur.text;
-                advance_tok(p);
-            } else {
-                if (had_comma) {
-                    PIR_VEC_FREE(&items);
-                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected 'align' or 'section' after ','");
-                    return false;
-                }
-                break;
-            }
-        }
+        if (!parse_global_typed_init(p, &g, &items)) { PIR_VEC_FREE(&items); return false; }
+        if (!parse_global_clauses(p, &g, true)) { PIR_VEC_FREE(&items); return false; }
     }
 
     if (items.len > 0u) {

@@ -809,17 +809,21 @@ void vla_setty(Type *ty, Node *len, int64_t arr_len) {
   }
 }
 
-bool is_compatible_unqual_ptr_target(Type *t1, Type *t2) {
+static bool is_compatible_ptr_target(Type *t1, Type *t2, bool check_atomic) {
   if (is_array(t1) && is_array(t2)) {
     int64_t *len1 = get_arr_len(t1);
     int64_t *len2 = get_arr_len(t2);
     if (!len1 || !len2 || *len1 == *len2)
-      return is_compatible_unqual_ptr_target(t1->base, t2->base);
+      return is_compatible_ptr_target(t1->base, t2->base, check_atomic);
     return false;
   }
-  if (!!(t1->qual & Q_ATOMIC) != !!(t2->qual & Q_ATOMIC))
+  if (check_atomic && !!(t1->qual & Q_ATOMIC) != !!(t2->qual & Q_ATOMIC))
     return false;
   return is_compatible(t1, t2);
+}
+
+bool is_compatible_unqual_ptr_target(Type *t1, Type *t2) {
+  return is_compatible_ptr_target(t1, t2, true);
 }
 
 Type *vla_of(Type *base, Node *len, int64_t arr_len) {
@@ -829,14 +833,7 @@ Type *vla_of(Type *base, Node *len, int64_t arr_len) {
 }
 
 static bool is_compatible_assign_ptr_target(Type *t1, Type *t2) {
-  if (is_array(t1) && is_array(t2)) {
-    int64_t *len1 = get_arr_len(t1);
-    int64_t *len2 = get_arr_len(t2);
-    if (!len1 || !len2 || *len1 == *len2)
-      return is_compatible_assign_ptr_target(t1->base, t2->base);
-    return false;
-  }
-  return is_compatible(t1, t2);
+  return is_compatible_ptr_target(t1, t2, false);
 }
 
 Node *assign_cast(Type *to_ty, Node *expr) {

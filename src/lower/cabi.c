@@ -965,6 +965,18 @@ static void rewrite_defined_callee(PirModule *mod, const PirTargetSpec *target,
     }
 }
 
+static bool call_has_va_special(const PirInst *inst, uint32_t fixed_params) {
+    for (uint32_t k = fixed_params + 1u; k < inst->operand_count; ++k) {
+        const PirOperand *op = &inst->operands[k];
+        if (op->call_abi == PIR_PARAM_BYVAL ||
+            (op->type.kind == PIR_TYPE_SCALAR && op->type.u.scalar == PIR_SCALAR_I128) ||
+            (op->type.kind == PIR_TYPE_VECTOR && pir_vec_bits(op->type.u.vec) >= 128u)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool pir_lower_cabi(PirModule *mod, const PirTargetSpec *target, PirDiag *diag) {
     /* 1. Compute ABI plans for all functions & signatures before mutating anything. */
     CabiPlan *fn_plans  = (CabiPlan *)calloc(mod->funcs.len + 1u, sizeof(CabiPlan));
@@ -996,20 +1008,8 @@ bool pir_lower_cabi(PirModule *mod, const PirTargetSpec *target, PirDiag *diag) 
                     copy.operands[0].u.sym.is_func) {
                     PirFuncId cid = copy.operands[0].u.sym.id;
                     const PirFunction *cal = &mod->funcs.data[cid];
-                    bool has_va_special = false;
-                    if (cal->is_variadic) {
-                        for (uint32_t k = cal->param_count + 1u; k < copy.operand_count; ++k) {
-                            if (copy.operands[k].call_abi == PIR_PARAM_BYVAL ||
-                                (copy.operands[k].type.kind == PIR_TYPE_SCALAR &&
-                                 copy.operands[k].type.u.scalar == PIR_SCALAR_I128) ||
-                                (copy.operands[k].type.kind == PIR_TYPE_VECTOR &&
-                                 pir_vec_bits(copy.operands[k].type.u.vec) >= 128u)) {
-                                has_va_special = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (fn_plans[cid].needs_rewrite || (cal->is_variadic && has_va_special)) {
+                    if (fn_plans[cid].needs_rewrite ||
+                        (cal->is_variadic && call_has_va_special(&copy, cal->param_count))) {
                         if (!rewrite_call_site(mod, target, fn, b, &out, &entry_allocas, &copy,
                                                &fn_plans[cid], cal->params, cal->is_variadic, diag)) {
                             ok = false;
@@ -1020,20 +1020,8 @@ bool pir_lower_cabi(PirModule *mod, const PirTargetSpec *target, PirDiag *diag) 
                 } else if (copy.op == PIR_OP_CALL_INDIRECT && copy.sig_id < mod->sigs.len) {
                     PirSigId sid = copy.sig_id;
                     const PirSigDef *sig = &mod->sigs.data[sid];
-                    bool has_va_special = false;
-                    if (sig->is_variadic) {
-                        for (uint32_t k = sig->param_count + 1u; k < copy.operand_count; ++k) {
-                            if (copy.operands[k].call_abi == PIR_PARAM_BYVAL ||
-                                (copy.operands[k].type.kind == PIR_TYPE_SCALAR &&
-                                 copy.operands[k].type.u.scalar == PIR_SCALAR_I128) ||
-                                (copy.operands[k].type.kind == PIR_TYPE_VECTOR &&
-                                 pir_vec_bits(copy.operands[k].type.u.vec) >= 128u)) {
-                                has_va_special = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (sig_plans[sid].needs_rewrite || (sig->is_variadic && has_va_special)) {
+                    if (sig_plans[sid].needs_rewrite ||
+                        (sig->is_variadic && call_has_va_special(&copy, sig->param_count))) {
                         if (!rewrite_call_site(mod, target, fn, b, &out, &entry_allocas, &copy,
                                                &sig_plans[sid], sig->params, sig->is_variadic, diag)) {
                             ok = false;

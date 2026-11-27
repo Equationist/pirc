@@ -1202,39 +1202,7 @@ void tokenize_string_literal(Token *tok, Type *basety) {
   tok->str = tok2->str;
 }
 
-void convert_ucn_ident(Token *tok) {
-  const char *p = tok->loc;
-  const char *end = p + tok->len;
-  char *buf = calloc(1, tok->len);
-  char *q = buf;
-
-  while (p != end) {
-    if (p > end)
-      error_tok(tok, "invalid token");
-
-    if (*p != '\\') {
-      *q++ = *p++;
-      continue;
-    }
-    bool invalid = false;
-    uint32_t c;
-    if (!read_ucn(&p, p + 1, &c, &invalid) || invalid || c < 0xA0 ||
-        !(q == buf ? is_ident1(c) : is_ident2(c)))
-      error_tok(tok, "invalid universal character name");
-    q += encode_utf8(q, c);
-  }
-  Token *orig = tok->origin;
-  if (!orig) {
-    orig = malloc(sizeof(Token));
-    *orig = *tok;
-  }
-  tok->origin = orig;
-  tok->loc = buf;
-  tok->len = q - buf;
-  tok->has_ucn = false;
-}
-
-static void try_convert_ucn_ident(Token *tok) {
+static void convert_ucn_ident_impl(Token *tok, bool strict) {
   const char *p = tok->loc;
   const char *end = p + tok->len;
   char *buf = calloc(1, tok->len + 1);
@@ -1250,6 +1218,8 @@ static void try_convert_ucn_ident(Token *tok) {
     if (!read_ucn(&p, p + 1, &c, &invalid) || invalid || c < 0xA0 ||
         !(q == buf ? is_ident1(c) : is_ident2(c)) || p > end) {
       free(buf);
+      if (strict)
+        error_tok(tok, "invalid universal character name");
       return;
     }
     q += encode_utf8(q, c);
@@ -1263,6 +1233,14 @@ static void try_convert_ucn_ident(Token *tok) {
   tok->loc = buf;
   tok->len = q - buf;
   tok->has_ucn = false;
+}
+
+void convert_ucn_ident(Token *tok) {
+  convert_ucn_ident_impl(tok, true);
+}
+
+static void try_convert_ucn_ident(Token *tok) {
+  convert_ucn_ident_impl(tok, false);
 }
 
 Token *tokenize(File *file, SlashDelta *delta, Token **end) {

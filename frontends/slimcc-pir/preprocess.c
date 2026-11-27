@@ -395,6 +395,15 @@ static Token *to_pp_eval_int(Token *tok, int64_t val) {
   return tok;
 }
 
+static Token *handle_incl_end(Token *tok) {
+  if (cond_incl.cnt != incl_cond_base)
+    error_tok(cond_incl.data[cond_incl.cnt - 1].tok, "unterminated conditional directive");
+  incl_cond_base = (int32_t)tok->ival;
+  if (incl_depth > 0)
+    incl_depth--;
+  return tok->next;
+}
+
 static Token *read_pp_const_expr(Token *tok) {
   Token head = {0};
   Token *cur = &head;
@@ -402,12 +411,7 @@ static Token *read_pp_const_expr(Token *tok) {
 
   for (; tok->kind != TK_EOF; pop_macro_lock(tok)) {
     if (tok->kind == TK_INCL_END) {
-      if (cond_incl.cnt != incl_cond_base)
-        error_tok(cond_incl.data[cond_incl.cnt - 1].tok, "unterminated conditional directive");
-      incl_cond_base = (int32_t)tok->ival;
-      if (incl_depth > 0)
-        incl_depth--;
-      tok = tok->next;
+      tok = handle_incl_end(tok);
       continue;
     }
     if (tok->kind == TK_IDENT && !tok->dont_expand) {
@@ -802,12 +806,7 @@ static Token *expand_tok(Token *tok) {
 
   for (; tok->kind != TK_EOF; pop_macro_lock(tok)) {
     if (tok->kind == TK_INCL_END) {
-      if (cond_incl.cnt != incl_cond_base)
-        error_tok(cond_incl.data[cond_incl.cnt - 1].tok, "unterminated conditional directive");
-      incl_cond_base = (int32_t)tok->ival;
-      if (incl_depth > 0)
-        incl_depth--;
-      tok = tok->next;
+      tok = handle_incl_end(tok);
       continue;
     }
     if (tok->kind == TK_IDENT && !tok->dont_expand) {
@@ -1189,12 +1188,7 @@ static Token *prepare_funclike_args(Token *start) {
       error_tok(start, "unterminated list");
 
     if (tok->kind == TK_INCL_END) {
-      if (cond_incl.cnt != incl_cond_base)
-        error_tok(cond_incl.data[cond_incl.cnt - 1].tok, "unterminated conditional directive");
-      incl_cond_base = (int32_t)tok->ival;
-      if (incl_depth > 0)
-        incl_depth--;
-      tok = tok->next;
+      tok = handle_incl_end(tok);
       continue;
     }
 
@@ -1632,12 +1626,7 @@ void preprocess2(Token *tok, Token **cur) {
 
   for (; tok->kind != TK_EOF; pop_macro_lock(tok)) {
     if (tok->kind == TK_INCL_END) {
-      if (cond_incl.cnt != incl_cond_base)
-        error_tok(cond_incl.data[cond_incl.cnt - 1].tok, "unterminated conditional directive");
-      incl_cond_base = (int32_t)tok->ival;
-      if (incl_depth > 0)
-        incl_depth--;
-      tok = tok->next;
+      tok = handle_incl_end(tok);
       continue;
     }
     if (tok->kind == TK_IDENT && !tok->dont_expand) {
@@ -1759,21 +1748,11 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
     return tok;
   }
 
-  if (equal(tok, "ifdef")) {
+  if (equal(tok, "ifdef") || equal(tok, "ifndef")) {
+    bool is_ifndef = (tok->loc[2] == 'n');
     if (tok->next->at_bol)
       error_tok(tok, "expected an identifier");
-    bool active = has_macro(tok->next);
-    push_cond_incl(tok, active);
-    tok = skip_line(tok->next->next);
-    if (!active)
-      return skip_cond_incl(tok);
-    return tok;
-  }
-
-  if (equal(tok, "ifndef")) {
-    if (tok->next->at_bol)
-      error_tok(tok, "expected an identifier");
-    bool active = !has_macro(tok->next);
+    bool active = has_macro(tok->next) ^ is_ifndef;
     push_cond_incl(tok, active);
     tok = skip_line(tok->next->next);
     if (!active)
@@ -1794,43 +1773,23 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
     return skip_cond_incl(tok);
   }
 
-  if (equal(tok, "elifdef")) {
-    if (is_iso_std && opt_std < STD_C23 && !start->file->is_syshdr)
-      error_tok(tok, "'#elifdef' is a C23 extension");
+  if (equal(tok, "elifdef") || equal(tok, "elifndef")) {
+    bool is_neg = (tok->loc[4] == 'n');
+    const char *dname = is_neg ? "#elifndef" : "#elifdef";
+    if (opt_std < STD_C23 && is_iso_user_tok(start))
+      error_tok(tok, "'%s' is a C23 extension", dname);
     CondIncl *cond;
     if (!get_cond_incl(&cond) || cond->is_else)
-      error_tok(start, "stray #elifdef");
+      error_tok(start, "stray %s", dname);
     cond->tok->is_incl_guard = false;
 
     if (!cond->been_active) {
       if (tok->next->at_bol || tok->next->kind != TK_IDENT)
         error_tok(tok->next, "macro name must be an identifier");
-      if (is_iso_std && !tok->next->next->at_bol && tok->next->next->kind != TK_EOF &&
-          !start->file->is_syshdr)
-        error_tok(tok->next->next, "extra tokens at end of #elifdef directive");
-      if (has_macro(tok->next)) {
-        cond->been_active = true;
-        return skip_line(tok->next->next);
-      }
-    }
-    return skip_cond_incl(tok);
-  }
-
-  if (equal(tok, "elifndef")) {
-    if (is_iso_std && opt_std < STD_C23 && !start->file->is_syshdr)
-      error_tok(tok, "'#elifndef' is a C23 extension");
-    CondIncl *cond;
-    if (!get_cond_incl(&cond) || cond->is_else)
-      error_tok(start, "stray #elifndef");
-    cond->tok->is_incl_guard = false;
-
-    if (!cond->been_active) {
-      if (tok->next->at_bol || tok->next->kind != TK_IDENT)
-        error_tok(tok->next, "macro name must be an identifier");
-      if (is_iso_std && !tok->next->next->at_bol && tok->next->next->kind != TK_EOF &&
-          !start->file->is_syshdr)
-        error_tok(tok->next->next, "extra tokens at end of #elifndef directive");
-      if (!has_macro(tok->next)) {
+      if (!tok->next->next->at_bol && tok->next->next->kind != TK_EOF &&
+          is_iso_user_tok(start))
+        error_tok(tok->next->next, "extra tokens at end of %s directive", dname);
+      if (has_macro(tok->next) ^ is_neg) {
         cond->been_active = true;
         return skip_line(tok->next->next);
       }
@@ -1923,10 +1882,6 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
       return pass_line(cur, start);
     }
   }
-
-  // `#`-only line is legal. It's called a null directive.
-  if (tok->at_bol)
-    return tok;
 
   error_tok(tok, "invalid preprocessor directive");
 }
@@ -2144,23 +2099,22 @@ static Token *pragma_macro(Token *start) {
   return hash;
 }
 
-static Token *has_include_macro(Token *start) {
-  Token *tok = skip_tk(start->next, TK_LPAREN);
-  Token *end;
-  const char *dir = NULL;
-  char *filename = read_include_filename(split_paren_pop_locks(&end, start, tok), &dir);
-  bool found = search_include_paths2(filename, dir, &(InclIdx){INCL_REL}, true);
-  return new_bool_int_token(found, start, end);
-}
-
-static Token *has_include_next_macro(Token *start) {
+static Token *has_include_impl(Token *start, bool is_next) {
   Token *file_tok = skip_tk(start->next, TK_LPAREN);
-  InclIdx idx = file_tok->file->incl_idx + 1;
+  InclIdx idx = is_next ? (file_tok->file->incl_idx + 1) : INCL_REL;
   const char *dir = NULL;
   Token *end;
   char *filename = read_include_filename(split_paren_pop_locks(&end, start, file_tok), &dir);
   bool found = search_include_paths2(filename, dir, &idx, true);
   return new_bool_int_token(found, start, end);
+}
+
+static Token *has_include_macro(Token *start) {
+  return has_include_impl(start, false);
+}
+
+static Token *has_include_next_macro(Token *start) {
+  return has_include_impl(start, true);
 }
 
 static Token *has_embed_macro(Token *start) {

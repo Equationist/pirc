@@ -209,6 +209,38 @@ static bool is_pad_agg_type(const PirModule *mod, PirType t) {
            mod->agg_types.data[t.u.agg_id].kind == PIR_AGG_PAD;
 }
 
+static void verify_lowered_cabi_meta(Verifier *v, uint32_t line, const char *ctx_prefix,
+                                     const char *name, bool is_valid_byval_ptr,
+                                     uint64_t byval_size, uint32_t byval_align,
+                                     uint32_t stack_align, uint64_t max_sz) {
+    if (byval_size > 0u) {
+        if (v->target && (v->target->arch != PIR_ARCH_X86_64 || v->target->os == PIR_OS_WINDOWS)) {
+            pir_diag_error(v->diag, line, 0u,
+                           "%s'%s': byval_size is only valid on SysV x86-64 targets",
+                           ctx_prefix, name);
+        }
+        if (!is_valid_byval_ptr) {
+            pir_diag_error(v->diag, line, 0u,
+                           "%s'%s': byval_size requires normal ptr value or symbol",
+                           ctx_prefix, name);
+        } else if (byval_size > max_sz) {
+            pir_diag_error(v->diag, line, 0u,
+                           "%s'%s': byval_size %" PRIu64 " exceeds maximum",
+                           ctx_prefix, name, byval_size);
+        }
+    }
+    if (byval_align != 0u) {
+        if (byval_size == 0u || !align_valid_u32(byval_align)) {
+            pir_diag_error(v->diag, line, 0u,
+                           "%s'%s': invalid byval_align %u", ctx_prefix, name, byval_align);
+        }
+    }
+    if (stack_align != 0u && !align_valid_u32(stack_align)) {
+        pir_diag_error(v->diag, line, 0u,
+                       "%s'%s': invalid stack_align %u", ctx_prefix, name, stack_align);
+    }
+}
+
 static void verify_params_and_ret(Verifier *v, const char *owner, uint32_t line,
                                   PirCallingConv cc, uint32_t fn_attrs,
                                   const PirParamDecl *params,
@@ -279,24 +311,10 @@ static void verify_params_and_ret(Verifier *v, const char *owner, uint32_t line,
                 pir_diag_error(v->diag, line, 0u, "'%s': lowered C ABI parameter metadata requires cc \"c\"", owner);
             }
         }
-        if (pd->abi_byval_size > 0u) {
-            if (v->target && (v->target->arch != PIR_ARCH_X86_64 || v->target->os == PIR_OS_WINDOWS)) {
-                pir_diag_error(v->diag, line, 0u, "'%s': byval_size is only valid on SysV x86-64 targets", owner);
-            }
-            if (pd->abi_kind != PIR_PARAM_NORMAL || !is_ptr_type(pd->type)) {
-                pir_diag_error(v->diag, line, 0u, "'%s': byval_size only valid on normal ptr parameter", owner);
-            } else if (pd->abi_byval_size > max_sz) {
-                pir_diag_error(v->diag, line, 0u, "'%s': byval_size %" PRIu64 " exceeds maximum", owner, pd->abi_byval_size);
-            }
-        }
-        if (pd->abi_byval_align != 0u) {
-            if (pd->abi_byval_size == 0u || !align_valid_u32(pd->abi_byval_align)) {
-                pir_diag_error(v->diag, line, 0u, "'%s': invalid byval_align %u", owner, pd->abi_byval_align);
-            }
-        }
-        if (pd->abi_stack_align != 0u && !align_valid_u32(pd->abi_stack_align)) {
-            pir_diag_error(v->diag, line, 0u, "'%s': invalid stack_align %u", owner, pd->abi_stack_align);
-        }
+        verify_lowered_cabi_meta(v, line, "", owner,
+                                 pd->abi_kind == PIR_PARAM_NORMAL && is_ptr_type(pd->type),
+                                 pd->abi_byval_size, pd->abi_byval_align, pd->abi_stack_align,
+                                 max_sz);
         if (pd->abi_kind != PIR_PARAM_NORMAL && (pd->abi_stack_align != 0u || pd->abi_force_stack)) {
             pir_diag_error(v->diag, line, 0u, "'%s': stack_align/force_stack cannot be combined with HIR byval/retbuf", owner);
         }
@@ -620,30 +638,12 @@ static void check_call_args(Verifier *v, const PirFunction *fn, const PirInst *i
             pir_diag_error(v->diag, inst->src_line, 0u,
                            "call to '%s': cannot combine byval(@T) with lowered C ABI metadata", callee_name);
         }
-        if (arg->call_byval_size > 0u) {
-            if (v->target && (v->target->arch != PIR_ARCH_X86_64 || v->target->os == PIR_OS_WINDOWS)) {
-                pir_diag_error(v->diag, inst->src_line, 0u,
-                               "call to '%s': byval_size is only valid on SysV x86-64 targets", callee_name);
-            }
-            if (!is_ptr_type(arg->type) || arg->kind == PIR_OPER_IMM_INT || arg->kind == PIR_OPER_IMM_FLOAT) {
-                pir_diag_error(v->diag, inst->src_line, 0u,
-                               "call to '%s': byval_size requires ptr value or symbol", callee_name);
-            } else if (arg->call_byval_size > max_sz) {
-                pir_diag_error(v->diag, inst->src_line, 0u,
-                               "call to '%s': byval_size %" PRIu64 " exceeds maximum",
-                               callee_name, arg->call_byval_size);
-            }
-        }
-        if (arg->call_byval_align != 0u) {
-            if (arg->call_byval_size == 0u || !align_valid_u32(arg->call_byval_align)) {
-                pir_diag_error(v->diag, inst->src_line, 0u,
-                               "call to '%s': invalid byval_align %u", callee_name, arg->call_byval_align);
-            }
-        }
-        if (arg->call_stack_align != 0u && !align_valid_u32(arg->call_stack_align)) {
-            pir_diag_error(v->diag, inst->src_line, 0u,
-                           "call to '%s': invalid stack_align %u", callee_name, arg->call_stack_align);
-        }
+        verify_lowered_cabi_meta(v, inst->src_line, "call to ", callee_name,
+                                 is_ptr_type(arg->type) &&
+                                 arg->kind != PIR_OPER_IMM_INT &&
+                                 arg->kind != PIR_OPER_IMM_FLOAT,
+                                 arg->call_byval_size, arg->call_byval_align, arg->call_stack_align,
+                                 max_sz);
         if (arg->call_no_f32_promote &&
             !(arg->type.kind == PIR_TYPE_SCALAR && arg->type.u.scalar == PIR_SCALAR_F32)) {
             pir_diag_error(v->diag, inst->src_line, 0u,
