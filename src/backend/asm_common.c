@@ -26,7 +26,7 @@ const char *pir_asm_sym_pfx(const PirTargetSpec *target) {
 }
 
 const char *pir_asm_lbl_pfx(const PirTargetSpec *target) {
-    return pir_asm_is_macho(target) ? "L" : ".L";
+    return pir_asm_is_macho(target) ? "L" : ".L__pir_";
 }
 
 uint32_t pir_asm_log2_align(uint32_t align) {

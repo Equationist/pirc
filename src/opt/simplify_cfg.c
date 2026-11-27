@@ -155,62 +155,117 @@ static bool prune_unreachable_blocks(PirFunction *fn, const PirCfg *cfg) {
     return true;
 }
 
-static bool merge_single_pred(PirModule *mod, PirFunction *fn, const PirCfg *cfg) {
-    for (uint32_t a = 0u; a < fn->blocks.len; ++a) {
-        if (!cfg->reachable[a]) continue;
-        PirBlock *ba = &fn->blocks.data[a];
-        if (ba->insts.len == 0u) continue;
-        PirInst *term = &fn->insts.data[ba->insts.data[ba->insts.len - 1u]];
-        if (term->op != PIR_OP_JMP) continue;
-
-        PirBlockId b = term->targets[0].target;
-        if (b == 0u || b == a || b >= fn->blocks.len) continue;
-        if (cfg->preds[b].len != 1u || cfg->preds[b].data[0] != a) continue;
-
-        /* Pop jmp from A and save its arguments. */
-        PirBranchTarget jmp_bt = term->targets[0];
-        ba->insts.len--;
-
-        /* Bind B's block params to A's jump arguments. */
-        uint32_t nparams = fn->blocks.data[b].params.len;
-        uint32_t src_line = fn->blocks.data[b].src_line;
-        for (uint32_t k = 0u; k < nparams; ++k) {
-            PirValueId pv = fn->blocks.data[b].params.data[k];
-            PirOperand arg = jmp_bt.args[k];
-            if (arg.kind == PIR_OPER_VAL) {
-                pir_fn_replace_val_uses(fn, pv, arg.u.val);
-            } else {
-                PirType pty = fn->values.data[pv].type;
-                PirOpcode cop = (arg.kind == PIR_OPER_SYM) ? PIR_OP_ADDR : PIR_OP_CONST;
-                PirInst ci = pir_make_inst(cop, pty, src_line, 0u);
-                ci.operands = pir_alloc_ops(mod, 1u);
-                ci.operands[0] = arg;
-                ci.operand_count = 1u;
-                ci.results[0] = pv;
-                fn->values.data[pv].def_block = a;
-                fn->values.data[pv].param_index = 0u;
-                pir_fn_append_inst(fn, &fn->blocks.data[a].insts, ci);
-            }
+static void remap_ops_arr(PirOperand *ops, uint32_t n, const PirValueId *remap, uint32_t nvals) {
+    for (uint32_t i = 0u; i < n; ++i) {
+        if (ops[i].kind == PIR_OPER_VAL && ops[i].u.val < nvals) {
+            ops[i].u.val = remap[ops[i].u.val];
         }
-
-        /* Move B's instructions into A. */
-        uint32_t nb = fn->blocks.data[b].insts.len;
-        for (uint32_t j = 0u; j < nb; ++j) {
-            PirInstId iid = fn->blocks.data[b].insts.data[j];
-            PIR_VEC_PUSH(&fn->blocks.data[a].insts, iid);
-            const PirInst *ins = &fn->insts.data[iid];
-            if (ins->results[0] != PIR_INVALID_ID) {
-                fn->values.data[ins->results[0]].def_block = a;
-            }
-            if (ins->results[1] != PIR_INVALID_ID) {
-                fn->values.data[ins->results[1]].def_block = a;
-            }
-        }
-        fn->blocks.data[b].params.len = 0u;
-        fn->blocks.data[b].insts.len = 0u;
-        return true;
     }
-    return false;
+}
+
+static bool merge_single_pred(PirModule *mod, PirFunction *fn, const PirCfg *cfg) {
+    uint32_t nblks = fn->blocks.len;
+    uint32_t nvals = fn->values.len;
+    bool *merged = (bool *)calloc(nblks + 1u, sizeof(bool));
+    PirValueId *remap = (PirValueId *)malloc((nvals + 1u) * sizeof(PirValueId));
+    if (!merged || !remap) abort();
+    for (uint32_t v = 0u; v < nvals; ++v) remap[v] = v;
+
+    bool any_merged = false;
+    bool any_remap  = false;
+    for (uint32_t a = 0u; a < nblks; ++a) {
+        if (!cfg->reachable[a] || merged[a]) continue;
+        PirBlockId cur = a;
+        for (;;) {
+            PirBlock *ba = &fn->blocks.data[a];
+            if (ba->insts.len == 0u) break;
+            PirInst *term = &fn->insts.data[ba->insts.data[ba->insts.len - 1u]];
+            if (term->op != PIR_OP_JMP) break;
+
+            PirBlockId b = term->targets[0].target;
+            if (b == 0u || b == a || b >= nblks || merged[b]) break;
+            if (cfg->preds[b].len != 1u || cfg->preds[b].data[0] != cur) break;
+
+            /* Pop jmp from A and save its arguments. */
+            PirBranchTarget jmp_bt = term->targets[0];
+            ba->insts.len--;
+
+            /* Bind B's block params to A's jump arguments. */
+            uint32_t nparams  = fn->blocks.data[b].params.len;
+            uint32_t src_line = fn->blocks.data[b].src_line;
+            for (uint32_t k = 0u; k < nparams; ++k) {
+                PirValueId pv = fn->blocks.data[b].params.data[k];
+                PirOperand arg = jmp_bt.args[k];
+                if (arg.kind == PIR_OPER_VAL) {
+                    PirValueId rv = arg.u.val;
+                    for (uint32_t s = 0u; s < nvals && rv < nvals && remap[rv] != rv; ++s) {
+                        rv = remap[rv];
+                    }
+                    if (pv < nvals) {
+                        remap[pv] = rv;
+                        any_remap = true;
+                    }
+                } else {
+                    PirType pty = fn->values.data[pv].type;
+                    PirOpcode cop = (arg.kind == PIR_OPER_SYM) ? PIR_OP_ADDR : PIR_OP_CONST;
+                    PirInst ci = pir_make_inst(cop, pty, src_line, 0u);
+                    ci.operands = pir_alloc_ops(mod, 1u);
+                    ci.operands[0] = arg;
+                    ci.operand_count = 1u;
+                    ci.results[0] = pv;
+                    fn->values.data[pv].def_block = a;
+                    fn->values.data[pv].param_index = 0u;
+                    pir_fn_append_inst(fn, &fn->blocks.data[a].insts, ci);
+                }
+            }
+
+            /* Move B's instructions into A. */
+            uint32_t nb = fn->blocks.data[b].insts.len;
+            for (uint32_t j = 0u; j < nb; ++j) {
+                PirInstId iid = fn->blocks.data[b].insts.data[j];
+                PIR_VEC_PUSH(&fn->blocks.data[a].insts, iid);
+                const PirInst *ins = &fn->insts.data[iid];
+                if (ins->results[0] != PIR_INVALID_ID) {
+                    fn->values.data[ins->results[0]].def_block = a;
+                }
+                if (ins->results[1] != PIR_INVALID_ID) {
+                    fn->values.data[ins->results[1]].def_block = a;
+                }
+            }
+            fn->blocks.data[b].params.len = 0u;
+            fn->blocks.data[b].insts.len  = 0u;
+            merged[b]  = true;
+            any_merged = true;
+            cur        = b;
+        }
+    }
+
+    if (any_remap) {
+        for (uint32_t v = 0u; v < nvals; ++v) {
+            PirValueId r = remap[v];
+            for (uint32_t s = 0u; s < nvals && r < nvals && remap[r] != r; ++s) {
+                r = remap[r];
+            }
+            remap[v] = r;
+        }
+        for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
+            const PirBlock *blk = &fn->blocks.data[b];
+            for (uint32_t j = 0u; j < blk->insts.len; ++j) {
+                PirInst *ins = &fn->insts.data[blk->insts.data[j]];
+                remap_ops_arr(ins->operands, ins->operand_count, remap, nvals);
+                remap_ops_arr(ins->targets[0].args, ins->targets[0].arg_count, remap, nvals);
+                remap_ops_arr(ins->targets[1].args, ins->targets[1].arg_count, remap, nvals);
+                for (uint32_t c = 0u; c < ins->switch_case_count; ++c) {
+                    remap_ops_arr(ins->switch_cases[c].target.args,
+                                  ins->switch_cases[c].target.arg_count, remap, nvals);
+                }
+            }
+        }
+    }
+
+    free(remap);
+    free(merged);
+    return any_merged;
 }
 
 static bool args_dominate_all(const PirFunction *fn, const PirBranchTarget *bt) {

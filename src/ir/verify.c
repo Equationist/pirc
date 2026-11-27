@@ -230,6 +230,8 @@ static void verify_params_and_ret(Verifier *v, const char *owner, uint32_t line,
             pir_diag_error(v->diag, line, 0u, "'%s': return cannot have both signext and zeroext", owner);
         }
     }
+    bool has_hir_abi = false;
+    bool has_lowered_abi = (cabi_ret && cabi_ret->kind != PIR_CABI_RET_NONE);
     for (uint32_t i = 0u; i < param_count; ++i) {
         const PirParamDecl *pd = &params[i];
         if (pd->name && pd->name[0] != '\0') {
@@ -242,6 +244,7 @@ static void verify_params_and_ret(Verifier *v, const char *owner, uint32_t line,
             }
         }
         if (pd->abi_kind != PIR_PARAM_NORMAL) {
+            has_hir_abi = true;
             if (v->mode == PIR_VERIFY_LIR) {
                 pir_diag_error(v->diag, line, 0u, "LIR forbids byval/retbuf parameter on '%s'", owner);
             }
@@ -271,6 +274,7 @@ static void verify_params_and_ret(Verifier *v, const char *owner, uint32_t line,
         }
         if (pd->abi_byval_size > 0u || pd->abi_byval_align != 0u ||
             pd->abi_stack_align != 0u || pd->abi_force_stack) {
+            has_lowered_abi = true;
             if (cc != PIR_CC_C) {
                 pir_diag_error(v->diag, line, 0u, "'%s': lowered C ABI parameter metadata requires cc \"c\"", owner);
             }
@@ -309,6 +313,10 @@ static void verify_params_and_ret(Verifier *v, const char *owner, uint32_t line,
                 pir_diag_error(v->diag, line, 0u, "'%s': parameter cannot have both signext and zeroext", owner);
             }
         }
+    }
+    if (has_hir_abi && has_lowered_abi) {
+        pir_diag_error(v->diag, line, 0u,
+                       "'%s': cannot mix HIR byval/retbuf with lowered C ABI metadata", owner);
     }
     if (cabi_ret && cabi_ret->kind != PIR_CABI_RET_NONE) {
         if (cc != PIR_CC_C) {
@@ -589,18 +597,28 @@ static void check_call_args(Verifier *v, const PirFunction *fn, const PirInst *i
                        callee_name, is_variadic ? "at least " : "", param_count, provided);
         return;
     }
+    bool call_has_hir_byval = false;
+    bool call_has_lowered_meta = false;
     for (uint32_t i = 0u; i < provided; ++i) {
         const PirOperand *arg = &inst->operands[first_arg_idx + i];
         if (callee_cc != PIR_CC_C && operand_has_call_meta(arg)) {
             pir_diag_error(v->diag, inst->src_line, 0u,
                            "call to '%s': C ABI call-site metadata requires cc \"c\"", callee_name);
         }
-        if (arg->call_abi == PIR_PARAM_BYVAL && v->mode == PIR_VERIFY_LIR) {
-            pir_diag_error(v->diag, inst->src_line, 0u, "LIR forbids byval at call site");
+        if (arg->call_abi == PIR_PARAM_BYVAL) {
+            call_has_hir_byval = true;
+            if (v->mode == PIR_VERIFY_LIR) {
+                pir_diag_error(v->diag, inst->src_line, 0u, "LIR forbids byval at call site");
+            }
         }
-        if (arg->call_abi == PIR_PARAM_BYVAL && arg->call_byval_size > 0u) {
+        if (arg->call_byval_size > 0u || arg->call_byval_align != 0u ||
+            arg->call_stack_align != 0u || arg->call_force_stack) {
+            call_has_lowered_meta = true;
+        }
+        if (arg->call_abi == PIR_PARAM_BYVAL &&
+            (arg->call_byval_size > 0u || arg->call_stack_align != 0u || arg->call_force_stack)) {
             pir_diag_error(v->diag, inst->src_line, 0u,
-                           "call to '%s': cannot combine byval(@T) with byval_size", callee_name);
+                           "call to '%s': cannot combine byval(@T) with lowered C ABI metadata", callee_name);
         }
         if (arg->call_byval_size > 0u) {
             if (v->target && (v->target->arch != PIR_ARCH_X86_64 || v->target->os == PIR_OS_WINDOWS)) {
@@ -684,6 +702,11 @@ static void check_call_args(Verifier *v, const PirFunction *fn, const PirInst *i
                 check_operand_kind_and_type(v, fn, arg, arg->type, inst->src_line, "variadic call argument");
             }
         }
+    }
+    if (call_has_hir_byval && call_has_lowered_meta) {
+        pir_diag_error(v->diag, inst->src_line, 0u,
+                       "call to '%s': cannot mix HIR byval(@T) with lowered C ABI metadata",
+                       callee_name);
     }
 }
 
@@ -1264,9 +1287,12 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
                         check_int_imm_range(v, db_imm, op0->u.imm_int.lo, op0->u.imm_int.hi,
                                             op0->u.imm_int.is_negative, inst->src_line, "bitcast");
                     }
-                } else if (op0->kind == PIR_OPER_IMM_FLOAT &&
-                           !(src.kind == PIR_TYPE_SCALAR && pir_scalar_is_float(src.u.scalar))) {
-                    pir_diag_error(v->diag, inst->src_line, 0u, "float immediate invalid for type in bitcast");
+                } else if (op0->kind == PIR_OPER_IMM_FLOAT) {
+                    if (!(src.kind == PIR_TYPE_SCALAR && pir_scalar_is_float(src.u.scalar))) {
+                        pir_diag_error(v->diag, inst->src_line, 0u, "float immediate invalid for type in bitcast");
+                    } else if (src.u.scalar == PIR_SCALAR_F32 && op0->u.imm_float.f32_overflow) {
+                        pir_diag_error(v->diag, inst->src_line, 0u, "float literal overflows f32 range in bitcast");
+                    }
                 }
                 check_lir_type(v, src, inst->src_line, "bitcast src");
                 uint32_t sb = pir_type_bits(src, ptr_bytes);
@@ -2397,6 +2423,23 @@ static void check_elf_symbol_name(Verifier *v, const char *name, PirLinkage link
         pir_diag_error(v->diag, line, 0u,
                        "exported/weak symbol '@%s' starting with '.L' is invalid on ELF targets", name);
     }
+    if (strncmp(name, ".L__pir_", 8u) == 0) {
+        pir_diag_error(v->diag, line, 0u,
+                       "symbol '@%s' uses reserved ELF compiler label prefix '.L__pir_'", name);
+    }
+}
+
+static void check_elf_section_name(Verifier *v, const char *sec, uint32_t line) {
+    if (!v->target || v->target->os == PIR_OS_MACOS || v->target->os == PIR_OS_WINDOWS || !sec) {
+        return;
+    }
+    for (const char *p = sec; *p; ++p) {
+        if (*p == '\\' || *p == '"') {
+            pir_diag_error(v->diag, line, 0u,
+                           "ELF section name cannot contain backslash or quote");
+            return;
+        }
+    }
 }
 
 bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
@@ -2516,6 +2559,7 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
         const PirGlobal *g = &mod->globals.data[i];
         check_unique_symbol(&v, g->name, g->src_line, &seen);
         check_elf_symbol_name(&v, g->name, g->linkage, g->src_line);
+        check_elf_section_name(&v, g->section, g->src_line);
         if (g->align != 0u && !align_valid_u32(g->align)) {
             pir_diag_error(diag, g->src_line, 0u,
                            "alignment %u is not a valid power of two", g->align);
@@ -2693,6 +2737,7 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
         const PirFunction *fn = &mod->funcs.data[i];
         check_unique_symbol(&v, fn->name, fn->src_line, &seen);
         check_elf_symbol_name(&v, fn->name, fn->linkage, fn->src_line);
+        check_elf_section_name(&v, fn->section, fn->src_line);
         if (target && target->os != PIR_OS_MACOS && target->os != PIR_OS_WINDOWS &&
             fn->section && (strcmp(fn->section, ".bss") == 0 || strcmp(fn->section, ".tbss") == 0)) {
             pir_diag_error(diag, fn->src_line, 0u,

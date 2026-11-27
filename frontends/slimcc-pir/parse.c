@@ -1006,10 +1006,18 @@ static void cleanup_attr(Token *name, Token *tok, VarAttr *attr, Obj *var) {
   }
 }
 
-static void chk_vardecl(Type *ty, Token *name, Token *tok) {
+static bool has_lcurly_before(Token *start, Token *end) {
+  for (Token *t = start; t && t != end; t = t->next) {
+    if (t->kind == TK_LCURLY)
+      return true;
+  }
+  return false;
+}
+
+static void chk_vardecl(Type *ty, Token *name, Token *tok, bool allow_void) {
   if (!name)
     error_tok(tok, "variable name omitted");
-  if (ty->kind == TY_VOID)
+  if (ty->kind == TY_VOID && !allow_void)
     error_tok(tok, "variable declared void");
 }
 
@@ -2044,7 +2052,8 @@ static Node *declaration2(Token **rest, Token *tok, Type *basety, VarAttr *attr,
     validate_decl_attrs(attr, DECL_CTX_FUNC, name ? name : tok);
     strip_proto_vla_exprs(ty);
     Obj *fn = func_prototype(tok, name, ty, attr, false);
-    strip_proto_vla_exprs(fn->ty);
+    if (!fn->is_definition && !(fnctx && fnctx->fn == fn))
+      strip_proto_vla_exprs(fn->ty);
     assembler_name(&tok, tok, fn);
     if (declared_obj)
       *declared_obj = false;
@@ -2054,7 +2063,7 @@ static Node *declaration2(Token **rest, Token *tok, Type *basety, VarAttr *attr,
 
   if (declared_obj)
     *declared_obj = true;
-  chk_vardecl(ty, name, tok);
+  chk_vardecl(ty, name, tok, false);
   chk_inline(attr, tok);
   ty = qual_constexpr(ty, attr, tok);
 
@@ -2209,6 +2218,9 @@ static Node *declaration_sc(Token **rest, Token *tok, StorageClass allow_sc, boo
   if (attr.strg & SC_EXTERN) {
     if (for_init && is_iso_std)
       error_tok(start, "declaration in 'for' loop initial declaration cannot be 'extern'");
+    if (tok->kind == TK_SEMI && is_iso_std && !tok->file->is_syshdr &&
+        basety->is_enum && !has_lcurly_before(start, tok))
+      error_tok(start, "declaration does not declare anything");
     global_declaration(rest, tok, basety, &attr);
     return NULL;
   }
@@ -2220,7 +2232,8 @@ static Node *declaration_sc(Token **rest, Token *tok, StorageClass allow_sc, boo
     if (for_init && is_iso_std && !tok->file->is_syshdr)
       error_tok(start, "'for' loop initial declaration must declare an object");
     if (is_iso_std && !tok->file->is_syshdr &&
-        basety->kind != TY_STRUCT && basety->kind != TY_UNION && !basety->is_enum)
+        basety->kind != TY_STRUCT && basety->kind != TY_UNION &&
+        (!basety->is_enum || !has_lcurly_before(start, tok)))
       error_tok(start, "declaration does not declare anything");
     *rest = tok->next;
     return expr;
@@ -5898,6 +5911,13 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
       continue;
     }
 
+    if (tok->kind == TK_SEMI) {
+      if (is_iso_std && (!tok->file || !tok->file->is_syshdr))
+        error_tok(decl_start, "declaration does not declare anything");
+      tok = tok->next;
+      continue;
+    }
+
     // Regular struct members
     bool first = true;
     for (; comma_list(&tok, &tok, TK_SEMI, !first); first = false) {
@@ -7267,6 +7287,7 @@ static Obj *func_prototype(Token *tok, Token *name, Type *ty, VarAttr *attr, boo
   HashEntry *ent = hashmap_get_or_insert(&symbols, name->loc, name->len);
   Obj *fn = ent->val;
   Type *scoped_fn_ty = NULL;
+  VarScope *prev_vsc = scope->parent ? find_var(name) : NULL;
   if (fn) {
     if (!is_compatible(fn->ty, ty))
       error_tok(name, "incompatible redeclaration");
@@ -7303,13 +7324,19 @@ static Obj *func_prototype(Token *tok, Token *name, Type *ty, VarAttr *attr, boo
     fn = ent->val = new_gvar(get_ident(&cc1_arena, name), ty);
     fn->is_static = attr->strg & SC_STATIC;
     fn->has_file_decl = !scope->parent;
+    if (scope->parent && !is_def)
+      scoped_fn_ty = ty;
     set_returns_twice(fn);
   }
   VarScope *vsc = push_gvar_name2(name, fn);
   if (scoped_fn_ty && vsc) {
-    if (vsc->var_ty && !is_compatible(vsc->var_ty, scoped_fn_ty))
-      error_tok(name, "incompatible redeclaration");
-    vsc->var_ty = vsc->var_ty ? composite_type(vsc->var_ty, scoped_fn_ty) : scoped_fn_ty;
+    if (prev_vsc && prev_vsc->var == fn) {
+      Type *prev_ty = prev_vsc->var_ty ? prev_vsc->var_ty : fn->ty;
+      if (!is_compatible(prev_ty, scoped_fn_ty))
+        error_tok(name, "incompatible redeclaration");
+      scoped_fn_ty = composite_type(prev_ty, scoped_fn_ty);
+    }
+    vsc->var_ty = scoped_fn_ty;
   }
 
   fn->is_gnu_inline |= is_gnu_inline;
@@ -7366,12 +7393,13 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
         func_definition(rest, tok, fn, ty);
         return;
       }
-      strip_proto_vla_exprs(fn->ty);
+      if (!fn->is_definition && !(fnctx && fnctx->fn == fn))
+        strip_proto_vla_exprs(fn->ty);
       assembler_name(&tok, tok, fn);
       continue;
     }
 
-    chk_vardecl(ty, name, tok);
+    chk_vardecl(ty, name, tok, (attr->strg & SC_EXTERN) && tok->kind != TK_EQ);
     chk_inline(attr, tok);
     ty = qual_constexpr(ty, attr, tok);
 
@@ -7390,6 +7418,7 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
     HashEntry *ent = hashmap_get_or_insert(&symbols, name->loc, name->len);
     Obj *var = ent->val;
     Type *scoped_ty = NULL;
+    VarScope *prev_vsc = scope->parent ? find_var(name) : NULL;
     bool existed = (var != NULL);
     if (var) {
       if (!is_compatible2(var->ty, ty))
@@ -7410,14 +7439,20 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
       var = ent->val = new_gvar(get_ident(&cc1_arena, name), ty);
       var->is_static = (attr->strg & SC_STATIC) || (attr->strg & SC_CONSTEXPR);
       var->has_file_decl = !scope->parent;
+      if (scope->parent)
+        scoped_ty = ty;
       if (attr->strg & SC_THREAD)
         var->kind = OBJ_TLS;
     }
     VarScope *vsc = push_gvar_name2(name, var);
     if (scoped_ty && vsc) {
-      if (vsc->var_ty && !is_compatible2(vsc->var_ty, ty))
-        error_tok(name, "incompatible redeclaration");
-      vsc->var_ty = vsc->var_ty ? composite_type(vsc->var_ty, scoped_ty) : scoped_ty;
+      if (prev_vsc && prev_vsc->var == var) {
+        Type *prev_ty = prev_vsc->var_ty ? prev_vsc->var_ty : var->ty;
+        if (!is_compatible2(prev_ty, scoped_ty))
+          error_tok(name, "incompatible redeclaration");
+        scoped_ty = composite_type(prev_ty, scoped_ty);
+      }
+      vsc->var_ty = scoped_ty;
     }
 
     assembler_name(&tok, tok, var);
@@ -7534,7 +7569,8 @@ Obj *parse(Token *tok) {
     if (tok->kind == TK_SEMI) {
       chk_inline(&attr, tok);
       if (is_iso_std && !decl_start->file->is_syshdr &&
-          basety->kind != TY_STRUCT && basety->kind != TY_UNION && !basety->is_enum)
+          basety->kind != TY_STRUCT && basety->kind != TY_UNION &&
+          (!basety->is_enum || !has_lcurly_before(decl_start, tok)))
         error_tok(decl_start, "declaration does not declare anything");
       tok = tok->next;
       arena_off(&ast_arena);

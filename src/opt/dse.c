@@ -193,11 +193,6 @@ static void dse_process_block(DseCtx *ctx, PirBlockId b, const ActiveLoadVec *pa
                     }
                 }
                 if (!forwarded) {
-                    for (uint32_t k = 0u; k < active.len; ++k) {
-                        PirAliasResult ar = pir_alias_query(fn, active.data[k].ptr, active.data[k].size,
-                                                            ins->operands[0], lsz, ctx->target->ptr_bytes);
-                        if (ar != PIR_ALIAS_NO) active.data[k].observed = true;
-                    }
                     ActiveLoad al;
                     al.ptr  = ins->operands[0];
                     al.val  = ins->results[0];

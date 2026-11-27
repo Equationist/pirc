@@ -27,6 +27,7 @@ src/target/target.c
 src/target/abi_sysv_x64.c
 src/target/abi_aapcs64.c
 src/target/abi_win64.c
+src/target/abi_rv32.c
 src/analysis/cfg.c
 src/analysis/dom.c
 src/analysis/loops.c
@@ -41,6 +42,7 @@ src/lower/varargs.c
 src/lower/cabi.c
 src/lower/aggregates.c
 src/lower/i128.c
+src/lower/i64.c
 src/lower/simd.c
 src/lower/legalize.c
 src/opt/opt.c
@@ -63,6 +65,9 @@ src/backend/arm64/arm64_asm.c
 src/backend/x64/x64_isel.c
 src/backend/x64/x64_frame.c
 src/backend/x64/x64_asm.c
+src/backend/rv32/rv32_isel.c
+src/backend/rv32/rv32_frame.c
+src/backend/rv32/rv32_asm.c
 "
 
 SLIMCC_SRCS="
@@ -95,7 +100,7 @@ make -C frontends/slimcc-pir -f Makefile.pir >/dev/null
 cp build/pirc "$BOOT_DIR/pirc-stage0"
 cp frontends/slimcc-pir/slimcc-pir "$BOOT_DIR/slimcc-pir-stage0"
 
-echo "=== [Bootstrap Stage 1] Compiling pirc (37 TUs) with slimcc-pir-stage0 -> pirc-stage0 -O2 ==="
+echo "=== [Bootstrap Stage 1] Compiling pirc (42 TUs) with slimcc-pir-stage0 -> pirc-stage0 -O2 ==="
 for f in $PIRC_SRCS; do
     tag="$(printf '%s' "$f" | tr '/' '_' | sed 's/\.c$//')"
     "$BOOT_DIR/slimcc-pir-stage0" --pirc="$BOOT_DIR/pirc-stage0" -O2 \
@@ -135,7 +140,7 @@ done
 
 echo "=== [Bootstrap Gate 1] Comparing stage2_asm/ vs stage3_asm/ (fixed-point check) ==="
 diff -ru "$BOOT_DIR/stage2_asm" "$BOOT_DIR/stage3_asm"
-echo "PASS: stage2_asm/ and stage3_asm/ are 100% byte-identical across all 37 translation units!"
+echo "PASS: stage2_asm/ and stage3_asm/ are 100% byte-identical across all 42 translation units!"
 
 echo "=== [Bootstrap Gate 2] Running full pirc test suite (M1-M7) with pirc-stage2 ==="
 sh tests/run_interp_tests.sh "$BOOT_DIR/pirc-stage2"

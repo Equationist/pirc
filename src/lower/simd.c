@@ -115,13 +115,28 @@ static bool is_vec_cast_op(PirOpcode op) {
 }
 
 static void set_simd_sret_cabi(const PirTargetSpec *target, PirCallingConv cc,
-                               PirCabiRetInfo *cabi_ret) {
+                               PirType orig_ret_ty, PirCabiRetInfo *cabi_ret) {
     if (cc != PIR_CC_C) return;
     memset(cabi_ret, 0, sizeof(*cabi_ret));
     if (target->arch == PIR_ARCH_ARM64) {
         cabi_ret->kind = PIR_CABI_RET_SRET_X8;
     } else if (target->arch == PIR_ARCH_X86_64) {
-        cabi_ret->kind = PIR_CABI_RET_SRET_RAX;
+        if (target->os != PIR_OS_WINDOWS && target->caps.max_simd_bits == 128u &&
+            orig_ret_ty.kind == PIR_TYPE_VECTOR && pir_vec_bits(orig_ret_ty.u.vec) == 256u) {
+            /* SysV AMD64 without AVX returns bare 256-bit vectors split across (xmm0, xmm1). */
+            PirType pty;
+            uint32_t cnt = 0u;
+            split_spec(orig_ret_ty.u.vec, 128u, &pty, &cnt);
+            cabi_ret->kind      = PIR_CABI_RET_MULTI_REG;
+            cabi_ret->reg_count = cnt;
+            for (uint32_t k = 0u; k < cnt && k < 4u; ++k) {
+                cabi_ret->regs[k] = pty;
+            }
+            cabi_ret->agg_size  = 32u;
+            cabi_ret->agg_align = 16u;
+        } else {
+            cabi_ret->kind = PIR_CABI_RET_SRET_RAX;
+        }
     }
 }
 
@@ -205,8 +220,9 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
             op.val_id   = ret_out_val;
             PIR_VEC_PUSH(&nfp, op);
 
+            PirType orig_ret = fn->ret_type;
             fn->ret_type = tvoid;
-            set_simd_sret_cabi(target, fn->cc, &fn->cabi_ret);
+            set_simd_sret_cabi(target, fn->cc, orig_ret, &fn->cabi_ret);
         }
         for (uint32_t i = 0u; i < fn->param_count; ++i) {
             if (needs_split(fn->params[i].type, max_bits)) {
@@ -835,8 +851,9 @@ static void split_simd_decl(PirModule *mod, const PirTargetSpec *target, PirCall
         op.abi_type = pir_type_scalar(PIR_SCALAR_VOID);
         op.val_id   = PIR_INVALID_ID;
         PIR_VEC_PUSH(&np, op);
+        PirType orig_ret = *ret_ty_io;
         *ret_ty_io = pir_type_scalar(PIR_SCALAR_VOID);
-        set_simd_sret_cabi(target, cc, cabi_ret_io);
+        set_simd_sret_cabi(target, cc, orig_ret, cabi_ret_io);
     }
     for (uint32_t i = 0u; i < old_n; ++i) {
         if (needs_split(old_p[i].type, max_bits)) {

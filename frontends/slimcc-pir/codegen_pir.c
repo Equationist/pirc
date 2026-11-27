@@ -899,7 +899,7 @@ static const char *get_pir_sig_for_call(Type *fnty, Obj *call_args) {
   sb_printf(&sb, "(");
   bool first = true;
 
-  Type *rty = fnty->return_ty;
+  Type *rty = unqual(fnty->return_ty);
   bool has_retbuf = is_mem_val_ty(rty) && rty->size > 0;
   if (has_retbuf) {
     sb_printf(&sb, "retbuf(@%s)", get_pir_agg_type_name(rty));
@@ -1795,6 +1795,15 @@ static int32_t effective_lval_align(Node *n) {
   default:
     return align_floor_pow2(al);
   }
+}
+
+static int32_t effective_ptr_target_align(Node *ptr_expr, int32_t fallback_al) {
+  Node *p = ptr_expr;
+  while (p && p->kind == ND_CAST && is_ptr(p->ty))
+    p = p->m.lhs;
+  if (p && p->kind == ND_ADDR)
+    return effective_lval_align(p->m.lhs);
+  return align_floor_pow2(fallback_al > 0 ? fallback_al : 1);
 }
 
 static int64_t atomic_unqual_size(Type *atomic_ty) {
@@ -2993,9 +3002,9 @@ static PirVal gen_expr(Node *node) {
     if (!it)
       it = "i64";
     int32_t old_al = pad_old ? stage_al
-                   : (is_agg_cas
-                      ? (node->cas.old_val->ty->base->align > 0 ? node->cas.old_val->ty->base->align : 1)
-                      : pir_scalar_align(ty));
+                   : effective_ptr_target_align(
+                       node->cas.old_val,
+                       is_agg_cas ? node->cas.old_val->ty->base->align : pir_scalar_align(ty));
     int32_t p2_old = align_floor_pow2(old_al);
 
     int64_t cas_sz = ty->size > 0 ? ty->size : (pir_ty_bits(it) / 8);
@@ -3006,8 +3015,7 @@ static PirVal gen_expr(Node *node) {
       sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", exp_id, it, eff_old.id, p2_old);
       int new_id = eff_new.id;
       if (is_agg_cas) {
-        int32_t new_al = pad_new ? stage_al
-                       : (node->cas.new_val->ty->align > 0 ? node->cas.new_val->ty->align : 1);
+        int32_t new_al = pad_new ? stage_al : effective_lval_align(node->cas.new_val);
         int32_t p2_new = align_floor_pow2(new_al);
         new_id = new_tid();
         sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", new_id, it, eff_new.id, p2_new);
@@ -3079,8 +3087,7 @@ static PirVal gen_expr(Node *node) {
     sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", exp_id, it, eff_old.id, p2_old);
     int new_id = eff_new.id;
     if (is_agg_cas) {
-      int32_t new_al = pad_new ? stage_al
-                     : (node->cas.new_val->ty->align > 0 ? node->cas.new_val->ty->align : 1);
+      int32_t new_al = pad_new ? stage_al : effective_lval_align(node->cas.new_val);
       int32_t p2_new = align_floor_pow2(new_al);
       new_id = new_tid();
       sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", new_id, it, eff_new.id, p2_new);
@@ -3622,13 +3629,21 @@ static void gen_stmt(Node *node) {
     }
     PirVal rv = gen_expr(node->m.lhs);
     if (fc->has_retbuf) {
-      int32_t dst_al = align_floor_pow2(rty->align > 0 ? rty->align : 1);
+      Type *urty = unqual(rty);
+      int32_t dst_al = align_floor_pow2(urty->align > 0 ? urty->align : 1);
       int32_t src_al = effective_lval_align(node->m.lhs);
       int32_t p2 = dst_al < src_al ? dst_al : src_al;
-      int64_t rsz = is_agg_ty(rty) ? agg_copy_size(rty) : rty->size;
+      int64_t rsz = is_agg_ty(urty) ? agg_copy_size(urty) : urty->size;
+      int64_t ssz = is_agg_ty(node->m.lhs->ty) ? agg_copy_size(node->m.lhs->ty) : node->m.lhs->ty->size;
       ensure_open_block();
-      sb_printf(&fc->body_sb, "    memcpy %%__retbuf, %%t%d, %" PRIi64 ", align %d\n",
-                rv.id, rsz, p2);
+      if (ssz > 0 && ssz < rsz) {
+        sb_printf(&fc->body_sb, "    memset %%__retbuf, 0, %" PRIi64 ", align %d\n", rsz, dst_al);
+        sb_printf(&fc->body_sb, "    memcpy %%__retbuf, %%t%d, %" PRIi64 ", align %d\n",
+                  rv.id, ssz, p2);
+      } else {
+        sb_printf(&fc->body_sb, "    memcpy %%__retbuf, %%t%d, %" PRIi64 ", align %d\n",
+                  rv.id, rsz, p2);
+      }
       gen_defr(node);
       ensure_open_block();
       sb_printf(&fc->body_sb, "    ret\n");
@@ -3674,7 +3689,7 @@ void emit_text(Obj *fn) {
   ctx.vla_sp_slot = -1;
   fc = &ctx;
 
-  Type *rty = fn->ty->return_ty;
+  Type *rty = unqual(fn->ty->return_ty);
   ctx.has_retbuf = is_mem_val_ty(rty) && rty->size > 0;
   ctx.ret_pir_ty = ctx.has_retbuf ? "void" : pir_ret_ty_name(rty);
 
@@ -3894,7 +3909,7 @@ static void emit_extern_decl(SBuf *sb, Obj *var) {
     sb_emit_sym(sb, pir_sym_name(var));
     sb_printf(sb, "(");
     bool first = true;
-    Type *rty = var->ty->return_ty;
+    Type *rty = unqual(var->ty->return_ty);
     bool has_rb = is_mem_val_ty(rty) && rty->size > 0;
     if (has_rb) {
       sb_printf(sb, "retbuf(@%s)", get_pir_agg_type_name(rty));

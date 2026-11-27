@@ -218,9 +218,10 @@ static PirBlockId lower_va_arg_sysv_agg(PirModule *mod, const PirTargetSpec *tar
             bool is_sse = pir_type_is_float(rty) || rty.kind == PIR_TYPE_VECTOR;
             uint64_t dst_off = info.has_reg_offsets ? info.reg_offsets[k] : ((uint64_t)k * 8u);
             uint64_t rem     = (plan.size > dst_off) ? (plan.size - dst_off) : 0u;
-            uint64_t chunk   = (rty.kind == PIR_TYPE_VECTOR && pir_vec_bits(rty.u.vec) == 128u)
-                               ? (rem < 16u ? rem : 16u)
-                               : (rem < 8u ? rem : 8u);
+            uint64_t reg_sz  = (rty.kind == PIR_TYPE_VECTOR)
+                               ? (uint64_t)(pir_vec_bits(rty.u.vec) / 8u)
+                               : 8u;
+            uint64_t chunk   = (rem < reg_sz) ? rem : reg_sz;
             if (chunk == 0u) continue;
 
             PirValueId base_off32 = is_sse ? fp_off_v : gp_off_v;
@@ -880,8 +881,7 @@ bool pir_lower_varargs(PirModule *mod, const PirTargetSpec *target, PirDiag *dia
                             PirInst ld = pir_make_inst(PIR_OP_LOAD, tptr, copy.src_line, copy.loc_idx);
                             ld.align = ptr_al; ld.operand_count = 1u; ld.operands = pir_alloc_ops(mod, 1u);
                             ld.operands[0] = nops[k];
-                            ld.operands[0].call_abi = PIR_PARAM_NORMAL;
-                            ld.operands[0].has_explicit_type = false;
+                            pir_op_strip_call_meta(&ld.operands[0]);
                             ld.results[0]  = pir_fn_new_val(mod, fn, "vap_v", tptr, b, PIR_INVALID_ID, 0u);
                             pir_fn_append_inst(fn, &out, ld);
                             nops[k] = pir_op_val(ld.results[0], tptr);

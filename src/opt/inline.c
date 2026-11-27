@@ -310,6 +310,18 @@ static void inline_call_site(PirModule *mod, PirFunction *caller,
                     jmp.targets[0].args = pir_alloc_ops(mod, 1u);
                     jmp.targets[0].args[0] = remap_operand(ci->operands[0], val_map, callee_nvals);
                     jmp.targets[0].arg_count = 1u;
+                } else if (ci->operand_count == 1u) {
+                    PirOperand rop = remap_operand(ci->operands[0], val_map, callee_nvals);
+                    if (pir_op_is_tls_sym(mod, &rop)) {
+                        PirInst ai = pir_make_inst(PIR_OP_ADDR, pir_type_scalar(PIR_SCALAR_PTR), call_line, call_loc);
+                        ai.operand_count = 1u;
+                        ai.operands      = pir_alloc_ops(mod, 1u);
+                        ai.operands[0]   = rop;
+                        ai.results[0]    = pir_fn_new_val(mod, caller, "inl_tls",
+                                                          pir_type_scalar(PIR_SCALAR_PTR),
+                                                          nb, PIR_INVALID_ID, 0u);
+                        pir_fn_append_inst(caller, &caller->blocks.data[nb].insts, ai);
+                    }
                 }
                 PirInstId jiid = caller->insts.len;
                 PIR_VEC_PUSH(&caller->insts, jmp);
@@ -380,20 +392,7 @@ static void inline_call_site(PirModule *mod, PirFunction *caller,
         }
     }
 
-    if (hoisted_allocas.len > 0u) {
-        PirBlock *eb = &caller->blocks.data[0];
-        uint32_t old_len = eb->insts.len;
-        uint32_t add_len = hoisted_allocas.len;
-        for (uint32_t k = 0u; k < add_len; ++k) {
-            PIR_VEC_PUSH(&eb->insts, 0u);
-        }
-        memmove(&eb->insts.data[add_len], &eb->insts.data[0],
-                (size_t)old_len * sizeof(PirInstId));
-        memcpy(&eb->insts.data[0], hoisted_allocas.data,
-               (size_t)add_len * sizeof(PirInstId));
-    }
-
-    PIR_VEC_FREE(&hoisted_allocas);
+    pir_fn_prepend_entry_insts(caller, &hoisted_allocas);
     free(val_map);
     free(blk_map);
 }
@@ -483,8 +482,8 @@ static bool func_calls_target(const PirModule *mod, const PirFunction *fn, uint3
  * gated by target callee-saved register budget so we avoid spilling on 5-cs-reg x86-64. */
 static void try_self_inline_tiny(PirModule *mod, PirFunction *fn, uint32_t fi,
                                  const PirTargetSpec *target) {
-    uint32_t max_params = (target->arch == PIR_ARCH_ARM64) ? 3u : 2u;
-    uint32_t max_calls  = (target->arch == PIR_ARCH_ARM64) ? 3u : 2u;
+    uint32_t max_params = (target && target->arch == PIR_ARCH_ARM64) ? 3u : 2u;
+    uint32_t max_calls  = (target && target->arch == PIR_ARCH_ARM64) ? 3u : 2u;
     if (!fn->is_defined || fn->linkage == PIR_LINK_WEAK || fn->is_variadic ||
         fn->cabi_ret.kind != PIR_CABI_RET_NONE || fn->blocks.len == 0u ||
         fn->blocks.data[0].params.len != 0u || fn->param_count > max_params) {

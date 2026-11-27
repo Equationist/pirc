@@ -1008,7 +1008,10 @@ static Token *subst(Token *tok, MacroContext *ctx) {
           continue;
         }
         cur = cur->next = copy_token(tok);
-        tok = tok->next->next;
+        if (arg->tok->kind == TK_EOF)
+          tok = tok->next->next->next;
+        else
+          tok = tok->next->next;
         continue;
       }
     }
@@ -1383,7 +1386,7 @@ static char *read_filename(Token **rest, Token *tok, const char **dir) {
   }
 
   char *filename = NULL;
-  if (tok->kind == TK_STR ||
+  if ((tok->kind == TK_STR && tok->loc[0] == '"') ||
       (tok->kind == TK_INVALID && tok->len >= 2 &&
        tok->loc[0] == '"' && tok->loc[tok->len - 1] == '"')) {
     // Pattern 1: #include "foo.h"
@@ -1394,18 +1397,28 @@ static char *read_filename(Token **rest, Token *tok, const char **dir) {
     // So we don't want to use token->str.
     filename = arena_copy_string(&cc1_arena, tok->loc + 1, tok->len - 2);
     *dir = (tok->origin ? tok->origin : tok)->file->name;
-  } else if (tok->kind == TK_LANGLE) {
+  } else if (tok->kind == TK_LANGLE ||
+             (!is_expanded && tok->kind == TK_LBRACK && tok->len == 2 &&
+              tok->loc[0] == '<' && tok->loc[1] == ':')) {
     // Pattern 2: #include <foo.h>
     // Reconstruct a filename from between "<" and ">".
     Token *start = tok;
+    tok = tok->next;
 
-    // Find closing ">".
-    for (; tok->kind != TK_RANGLE; tok = tok->next)
+    // Find closing ">" (or ":>" digraph when lexed from raw source).
+    for (;; tok = tok->next) {
+      if (tok->kind == TK_RANGLE)
+        break;
+      if (!is_expanded && tok->kind == TK_RBRACK && tok->len == 2 &&
+          tok->loc[0] == ':' && tok->loc[1] == '>')
+        break;
       if (tok->kind == TK_EOF)
         error_tok(tok, "expected '>'");
+    }
 
-    if (!is_expanded && start->file == tok->file && start->loc < tok->loc)
-      filename = arena_copy_string(&cc1_arena, start->loc + 1, tok->loc - start->loc - 1);
+    const char *end_loc = (tok->kind == TK_RBRACK) ? (tok->loc + 1) : tok->loc;
+    if (!is_expanded && start->file == tok->file && start->loc < end_loc)
+      filename = arena_copy_string(&cc1_arena, start->loc + 1, end_loc - start->loc - 1);
     else
       filename = join_tokens(start->next, tok, false);
   }
@@ -1580,6 +1593,8 @@ static void read_line_marker(Token **rest, Token *tok, bool is_line_dir) {
 
   if (tok->kind != TK_STR)
     error_tok(tok, "filename expected");
+  if (tok->str_invalid)
+    error_tok(tok, "invalid string literal in #line directive");
   if (is_iso_std && is_line_dir && tok->loc[0] != '"' && !start->file->is_syshdr)
     error_tok(tok, "invalid filename in #line directive");
 
@@ -1887,6 +1902,23 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
             hashmap_put(&pragma_once, arena_strdup(&cc1_arena, realpathbuf), (void *)1);
         }
         return skip_line(tok->next->next);
+      }
+      if (equal(tok->next, "pack") && !tok->next->next->at_bol) {
+        Token *rest = NULL;
+        Token *args = expand_tok(split_line(&rest, tok->next->next));
+        Token *pack_tok = tok->next;
+        finalize_tok(start);
+        finalize_tok(tok);
+        finalize_tok(pack_tok);
+        *cur = (*cur)->next = start;
+        *cur = (*cur)->next = tok;
+        *cur = (*cur)->next = pack_tok;
+        for (Token *t = args; t->kind != TK_EOF; t = t->next) {
+          t->at_bol = false;
+          finalize_tok(t);
+          *cur = (*cur)->next = t;
+        }
+        return rest;
       }
       return pass_line(cur, start);
     }
@@ -2360,9 +2392,12 @@ static void join_adjacent_string_literals(Token *tok) {
         tokenize_string_literal(t, basety);
 
   // Concatenate adjacent string literals.
+  bool any_invalid = tok->str_invalid;
   int len = tok->ty->array_len;
-  for (Token *t = tok->next; t != end; t = t->next)
+  for (Token *t = tok->next; t != end; t = t->next) {
+    any_invalid |= t->str_invalid;
     len = len + t->ty->array_len - 1;
+  }
 
   char *buf = calloc(basety->size, len);
 
@@ -2374,6 +2409,7 @@ static void join_adjacent_string_literals(Token *tok) {
 
   tok->ty = array_of(basety, len);
   tok->str = buf;
+  tok->str_invalid = any_invalid;
   tok->next = end;
 }
 

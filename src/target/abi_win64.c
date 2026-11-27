@@ -34,8 +34,8 @@ bool pir_abi_win64_param(const PirModule *mod, const PirTargetSpec *target,
         classify_win64_agg(mod, target, pd->abi_type, out);
     } else {
         PirTypeLayout ly = pir_type_layout(mod, target, pd->type);
-        if (ly.size > 8u) {
-            /* Win64 passes values > 8 bytes (i128, v128, v256) indirectly via hidden pointer. */
+        if (ly.size > 8u || pd->type.kind == PIR_TYPE_VECTOR) {
+            /* Win64 passes values > 8 bytes (i128, v128, v256) and SIMD vectors indirectly via hidden pointer. */
             out->kind    = PIR_ABI_INDIRECT;
             out->gp_used = 1u;
         } else {

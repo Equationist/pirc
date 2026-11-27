@@ -1005,7 +1005,7 @@ static Type *cond_ptr_conv(Node **lhs, Node **rhs, Node **cond) {
         error_tok((*lhs)->tok, "incompatible pointer types in conditional expression");
       QualMask q1 = eff_qual(ty1->base);
       QualMask q2 = eff_qual(ty2->base);
-      return pointer_to(add_qual(q1 | q2, ty_void, NULL));
+      return pointer_to(add_qual((q1 | q2) & ~Q_ATOMIC, ty_void, NULL));
     }
 
     if (is_compatible(ty1->base, ty2->base) &&
@@ -1363,10 +1363,34 @@ void _add_type(Node *node) {
     return;
   }
   case ND_POST_INCDEC:
-  case ND_ARITH_ASSIGN: {
     add_type(node->m.lhs);
     add_type(node->m.rhs);
     node->ty = unqual(node->m.lhs->ty);
+    return;
+  case ND_ARITH_ASSIGN: {
+    add_type(node->m.lhs);
+    add_type(node->m.rhs);
+    Type *lt = node->m.lhs->ty;
+    Type *rt = node->m.rhs->ty;
+    switch (node->arith_kind) {
+    case ND_MUL:
+    case ND_DIV:
+      if (!is_numeric(lt) || !is_numeric(rt))
+        error_tok(node->tok, "invalid operands");
+      break;
+    case ND_REM:
+    case ND_BITAND:
+    case ND_BITOR:
+    case ND_BITXOR:
+    case ND_SHL:
+    case ND_SHR:
+      if (!is_int_class(lt) || !is_int_class(rt))
+        error_tok(node->tok, "invalid operands");
+      break;
+    default:
+      break;
+    }
+    node->ty = unqual(lt);
     return;
   }
   case ND_STMT_EXPR:

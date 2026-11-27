@@ -117,8 +117,13 @@ static bool lex_string_body(PirLexer *lex, uint32_t start_line, uint32_t start_c
                 }
                 default:
                     free(tmp);
-                    pir_diag_error(lex->diag, lex->line, lex->col,
-                                   "unknown escape sequence '\\%c'", esc);
+                    if ((unsigned char)esc >= 0x20u && (unsigned char)esc < 0x7fu) {
+                        pir_diag_error(lex->diag, lex->line, lex->col,
+                                       "unknown escape sequence '\\%c'", esc);
+                    } else {
+                        pir_diag_error(lex->diag, lex->line, lex->col,
+                                       "unknown escape sequence '\\x%02x'", (unsigned)(unsigned char)esc);
+                    }
                     return false;
             }
         }
@@ -482,7 +487,11 @@ PirToken pir_lexer_next(PirLexer *lex) {
     }
 
     advance(lex);
-    pir_diag_error(lex->diag, tok.line, tok.col, "unexpected character '%c'", c);
+    if ((unsigned char)c >= 0x20u && (unsigned char)c < 0x7fu) {
+        pir_diag_error(lex->diag, tok.line, tok.col, "unexpected character '%c'", c);
+    } else {
+        pir_diag_error(lex->diag, tok.line, tok.col, "unexpected byte 0x%02x", (unsigned)(unsigned char)c);
+    }
     tok.kind = TOK_ERR;
     return tok;
 }

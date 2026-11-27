@@ -602,12 +602,7 @@ static void run_sroa(PirModule *mod, PirFunction *fn, uint8_t ptr_bytes) {
         }
 
         /* Prepend new scalar allocas to entry block. */
-        PirInstIdVec *b0 = &fn->blocks.data[0].insts;
-        PirInstIdVec merged = {NULL, 0u, 0u};
-        for (uint32_t i = 0u; i < new_allocas.len; ++i) PIR_VEC_PUSH(&merged, new_allocas.data[i]);
-        for (uint32_t i = 0u; i < b0->len; ++i)          PIR_VEC_PUSH(&merged, b0->data[i]);
-        PIR_VEC_FREE(b0);
-        *b0 = merged;
+        pir_fn_prepend_entry_insts(fn, &new_allocas);
     }
 
     PIR_VEC_FREE(&new_allocas);
@@ -950,21 +945,7 @@ void pir_opt_mem2reg(PirModule *mod, PirFunction *fn, const PirTargetSpec *targe
     }
 
     /* Prepend any synthesized zero constants to the entry block now that renaming is done. */
-    if (rctx.entry_zeros.len > 0u) {
-        PirInstIdVec *b0 = &fn->blocks.data[0].insts;
-        uint32_t nz = rctx.entry_zeros.len;
-        uint32_t old_n = b0->len;
-        PirInstIdVec merged = {NULL, 0u, 0u};
-        for (uint32_t i = 0u; i < nz; ++i) {
-            PIR_VEC_PUSH(&merged, rctx.entry_zeros.data[i]);
-        }
-        for (uint32_t i = 0u; i < old_n; ++i) {
-            PIR_VEC_PUSH(&merged, b0->data[i]);
-        }
-        PIR_VEC_FREE(b0);
-        *b0 = merged;
-    }
-    PIR_VEC_FREE(&rctx.entry_zeros);
+    pir_fn_prepend_entry_insts(fn, &rctx.entry_zeros);
 
     /* Final sweep to ensure all backedge / cross-block references resolve through val_remap. */
     for (uint32_t b = 0u; b < nblks; ++b) {

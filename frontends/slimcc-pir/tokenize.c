@@ -1491,7 +1491,8 @@ Token *tokenize_file_ex(const char *path, Token *tok, Token **end, bool is_syshd
   fflush(out);
   if (buflen > 0 && memchr(buf, '\0', buflen))
     error("%s: embedded null character in input", path);
-  if (buflen == 0 || buf[buflen - 1] != '\n')
+  bool appended_nl = (buflen == 0 || buf[buflen - 1] != '\n');
+  if (appended_nl)
     fputc('\n', out);
   fputc('\0', out);
   fclose(out);
@@ -1533,7 +1534,21 @@ Token *tokenize_file_ex(const char *path, Token *tok, Token **end, bool is_syshd
   }
 
   SlashDelta dlt = {0};
-  remove_backslash_newline(buf, &dlt);
+  if (appended_nl) {
+    size_t n = strlen(buf);
+    if (n >= 2 && buf[n - 1] == '\n' && buf[n - 2] == '\\') {
+      /* Preserve a bare trailing '\\' (or '??/') at EOF without a real newline. */
+      buf[n - 1] = '\0';
+      remove_backslash_newline(buf, &dlt);
+      size_t m = strlen(buf);
+      buf[m] = '\n';
+      buf[m + 1] = '\0';
+    } else {
+      remove_backslash_newline(buf, &dlt);
+    }
+  } else {
+    remove_backslash_newline(buf, &dlt);
+  }
 
   File *f = new_file(path, buf);
   f->is_syshdr = is_syshdr;

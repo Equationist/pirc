@@ -293,15 +293,16 @@ int main(int argc, char **argv) {
         fprintf(stderr, "pirc: conflicting options '-S' and '-c'\n");
         return 1;
     }
-    if (do_verify_only && (do_print || do_emit_lir || do_dump_layout || do_interp ||
-                           do_emit_asm || do_emit_obj)) {
-        fprintf(stderr, "pirc: '--verify-only' cannot be combined with output or execution flags\n");
+    int n_actions = (do_verify_only ? 1 : 0) + (do_print ? 1 : 0) +
+                    (do_emit_lir ? 1 : 0) + (do_dump_layout ? 1 : 0) +
+                    (do_interp ? 1 : 0) + (do_emit_asm ? 1 : 0) +
+                    (do_emit_obj ? 1 : 0);
+    if (n_actions > 1) {
+        fprintf(stderr, "pirc: conflicting output/execution action flags\n");
         return 1;
     }
-    if ((do_print && do_emit_lir) ||
-        ((do_print || do_emit_lir) && (do_emit_asm || do_emit_obj || do_interp)) ||
-        (do_interp && (do_emit_asm || do_emit_obj))) {
-        fprintf(stderr, "pirc: conflicting output/execution action flags\n");
+    if (do_emit_obj && !output_path) {
+        fprintf(stderr, "pirc: '-c' requires '-o <out.o>'\n");
         return 1;
     }
     if (want_hir && want_lir) {

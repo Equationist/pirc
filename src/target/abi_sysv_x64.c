@@ -25,6 +25,8 @@ typedef struct {
     bool      single_v128;
     PirType   v128_ty;
     bool      single_v256;
+    bool      has_v256;
+    bool      has_explicit_align32;
     PirType   v256_ty;
     uint32_t  non_v256_leaves;
 } SysvAggWalk;
@@ -79,11 +81,16 @@ static void walk_sysv(const PirModule *mod, const PirTargetSpec *target,
             return;
         }
         uint16_t bits = pir_vec_bits(ty.u.vec);
-        if (bits == 256u && base_off == 0u) {
-            w->single_v256 = true;
-            w->v256_ty     = ty;
-            w->cls[0] = merge_cls(w->cls[0], EB_SSE);
-            w->cls[1] = merge_cls(w->cls[1], EB_SSEUP);
+        if (bits == 256u) {
+            w->has_v256 = true;
+            if (base_off == 0u) {
+                w->single_v256 = true;
+                w->v256_ty     = ty;
+                w->cls[0] = merge_cls(w->cls[0], EB_SSE);
+                w->cls[1] = merge_cls(w->cls[1], EB_SSEUP);
+            } else {
+                w->non_v256_leaves++;
+            }
         } else if (bits == 128u && base_off == 0u) {
             w->non_v256_leaves++;
             w->single_v128 = true;
@@ -108,6 +115,9 @@ static void walk_sysv(const PirModule *mod, const PirTargetSpec *target,
         seen_off[aid] |= bit;
     }
     const PirAggDef *agg = &mod->agg_types.data[aid];
+    if (agg->min_align >= 32u) {
+        w->has_explicit_align32 = true;
+    }
     if (agg->abi_memory) {
         w->unaligned = true;
         return;
@@ -142,6 +152,18 @@ static void walk_sysv(const PirModule *mod, const PirTargetSpec *target,
     }
 }
 
+static void run_walk_sysv(const PirModule *mod, const PirTargetSpec *target,
+                          PirType agg_ty, SysvAggWalk *w) {
+    uint32_t n = mod->agg_types.len;
+    uint16_t stack_seen[64];
+    uint16_t *seen = (n <= 64u) ? stack_seen : (uint16_t *)calloc(n, sizeof(uint16_t));
+    if (!seen) abort();
+    if (seen == stack_seen) memset(stack_seen, 0, n * sizeof(uint16_t));
+    memset(w, 0, sizeof(*w));
+    walk_sysv(mod, target, agg_ty, 0u, w, seen);
+    if (seen != stack_seen) free(seen);
+}
+
 static void classify_sysv_agg(const PirModule *mod, const PirTargetSpec *target,
                               PirType agg_ty, PirAbiArgInfo *out) {
     memset(out, 0, sizeof(*out));
@@ -155,15 +177,8 @@ static void classify_sysv_agg(const PirModule *mod, const PirTargetSpec *target,
     }
     if (ly.size > 16u) {
         if (ly.size == 32u && target->caps.max_simd_bits >= 256u) {
-            uint32_t n2 = mod->agg_types.len;
-            uint16_t stack_seen2[64];
-            uint16_t *seen2 = (n2 <= 64u) ? stack_seen2 : (uint16_t *)calloc(n2, sizeof(uint16_t));
-            if (!seen2) abort();
-            if (seen2 == stack_seen2) memset(stack_seen2, 0, n2 * sizeof(uint16_t));
             SysvAggWalk w2;
-            memset(&w2, 0, sizeof(w2));
-            walk_sysv(mod, target, agg_ty, 0u, &w2, seen2);
-            if (seen2 != stack_seen2) free(seen2);
+            run_walk_sysv(mod, target, agg_ty, &w2);
             if (!w2.unaligned && w2.single_v256 && w2.non_v256_leaves == 0u) {
                 out->kind      = PIR_ABI_DIRECT;
                 out->reg_count = 1u;
@@ -179,16 +194,9 @@ static void classify_sysv_agg(const PirModule *mod, const PirTargetSpec *target,
             mod->agg_types.data[agg_ty.u.agg_id].min_align < 32u) {
             /* Apple x86_64 without AVX caps v256 aggregate stack alignment at 16B
              * unless explicitly over-aligned with _Alignas(>=32). */
-            uint32_t n2 = mod->agg_types.len;
-            uint16_t stack_seen2[64];
-            uint16_t *seen2 = (n2 <= 64u) ? stack_seen2 : (uint16_t *)calloc(n2, sizeof(uint16_t));
-            if (!seen2) abort();
-            if (seen2 == stack_seen2) memset(stack_seen2, 0, n2 * sizeof(uint16_t));
             SysvAggWalk w2;
-            memset(&w2, 0, sizeof(w2));
-            walk_sysv(mod, target, agg_ty, 0u, &w2, seen2);
-            if (seen2 != stack_seen2) free(seen2);
-            if (w2.single_v256) byval_al = 16u;
+            run_walk_sysv(mod, target, agg_ty, &w2);
+            if (w2.has_v256 && !w2.has_explicit_align32) byval_al = 16u;
         }
         out->kind              = PIR_ABI_INDIRECT;
         out->gp_used           = 0u;
@@ -196,16 +204,8 @@ static void classify_sysv_agg(const PirModule *mod, const PirTargetSpec *target,
         out->stack_byval_align = byval_al;
         return;
     }
-    uint32_t n = mod->agg_types.len;
-    uint16_t stack_seen[64];
-    uint16_t *seen_off = (n <= 64u) ? stack_seen : (uint16_t *)calloc(n, sizeof(uint16_t));
-    if (!seen_off) abort();
-    if (seen_off == stack_seen) memset(stack_seen, 0, n * sizeof(uint16_t));
-
     SysvAggWalk w;
-    memset(&w, 0, sizeof(w));
-    walk_sysv(mod, target, agg_ty, 0u, &w, seen_off);
-    if (seen_off != stack_seen) free(seen_off);
+    run_walk_sysv(mod, target, agg_ty, &w);
     if (w.unaligned) {
         out->kind              = PIR_ABI_INDIRECT;
         out->gp_used           = 0u;

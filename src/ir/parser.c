@@ -2149,7 +2149,12 @@ static bool parse_global_item(Parser *p, PirType hint_ty, PirGlobalItem *out) {
     if (is_ident(p, "zeroinit")) {
         out->kind = PIR_GITEM_ZERO;
         advance_tok(p);
-        if (p->cur.kind == TOK_INT && !p->cur.int_neg && p->cur.int_hi == 0u) {
+        if (p->cur.kind == TOK_INT) {
+            if (p->cur.int_neg || p->cur.int_hi != 0u || p->cur.int_lo == 0u) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col,
+                               "zeroinit byte count must be a positive 64-bit integer");
+                return false;
+            }
             out->len = p->cur.int_lo;
             advance_tok(p);
         }
@@ -2582,6 +2587,23 @@ static void resolve_branch_arg_literals(PirFunction *fn, PirBranchTarget *bt) {
     }
 }
 
+static void resolve_sym_ops(PirOperand *ops, uint32_t count,
+                            const PirSymMap *glob_map, const PirSymMap *func_map) {
+    for (uint32_t k = 0u; k < count; ++k) {
+        if (ops[k].kind != PIR_OPER_SYM || ops[k].u.sym.id != PIR_INVALID_ID || !ops[k].u.sym.name) {
+            continue;
+        }
+        uint32_t id = 0u;
+        if (pir_symmap_get(glob_map, ops[k].u.sym.name, &id)) {
+            ops[k].u.sym.is_func = false;
+            ops[k].u.sym.id      = id;
+        } else if (pir_symmap_get(func_map, ops[k].u.sym.name, &id)) {
+            ops[k].u.sym.is_func = true;
+            ops[k].u.sym.id      = id;
+        }
+    }
+}
+
 static bool resolve_module(Parser *p) {
     PirModule *mod = p->mod;
 
@@ -2593,18 +2615,23 @@ static bool resolve_module(Parser *p) {
         }
     }
 
-    /* 2. Resolve branch target labels -> PirBlockId. */
+    /* 2. Resolve branch target labels -> PirBlockId in O(1) per target. */
+    PirSymMap blk_map;
+    memset(&blk_map, 0, sizeof(blk_map));
+    PirFuncId blk_map_fn = PIR_INVALID_ID;
     for (uint32_t i = 0u; i < p->pending_targets.len; ++i) {
         PendingTarget *pt = &p->pending_targets.data[i];
         PirFunction *fn = &mod->funcs.data[pt->func_idx];
-        PirBlockId bid = PIR_INVALID_ID;
-        for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
-            if (strcmp(fn->blocks.data[b].label, pt->label) == 0) {
-                bid = b;
-                break;
+        if (pt->func_idx != blk_map_fn) {
+            if (blk_map.cap == 0u) pir_symmap_init(&blk_map, fn->blocks.len + 1u);
+            else pir_symmap_clear(&blk_map);
+            for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
+                pir_symmap_put_if_absent(&blk_map, fn->blocks.data[b].label, b);
             }
+            blk_map_fn = pt->func_idx;
         }
-        if (bid == PIR_INVALID_ID) {
+        PirBlockId bid = PIR_INVALID_ID;
+        if (!pir_symmap_get(&blk_map, pt->label, &bid)) {
             pir_diag_error(p->diag, pt->line, 0u, "undefined block label '.%s'", pt->label);
             continue;
         }
@@ -2613,18 +2640,18 @@ static bool resolve_module(Parser *p) {
         else if (pt->which_target == 1) inst->targets[1].target = bid;
         else inst->switch_cases[pt->which_target - 2].target.target = bid;
     }
+    pir_symmap_destroy(&blk_map);
 
-    /* 3. Resolve @Sig references on call_indirect / invoke_indirect. */
+    /* 3. Resolve @Sig references on call_indirect / invoke_indirect in O(1). */
+    PirSymMap sig_map;
+    pir_symmap_init(&sig_map, mod->sigs.len + 1u);
+    for (uint32_t s = 0u; s < mod->sigs.len; ++s) {
+        pir_symmap_put_if_absent(&sig_map, mod->sigs.data[s].name, s);
+    }
     for (uint32_t i = 0u; i < p->pending_sigs.len; ++i) {
         PendingSigRef *sr = &p->pending_sigs.data[i];
         PirSigId sid = PIR_INVALID_ID;
-        for (uint32_t s = 0u; s < mod->sigs.len; ++s) {
-            if (strcmp(mod->sigs.data[s].name, sr->sig_name) == 0) {
-                sid = s;
-                break;
-            }
-        }
-        if (sid == PIR_INVALID_ID) {
+        if (!pir_symmap_get(&sig_map, sr->sig_name, &sid)) {
             pir_diag_error(p->diag, sr->line, 0u, "undefined signature '@%s'", sr->sig_name);
             continue;
         }
@@ -2637,8 +2664,19 @@ static bool resolve_module(Parser *p) {
             fn->values.data[inst->results[0]].type = sig->ret_type;
         }
     }
+    pir_symmap_destroy(&sig_map);
 
-    /* 4. Resolve direct call/invoke callee symbols & result/literal types. */
+    /* 4. Resolve direct call/invoke callee symbols, global/func sym IDs, & literal types in O(1). */
+    PirSymMap func_map;
+    PirSymMap glob_map;
+    pir_symmap_init(&func_map, mod->funcs.len + 1u);
+    pir_symmap_init(&glob_map, mod->globals.len + 1u);
+    for (uint32_t c = 0u; c < mod->funcs.len; ++c) {
+        pir_symmap_put_if_absent(&func_map, mod->funcs.data[c].name, c);
+    }
+    for (uint32_t g = 0u; g < mod->globals.len; ++g) {
+        pir_symmap_put_if_absent(&glob_map, mod->globals.data[g].name, g);
+    }
     for (uint32_t fi = 0u; fi < mod->funcs.len; ++fi) {
         PirFunction *fn = &mod->funcs.data[fi];
         for (uint32_t ii = 0u; ii < fn->insts.len; ++ii) {
@@ -2646,13 +2684,7 @@ static bool resolve_module(Parser *p) {
             if (inst->op == PIR_OP_CALL || inst->op == PIR_OP_INVOKE) {
                 const char *cname = inst->operands[0].u.sym.name;
                 PirFuncId cid = PIR_INVALID_ID;
-                for (uint32_t c = 0u; c < mod->funcs.len; ++c) {
-                    if (strcmp(mod->funcs.data[c].name, cname) == 0) {
-                        cid = c;
-                        break;
-                    }
-                }
-                if (cid != PIR_INVALID_ID) {
+                if (pir_symmap_get(&func_map, cname, &cid)) {
                     inst->operands[0].u.sym.is_func = true;
                     inst->operands[0].u.sym.id      = cid;
                     const PirFunction *callee = &mod->funcs.data[cid];
@@ -2686,21 +2718,32 @@ static bool resolve_module(Parser *p) {
                 }
             }
 
-            /* Resolve branch target literal types. */
+            /* Resolve all remaining global/func symbol operand IDs for O(1) downstream lookups. */
+            resolve_sym_ops(inst->operands, inst->operand_count, &glob_map, &func_map);
+
+            /* Resolve branch target literal types & symbol operand IDs. */
             if (inst->op == PIR_OP_JMP) {
                 resolve_branch_arg_literals(fn, &inst->targets[0]);
+                resolve_sym_ops(inst->targets[0].args, inst->targets[0].arg_count, &glob_map, &func_map);
             } else if (inst->op == PIR_OP_BR || inst->op == PIR_OP_INVOKE ||
                        inst->op == PIR_OP_INVOKE_INDIRECT) {
                 resolve_branch_arg_literals(fn, &inst->targets[0]);
                 resolve_branch_arg_literals(fn, &inst->targets[1]);
+                resolve_sym_ops(inst->targets[0].args, inst->targets[0].arg_count, &glob_map, &func_map);
+                resolve_sym_ops(inst->targets[1].args, inst->targets[1].arg_count, &glob_map, &func_map);
             } else if (inst->op == PIR_OP_SWITCH) {
                 resolve_branch_arg_literals(fn, &inst->targets[0]);
+                resolve_sym_ops(inst->targets[0].args, inst->targets[0].arg_count, &glob_map, &func_map);
                 for (uint32_t c = 0u; c < inst->switch_case_count; ++c) {
                     resolve_branch_arg_literals(fn, &inst->switch_cases[c].target);
+                    resolve_sym_ops(inst->switch_cases[c].target.args,
+                                    inst->switch_cases[c].target.arg_count, &glob_map, &func_map);
                 }
             }
         }
     }
+    pir_symmap_destroy(&glob_map);
+    pir_symmap_destroy(&func_map);
 
     /* 5. Resolve %val references using O(1) hash-indexed name buckets + dominator lookup. */
     PirFuncId idx_fn_id = PIR_INVALID_ID;

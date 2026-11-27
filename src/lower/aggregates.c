@@ -247,7 +247,8 @@ static bool lower_mem_intrinsic(PirModule *mod, const PirTargetSpec *target,
     PirOperand len = inst->operands[2];
     uint32_t al = inst->align;
 
-    bool const_small = (len.kind == PIR_OPER_IMM_INT && !len.u.imm_int.is_negative &&
+    bool const_small = (len.kind == PIR_OPER_IMM_INT &&
+                        (!len.u.imm_int.is_negative || len.u.imm_int.lo == 0u) &&
                         len.u.imm_int.hi == 0u && len.u.imm_int.lo <= 64u);
 
     if (const_small && len.u.imm_int.lo == 0u) {
@@ -300,7 +301,10 @@ static bool lower_mem_intrinsic(PirModule *mod, const PirTargetSpec *target,
     PirOperand arg1 = src;
     if (inst->op == PIR_OP_MEMSET) {
         if (src.kind == PIR_OPER_IMM_INT) {
-            arg1.type = pir_type_scalar(PIR_SCALAR_I32);
+            uint8_t byte_v = (uint8_t)(src.u.imm_int.is_negative
+                                       ? (UINT64_C(0) - src.u.imm_int.lo)
+                                       : src.u.imm_int.lo);
+            arg1 = pir_op_imm_i((uint64_t)byte_v, false, pir_type_scalar(PIR_SCALAR_I32));
         } else {
             PirInst z = pir_make_inst(PIR_OP_ZEXT, pir_type_scalar(PIR_SCALAR_I32),
                                       inst->src_line, inst->loc_idx);
@@ -317,15 +321,8 @@ static bool lower_mem_intrinsic(PirModule *mod, const PirTargetSpec *target,
     PirOperand arg2 = len;
     if (!pir_type_eq(arg2.type, idx_ty)) {
         if (arg2.kind == PIR_OPER_IMM_INT) {
-            if (idx_ty.u.scalar == PIR_SCALAR_I64 &&
-                arg2.type.kind == PIR_TYPE_SCALAR && arg2.type.u.scalar == PIR_SCALAR_I32) {
-                uint32_t v32 = arg2.u.imm_int.is_negative
-                               ? (0u - (uint32_t)arg2.u.imm_int.lo)
-                               : (uint32_t)arg2.u.imm_int.lo;
-                arg2.u.imm_int.lo          = (uint64_t)v32;
-                arg2.u.imm_int.hi          = 0u;
-                arg2.u.imm_int.is_negative = false;
-            } else if (idx_ty.u.scalar == PIR_SCALAR_I32) {
+            if (idx_ty.u.scalar == PIR_SCALAR_I32 ||
+                (arg2.type.kind == PIR_TYPE_SCALAR && arg2.type.u.scalar == PIR_SCALAR_I32)) {
                 uint32_t v32 = arg2.u.imm_int.is_negative
                                ? (0u - (uint32_t)arg2.u.imm_int.lo)
                                : (uint32_t)arg2.u.imm_int.lo;
@@ -829,6 +826,7 @@ bool pir_lower_aggregates(PirModule *mod, const PirTargetSpec *target, PirDiag *
                             off = UINT64_C(0) - off;
                             neg = false;
                         }
+                        if (off == 0u) neg = false;
                         if (off == 0u && copy.operands[0].kind == PIR_OPER_VAL &&
                             copy.results[0] != copy.operands[0].u.val) {
                             pir_fn_replace_val_uses(fn, copy.results[0], copy.operands[0].u.val);

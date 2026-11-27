@@ -289,7 +289,7 @@ void pir_abi_plan_va_arg(const PirModule *mod, const PirTargetSpec *target,
     if (is_sysv_x64) {
         if (is_buf) {
             out->force_mem = !(out->abi_valid && out->abi.kind == PIR_ABI_DIRECT &&
-                               out->abi.reg_count > 0u &&
+                               out->abi.reg_count > 0u && out->size <= 16u &&
                                (out->abi.gp_used > 0u || out->abi.fp_used > 0u));
         } else {
             /* SysV AMD64 §3.5.7: 256-bit vectors always come from overflow_arg_area. */
@@ -314,7 +314,10 @@ void pir_abi_plan_va_arg(const PirModule *mod, const PirTargetSpec *target,
 
     out->mem_align = slot_sz;
     if (is_sysv_x64) {
-        if (out->align > 8u) {
+        if (is_buf && out->abi_valid && out->abi.kind == PIR_ABI_INDIRECT &&
+            out->abi.stack_byval_align > 0u) {
+            out->mem_align = (out->abi.stack_byval_align > 8u) ? out->abi.stack_byval_align : 8u;
+        } else if (out->align > 8u) {
             uint64_t mal = (is_buf && out->align < 16u) ? 16u : out->align;
             if (target->os == PIR_OS_MACOS && target->caps.max_simd_bits < 256u &&
                 !is_buf && out->load_ty.kind == PIR_TYPE_VECTOR && out->size > 16u && mal > 16u) {

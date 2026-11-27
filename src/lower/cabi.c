@@ -473,7 +473,10 @@ static bool rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
             vpd.abi_type = arg.call_abi_type;
             vpd.type     = tptr;
             PirAbiArgInfo vinfo;
-            if (!pir_abi_classify_param(mod, target, &vpd, &va_st, &vinfo)) {
+            PirAbiRegState darwin_va_st = { 0u, 0u };
+            PirAbiRegState *va_st_ptr = (target->arch == PIR_ARCH_ARM64 && target->os == PIR_OS_MACOS)
+                                        ? &darwin_va_st : &va_st;
+            if (!pir_abi_classify_param(mod, target, &vpd, va_st_ptr, &vinfo)) {
                 pir_diag_error(diag, ln, 0u, "unsupported C ABI target for variadic byval argument");
                 PIR_VEC_FREE(&new_ops);
                 return false;
@@ -494,21 +497,32 @@ static bool rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
                         vinfo.regs[w] = ti64;
                     }
                 }
-                if (vly.align > 8u) {
-                    vinfo.stack_align = (vly.align > 16u) ? 16u : vly.align;
-                }
+                vinfo.stack_align = (vly.align > 8u) ? ((vly.align > 16u) ? 16u : vly.align) : 0u;
             } else if (target->arch == PIR_ARCH_X86_64 && target->os != PIR_OS_WINDOWS &&
-                       vinfo.kind == PIR_ABI_DIRECT && vinfo.fp_used > 0u) {
-                /* SysV AMD64: variadic aggregate f32 eightbytes must NOT undergo C default
-                 * float->double promotion (cvtss2sd). Widen f32 pieces to v2f32 (or f64 when
-                 * SIMD is disabled) so raw 32-bit float bits land in low XMM lane zero-padded. */
-                PirType widen_ty = (target->caps.max_simd_bits >= 64u)
-                                   ? pir_type_vec(PIR_VEC_V2F32)
-                                   : pir_type_scalar(PIR_SCALAR_F64);
-                for (uint32_t k = 0u; k < vinfo.reg_count; ++k) {
-                    if (vinfo.regs[k].kind == PIR_TYPE_SCALAR &&
-                        vinfo.regs[k].u.scalar == PIR_SCALAR_F32) {
-                        vinfo.regs[k] = widen_ty;
+                       vinfo.kind == PIR_ABI_DIRECT) {
+                PirTypeLayout vly = pir_type_layout(mod, target, vpd.abi_type);
+                if (vly.size > 16u) {
+                    /* SysV AMD64 §3.5.7: aggregates > 16 bytes (including 256-bit vector wrappers
+                     * under AVX) in variadic positions ALWAYS pass in overflow_arg_area. */
+                    memset(&vinfo, 0, sizeof(vinfo));
+                    vinfo.kind              = PIR_ABI_INDIRECT;
+                    vinfo.stack_byval_size  = vly.size;
+                    vinfo.stack_byval_align = (target->os == PIR_OS_MACOS &&
+                                               target->caps.max_simd_bits < 256u &&
+                                               vly.align > 16u)
+                                              ? 16u : vly.align;
+                } else if (vinfo.fp_used > 0u) {
+                    /* SysV AMD64: variadic aggregate f32 eightbytes must NOT undergo C default
+                     * float->double promotion (cvtss2sd). Widen f32 pieces to v2f32 (or f64 when
+                     * SIMD is disabled) so raw 32-bit float bits land in low XMM lane zero-padded. */
+                    PirType widen_ty = (target->caps.max_simd_bits >= 64u)
+                                       ? pir_type_vec(PIR_VEC_V2F32)
+                                       : pir_type_scalar(PIR_SCALAR_F64);
+                    for (uint32_t k = 0u; k < vinfo.reg_count; ++k) {
+                        if (vinfo.regs[k].kind == PIR_TYPE_SCALAR &&
+                            vinfo.regs[k].u.scalar == PIR_SCALAR_F32) {
+                            vinfo.regs[k] = widen_ty;
+                        }
                     }
                 }
             } else if (target->arch == PIR_ARCH_RV32 && vinfo.kind == PIR_ABI_DIRECT) {
@@ -674,8 +688,8 @@ static bool rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
 
 static void populate_cabi_ret(const PirModule *mod, const PirTargetSpec *target,
                               const CabiPlan *plan, PirCabiRetInfo *out) {
-    memset(out, 0, sizeof(*out));
     if (!plan->has_retbuf) return;
+    memset(out, 0, sizeof(*out));
     if (plan->ret_info.kind == PIR_ABI_DIRECT && plan->ret_info.reg_count <= 1u) {
         out->kind = PIR_CABI_RET_NONE;
         return;

@@ -257,7 +257,7 @@ static bool match_unit_stride_offset(const PirFunction *fn, PirBlockId body_bid,
 }
 
 /* Match `ptr_add base, ((iv + delta) * elem_bytes)` where `base` is loop-invariant. */
-static bool match_unit_stride_ptr(const PirFunction *fn, const PirLoop *loop, PirBlockId body_bid,
+static bool match_unit_stride_ptr(const PirModule *mod, const PirFunction *fn, const PirLoop *loop, PirBlockId body_bid,
                                   PirValueId iv, bool is_signed, uint32_t elem_bytes, PirOperand ptr_op,
                                   PirOperand *out_base, int64_t *out_delta,
                                   bool *out_narrow_shift, PirInstId *out_pa,
@@ -273,6 +273,7 @@ static bool match_unit_stride_ptr(const PirFunction *fn, const PirLoop *loop, Pi
     /* ptr_add.i32 truncates and sign-extends its i32 byte offset, whereas vectorized
      * address generation widens the IV to i64 before scaling; reject ptr_add.i32. */
     if (pa->ty.kind == PIR_TYPE_SCALAR && pa->ty.u.scalar == PIR_SCALAR_I32) return false;
+    if (pir_op_is_tls_sym(mod, &pa->operands[0])) return false;
     if (!operand_outside_loop(fn, loop, pa->operands[0])) return false;
     if (!match_unit_stride_offset(fn, body_bid, iv, is_signed, elem_bytes, pa->operands[1],
                                   out_delta, out_narrow_shift, out_off1, out_off2, out_off3)) {
@@ -598,7 +599,7 @@ static bool try_vectorize_loop(PirModule *mod, PirFunction *fn, const PirTargetS
             int64_t delta = 0;
             bool narrow_shift = false;
             PirInstId pa_id, off1, off2, off3;
-            if (!match_unit_stride_ptr(fn, loop, body_bid, iv, is_signed, elem_bytes, pop,
+            if (!match_unit_stride_ptr(mod, fn, loop, body_bid, iv, is_signed, elem_bytes, pop,
                                        &base, &delta, &narrow_shift, &pa_id, &off1, &off2, &off3)) {
                 legal = false; break;
             }

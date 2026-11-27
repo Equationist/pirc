@@ -51,7 +51,8 @@ static bool x64_needs_sym_quote(const char *s) {
         "eiz", "riz", "rflags", "eflags", "flags", "mxcsr", "ssp", "fpcr", "fpsr",
         /* Intel-syntax keywords and operators */
         "byte", "word", "dword", "qword", "tbyte", "oword",
-        "xmmword", "ymmword", "zmmword", "fword", "xword",
+        "mmword", "xmmword", "ymmword", "zmmword", "fword", "xword",
+        "long", "float", "double",
         "ptr", "offset", "short", "near", "far", "flat", "seg",
         "not", "and", "or", "xor", "shl", "shr", "mod"
     };
