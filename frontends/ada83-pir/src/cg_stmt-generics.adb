@@ -206,7 +206,29 @@ package body Cg_Stmt.Generics is
                      Scan_Tree_For_Captures (Ctx, D (AS_EXP2, Rng), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth + 1, Inst_Key, Inst_Gen_Id);
                   end if;
                end;
+            when DN_ARRAY =>
+               Scan_Type_Bounds (D (SM_COMP_TYPE, RT));
+               declare
+                  IS_N : constant TREE := D (SM_INDEX_S, RT);
+               begin
+                  if not Is_Void_Tree (IS_N) then
+                     declare
+                        IL : SEQ_TYPE := LIST (IS_N);
+                        IT : TREE;
+                     begin
+                        while not IS_EMPTY (IL) loop
+                           POP (IL, IT);
+                           if not Is_Void_Tree (IT) and then KIND (IT) = DN_INDEX then
+                              Scan_Type_Bounds (D (SM_TYPE_SPEC, IT));
+                           else
+                              Scan_Type_Bounds (IT);
+                           end if;
+                        end loop;
+                     end;
+                  end if;
+               end;
             when DN_CONSTRAINED_ARRAY =>
+               Scan_Type_Bounds (Base_Type_Spec (RT));
                declare
                   IS_N : constant TREE := D (SM_INDEX_SUBTYPE_S, RT);
                begin
@@ -224,8 +246,21 @@ package body Cg_Stmt.Generics is
                end;
             when DN_ACCESS | DN_CONSTRAINED_ACCESS =>
                Scan_Type_Bounds (D (SM_DESIG_TYPE, RT));
+            when DN_RECORD =>
+               declare
+                  DS_N : constant TREE := D (SM_DISCRIMINANT_S, RT);
+                  CL_N : constant TREE := D (SM_COMP_LIST, RT);
+               begin
+                  if not Is_Void_Tree (DS_N) then
+                     Scan_Tree_For_Captures (Ctx, DS_N, Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth + 1, Inst_Key, Inst_Gen_Id);
+                  end if;
+                  if not Is_Void_Tree (CL_N) then
+                     Scan_Tree_For_Captures (Ctx, CL_N, Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth + 1, Inst_Key, Inst_Gen_Id);
+                  end if;
+               end;
             when DN_CONSTRAINED_RECORD =>
                Scan_Tree_For_Captures (Ctx, D (SM_NORMALIZED_DSCRMT_S, RT), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth + 1, Inst_Key, Inst_Gen_Id);
+               Scan_Type_Bounds (Base_Type_Spec (RT));
             when others =>
                null;
          end case;
@@ -565,6 +600,7 @@ package body Cg_Stmt.Generics is
             begin
                if SK /= Current_Subp then
                   Register_Nested_Child (SK);
+                  Scan_Tree_For_Captures (Ctx, D (AS_HEADER, Node), SK, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth, Inst_Key, Inst_Gen_Id);
                   Scan_Tree_For_Captures (Ctx, Scan_B, SK, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth, Inst_Key, Inst_Gen_Id);
                   return;
                end if;
@@ -572,7 +608,7 @@ package body Cg_Stmt.Generics is
          end;
       end if;
 
-      if KIND (Node) in DN_PROCEDURE_CALL | DN_FUNCTION_CALL then
+      if KIND (Node) in DN_PROCEDURE_CALL | DN_FUNCTION_CALL | DN_ENTRY_CALL then
          Scan_Tree_For_Captures (Ctx, D (AS_NAME, Node), Current_Subp, Owner_Map, Parent_Map, Captured_Vars, Nested_Subps, Target_Owner, Type_Depth, Inst_Key, Inst_Gen_Id);
          declare
             NPS : constant TREE := D (SM_NORMALIZED_PARAM_S, Node);
@@ -614,7 +650,7 @@ package body Cg_Stmt.Generics is
          return False;
       end if;
       K := KIND (Node);
-      if K not in CLASS_ALL_SOURCE or else K = DN_SUBPROGRAM_BODY then
+      if K not in CLASS_ALL_SOURCE or else K = DN_SUBPROGRAM_BODY or else K = DN_TASK_BODY then
          return False;
       end if;
 
@@ -633,28 +669,64 @@ package body Cg_Stmt.Generics is
                   end if;
                end;
             end if;
+            declare
+               NN : TREE := D (AS_NAME, Node);
+            begin
+               if not Is_Void_Tree (NN) then
+                  if KIND (NN) = DN_SELECTED then
+                     NN := D (AS_DESIGNATOR, NN);
+                  end if;
+                  if KIND (NN) = DN_USED_OP then
+                     declare
+                        Def : constant TREE := D (SM_DEFN, NN);
+                     begin
+                        if not Is_Void_Tree (Def) and then KIND (Def) = DN_BLTN_OPERATOR_ID then
+                           declare
+                              Op_C : constant Integer := DI (SM_OPERATOR, Def);
+                           begin
+                              if Op_C = 19
+                                or else (Op_C in 0 | 1 | 2 | 3 and then not Is_Void_Tree (ET) and then Is_Array_Type (ET))
+                              then
+                                 return True;
+                              end if;
+                           end;
+                        end if;
+                     end;
+                  elsif not Is_Void_Tree (ET) and then Is_Array_Type (ET)
+                    and then KIND (NN) in DN_USED_OBJECT_ID | DN_USED_NAME_ID
+                  then
+                     declare
+                        Def : constant TREE := Canonical_Def (Subst_Tree (Ctx, D (SM_DEFN, NN)));
+                     begin
+                        if not Is_Void_Tree (Def) and then KIND (Def) in DN_FUNCTION_ID | DN_OPERATOR_ID
+                          and then not Is_Void_Tree (D (SM_UNIT_DESC, Def))
+                          and then KIND (D (SM_UNIT_DESC, Def)) = DN_INSTANTIATION
+                        then
+                           declare
+                              GId : constant TREE := Canonical_Def (Get_Name_Defn (D (AS_NAME, D (SM_UNIT_DESC, Def))));
+                           begin
+                              if Is_RTL_Generic (GId) and then Sym_Name (GId) = "UNCHECKED_CONVERSION" then
+                                 return True;
+                              end if;
+                           end;
+                        end if;
+                     end;
+                  end if;
+               end if;
+            end;
          end;
-         declare
-            NN : TREE := D (AS_NAME, Node);
-         begin
-            if not Is_Void_Tree (NN) then
-               if KIND (NN) = DN_SELECTED then
-                  NN := D (AS_DESIGNATOR, NN);
-               end if;
-               if KIND (NN) = DN_USED_OP then
-                  declare
-                     Def : constant TREE := D (SM_DEFN, NN);
-                  begin
-                     if not Is_Void_Tree (Def) and then KIND (Def) = DN_BLTN_OPERATOR_ID
-                       and then DI (SM_OPERATOR, Def) = 19
-                     then
-                        return True;
-                     end if;
-                  end;
-               end if;
+         if K = DN_FUNCTION_CALL and then not Is_Void_Tree (D (SM_NORMALIZED_PARAM_S, Node)) then
+            if Tree_Uses_SS (Ctx, D (SM_NORMALIZED_PARAM_S, Node)) then
+               return True;
             end if;
-         end;
-      elsif K = DN_AGGREGATE then
+         end if;
+      elsif K in DN_PROCEDURE_CALL | DN_ENTRY_CALL then
+         if not Is_Void_Tree (D (SM_NORMALIZED_PARAM_S, Node)) then
+            if Tree_Uses_SS (Ctx, D (SM_NORMALIZED_PARAM_S, Node)) then
+               return True;
+            end if;
+         end if;
+      elsif K = DN_AGGREGATE or else K = DN_QUALIFIED_ALLOCATOR then
          return True;
       elsif K = DN_ATTRIBUTE then
          declare
@@ -713,7 +785,7 @@ package body Cg_Stmt.Generics is
          return False;
       end if;
       K := KIND (Node);
-      if K not in CLASS_ALL_SOURCE or else K = DN_SUBPROGRAM_BODY then
+      if K not in CLASS_ALL_SOURCE or else K = DN_SUBPROGRAM_BODY or else K = DN_TASK_BODY then
          return False;
       end if;
       if K = DN_RETURN then
@@ -1045,7 +1117,7 @@ package body Cg_Stmt.Generics is
                            and then not Is_Void_Tree (D (SM_SPEC, Gen_Id))
                            and then KIND (D (SM_SPEC, Gen_Id)) = DN_PACKAGE_SPEC
                            and then (Lib_Binder.Decl_List_Requires_Body (D (AS_DECL_S1, D (SM_SPEC, Gen_Id)))
-                                     or else Lib_Binder.Decl_List_Requires_Body (D (AS_DECL_S2, D (SM_SPEC, Gen_Id))))))
+                                     or else Lib_Binder.Decl_List_Requires_Body (D (AS_DECL_S2, D (SM_SPEC, Gen_Id)), Is_Private_Part => True))))
       then
          declare
             GSym_U : Unbounded_String;
@@ -1892,9 +1964,10 @@ package body Cg_Stmt.Generics is
                   begin
                      for C in Ctx.Gen_Cap_Slots.Iterate loop
                         declare
-                           PK : constant Unsigned_64 := U64_Nat_Maps.Key (C);
-                           CI : constant Unsigned_32 := Unsigned_32 (Shift_Right (PK, 32) and 16#FFFF_FFFF#);
-                           VK : constant Unsigned_32 := Unsigned_32 (PK and 16#FFFF_FFFF#);
+                           PK   : constant Unsigned_64 := U64_Cap_Maps.Key (C);
+                           CI   : constant Unsigned_32 := Unsigned_32 (Shift_Right (PK, 32) and 16#FFFF_FFFF#);
+                           VK   : constant Unsigned_32 := Unsigned_32 (PK and 16#FFFF_FFFF#);
+                           Pair : constant Cap_Slot_Pair := U64_Cap_Maps.Element (C);
                         begin
                            if CI = IK
                              and then not (Ctx.Gen_Env_Vars.Contains (Gen_Key) and then Ctx.Gen_Env_Vars.Element (Gen_Key).Contains (VK))
@@ -1902,11 +1975,9 @@ package body Cg_Stmt.Generics is
                               declare
                                  V : Var_Info;
                               begin
-                                 if Ctx.Vars.Contains (VK) then
-                                    V := Ctx.Vars.Element (VK);
-                                 end if;
-                                 V.Owner_Subp    := Ctx.Cur_Subp_Key;
-                                 V.Captured_Slot := U64_Nat_Maps.Element (C);
+                                 V.Owner_Subp        := Ctx.Cur_Subp_Key;
+                                 V.Captured_Slot     := Pair.Cap_Slot;
+                                 V.Con_Captured_Slot := Pair.Con_Cap_Slot;
                                  Ctx.Vars.Include (VK, V);
                               end;
                            end if;
@@ -1994,11 +2065,20 @@ package body Cg_Stmt.Generics is
                      if Has_Hdl then
                         Hdl_Lbl   := To_Unbounded_String (Next_Label (Ctx.E, "gexc_h"));
                         After_Lbl := To_Unbounded_String (Next_Label (Ctx.E, "gexc_end"));
-                        Ctx.Handlers.Append ((Handler_Label => Hdl_Lbl,
-                                              Current_Exn   => Null_Unbounded_String,
-                                              In_Handler    => False,
-                                              SS_Mark       => Null_Unbounded_String,
-                                              SP_Mark       => Null_Unbounded_String));
+                        declare
+                           H_Mark : Unbounded_String := Null_Unbounded_String;
+                           H_SP   : constant String := Next_Reg (Ctx.E, "ghsp");
+                        begin
+                           Emit_Inst (Ctx.E, H_SP & " = stacksave");
+                           if not Ctx.Cur_Ret_Uncon and then Tree_Uses_SS (Ctx, D (AS_STM_S, Bdy_Block)) then
+                              Emit_Call_Or_Invoke (Ctx, "@__ada_ss_mark", "", "i64", H_Mark, Nounwind => True);
+                           end if;
+                           Ctx.Handlers.Append ((Handler_Label => Hdl_Lbl,
+                                                 Current_Exn   => Null_Unbounded_String,
+                                                 In_Handler    => False,
+                                                 SS_Mark       => H_Mark,
+                                                 SP_Mark       => To_Unbounded_String (H_SP)));
+                        end;
                      end if;
                      if Pkg_Gid /= 0 then
                         declare

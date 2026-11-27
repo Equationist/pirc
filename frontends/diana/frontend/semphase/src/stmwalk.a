@@ -986,8 +986,15 @@ package body STMWALK is
 							    and then D(SM_DEFN, NM) /= CONST_VOID
 							    and then KIND(D(SM_DEFN, NM)) in CLASS_TYPE_NAME then
 								declare
-								    TS_N: constant TREE := D(SM_TYPE_SPEC, D(SM_DEFN, NM));
+								    TS_N: TREE := D(SM_TYPE_SPEC, D(SM_DEFN, NM));
 								begin
+								    if TS_N /= CONST_VOID and then KIND(TS_N) in CLASS_PRIVATE_SPEC
+								    and then D(SM_TYPE_SPEC, TS_N) /= CONST_VOID then
+									TS_N := D(SM_TYPE_SPEC, TS_N);
+								    elsif TS_N /= CONST_VOID and then KIND(TS_N) = DN_INCOMPLETE
+								    and then D(XD_FULL_TYPE_SPEC, TS_N) /= CONST_VOID then
+									TS_N := D(XD_FULL_TYPE_SPEC, TS_N);
+								    end if;
 								    if TS_N /= CONST_VOID and then KIND(TS_N) in DN_ENUMERATION .. DN_INTEGER then
 									R_NODE := D(SM_RANGE, TS_N);
 								    end if;

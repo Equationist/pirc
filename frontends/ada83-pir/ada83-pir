@@ -75,6 +75,15 @@ require_arg() {
     fi
 }
 
+require_nonempty() {
+    local opt="$1"
+    local val="$2"
+    if [ -z "$val" ]; then
+        echo "ada83-pir: option '$opt' requires a non-empty argument" >&2
+        exit 1
+    fi
+}
+
 PARSING_OPTS=1
 while [ $# -gt 0 ]; do
     if [ "$PARSING_OPTS" -eq 0 ]; then
@@ -87,24 +96,25 @@ while [ $# -gt 0 ]; do
     fi
     case "$1" in
         --) PARSING_OPTS=0 ;;
-        -o) require_arg "$1" "$#"; shift; OUTPUT="$1" ;;
-        -L|--lib) require_arg "$1" "$#"; shift; LIB_DIR="$1" ;;
-        --lib=*) LIB_DIR="${1#--lib=}" ;;
+        -o) require_arg "$1" "$#"; shift; require_nonempty "-o" "$1"; OUTPUT="$1" ;;
+        -L|--lib) opt="$1"; require_arg "$opt" "$#"; shift; require_nonempty "$opt" "$1"; LIB_DIR="$1" ;;
+        --lib=*) LIB_DIR="${1#--lib=}"; require_nonempty "--lib" "$LIB_DIR" ;;
         -c) COMPILE_ONLY=1 ;;
-        --main=*) MAIN_UNIT="${1#--main=}" ;;
-        --main) require_arg "$1" "$#"; shift; MAIN_UNIT="$1" ;;
-        --bind) require_arg "$1" "$#"; shift; BIND_ONLY=1; MAIN_UNIT="$1" ;;
-        --bind=*) BIND_ONLY=1; MAIN_UNIT="${1#--bind=}" ;;
+        --main=*) MAIN_UNIT="${1#--main=}"; require_nonempty "--main" "$MAIN_UNIT" ;;
+        --main) require_arg "$1" "$#"; shift; require_nonempty "--main" "$1"; MAIN_UNIT="$1" ;;
+        --bind) require_arg "$1" "$#"; shift; require_nonempty "--bind" "$1"; BIND_ONLY=1; MAIN_UNIT="$1" ;;
+        --bind=*) BIND_ONLY=1; MAIN_UNIT="${1#--bind=}"; require_nonempty "--bind" "$MAIN_UNIT" ;;
         -O0|-O1|-O2) OPT="$1" ;;
-        --target=*) TARGET="${1#--target=}" ;;
-        --target) require_arg "$1" "$#"; shift; TARGET="$1" ;;
+        --target=*) TARGET="${1#--target=}"; require_nonempty "--target" "$TARGET" ;;
+        --target) require_arg "$1" "$#"; shift; require_nonempty "--target" "$1"; TARGET="$1" ;;
         --no-checks) CHECKS_FLAG="--no-checks" ;;
         --checks) CHECKS_FLAG="--checks" ;;
         --emit-pir) EMIT_PIR=1 ;;
         -S) EMIT_ASM=1 ;;
         --interp) DO_INTERP=1 ;;
-        --pirc=*) PIRC="${1#--pirc=}" ;;
-        --pirc) require_arg "$1" "$#"; shift; PIRC="$1" ;;
+        --pirc=*) PIRC="${1#--pirc=}"; require_nonempty "--pirc" "$PIRC" ;;
+        --pirc) require_arg "$1" "$#"; shift; require_nonempty "--pirc" "$1"; PIRC="$1" ;;
+        -l) require_arg "$1" "$#"; shift; require_nonempty "-l" "$1"; EXTRA_LINK+=("-l$1") ;;
         -l*|-Wl,*) EXTRA_LINK+=("$1") ;;
         -h|--help) usage 0 ;;
         -*) echo "ada83-pir: unknown option '$1'" >&2; usage 1 ;;
@@ -128,13 +138,17 @@ if [ "$BIND_ONLY" -eq 1 ] && { [ "$COMPILE_ONLY" -eq 1 ] || [ "$SINGLE_MODES" -g
     echo "ada83-pir: --bind cannot be combined with -c, --emit-pir, -S, or --interp" >&2
     exit 1
 fi
+if [ "$COMPILE_ONLY" -eq 1 ] && [ "$SINGLE_MODES" -gt 0 ]; then
+    echo "ada83-pir: -c cannot be combined with --emit-pir, -S, or --interp" >&2
+    exit 1
+fi
 if [ "$SINGLE_MODES" -eq 1 ] && [ ${#SRCS[@]} -ne 1 ]; then
     echo "ada83-pir: --emit-pir, -S, and --interp require exactly one source file" >&2
     exit 1
 fi
 
 # Validate toolchain binaries and source files upfront
-for tool in "$DIANA_BIN/parphase" "$DIANA_BIN/libphase" "$DIANA_BIN/semphase" "$DIANA_BIN/errphase" "$DIANA2PIR" "$PIRC"; do
+for tool in "$DIANA_BIN/parphase" "$DIANA_BIN/libphase" "$DIANA_BIN/semphase" "$DIANA_BIN/errphase" "$DIANA_BIN/writelib" "$DIANA2PIR" "$PIRC"; do
     if [ ! -x "$tool" ]; then
         echo "ada83-pir: required tool not found or not executable: $tool" >&2
         exit 1
@@ -187,7 +201,7 @@ check_diana_errors() {
     local err_log="$1"
     local rc=0
     "$DIANA_BIN/errphase" >"$err_log" 2>&1 || rc=$?
-    if [ "$rc" -ge 126 ]; then
+    if [ "$rc" -ne 0 ]; then
         cat "$err_log" >&2
         return 1
     fi
@@ -205,36 +219,62 @@ if [ -f "$SEQ_FILE" ]; then
     OBJ_SEQ="$(cat "$SEQ_FILE")"
 fi
 
+TX_ACTIVE=0
+TX_HAD_IDX=0
+TX_PREV_SEQ=0
+TX_CUR_SEQ=0
+
+rollback_lib() {
+    if [ "$TX_ACTIVE" -eq 0 ]; then
+        return 0
+    fi
+    TX_ACTIVE=0
+    if [ "$USE_SINGLE_DIRECT" -eq 0 ]; then
+        if [ -f "$WORK/ADA__LIB.CTL.bak" ]; then
+            mv -f "$WORK/ADA__LIB.CTL.bak" "$WORK/ADA__LIB.CTL"
+        fi
+        if [ "$TX_HAD_IDX" -eq 1 ] && [ -f "$WORK/UNITS.IDX.bak" ]; then
+            mv -f "$WORK/UNITS.IDX.bak" "$WORK/ADA__LIB/UNITS.IDX"
+        elif [ "$TX_HAD_IDX" -eq 0 ]; then
+            rm -f "$WORK/ADA__LIB/UNITS.IDX" "$WORK/UNITS.IDX.bak"
+        fi
+        if [ -d "$WORK/ADA__LIB.bak" ]; then
+            rm -rf "$WORK/ADA__LIB"
+            mv -f "$WORK/ADA__LIB.bak" "$WORK/ADA__LIB"
+        fi
+        echo "$TX_PREV_SEQ" > "$SEQ_FILE"
+        rm -f "$WORK/objs/unit_${TX_CUR_SEQ}.pir" "$WORK/objs/unit_${TX_CUR_SEQ}.o" \
+              "$WORK/objs/unit_${TX_CUR_SEQ}__cu"*.pir "$WORK/objs/unit_${TX_CUR_SEQ}__cu"*.o
+    fi
+    rm -f "$WORK/\$\$\$.TMP" "$WORK/\$\$\$PGM.TMP" "$WORK/SEMPHASE.TMP" "$WORK/WRITELIB.TMP" "$WORK/ADA__LIB.TMP"
+}
+
+if [ -n "$LIB_DIR" ]; then
+    trap 'rollback_lib; exit 130' INT
+    trap 'rollback_lib; exit 143' TERM
+fi
+
 SINGLE_OBJ=""
 for idx in "${!SRCS[@]}"; do
     src_abs="$(cd -- "$(dirname -- "${SRCS[$idx]}")" && pwd)/$(basename -- "${SRCS[$idx]}")"
+    TX_PREV_SEQ="$OBJ_SEQ"
     OBJ_SEQ=$((OBJ_SEQ + 1))
+    TX_CUR_SEQ="$OBJ_SEQ"
     echo "$OBJ_SEQ" > "$SEQ_FILE"
     pir_out="$WORK/objs/unit_${OBJ_SEQ}.pir"
     obj_out="$WORK/objs/unit_${OBJ_SEQ}.o"
 
-    # Snapshot persistent library metadata before mutating so failures leave -L consistent
-    HAD_IDX=0
+    # Snapshot persistent library metadata before mutating so failures or signals leave -L consistent
+    TX_HAD_IDX=0
+    TX_ACTIVE=1
     if [ "$USE_SINGLE_DIRECT" -eq 0 ]; then
         cp "$WORK/ADA__LIB.CTL" "$WORK/ADA__LIB.CTL.bak"
         if [ -f "$WORK/ADA__LIB/UNITS.IDX" ]; then
             cp "$WORK/ADA__LIB/UNITS.IDX" "$WORK/UNITS.IDX.bak"
-            HAD_IDX=1
+            TX_HAD_IDX=1
         fi
+        rm -rf "$WORK/ADA__LIB.bak"
     fi
-
-    rollback_lib() {
-        if [ "$USE_SINGLE_DIRECT" -eq 0 ]; then
-            if [ -f "$WORK/ADA__LIB.CTL.bak" ]; then
-                mv -f "$WORK/ADA__LIB.CTL.bak" "$WORK/ADA__LIB.CTL"
-            fi
-            if [ "$HAD_IDX" -eq 1 ] && [ -f "$WORK/UNITS.IDX.bak" ]; then
-                mv -f "$WORK/UNITS.IDX.bak" "$WORK/ADA__LIB/UNITS.IDX"
-            elif [ "$HAD_IDX" -eq 0 ]; then
-                rm -f "$WORK/ADA__LIB/UNITS.IDX" "$WORK/UNITS.IDX.bak"
-            fi
-        fi
-    }
 
     if ! (
         cd "$WORK"
@@ -260,7 +300,12 @@ for idx in "${!SRCS[@]}"; do
         fi
         cp '$$$.TMP' SEMPHASE.TMP
         if ! "$DIANA_BIN/semphase" >"$WORK/sem.log" 2>&1; then
-            "$DIANA_BIN/errphase" >&2 || cat "$WORK/sem.log" >&2
+            "$DIANA_BIN/errphase" >"$WORK/err.log" 2>&1 || true
+            if [ -s "$WORK/err.log" ]; then
+                cat "$WORK/err.log" >&2
+            else
+                cat "$WORK/sem.log" >&2
+            fi
             exit 1
         fi
         if ! check_diana_errors "$WORK/err.log"; then
@@ -271,15 +316,6 @@ for idx in "${!SRCS[@]}"; do
             "$DIANA2PIR" --target="$TARGET" "$CHECKS_FLAG" --main -o "$pir_out"
         else
             "$DIANA2PIR" --target="$TARGET" "$CHECKS_FLAG" --no-main --lib="$WORK/ADA__LIB" --record-obj="$obj_out" -o "$pir_out"
-            # Save compiled unit to ADA__LIB for subsequent units (with clauses)
-            if [ -f ADA__LIB.TMP ]; then
-                mv ADA__LIB.TMP ADA__LIB.CTL
-            fi
-            cp '$$$.TMP' WRITELIB.TMP
-            if ! "$DIANA_BIN/writelib" >"$WORK/wlib.log" 2>&1; then
-                cat "$WORK/wlib.log" >&2
-                exit 1
-            fi
         fi
     ); then
         rollback_lib
@@ -287,6 +323,7 @@ for idx in "${!SRCS[@]}"; do
     fi
 
     if [ "$EMIT_PIR" -eq 1 ]; then
+        TX_ACTIVE=0
         if [ -n "$OUTPUT" ]; then
             cp -- "$pir_out" "$OUTPUT"
         else
@@ -296,11 +333,13 @@ for idx in "${!SRCS[@]}"; do
     fi
 
     if [ "$DO_INTERP" -eq 1 ]; then
+        TX_ACTIVE=0
         "$PIRC" --interp --target="$TARGET" "$OPT" "$pir_out"
         exit $?
     fi
 
     if [ "$EMIT_ASM" -eq 1 ]; then
+        TX_ACTIVE=0
         if [ -n "$OUTPUT" ]; then
             "$PIRC" --target="$TARGET" "$OPT" -S "$pir_out" -o "$OUTPUT"
         else
@@ -327,6 +366,27 @@ for idx in "${!SRCS[@]}"; do
         done
     fi
 
+    # Commit compiled unit into ADA__LIB only AFTER codegen & pirc -c succeed!
+    if [ "$USE_SINGLE_DIRECT" -eq 0 ]; then
+        cp -R "$WORK/ADA__LIB" "$WORK/ADA__LIB.bak"
+        if ! (
+            cd "$WORK"
+            if [ -f ADA__LIB.TMP ]; then
+                mv ADA__LIB.TMP ADA__LIB.CTL
+            fi
+            cp '$$$.TMP' WRITELIB.TMP
+            if ! "$DIANA_BIN/writelib" >"$WORK/wlib.log" 2>&1; then
+                cat "$WORK/wlib.log" >&2
+                exit 1
+            fi
+        ); then
+            rollback_lib
+            exit 1
+        fi
+        rm -rf "$WORK/ADA__LIB.bak"
+    fi
+
+    TX_ACTIVE=0
     rm -f "$WORK/ADA__LIB.CTL.bak" "$WORK/UNITS.IDX.bak"
 done
 

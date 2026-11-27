@@ -714,8 +714,9 @@ package body AGGRESO is
 	    if POSITIONAL_SEEN then
 		ERROR(D(LX_SRCPOS,EXP),
                         "Positional and named associations not allowed");
-	    elsif not NAMED_OTHERS_OK
-	    and OTHERS_SEEN then
+	    elsif (not NAMED_OTHERS_OK
+		   or else (KIND(INDEX) /= DN_INDEX and then not CHKSTAT.IS_STATIC_SUBTYPE(INDEX)))
+	    and then OTHERS_SEEN then
 		ERROR(D(LX_SRCPOS,EXP),
                         "Named associations not allowed with others");
 	    end if;
@@ -996,6 +997,13 @@ package body AGGRESO is
 			if KIND(RANGE_NODE) in CLASS_TYPE_NAME then
 			    RANGE_NODE := D(SM_TYPE_SPEC, RANGE_NODE);
 			end if;
+			if RANGE_NODE /= CONST_VOID and then KIND(RANGE_NODE) in CLASS_PRIVATE_SPEC
+			and then D(SM_TYPE_SPEC, RANGE_NODE) /= CONST_VOID then
+			    RANGE_NODE := D(SM_TYPE_SPEC, RANGE_NODE);
+			elsif RANGE_NODE /= CONST_VOID and then KIND(RANGE_NODE) = DN_INCOMPLETE
+			and then D(XD_FULL_TYPE_SPEC, RANGE_NODE) /= CONST_VOID then
+			    RANGE_NODE := D(XD_FULL_TYPE_SPEC, RANGE_NODE);
+			end if;
 			if KIND(RANGE_NODE) in CLASS_SCALAR then
 			    RANGE_NODE := D(SM_RANGE, RANGE_NODE);
 			end if;
@@ -1013,10 +1021,12 @@ package body AGGRESO is
 				, AGGREGATE_ARRAY(II).ASSOC
 				, MAKE_CHOICE_S (SINGLETON(CHOICE)) );
 			D(AS_DISCRETE_RANGE, CHOICE, RANGE_NODE);
+			AGGREGATE_ARRAY(II).CHOICE := CHOICE;
 		    end if;
 		end if;
-		-- get static value for first element of range
-		if KIND(RANGE_NODE) = DN_RANGE then
+		-- get static value for first element of range (both bounds must be static!)
+		if KIND(RANGE_NODE) = DN_RANGE
+		and then GET_STATIC_VALUE(D(AS_EXP2, RANGE_NODE)) /= CONST_VOID then
 		    AGGREGATE_ARRAY(II).EXP
 			    := GET_STATIC_VALUE(D(AS_EXP1, RANGE_NODE));
 		else

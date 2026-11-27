@@ -1,6 +1,7 @@
 -- Copyright (c) 2026 Ummon Karpe
 -- SPDX-License-Identifier: BSD-3-Clause
 
+with Ada.Containers.Vectors;
 with DIANA; use DIANA;
 with DIANATTR; use DIANATTR;
 with Diana_Util; use Diana_Util;
@@ -8,19 +9,61 @@ with Pir_Emit; use Pir_Emit;
 
 package body Cg_Expr.Composite is
 
-   procedure Emit_Copy_Composite
-     (Ctx      : in out Context;
-      Dst_Ptr  : String;
-      Src      : Expr_Val;
-      Dst_Type : TREE)
-   is
-      DTI : constant Type_Info := Get_Type_Info (Ctx, Dst_Type);
+   function Is_Named_No_Others_Agg (AN : TREE; Rem_D : Natural) return Boolean is
    begin
+      if Rem_D = 0 then return True; end if;
+      if Is_Void_Tree (AN) or else KIND (AN) /= DN_AGGREGATE then return False; end if;
+      declare
+         AL      : SEQ_TYPE := LIST (D (AS_GENERAL_ASSOC_S, AN));
+         IT      : TREE;
+         Has_Any : Boolean := False;
+      begin
+         while not IS_EMPTY (AL) loop
+            POP (AL, IT);
+            Has_Any := True;
+            if KIND (IT) not in DN_ASSOC | DN_NAMED then
+               return False;
+            end if;
+            declare
+               CS : SEQ_TYPE := LIST (D (AS_CHOICE_S, IT));
+               Ch : TREE;
+            begin
+               while not IS_EMPTY (CS) loop
+                  POP (CS, Ch);
+                  if KIND (Ch) = DN_CHOICE_OTHERS then return False; end if;
+               end loop;
+            end;
+            if Rem_D > 1 and then not Is_Named_No_Others_Agg (D (AS_EXP, IT), Rem_D - 1) then
+               return False;
+            end if;
+         end loop;
+         return Has_Any;
+      end;
+   end Is_Named_No_Others_Agg;
+
+   procedure Emit_Copy_Composite
+     (Ctx       : in out Context;
+      Dst_Ptr   : String;
+      Src       : Expr_Val;
+      Dst_Type  : TREE;
+      Max_Align : Natural := 8)
+   is
+      DTI   : constant Type_Info := Get_Type_Info (Ctx, Dst_Type);
+      Cl_Al : constant Natural := Natural'Max (1, Natural'Min (Natural'Max (1, DTI.Align), Max_Align));
+   begin
+      if DTI.Kind = TK_Constrained_Array and then not DTI.Is_Dynamic then
+         -- Static null constrained array (Last < First) has padded Byte_Size > 0; never read/write past bounds!
+         for D_I in 1 .. Natural'Min (DTI.NDims, Max_Array_Dims) loop
+            if DTI.Dims (D_I).Is_Static and then DTI.Dims (D_I).Last < DTI.Dims (D_I).First then
+               return;
+            end if;
+         end loop;
+      end if;
       if DTI.Kind = TK_Record or else (DTI.Kind = TK_Constrained_Array and then not DTI.Is_Dynamic) then
          if DTI.Byte_Size > 0 then
             Emit_Inst (Ctx.E,
               "memmove " & Dst_Ptr & ", " & To_String (Src.Reg) & ", " &
-              Img (DTI.Byte_Size) & ", align " & Img (DTI.Align));
+              Img (DTI.Byte_Size) & ", align " & Img (Cl_Al));
          end if;
          -- Recursively deep-copy any embedded dynamic constrained array fields (@__ada_arr_desc)
          -- in records, nested records, active variants, and arrays of records (c52008b)
@@ -87,7 +130,7 @@ package body Cg_Expr.Composite is
                elsif TI.Kind = TK_Constrained_Array then
                   return Type_Has_Dyn_Arr (TI.Elem_Type, Depth + 1);
                elsif TI.Kind = TK_Record then
-                  BT := Base_Type_Spec (Subst_Tree (Ctx, T));
+                  BT := Subst_Base_Type (Ctx, T);
                   if not Is_Void_Tree (BT) and then KIND (BT) = DN_RECORD then
                      return CL_Has_Dyn (D (SM_COMP_LIST, BT));
                   end if;
@@ -95,10 +138,10 @@ package body Cg_Expr.Composite is
                return False;
             end Type_Has_Dyn_Arr;
 
-            procedure Deep_Copy_Fields (Cur_Ptr : String; Cur_T : TREE) is
+            procedure Deep_Copy_Fields (Cur_Ptr : String; Cur_T : TREE; Cur_Al : Natural) is
                CTI_Top : constant Type_Info := Get_Type_Info (Ctx, Cur_T);
 
-               procedure Clone_Dyn_Arr (Arr_Desc_Ptr : String; Arr_T : TREE; ATI : Type_Info) is
+               procedure Clone_Dyn_Arr (Arr_Desc_Ptr : String; Arr_T : TREE; ATI : Type_Info; Desc_Al : Natural) is
                   ETI   : constant Type_Info := Get_Type_Info (Ctx, ATI.Elem_Type);
                   Is_DE : constant Boolean := ETI.Kind = TK_Constrained_Array and then ETI.Is_Dynamic;
                   EAl   : constant Natural := Elem_Storage_Align (ETI);
@@ -111,15 +154,16 @@ package body Cg_Expr.Composite is
                   AlB   : constant String := Next_Reg (Ctx.E, "dcal");
                   NewP  : Unbounded_String;
                   P0    : constant String := Next_Reg (Ctx.E, "dcp0");
+                  DAl   : constant Natural := Natural'Max (1, Natural'Min (8, Desc_Al));
                begin
-                  Emit_Unpack_Arr_Desc (Ctx, Arr_Desc_Ptr, Arr_T, Orig);
+                  Emit_Unpack_Arr_Desc (Ctx, Arr_Desc_Ptr, Arr_T, Orig, Align => DAl);
                   Emit_Array_Byte_Size_I64 (Ctx, Orig.First_Regs, Orig.Last_Regs, ND_A, ESz, Tot64, Byt);
                   Emit_Inst (Ctx.E, Nz & " = cmp_gt_s.i64 " & To_String (Byt) & ", 0");
                   Emit_Inst (Ctx.E, AlB & " = select.i64 " & Nz & ", " & To_String (Byt) & ", " & Img (EAl));
                   Emit_Call_Or_Invoke (Ctx, "@__ada_alloc", AlB, "ptr", NewP);
                   Emit_Inst (Ctx.E, "memcpy " & To_String (NewP) & ", " & To_String (Orig.Reg) & ", " & To_String (Byt) & ", align " & Img (EAl));
                   Emit_Inst (Ctx.E, P0 & " = field_ptr @__ada_arr_desc, " & Arr_Desc_Ptr & ", 0");
-                  Emit_Inst (Ctx.E, "store.ptr " & To_String (NewP) & ", " & P0 & ", align 8");
+                  Emit_Inst (Ctx.E, "store.ptr " & To_String (NewP) & ", " & P0 & ", align " & Img (DAl));
                   if Is_DE or else Type_Has_Dyn_Arr (ATI.Elem_Type) then
                      declare
                         Zero64 : constant String := Next_Reg (Ctx.E, "dca0");
@@ -141,9 +185,9 @@ package body Cg_Expr.Composite is
                         Emit_Inst (Ctx.E, Off_R & " = mul.i64 " & IR & ", " & Img (ESz));
                         Emit_Inst (Ctx.E, EP_R & " = ptr_add.i64 " & To_String (NewP) & ", " & Off_R & " [inbounds]");
                         if Is_DE then
-                           Clone_Dyn_Arr (EP_R, ATI.Elem_Type, ETI);
+                           Clone_Dyn_Arr (EP_R, ATI.Elem_Type, ETI, 8);
                         else
-                           Deep_Copy_Fields (EP_R, ATI.Elem_Type);
+                           Deep_Copy_Fields (EP_R, ATI.Elem_Type, EAl);
                         end if;
                         Emit_Inst (Ctx.E, Nxt_R & " = add.i64 " & IR & ", 1");
                         Emit_Term (Ctx.E, "jmp " & L_H & "(" & Nxt_R & ")");
@@ -180,11 +224,12 @@ package body Cg_Expr.Composite is
                                           declare
                                              FE : constant Field_Entry := Ctx.Fields.Element (CK);
                                              FP : constant String := Emit_Field_Addr (Ctx, Rec_P, Rec_Pir, FE, "dcfp");
+                                             FA : constant Natural := Natural'Min (Cur_Al, (if FE.Has_Explicit_Offset then 1 else 8));
                                           begin
                                              if CTI.Kind = TK_Constrained_Array and then CTI.Is_Dynamic then
-                                                Clone_Dyn_Arr (FP, CT, CTI);
+                                                Clone_Dyn_Arr (FP, CT, CTI, FA);
                                              else
-                                                Deep_Copy_Fields (FP, CT);
+                                                Deep_Copy_Fields (FP, CT, FA);
                                              end if;
                                           end;
                                        end if;
@@ -250,7 +295,7 @@ package body Cg_Expr.Composite is
             begin
                if CTI_Top.Kind = TK_Record then
                   declare
-                     BT : constant TREE := Base_Type_Spec (Subst_Tree (Ctx, Cur_T));
+                     BT : constant TREE := Subst_Base_Type (Ctx, Cur_T);
                   begin
                      if not Is_Void_Tree (BT) and then KIND (BT) = DN_RECORD then
                         Walk_Rec_CL (Cur_Ptr, To_String (CTI_Top.Pir_Type), D (SM_COMP_LIST, BT));
@@ -288,9 +333,9 @@ package body Cg_Expr.Composite is
                         Emit_Inst (Ctx.E, Off_R & " = mul.i64 " & Idx_R & ", " & Img (ESz));
                         Emit_Inst (Ctx.E, EP_R & " = ptr_add.i64 " & Cur_Ptr & ", " & Off_R & " [inbounds]");
                         if ETI.Kind = TK_Constrained_Array and then ETI.Is_Dynamic then
-                           Clone_Dyn_Arr (EP_R, CTI_Top.Elem_Type, ETI);
+                           Clone_Dyn_Arr (EP_R, CTI_Top.Elem_Type, ETI, Cur_Al);
                         else
-                           Deep_Copy_Fields (EP_R, CTI_Top.Elem_Type);
+                           Deep_Copy_Fields (EP_R, CTI_Top.Elem_Type, Natural'Min (Cur_Al, Natural'Max (1, ETI.Align)));
                         end if;
                         Emit_Inst (Ctx.E, Nxt_R & " = add.i64 " & Idx_R & ", 1");
                         Emit_Term (Ctx.E, "jmp " & L_Hdr & "(" & Nxt_R & ")");
@@ -301,7 +346,7 @@ package body Cg_Expr.Composite is
             end Deep_Copy_Fields;
          begin
             if Type_Has_Dyn_Arr (Dst_Type) then
-               Deep_Copy_Fields (Dst_Ptr, Dst_Type);
+               Deep_Copy_Fields (Dst_Ptr, Dst_Type, Cl_Al);
             end if;
          end;
       elsif DTI.Kind = TK_Unconstrained_Array or else DTI.Is_Dynamic then
@@ -357,14 +402,14 @@ package body Cg_Expr.Composite is
                         NP2   : Unbounded_String;
                         P0_2  : constant String := Next_Reg (Ctx.E, "dp02");
                      begin
-                        Emit_Unpack_Arr_Desc (Ctx, EP_R, DTI.Elem_Type, Orig);
+                        Emit_Unpack_Arr_Desc (Ctx, EP_R, DTI.Elem_Type, Orig, Align => Natural'Min (8, Max_Align));
                         Emit_Array_Byte_Size_I64 (Ctx, Orig.First_Regs, Orig.Last_Regs, ND2, ESz2, T2, B2);
                         Emit_Inst (Ctx.E, Nz2 & " = cmp_gt_s.i64 " & To_String (B2) & ", 0");
                         Emit_Inst (Ctx.E, Al2 & " = select.i64 " & Nz2 & ", " & To_String (B2) & ", " & Img (EAl2));
                         Emit_Call_Or_Invoke (Ctx, "@__ada_alloc", Al2, "ptr", NP2);
-                        Emit_Inst (Ctx.E, "memcpy " & To_String (NP2) & ", " & To_String (Orig.Reg) & ", " & To_String (B2) & ", align " & Img (EAl2));
+                        Emit_Copy_Composite (Ctx, To_String (NP2), Orig, DTI.Elem_Type);
                         Emit_Inst (Ctx.E, P0_2 & " = field_ptr @__ada_arr_desc, " & EP_R & ", 0");
-                        Emit_Inst (Ctx.E, "store.ptr " & To_String (NP2) & ", " & P0_2 & ", align 8");
+                        Emit_Inst (Ctx.E, "store.ptr " & To_String (NP2) & ", " & P0_2 & ", align " & Img (Natural'Min (8, Max_Align)));
                      end;
                      Emit_Inst (Ctx.E, Nxt_R & " = add.i64 " & Idx_R & ", 1");
                      Emit_Term (Ctx.E, "jmp " & L_Hdr & "(" & Nxt_R & ")");
@@ -467,7 +512,8 @@ package body Cg_Expr.Composite is
       Init_Node    : TREE;
       Dst_Firsts   : Str_Array_4 := (others => Null_Unbounded_String);
       Dst_Lasts    : Str_Array_4 := (others => Null_Unbounded_String);
-      Exact_Bounds : Boolean := False)
+      Exact_Bounds : Boolean := False;
+      Max_Align    : Natural := 8)
    is
       DTI : constant Type_Info := Get_Type_Info (Ctx, Dst_Type);
    begin
@@ -479,10 +525,11 @@ package body Cg_Expr.Composite is
             Qual_T : constant TREE := Subst_Tree (Ctx, D (SM_EXP_TYPE, Init_Node));
             QTI    : constant Type_Info := (if not Is_Void_Tree (Qual_T) then Get_Type_Info (Ctx, Qual_T) else DTI);
          begin
-            if not Is_Void_Tree (Qual_T) and then QTI.Kind = TK_Constrained_Array
+            if not Is_Void_Tree (Qual_T)
+              and then QTI.Kind in TK_Constrained_Array | TK_Unconstrained_Array
               and then DTI.Kind in TK_Constrained_Array | TK_Unconstrained_Array
             then
-               -- P3-3.6: Evaluate qualified array with Qual_T first (enforcing Qual_T's exact bounds),
+               -- P3-3.6 / P5-R4: Evaluate qualified array with Qual_T first (enforcing Qual_T's exact bounds),
                -- then check/slide into Dst_Type!
                declare
                   Src  : constant Expr_Val := Emit_Expr (Ctx, Init_Node, Qual_T);
@@ -509,10 +556,10 @@ package body Cg_Expr.Composite is
                         Emit_Array_Length_Check (Ctx, Tgt, Src, ND_A);
                      end if;
                   end if;
-                  Emit_Copy_Composite (Ctx, Dst_Ptr, Src, Dst_Type);
+                  Emit_Copy_Composite (Ctx, Dst_Ptr, Src, Dst_Type, Max_Align => Max_Align);
                end;
             else
-               Emit_Init_Composite (Ctx, Dst_Ptr, Dst_Type, D (AS_EXP, Init_Node), Dst_Firsts, Dst_Lasts, Exact_Bounds => True);
+               Emit_Init_Composite (Ctx, Dst_Ptr, Dst_Type, D (AS_EXP, Init_Node), Dst_Firsts, Dst_Lasts, Exact_Bounds => True, Max_Align => Max_Align);
                if not Is_Void_Tree (Qual_T) and then QTI.Kind = TK_Record then
                   Emit_Discriminant_Check (Ctx, Dst_Ptr, Qual_T, Is_Access => False);
                end if;
@@ -528,7 +575,7 @@ package body Cg_Expr.Composite is
             -- LRM 4.3.2(5)+(9) (c43205f): parenthesized aggregate loses applicable index constraint
             -- (lower bound comes from base index subtype 'FIRST), and as an aggregate component must match Dst_Type bounds!
             declare
-               Base_Arr : constant TREE := Resolve_Type_Spec (Base_Type_Spec (Subst_Tree (Ctx, Dst_Type)));
+               Base_Arr : constant TREE := Subst_Base_Type (Ctx, Dst_Type);
                Src      : constant Expr_Val := Emit_Expr (Ctx, D (AS_EXP, Init_Node), Base_Arr);
                ND_A     : constant Natural := Natural'Max (1, Natural'Min (DTI.NDims, Max_Array_Dims));
             begin
@@ -565,11 +612,11 @@ package body Cg_Expr.Composite is
                      end;
                   end if;
                end if;
-               Emit_Copy_Composite (Ctx, Dst_Ptr, Src, Dst_Type);
+               Emit_Copy_Composite (Ctx, Dst_Ptr, Src, Dst_Type, Max_Align => Max_Align);
             end;
             return;
          end if;
-         Emit_Init_Composite (Ctx, Dst_Ptr, Dst_Type, D (AS_EXP, Init_Node), Dst_Firsts, Dst_Lasts, Exact_Bounds => Exact_Bounds);
+         Emit_Init_Composite (Ctx, Dst_Ptr, Dst_Type, D (AS_EXP, Init_Node), Dst_Firsts, Dst_Lasts, Exact_Bounds => Exact_Bounds, Max_Align => Max_Align);
          return;
       end if;
 
@@ -579,7 +626,7 @@ package body Cg_Expr.Composite is
                Norm     : TREE := D (SM_NORMALIZED_COMP_S, Init_Node);
                Comps    : SEQ_TYPE;
                C_Exp    : TREE;
-               Base_Rec : constant TREE := Base_Type_Spec (Subst_Tree (Ctx, Dst_Type));
+               Base_Rec : constant TREE := Subst_Base_Type (Ctx, Dst_Type);
                -- Collect component IDs in field order (discriminants + fixed + active variant)
                Comp_Ids    : array (0 .. 255) of TREE;
                N_Comps     : Natural := 0;
@@ -783,7 +830,7 @@ package body Cg_Expr.Composite is
                end if;
                -- Zero-init record buffer first so padding/inactive union bytes are deterministic
                if DTI.Byte_Size > 0 then
-                  Emit_Inst (Ctx.E, "memset " & Dst_Ptr & ", 0, " & Img (DTI.Byte_Size) & ", align " & Img (Natural'Max (1, DTI.Align)));
+                  Emit_Inst (Ctx.E, "memset " & Dst_Ptr & ", 0, " & Img (DTI.Byte_Size) & ", align " & Img (Natural'Max (1, Natural'Min (Natural'Max (1, DTI.Align), Max_Align))));
                end if;
                Comps := LIST (Norm);
                declare
@@ -840,14 +887,15 @@ package body Cg_Expr.Composite is
                               VR := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, To_String (V.Reg), VP, DP, Is_Unsigned => VU));
                               Emit_Range_Check (Ctx, To_String (VR), DP, CT);
                               Emit_Discriminant_Check (Ctx, To_String (VR), CT, Is_Access => True);
-                              if Ctx.Fields.Contains (CK_F) and then Is_Bitfield (Ctx.Fields.Element (CK_F)) then
+                              if Ctx.Fields.Contains (CK_F) and then Uses_Bitfield_Access (Ctx, Ctx.Fields.Element (CK_F), CT) then
                                  Emit_Bitfield_Store (Ctx, Dst_Ptr, Ctx.Fields.Element (CK_F), To_String (VR), DP, CT);
                               else
                                  declare
                                     St_Al : constant Natural :=
-                                      (if Ctx.Fields.Contains (CK_F)
-                                       then Explicit_Field_Align (Ctx.Fields.Element (CK_F), CTI.Align)
-                                       else Natural'Max (1, CTI.Align));
+                                      Natural'Max (1, Natural'Min (Max_Align,
+                                        (if Ctx.Fields.Contains (CK_F)
+                                         then Explicit_Field_Align (Ctx.Fields.Element (CK_F), CTI.Align)
+                                         else Natural'Max (1, CTI.Align))));
                                  begin
                                     Emit_Inst (Ctx.E,
                                       "store." & DP & " " & To_String (VR) &
@@ -865,7 +913,7 @@ package body Cg_Expr.Composite is
                                  DV.Pir_Type   := CTI.Pir_Type;
                                  DV.Ada_Type   := CT;
                                  DV.Owner_Subp := Ctx.Cur_Subp_Key;
-                                 if Ctx.Fields.Contains (DK) and then Is_Bitfield (Ctx.Fields.Element (DK)) then
+                                 if Ctx.Fields.Contains (DK) and then Uses_Bitfield_Access (Ctx, Ctx.Fields.Element (DK), CT) then
                                     DV.Pir_Name    := To_Unbounded_String (Dst_Ptr);
                                     DV.Is_Bitfield := True;
                                     DV.BF_FE       := Ctx.Fields.Element (DK);
@@ -899,7 +947,7 @@ package body Cg_Expr.Composite is
                                  Emit_Index_Bounds (Ctx, CTI.Dims (D_I).Idx_Type, Firsts (D_I), Lasts (D_I));
                                  if Ctx.Enable_Checks then
                                     declare
-                                       BA  : constant TREE := Resolve_Type_Spec (Base_Type_Spec (CT));
+                                       BA  : constant TREE := Subst_Base_Type (Ctx, CT);
                                        BTI : constant Type_Info := (if not Is_Void_Tree (BA) and then KIND (BA) = DN_ARRAY then Get_Type_Info (Ctx, BA) else CTI);
                                     begin
                                        if D_I <= BTI.NDims and then not Is_Void_Tree (BTI.Dims (D_I).Idx_Type) then
@@ -907,78 +955,43 @@ package body Cg_Expr.Composite is
                                        end if;
                                     end;
                                  end if;
-                                 declare
-                                    DL : constant String := Emit_Dim_Len_I64 (Ctx, To_String (Firsts (D_I)), To_String (Lasts (D_I)));
-                                 begin
-                                    if D_I = 1 then Tot64 := To_Unbounded_String (DL);
-                                    else
-                                       declare
-                                          M : constant String := Next_Reg (Ctx.E, "ram");
-                                       begin
-                                          Emit_Inst (Ctx.E, M & " = mul.i64 " & To_String (Tot64) & ", " & DL);
-                                          Tot64 := To_Unbounded_String (M);
-                                       end;
-                                    end if;
-                                 end;
                               end loop;
-                              Emit_Inst (Ctx.E, Byt & " = mul.i64 " & To_String (Tot64) & ", " & Img (ESz));
+                              declare
+                                 Byt_U : Unbounded_String;
+                              begin
+                                 Emit_Array_Byte_Size_I64 (Ctx, Firsts, Lasts, ND_A, ESz, Tot64, Byt_U);
+                                 Emit_Inst (Ctx.E, Byt & " = add.i64 " & To_String (Byt_U) & ", 0");
+                              end;
                               Emit_Inst (Ctx.E, Nz & " = cmp_gt_s.i64 " & Byt & ", 0");
-                              Emit_Inst (Ctx.E, AlB & " = select.i64 " & Nz & ", " & Byt & ", " & Img (Natural'Max (1, ETI.Align)));
+                              Emit_Inst (Ctx.E, AlB & " = select.i64 " & Nz & ", " & Byt & ", " & Img (Elem_Storage_Align (ETI)));
                               Emit_Call_Or_Invoke (Ctx, "@__ada_alloc", AlB, "ptr", DataP);
-                              Emit_Store_Arr_Desc (Ctx, FP, To_String (DataP), Firsts, Lasts, ND_A);
+                              declare
+                                 Desc_Al : constant Natural :=
+                                   Natural'Max (1, Natural'Min (Max_Align,
+                                     (if Ctx.Fields.Contains (CID_K) and then Ctx.Fields.Element (CID_K).Has_Explicit_Offset
+                                      then 1 else 8)));
+                              begin
+                                 Emit_Store_Arr_Desc (Ctx, FP, To_String (DataP), Firsts, Lasts, ND_A, Align => Desc_Al);
+                              end;
                               if KIND (C_Exp) = DN_AGGREGATE then
-                                 declare
-                                    function Agg_All_Named_No_Others (AN : TREE; Rem_D : Natural) return Boolean is
+                                 if Is_Named_No_Others_Agg (C_Exp, ND_A) then
+                                    -- LRM 4.3.1(3) + 4.3.2(8) (c43103b Case 5): evaluate all dim choices via Pass-1 and check exact bounds!
+                                    declare
+                                       Base_CT : constant TREE := Subst_Base_Type (Ctx, CT);
+                                       SV      : constant Expr_Val := Emit_Expr (Ctx, C_Exp, Base_CT);
+                                       SV_W    : constant Array_View := Resolve_Array_View (Ctx, SV);
                                     begin
-                                       if Rem_D = 0 then return True; end if;
-                                       if Is_Void_Tree (AN) or else KIND (AN) /= DN_AGGREGATE then return False; end if;
-                                       declare
-                                          AL : SEQ_TYPE := LIST (D (AS_GENERAL_ASSOC_S, AN));
-                                          IT : TREE;
-                                          Has_Any : Boolean := False;
-                                       begin
-                                          while not IS_EMPTY (AL) loop
-                                             POP (AL, IT);
-                                             Has_Any := True;
-                                             if KIND (IT) not in DN_ASSOC | DN_NAMED then
-                                                return False;
-                                             end if;
-                                             declare
-                                                CS : SEQ_TYPE := LIST (D (AS_CHOICE_S, IT));
-                                                Ch : TREE;
-                                             begin
-                                                while not IS_EMPTY (CS) loop
-                                                   POP (CS, Ch);
-                                                   if KIND (Ch) = DN_CHOICE_OTHERS then return False; end if;
-                                                end loop;
-                                             end;
-                                             if Rem_D > 1 and then not Agg_All_Named_No_Others (D (AS_EXP, IT), Rem_D - 1) then
-                                                return False;
-                                             end if;
-                                          end loop;
-                                          return Has_Any;
-                                       end;
-                                    end Agg_All_Named_No_Others;
-                                 begin
-                                    if Agg_All_Named_No_Others (C_Exp, ND_A) then
-                                       -- LRM 4.3.1(3) + 4.3.2(8) (c43103b Case 5): evaluate all dim choices via Pass-1 and check exact bounds!
-                                       declare
-                                          Base_CT : constant TREE := Subst_Base_Type (Ctx, CT);
-                                          SV      : constant Expr_Val := Emit_Expr (Ctx, C_Exp, Base_CT);
-                                          SV_W    : constant Array_View := Resolve_Array_View (Ctx, SV);
-                                       begin
-                                          Emit_Exact_Bounds_Check (Ctx, SV_W.Firsts, SV_W.Lasts, Firsts, Lasts, ND_A);
-                                          Emit_Inst (Ctx.E, "memmove " & To_String (DataP) & ", " & To_String (SV.Reg) & ", " & Byt & ", align " & Img (ETI.Align));
-                                       end;
-                                    else
-                                       Emit_Init_Composite (Ctx, To_String (DataP), CT, C_Exp, Firsts, Lasts, Exact_Bounds => True);
-                                    end if;
-                                 end;
+                                       Emit_Exact_Bounds_Check (Ctx, SV_W.Firsts, SV_W.Lasts, Firsts, Lasts, ND_A);
+                                       Emit_Copy_Composite (Ctx, To_String (DataP), SV, CT);
+                                    end;
+                                 else
+                                    Emit_Init_Composite (Ctx, To_String (DataP), CT, C_Exp, Firsts, Lasts, Exact_Bounds => True);
+                                 end if;
                               else
                                  declare
                                     Is_Par : constant Boolean := KIND (C_Exp) = DN_PARENTHESIZED;
                                     Eval_T : constant TREE :=
-                                      (if Is_Par then Resolve_Type_Spec (Base_Type_Spec (Subst_Tree (Ctx, CT))) else CT);
+                                      (if Is_Par then Subst_Base_Type (Ctx, CT) else CT);
                                     SV  : constant Expr_Val := Emit_Expr (Ctx, C_Exp, Eval_T);
                                     Tgt : Expr_Val;
                                  begin
@@ -994,17 +1007,41 @@ package body Cg_Expr.Composite is
                                           Emit_Exact_Bounds_Check (Ctx, SV_W.Firsts, SV_W.Lasts, Firsts, Lasts, ND_A);
                                        end;
                                     end if;
-                                    Emit_Inst (Ctx.E, "memmove " & To_String (DataP) & ", " & To_String (SV.Reg) & ", " & Byt & ", align " & Img (ETI.Align));
+                                    Emit_Copy_Composite (Ctx, To_String (DataP), SV, CT);
                                  end;
                               end if;
                            end;
                         else
                            declare
+                              Comp_Al : constant Natural :=
+                                Natural'Max (1, Natural'Min (Max_Align,
+                                  (if Ctx.Fields.Contains (CID_K) and then Ctx.Fields.Element (CID_K).Has_Explicit_Offset
+                                   then 1 else Natural'Max (1, CTI.Align))));
                               Need_Exact : constant Boolean :=
                                 CTI.Kind = TK_Constrained_Array
                                 and then KIND (C_Exp) not in DN_AGGREGATE | DN_STRING_LITERAL;
                            begin
-                              Emit_Init_Composite (Ctx, FP, CT, C_Exp, Exact_Bounds => Need_Exact);
+                              if CTI.Kind = TK_Constrained_Array and then KIND (C_Exp) = DN_AGGREGATE
+                                and then Is_Named_No_Others_Agg (C_Exp, Natural'Max (1, Natural'Min (CTI.NDims, Max_Array_Dims)))
+                              then
+                                 -- LRM 4.3.1(3) + 4.3.2(8): evaluate all dim choices via Pass-1 and check exact bounds!
+                                 declare
+                                    ND_S    : constant Natural := Natural'Max (1, Natural'Min (CTI.NDims, Max_Array_Dims));
+                                    SV      : constant Expr_Val := Emit_Expr (Ctx, C_Exp, Subst_Base_Type (Ctx, CT));
+                                    SV_W    : constant Array_View := Resolve_Array_View (Ctx, SV);
+                                    DF, DL  : Str_Array_4;
+                                 begin
+                                    if Ctx.Enable_Checks then
+                                       for D_I in 1 .. ND_S loop
+                                          Emit_Index_Bounds (Ctx, CTI.Dims (D_I).Idx_Type, DF (D_I), DL (D_I));
+                                       end loop;
+                                       Emit_Exact_Bounds_Check (Ctx, SV_W.Firsts, SV_W.Lasts, DF, DL, ND_S);
+                                    end if;
+                                    Emit_Copy_Composite (Ctx, FP, SV, CT, Max_Align => Comp_Al);
+                                 end;
+                              else
+                                 Emit_Init_Composite (Ctx, FP, CT, C_Exp, Exact_Bounds => Need_Exact or else KIND (C_Exp) = DN_AGGREGATE, Max_Align => Comp_Al);
+                              end if;
                            end;
                            if CTI.Kind = TK_Record then
                               Emit_Discriminant_Check (Ctx, FP, CT, Is_Access => False);
@@ -1113,11 +1150,11 @@ package body Cg_Expr.Composite is
                               Emit_Init_Array_Dim (To_String (EP_S), Unw_V, Dim + 1);
                            elsif not Is_Void_Tree (Unw_V) and then KIND (Unw_V) = DN_STRING_LITERAL then
                               declare
-                                 SV  : constant Expr_Val := Emit_Expr (Ctx, Unw_V);
+                                 SV  : constant Expr_Val := Emit_Expr (Ctx, Unw_V, Dst_Type);
                                  ESz : constant Natural := Elem_Storage_Size (ETI);
                                  Byt : constant String := Next_Reg (Ctx.E, "sby");
                               begin
-                                 -- P3-3.8: Check multi-D string sub-aggregate length against dim+1 length!
+                                 -- P3-3.8 / P5-R4: Check multi-D string sub-aggregate length & unconstrained lower bound!
                                  if Ctx.Enable_Checks then
                                     declare
                                        D2Lo, D2Hi, SF, SL : Unbounded_String;
@@ -1130,10 +1167,22 @@ package body Cg_Expr.Composite is
                                        SLen  := To_Unbounded_String (Emit_Dim_Len_I64 (Ctx, To_String (SF), To_String (SL)));
                                        Emit_Inst (Ctx.E, Mis & " = cmp_ne.i64 " & To_String (SLen) & ", " & To_String (D2Len));
                                        Emit_Check_Fail_If (Ctx, Mis);
+                                       if DTI.Kind = TK_Unconstrained_Array and then Dim + 1 <= DTI.NDims
+                                         and then not Is_Void_Tree (DTI.Dims (Dim + 1).Idx_Type)
+                                       then
+                                          declare
+                                             BF, BL : Unbounded_String;
+                                             BMis   : constant String := Next_Reg (Ctx.E, "slo");
+                                          begin
+                                             Emit_Index_Bounds (Ctx, DTI.Dims (Dim + 1).Idx_Type, BF, BL);
+                                             Emit_Inst (Ctx.E, BMis & " = cmp_ne.i64 " & To_String (D2Lo) & ", " & To_String (BF));
+                                             Emit_Check_Fail_If (Ctx, BMis);
+                                          end;
+                                       end if;
                                     end;
                                  end if;
                                  Emit_Inst (Ctx.E, Byt & " = mul.i64 " & Stride & ", " & Img (ESz));
-                                 Emit_Inst (Ctx.E, "memcpy " & To_String (EP_S) & ", " & To_String (SV.Reg) & ", " & Byt & ", align " & Img (ETI.Align));
+                                 Emit_Inst (Ctx.E, "memcpy " & To_String (EP_S) & ", " & To_String (SV.Reg) & ", " & Byt & ", align " & Img (Natural'Max (1, Natural'Min (Natural'Max (1, ETI.Align), Max_Align))));
                               end;
                            end if;
                         end;
@@ -1146,13 +1195,13 @@ package body Cg_Expr.Composite is
                               declare
                                  V  : constant Expr_Val := Emit_Expr (Ctx, Val_Node, DTI.Elem_Type);
                                  VR : constant String :=
-                                   Emit_Scalar_Coerce (Ctx, To_String (V.Reg), To_String (V.Pir_Type), To_String (ETI.Pir_Type));
+                                   Emit_Typed_Scalar_Convert (Ctx, To_String (V.Reg), V.Ada_Type, To_String (V.Pir_Type),
+                                     DTI.Elem_Type, To_String (ETI.Pir_Type), Check_Range => True);
                               begin
-                                 Emit_Range_Check (Ctx, VR, To_String (ETI.Pir_Type), DTI.Elem_Type);
                                  Emit_Discriminant_Check (Ctx, VR, DTI.Elem_Type, Is_Access => True);
                                  Emit_Inst (Ctx.E,
                                    "store." & To_String (ETI.Pir_Type) & " " & VR &
-                                   ", " & EP2 & ", align " & Img (ETI.Align));
+                                   ", " & EP2 & ", align " & Img (Natural'Max (1, Natural'Min (Natural'Max (1, ETI.Align), Max_Align))));
                               end;
                            elsif ETI.Kind = TK_Constrained_Array and then ETI.Is_Dynamic then
                               -- Array-of-dynamic-array element: allocate buffer, store @__ada_arr_desc at EP2, init/copy!
@@ -1171,32 +1220,36 @@ package body Cg_Expr.Composite is
                               begin
                                  for D_I in 1 .. IND_A loop
                                     Emit_Index_Bounds (Ctx, ETI.Dims (D_I).Idx_Type, IFirsts (D_I), ILasts (D_I));
-                                    declare
-                                       DL : constant String := Emit_Dim_Len_I64 (Ctx, To_String (IFirsts (D_I)), To_String (ILasts (D_I)));
-                                    begin
-                                       if D_I = 1 then ITot64 := To_Unbounded_String (DL);
-                                       else
-                                          declare
-                                             M : constant String := Next_Reg (Ctx.E, "aam");
-                                          begin
-                                             Emit_Inst (Ctx.E, M & " = mul.i64 " & To_String (ITot64) & ", " & DL);
-                                             ITot64 := To_Unbounded_String (M);
-                                          end;
-                                       end if;
-                                    end;
                                  end loop;
-                                 Emit_Inst (Ctx.E, IByt & " = mul.i64 " & To_String (ITot64) & ", " & Img (IESz));
+                                 declare
+                                    IByt_U : Unbounded_String;
+                                 begin
+                                    Emit_Array_Byte_Size_I64 (Ctx, IFirsts, ILasts, IND_A, IESz, ITot64, IByt_U);
+                                    Emit_Inst (Ctx.E, IByt & " = add.i64 " & To_String (IByt_U) & ", 0");
+                                 end;
                                  Emit_Inst (Ctx.E, INz & " = cmp_gt_s.i64 " & IByt & ", 0");
                                  Emit_Inst (Ctx.E, IAlB & " = select.i64 " & INz & ", " & IByt & ", " & Img (IEAl));
                                  Emit_Call_Or_Invoke (Ctx, "@__ada_alloc", IAlB, "ptr", IDataP);
-                                 Emit_Store_Arr_Desc (Ctx, EP2, To_String (IDataP), IFirsts, ILasts, IND_A);
+                                 Emit_Store_Arr_Desc (Ctx, EP2, To_String (IDataP), IFirsts, ILasts, IND_A, Align => Natural'Min (8, Max_Align));
                                  if not Is_Void_Tree (Val_Node) and then KIND (Val_Node) = DN_AGGREGATE then
-                                    Emit_Init_Composite (Ctx, To_String (IDataP), DTI.Elem_Type, Val_Node, IFirsts, ILasts);
+                                    if Is_Named_No_Others_Agg (Val_Node, IND_A) then
+                                       declare
+                                          SV   : constant Expr_Val := Emit_Expr (Ctx, Val_Node, Subst_Base_Type (Ctx, DTI.Elem_Type));
+                                          SV_W : constant Array_View := Resolve_Array_View (Ctx, SV);
+                                       begin
+                                          if Ctx.Enable_Checks then
+                                             Emit_Exact_Bounds_Check (Ctx, SV_W.Firsts, SV_W.Lasts, IFirsts, ILasts, IND_A);
+                                          end if;
+                                          Emit_Copy_Composite (Ctx, To_String (IDataP), SV, DTI.Elem_Type);
+                                       end;
+                                    else
+                                       Emit_Init_Composite (Ctx, To_String (IDataP), DTI.Elem_Type, Val_Node, IFirsts, ILasts, Exact_Bounds => True);
+                                    end if;
                                  else
                                     declare
                                        Is_Par : constant Boolean := not Is_Void_Tree (Val_Node) and then KIND (Val_Node) = DN_PARENTHESIZED;
                                        Eval_T : constant TREE :=
-                                         (if Is_Par then Resolve_Type_Spec (Base_Type_Spec (Subst_Tree (Ctx, DTI.Elem_Type)))
+                                         (if Is_Par then Subst_Base_Type (Ctx, DTI.Elem_Type)
                                           else DTI.Elem_Type);
                                        SV  : constant Expr_Val := Emit_Expr (Ctx, Val_Node, Eval_T);
                                        Tgt : Expr_Val;
@@ -1212,51 +1265,23 @@ package body Cg_Expr.Composite is
                                              Emit_Exact_Bounds_Check (Ctx, SV_W.Firsts, SV_W.Lasts, IFirsts, ILasts, IND_A);
                                           end;
                                        end if;
-                                       Emit_Inst (Ctx.E, "memmove " & To_String (IDataP) & ", " & To_String (SV.Reg) & ", " & IByt & ", align " & Img (IEAl));
+                                       Emit_Copy_Composite (Ctx, To_String (IDataP), SV, DTI.Elem_Type);
                                     end;
                                  end if;
                               end;
                            else
                               declare
-                                 function Comp_Agg_All_Named (AN : TREE; Rem_D : Natural) return Boolean is
-                                 begin
-                                    if Rem_D = 0 then return True; end if;
-                                    if Is_Void_Tree (AN) or else KIND (AN) /= DN_AGGREGATE then return False; end if;
-                                    declare
-                                       AL : SEQ_TYPE := LIST (D (AS_GENERAL_ASSOC_S, AN));
-                                       IT : TREE;
-                                       Has_Any : Boolean := False;
-                                    begin
-                                       while not IS_EMPTY (AL) loop
-                                          POP (AL, IT);
-                                          Has_Any := True;
-                                          if KIND (IT) not in DN_ASSOC | DN_NAMED then return False; end if;
-                                          declare
-                                             CS : SEQ_TYPE := LIST (D (AS_CHOICE_S, IT));
-                                             Ch : TREE;
-                                          begin
-                                             while not IS_EMPTY (CS) loop
-                                                POP (CS, Ch);
-                                                if KIND (Ch) = DN_CHOICE_OTHERS then return False; end if;
-                                             end loop;
-                                          end;
-                                          if Rem_D > 1 and then not Comp_Agg_All_Named (D (AS_EXP, IT), Rem_D - 1) then
-                                             return False;
-                                          end if;
-                                       end loop;
-                                       return Has_Any;
-                                    end;
-                                 end Comp_Agg_All_Named;
+                                 El_Al      : constant Natural := Natural'Max (1, Natural'Min (Max_Align, Natural'Max (1, ETI.Align)));
                                  Need_Exact : constant Boolean :=
                                    ETI.Kind = TK_Constrained_Array
                                    and then not Is_Void_Tree (Val_Node)
                                    and then KIND (Val_Node) not in DN_AGGREGATE | DN_STRING_LITERAL;
                               begin
-                                 if ETI.Kind = TK_Constrained_Array and then ETI.NDims > 1
+                                 if ETI.Kind = TK_Constrained_Array
                                    and then not Is_Void_Tree (Val_Node) and then KIND (Val_Node) = DN_AGGREGATE
-                                   and then Comp_Agg_All_Named (Val_Node, ETI.NDims)
+                                   and then Is_Named_No_Others_Agg (Val_Node, Natural'Max (1, Natural'Min (ETI.NDims, Max_Array_Dims)))
                                  then
-                                    -- LRM 4.3.2(8) (c43208b): evaluate multi-D component aggregate's choices ONCE via Pass-1!
+                                    -- LRM 4.3.2(8) (c43208b): evaluate named component aggregate's choices ONCE via Pass-1!
                                     declare
                                        Base_ET : constant TREE := Subst_Base_Type (Ctx, DTI.Elem_Type);
                                        SV      : constant Expr_Val := Emit_Expr (Ctx, Val_Node, Base_ET);
@@ -1273,10 +1298,12 @@ package body Cg_Expr.Composite is
                                              Emit_Exact_Bounds_Check (Ctx, SV_W.Firsts, SV_W.Lasts, DF, DL, ND_E);
                                           end;
                                        end if;
-                                       Emit_Copy_Composite (Ctx, EP2, SV, DTI.Elem_Type);
+                                       Emit_Copy_Composite (Ctx, EP2, SV, DTI.Elem_Type, Max_Align => El_Al);
                                     end;
                                  else
-                                    Emit_Init_Composite (Ctx, EP2, DTI.Elem_Type, Val_Node, Exact_Bounds => Need_Exact);
+                                    Emit_Init_Composite (Ctx, EP2, DTI.Elem_Type, Val_Node,
+                                      Exact_Bounds => Need_Exact or else (not Is_Void_Tree (Val_Node) and then KIND (Val_Node) = DN_AGGREGATE),
+                                      Max_Align    => El_Al);
                                     if ETI.Kind = TK_Record then
                                        Emit_Discriminant_Check (Ctx, EP2, DTI.Elem_Type, Is_Access => False);
                                     end if;
@@ -1295,8 +1322,8 @@ package body Cg_Expr.Composite is
                      type Static_Span is record
                         Lo, Hi : Integer_64 := 0;
                      end record;
-                     Spans      : array (1 .. 64) of Static_Span;
-                     Num_Spans  : Natural := 0;
+                     package Span_Vecs is new Ada.Containers.Vectors (Positive, Static_Span);
+                     Spans      : Span_Vecs.Vector;
                      Pos_Cnt    : Integer_64 := 0;
                      Has_Dyn_Ch : Boolean := False;
                      Scan       : SEQ_TYPE := Assocs;
@@ -1318,9 +1345,8 @@ package body Cg_Expr.Composite is
                                     declare
                                        SV : constant TREE := Safe_SM_Value (D (AS_EXP, Ch));
                                     begin
-                                       if Has_Static_Val (SV) and then Num_Spans < 64 then
-                                          Num_Spans := Num_Spans + 1;
-                                          Spans (Num_Spans) := (Lo => Eval_Int64 (SV), Hi => Eval_Int64 (SV));
+                                       if Has_Static_Val (SV) then
+                                          Spans.Append ((Lo => Eval_Int64 (SV), Hi => Eval_Int64 (SV)));
                                        else
                                           Has_Dyn_Ch := True;
                                        end if;
@@ -1332,14 +1358,10 @@ package body Cg_Expr.Composite is
                                        if not Is_Void_Tree (DR) and then KIND (DR) = DN_RANGE
                                          and then Has_Static_Val (Safe_SM_Value (D (AS_EXP1, DR)))
                                          and then Has_Static_Val (Safe_SM_Value (D (AS_EXP2, DR)))
-                                         and then Num_Spans < 64
                                        then
-                                          Num_Spans := Num_Spans + 1;
-                                          Spans (Num_Spans) := (Lo => Eval_Int64 (Safe_SM_Value (D (AS_EXP1, DR))),
-                                                                Hi => Eval_Int64 (Safe_SM_Value (D (AS_EXP2, DR))));
-                                       elsif not Is_Void_Tree (DR) and then KIND (DR) = DN_DISCRETE_SUBTYPE
-                                         and then Num_Spans < 64
-                                       then
+                                          Spans.Append ((Lo => Eval_Int64 (Safe_SM_Value (D (AS_EXP1, DR))),
+                                                         Hi => Eval_Int64 (Safe_SM_Value (D (AS_EXP2, DR)))));
+                                       elsif not Is_Void_Tree (DR) and then KIND (DR) = DN_DISCRETE_SUBTYPE then
                                           declare
                                              Sub_N : constant TREE := D (AS_SUBTYPE_INDICATION, DR);
                                              Con_N : constant TREE := (if not Is_Void_Tree (Sub_N) then D (AS_CONSTRAINT, Sub_N) else CONST_VOID);
@@ -1358,8 +1380,7 @@ package body Cg_Expr.Composite is
                                                 Get_Discrete_Bounds (Subst_Tree (Ctx, D (SM_TYPE_SPEC, TM)), Got_S, SLo, SHi);
                                              end if;
                                              if Got_S then
-                                                Num_Spans := Num_Spans + 1;
-                                                Spans (Num_Spans) := (Lo => SLo, Hi => SHi);
+                                                Spans.Append ((Lo => SLo, Hi => SHi));
                                              else
                                                 Has_Dyn_Ch := True;
                                              end if;
@@ -1397,7 +1418,7 @@ package body Cg_Expr.Composite is
                            Cond   : constant String := Next_Reg (Ctx.E, "ac");
                            Next_I : constant String := Next_Reg (Ctx.E, "ain");
                            Start64 : constant String :=
-                             (if Pos_Cnt > 0 and then Num_Spans = 0 and then not Has_Dyn_Ch
+                             (if Pos_Cnt > 0 and then Spans.Is_Empty and then not Has_Dyn_Ch
                               then Img (Long_Long_Integer (Pos_Cnt)) else "0");
                         begin
                            Emit_Term (Ctx.E, "jmp " & L_Hdr & "(" & Start64 & ")");
@@ -1405,7 +1426,7 @@ package body Cg_Expr.Composite is
                            Emit_Inst (Ctx.E, Cond & " = cmp_lt_s.i64 " & I_Reg & ", " & Tot64);
                            Emit_Term (Ctx.E, "br " & Cond & ", " & L_Body & ", " & L_Done);
                            Emit_Label (Ctx.E, L_Body);
-                           if Num_Spans > 0 and then not Has_Dyn_Ch then
+                           if not Spans.Is_Empty and then not Has_Dyn_Ch then
                               -- Compute actual Ada index Idx64 = Lo_Reg + I_Reg and skip if covered by any static span
                               declare
                                  Idx64 : constant String := Next_Reg (Ctx.E, "oidx");
@@ -1413,16 +1434,17 @@ package body Cg_Expr.Composite is
                                  L_Do  : constant String := Next_Label (Ctx.E, "agg_do");
                               begin
                                  Emit_Inst (Ctx.E, Idx64 & " = add.i64 " & To_String (Lo_Reg) & ", " & I_Reg);
-                                 for S_I in 1 .. Num_Spans loop
+                                 for S_I in Spans.First_Index .. Spans.Last_Index loop
                                     declare
-                                       C1 : constant String := Next_Reg (Ctx.E, "oc1");
-                                       C2 : constant String := Next_Reg (Ctx.E, "oc2");
+                                       C1  : constant String := Next_Reg (Ctx.E, "oc1");
+                                       C2  : constant String := Next_Reg (Ctx.E, "oc2");
                                        InS : constant String := Next_Reg (Ctx.E, "oin");
+                                       Sp  : constant Static_Span := Spans.Element (S_I);
                                     begin
-                                       Emit_Inst (Ctx.E, C1 & " = cmp_ge_s.i64 " & Idx64 & ", " & Img (Long_Long_Integer (Spans (S_I).Lo)));
-                                       Emit_Inst (Ctx.E, C2 & " = cmp_le_s.i64 " & Idx64 & ", " & Img (Long_Long_Integer (Spans (S_I).Hi)));
+                                       Emit_Inst (Ctx.E, C1 & " = cmp_ge_s.i64 " & Idx64 & ", " & Img (Long_Long_Integer (Sp.Lo)));
+                                       Emit_Inst (Ctx.E, C2 & " = cmp_le_s.i64 " & Idx64 & ", " & Img (Long_Long_Integer (Sp.Hi)));
                                        Emit_Inst (Ctx.E, InS & " = and.i8 " & C1 & ", " & C2);
-                                       if S_I = 1 then
+                                       if S_I = Spans.First_Index then
                                           Cov := To_Unbounded_String (InS);
                                        else
                                           declare
@@ -1448,7 +1470,7 @@ package body Cg_Expr.Composite is
                      end if;
                      -- Check positional element count against dimension length when no OTHERS (c48009e, c48009f)
                      if Ctx.Enable_Checks and then Is_Void_Tree (Others_Exp)
-                       and then Pos_Cnt > 0 and then Num_Spans = 0 and then not Has_Dyn_Ch
+                       and then Pos_Cnt > 0 and then Spans.Is_Empty and then not Has_Dyn_Ch
                      then
                         declare
                            DLen : constant String := Emit_Dim_Len_I64 (Ctx, To_String (Lo_Reg), To_String (Hi_Reg));
@@ -1713,7 +1735,7 @@ package body Cg_Expr.Composite is
                end if;
             end;
          end if;
-         Emit_Copy_Composite (Ctx, Dst_Ptr, Src, Dst_Type);
+         Emit_Copy_Composite (Ctx, Dst_Ptr, Src, Dst_Type, Max_Align => Max_Align);
       end;
    end Emit_Init_Composite;
 
@@ -1753,7 +1775,7 @@ package body Cg_Expr.Composite is
             end;
          end if;
          declare
-            Next_E : constant TREE := Subst_Resolve_Type (Ctx, D (SM_DERIVED, Cur));
+            Next_E : constant TREE := Base_Of_Type (Ctx, D (SM_DERIVED, Cur));
          begin
             exit when Is_Void_Tree (Next_E) or else Next_E = Cur;
             Cur := Next_E;
@@ -2042,32 +2064,39 @@ package body Cg_Expr.Composite is
       Masked      : Unbounded_String;
       Is_Sig      : Boolean := False;
    begin
-      if Is_Integer_Type (Comp_Type) then
-         declare
-            St     : Boolean := False;
-            Lo, Hi : Integer_64 := 0;
-         begin
-            Get_Discrete_Bounds (Comp_Type, St, Lo, Hi);
-            Is_Sig := (not St) or else Lo < 0;
-         end;
-      elsif Is_Fixed_Type (Comp_Type) then
-         -- P3-6.1: Sign-extend fixed-point bitfields ONLY when the subtype's lower bound is negative!
-         declare
-            RT_F : constant TREE := Resolve_Type_Spec (Subst_Tree (Ctx, Comp_Type));
-            Rng  : constant TREE := (if not Is_Void_Tree (RT_F) and then KIND (RT_F) = DN_FIXED then D (SM_RANGE, RT_F) else CONST_VOID);
-         begin
-            if not Is_Void_Tree (Rng) and then KIND (Rng) = DN_RANGE
-              and then Has_Static_Val (Safe_SM_Value (D (AS_EXP1, Rng)))
-            then
-               Is_Sig := Eval_Float64 (Safe_SM_Value (D (AS_EXP1, Rng))) < 0.0;
-            else
-               Is_Sig := True;
-            end if;
-         end;
-      elsif Has_ERep then
-         -- P3-6.2: Sign-extend enum bitfield if its SM_REP codes include negative values!
-         Is_Sig := Enum_Rep_Has_Negative (BT_Comp);
-      end if;
+      declare
+         RT_C : constant TREE := Subst_Resolve_Type (Ctx, Comp_Type);
+      begin
+         if Is_Integer_Type (RT_C) then
+            declare
+               Rng : constant TREE := (if not Is_Void_Tree (RT_C) and then KIND (RT_C) = DN_INTEGER then D (SM_RANGE, RT_C) else CONST_VOID);
+            begin
+               if not Is_Void_Tree (Rng) and then KIND (Rng) = DN_RANGE
+                 and then Has_Static_Val (Safe_SM_Value (D (AS_EXP1, Rng)))
+               then
+                  Is_Sig := Eval_Int64 (Safe_SM_Value (D (AS_EXP1, Rng))) < 0;
+               else
+                  Is_Sig := not Is_Unsigned_Scalar (RT_C, Pir_Scalar_Type (RT_C));
+               end if;
+            end;
+         elsif Is_Fixed_Type (RT_C) then
+            -- P3-6.1: Sign-extend fixed-point bitfields ONLY when the subtype's lower bound is negative!
+            declare
+               Rng : constant TREE := (if not Is_Void_Tree (RT_C) and then KIND (RT_C) = DN_FIXED then D (SM_RANGE, RT_C) else CONST_VOID);
+            begin
+               if not Is_Void_Tree (Rng) and then KIND (Rng) = DN_RANGE
+                 and then Has_Static_Val (Safe_SM_Value (D (AS_EXP1, Rng)))
+               then
+                  Is_Sig := Eval_Float64 (Safe_SM_Value (D (AS_EXP1, Rng))) < 0.0;
+               else
+                  Is_Sig := True;
+               end if;
+            end;
+         elsif Has_ERep then
+            -- P3-6.2: Sign-extend enum bitfield if its SM_REP codes include negative values!
+            Is_Sig := Enum_Rep_Has_Negative (BT_Comp);
+         end if;
+      end;
       for K in 0 .. Low_Bytes - 1 loop
          declare
             Off_R : constant String := Next_Reg (Ctx.E, "bfo");
@@ -2368,7 +2397,7 @@ package body Cg_Expr.Composite is
       Prefix    : String := "fv") return String
    is
    begin
-      if Is_Bitfield (FE) then
+      if Uses_Bitfield_Access (Ctx, FE, Comp_Type) then
          return Emit_Bitfield_Load (Ctx, Rec_Ptr, FE, Comp_Type);
       end if;
       declare
@@ -2391,7 +2420,7 @@ package body Cg_Expr.Composite is
       Comp_TI   : Type_Info)
    is
    begin
-      if Is_Bitfield (FE) then
+      if Uses_Bitfield_Access (Ctx, FE, Comp_Type) then
          Emit_Bitfield_Store (Ctx, Rec_Ptr, FE, Val_Reg, To_String (Comp_TI.Pir_Type), Comp_Type);
       else
          declare
@@ -2490,7 +2519,8 @@ package body Cg_Expr.Composite is
       Dst_T      : TREE;
       Src_Ptr    : String;
       Src_T      : TREE;
-      Discs_Only : Boolean := False)
+      Discs_Only : Boolean := False;
+      Max_Align  : Natural := 8)
    is
       Src_BR : constant TREE := Subst_Base_Type (Ctx, Src_T);
       Dst_BR : constant TREE := Subst_Base_Type (Ctx, Dst_T);
@@ -2556,7 +2586,7 @@ package body Cg_Expr.Composite is
          return Search_CL (D (SM_COMP_LIST, BR));
       end Find_Comp;
 
-      procedure Copy_Comp (Dst_CID : TREE) is
+      procedure Copy_Comp (Dst_CID : TREE; Is_Disc : Boolean := False) is
          Can_D   : constant TREE := Canonical_Def (Dst_CID);
          Src_CID : constant TREE := Find_Comp (Src_BR, Sym_Name (Can_D));
          DK      : constant Unsigned_32 := Tree_Key (Can_D);
@@ -2572,8 +2602,14 @@ package body Cg_Expr.Composite is
             SCTI : constant Type_Info := Get_Type_Info (Ctx, SCT);
             DCT  : constant TREE := Subst_Tree (Ctx, D (SM_OBJ_TYPE, Can_D));
             DCTI : constant Type_Info := Get_Type_Info (Ctx, DCT);
+            Comp_Al : constant Natural := Natural'Max (1, Natural'Min (Max_Align, (if DFE.Has_Explicit_Offset then 1 else Natural'Max (1, DCTI.Align))));
+            Desc_Al : constant Natural := Natural'Max (1, Natural'Min (Max_Align, (if DFE.Has_Explicit_Offset then 1 else 8)));
+            Src_DAl : constant Natural := (if SFE.Has_Explicit_Offset then 1 else 8);
          begin
             if DCTI.Kind = TK_Scalar and then SCTI.Kind = TK_Scalar then
+               if Discs_Only and then not Is_Disc then
+                  return;
+               end if;
                declare
                   VR : Unbounded_String :=
                     To_Unbounded_String (Emit_Load_Field_Scalar (Ctx, Src_Ptr, To_String (STI_R.Pir_Type), SFE, SCT, SCTI, "rcsv"));
@@ -2590,18 +2626,15 @@ package body Cg_Expr.Composite is
                   DP : constant String := Emit_Field_Addr (Ctx, Dst_Ptr, To_String (DTI_R.Pir_Type), DFE, "rcdp");
                begin
                   if SCTI.Kind = TK_Record and then DCTI.Kind = TK_Record
-                    and then Subst_Base_Type (Ctx, SCT) /= Subst_Base_Type (Ctx, DCT)
-                    and then (not Is_Void_Tree (D (SM_REPRESENTATION, Subst_Base_Type (Ctx, SCT)))
-                              or else not Is_Void_Tree (D (SM_REPRESENTATION, Subst_Base_Type (Ctx, DCT)))
-                              or else SCTI.Byte_Size /= DCTI.Byte_Size)
+                    and then (Discs_Only or else Needs_Record_Rep_Conv (Ctx, SCT, DCT))
                   then
-                     Emit_Record_Rep_Copy_Into (Ctx, DP, DCT, SP, SCT);
+                     Emit_Record_Rep_Copy_Into (Ctx, DP, DCT, SP, SCT, Discs_Only => Discs_Only, Max_Align => Comp_Al);
                   elsif DCTI.Kind = TK_Constrained_Array and then DCTI.Is_Dynamic then
-                     -- Deep-copy dynamic constrained array descriptor
+                     -- Deep-copy dynamic constrained array descriptor (or allocate fresh buffer on Discs_Only OUT entry!)
                      declare
                         SV : Expr_Val;
                      begin
-                        Emit_Unpack_Arr_Desc (Ctx, SP, SCT, SV);
+                        Emit_Unpack_Arr_Desc (Ctx, SP, SCT, SV, Align => Src_DAl);
                         declare
                            ETI_D : constant Type_Info := Get_Type_Info (Ctx, DCTI.Elem_Type);
                            EAl_D : constant Natural := Elem_Storage_Align (ETI_D);
@@ -2611,25 +2644,24 @@ package body Cg_Expr.Composite is
                            Nz_D  : constant String := Next_Reg (Ctx.E, "rcnz");
                            Al_D  : constant String := Next_Reg (Ctx.E, "rcal");
                            NP_D  : Unbounded_String;
-                           P0_D  : constant String := Next_Reg (Ctx.E, "rcp0");
                         begin
-                           Emit_Inst (Ctx.E, "memcpy " & DP & ", " & SP & ", " & Img (Arr_Desc_Size) & ", align 1");
                            Emit_Array_Byte_Size_I64 (Ctx, SV.First_Regs, SV.Last_Regs, ND_D, ESz_D, T_D, B_D);
                            Emit_Inst (Ctx.E, Nz_D & " = cmp_gt_s.i64 " & To_String (B_D) & ", 0");
                            Emit_Inst (Ctx.E, Al_D & " = select.i64 " & Nz_D & ", " & To_String (B_D) & ", " & Img (EAl_D));
                            Emit_Call_Or_Invoke (Ctx, "@__ada_alloc", Al_D, "ptr", NP_D);
-                           Emit_Copy_Composite (Ctx, To_String (NP_D), SV, DCT);
-                           Emit_Inst (Ctx.E, P0_D & " = field_ptr @__ada_arr_desc, " & DP & ", 0");
-                           Emit_Inst (Ctx.E, "store.ptr " & To_String (NP_D) & ", " & P0_D & ", align 8");
+                           if not Discs_Only then
+                              Emit_Copy_Composite (Ctx, To_String (NP_D), SV, DCT);
+                           end if;
+                           Emit_Store_Arr_Desc (Ctx, DP, To_String (NP_D), SV.First_Regs, SV.Last_Regs, ND_D, Align => Desc_Al);
                         end;
                      end;
-                  else
+                  elsif not Discs_Only then
                      declare
                         SV : Expr_Val;
                      begin
                         SV.Kind := EK_Addr; SV.Reg := To_Unbounded_String (SP);
                         SV.Pir_Type := SCTI.Pir_Type; SV.Ada_Type := SCT; SV.Align := 1;
-                        Emit_Copy_Composite (Ctx, DP, SV, DCT);
+                        Emit_Copy_Composite (Ctx, DP, SV, DCT, Max_Align => Comp_Al);
                      end;
                   end if;
                end;
@@ -2637,7 +2669,7 @@ package body Cg_Expr.Composite is
          end;
       end Copy_Comp;
 
-      procedure Copy_DS (DS : TREE) is
+      procedure Copy_DS (DS : TREE; Is_Disc : Boolean := False) is
          DL : SEQ_TYPE;
          DD : TREE;
       begin
@@ -2652,7 +2684,7 @@ package body Cg_Expr.Composite is
                begin
                   while not IS_EMPTY (NS) loop
                      POP (NS, ID);
-                     Copy_Comp (ID);
+                     Copy_Comp (ID, Is_Disc => Is_Disc);
                   end loop;
                end;
             end if;
@@ -2723,23 +2755,23 @@ package body Cg_Expr.Composite is
          return;
       end if;
       if DTI_R.Byte_Size > 0 then
-         Emit_Inst (Ctx.E, "memset " & Dst_Ptr & ", 0, " & Img (DTI_R.Byte_Size) & ", align " & Img (Natural'Max (1, DTI_R.Align)));
+         Emit_Inst (Ctx.E, "memset " & Dst_Ptr & ", 0, " & Img (DTI_R.Byte_Size) & ", align " & Img (Natural'Max (1, Natural'Min (Natural'Max (1, DTI_R.Align), Max_Align))));
       end if;
-      Copy_DS (D (SM_DISCRIMINANT_S, Dst_BR));
-      if not Discs_Only then
-         Copy_CL (D (SM_COMP_LIST, Dst_BR));
-      end if;
+      Copy_DS (D (SM_DISCRIMINANT_S, Dst_BR), Is_Disc => True);
+      Copy_CL (D (SM_COMP_LIST, Dst_BR));
    end Emit_Record_Rep_Copy_Into;
 
    procedure Emit_Default_Init
      (Ctx            : in out Context;
       Dst_Ptr        : String;
       Dst_Type       : TREE;
-      Activate_Tasks : Boolean := False)
+      Activate_Tasks : Boolean := False;
+      Max_Align      : Natural := 8)
    is
       RT  : constant TREE := Subst_Resolve_Type (Ctx, Dst_Type);
       BT  : constant TREE := Subst_Base_Type (Ctx, RT);
       DTI : constant Type_Info := Get_Type_Info (Ctx, RT);
+      Ptr_Al : constant Natural := Natural'Max (1, Natural'Min (8, Max_Align));
    begin
       if Is_Void_Tree (RT) then
          return;
@@ -2748,16 +2780,16 @@ package body Cg_Expr.Composite is
          declare
             TH : constant String := Emit_Create_Task_Handle (Ctx, RT, Activate_Now => Activate_Tasks);
          begin
-            Emit_Inst (Ctx.E, "store.ptr " & TH & ", " & Dst_Ptr & ", align 8");
+            Emit_Inst (Ctx.E, "store.ptr " & TH & ", " & Dst_Ptr & ", align " & Img (Ptr_Al));
          end;
          return;
       elsif Is_Access_Type (RT) then
-         Emit_Inst (Ctx.E, "store.ptr 0, " & Dst_Ptr & ", align 8");
+         Emit_Inst (Ctx.E, "store.ptr 0, " & Dst_Ptr & ", align " & Img (Ptr_Al));
          return;
       elsif DTI.Kind = TK_Record and then not Is_Void_Tree (BT) and then KIND (BT) = DN_RECORD then
          -- Zero record storage so unused variant-union padding bytes are deterministic (e.g. c37215f)
          if DTI.Byte_Size > 0 then
-            Emit_Inst (Ctx.E, "memset " & Dst_Ptr & ", 0, " & Img (DTI.Byte_Size) & ", align " & Img (Natural'Max (1, DTI.Align)));
+            Emit_Inst (Ctx.E, "memset " & Dst_Ptr & ", 0, " & Img (DTI.Byte_Size) & ", align " & Img (Natural'Max (1, Natural'Min (Natural'Max (1, DTI.Align), Max_Align))));
          end if;
          -- 1. Discriminants (constrained values take precedence over default values)
          declare
@@ -2800,7 +2832,7 @@ package body Cg_Expr.Composite is
                                  declare
                                     Has_DFE : constant Boolean := Ctx.Fields.Contains (DK);
                                     DFE     : constant Field_Entry := (if Has_DFE then Ctx.Fields.Element (DK) else (others => <>));
-                                    Is_BF_D : constant Boolean := Has_DFE and then Is_Bitfield (DFE);
+                                    Is_BF_D : constant Boolean := Has_DFE and then Uses_Bitfield_Access (Ctx, DFE, CT);
                                  begin
                                     if not Is_BF_D then
                                        if Has_DFE and then (DFE.In_Union or else DFE.Has_Explicit_Offset) then
@@ -2851,7 +2883,7 @@ package body Cg_Expr.Composite is
                                           else
                                              Emit_Inst (Ctx.E,
                                                "store." & To_String (CTI.Pir_Type) & " " & To_String (VR) &
-                                               ", " & FP & ", align " & Img (if Has_DFE then Explicit_Field_Align (DFE, CTI.Align) else CTI.Align));
+                                               ", " & FP & ", align " & Img (Natural'Max (1, Natural'Min (Max_Align, (if Has_DFE then Explicit_Field_Align (DFE, CTI.Align) else CTI.Align)))));
                                           end if;
                                        end;
                                     end if;
@@ -2931,15 +2963,16 @@ package body Cg_Expr.Composite is
                                        Ctx.Saved_Type_Ranges.Include (SR_Key, Ctx.Saved_Type_Ranges.Element (CID_K));
                                     end if;
                                     if CTI.Kind = TK_Constrained_Array and then CTI.Is_Dynamic then
-                                       -- Allocate & initialize embedded @__ada_arr_desc with discriminants bound! (RC-8)
-                                       Emit_Inst (Ctx.E,
-                                         FP & " = field_ptr " & To_String (DTI.Pir_Type) & ", " &
-                                         Dst_Ptr & ", " & Img (FIdx));
+                                       -- CRITICAL P5-3 #1: Use Emit_Field_Addr (handles rep-claused 1-field byte-array records!)
                                        declare
+                                          Has_FE_DA : constant Boolean := Ctx.Fields.Contains (CID_K);
+                                          FE_DA     : constant Field_Entry := (if Has_FE_DA then Ctx.Fields.Element (CID_K) else (others => <>));
+                                          Desc_Al   : constant Natural :=
+                                            Natural'Max (1, Natural'Min (Max_Align, (if Has_FE_DA and then FE_DA.Has_Explicit_Offset then 1 else 8)));
                                           ETI   : constant Type_Info := Get_Type_Info (Ctx, CTI.Elem_Type);
                                           ESz   : constant Natural := Elem_Storage_Size (ETI);
                                           ND_A  : constant Natural := Natural'Max (1, Natural'Min (CTI.NDims, Max_Array_Dims));
-                                          BaseA : constant TREE := Resolve_Type_Spec (Base_Type_Spec (CT));
+                                          BaseA : constant TREE := Subst_Base_Type (Ctx, CT);
                                           BTI_A : constant Type_Info := Get_Type_Info (Ctx, BaseA);
                                           Firsts, Lasts : Str_Array_4;
                                           Tot64 : Unbounded_String;
@@ -2947,7 +2980,16 @@ package body Cg_Expr.Composite is
                                           Nz    : constant String := Next_Reg (Ctx.E, "danz");
                                           AlB   : constant String := Next_Reg (Ctx.E, "daal");
                                           DataP : Unbounded_String;
+                                          FP_DA : Unbounded_String;
                                        begin
+                                          if Has_FE_DA then
+                                             FP_DA := To_Unbounded_String (Emit_Field_Addr (Ctx, Dst_Ptr, To_String (DTI.Pir_Type), FE_DA, "dfp"));
+                                          else
+                                             Emit_Inst (Ctx.E,
+                                               FP & " = field_ptr " & To_String (DTI.Pir_Type) & ", " &
+                                               Dst_Ptr & ", " & Img (FIdx));
+                                             FP_DA := To_Unbounded_String (FP);
+                                          end if;
                                           for D_I in 1 .. ND_A loop
                                              Emit_Index_Bounds (Ctx, CTI.Dims (D_I).Idx_Type, Firsts (D_I), Lasts (D_I));
                                              -- Check non-null bounds belong to base array index subtype (c32114a, c32117a)
@@ -2964,7 +3006,7 @@ package body Cg_Expr.Composite is
                                           Emit_Inst (Ctx.E, Nz & " = cmp_gt_s.i64 " & Byt & ", 0");
                                           Emit_Inst (Ctx.E, AlB & " = select.i64 " & Nz & ", " & Byt & ", " & Img (Elem_Storage_Align (ETI)));
                                           Emit_Call_Or_Invoke (Ctx, "@__ada_alloc", AlB, "ptr", DataP);
-                                          Emit_Store_Arr_Desc (Ctx, FP, To_String (DataP), Firsts, Lasts, ND_A);
+                                          Emit_Store_Arr_Desc (Ctx, To_String (FP_DA), To_String (DataP), Firsts, Lasts, ND_A, Align => Desc_Al);
                                           if not Is_Void_Tree (IE) then
                                              if KIND (IE) = DN_AGGREGATE then
                                                 Emit_Init_Composite (Ctx, To_String (DataP), CT, IE, Firsts, Lasts);
@@ -2991,11 +3033,11 @@ package body Cg_Expr.Composite is
                                                          end;
                                                       end if;
                                                    end;
-                                                   Emit_Inst (Ctx.E, "memmove " & To_String (DataP) & ", " & To_String (SV.Reg) & ", " & Byt & ", align " & Img (ETI.Align));
+                                                   Emit_Copy_Composite (Ctx, To_String (DataP), SV, CT);
                                                 end;
                                              end if;
-                                          elsif Is_Access_Type (CTI.Elem_Type) or else Is_Record_Type (CTI.Elem_Type)
-                                            or else Is_Task_Type (CTI.Elem_Type) or else ETI.Kind = TK_Constrained_Array
+                                          elsif Is_Access_Type (Subst_Resolve_Type (Ctx, CTI.Elem_Type)) or else Is_Record_Type (Subst_Resolve_Type (Ctx, CTI.Elem_Type))
+                                            or else Is_Task_Type (Subst_Resolve_Type (Ctx, CTI.Elem_Type)) or else ETI.Kind = TK_Constrained_Array
                                           then
                                              declare
                                                 L_H : constant String := Next_Label (Ctx.E, "ddi_h");
@@ -3054,18 +3096,20 @@ package body Cg_Expr.Composite is
                                                 VR := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, To_String (V.Reg), VP, DP, Is_Unsigned => VU));
                                                 Emit_Range_Check (Ctx, To_String (VR), DP, CT);
                                                 Emit_Discriminant_Check (Ctx, To_String (VR), CT, Is_Access => True);
-                                                if Has_FE_D and then Is_Bitfield (FE_D) then
+                                                if Has_FE_D and then Uses_Bitfield_Access (Ctx, FE_D, CT) then
                                                    Emit_Bitfield_Store (Ctx, Dst_Ptr, FE_D, To_String (VR), DP, CT);
                                                 else
                                                    Emit_Inst (Ctx.E,
                                                      "store." & DP & " " & To_String (VR) &
-                                                     ", " & FP & ", align " & Img (if Has_FE_D then Explicit_Field_Align (FE_D, CTI.Align) else CTI.Align));
+                                                     ", " & FP & ", align " & Img (Natural'Max (1, Natural'Min (Max_Align, (if Has_FE_D then Explicit_Field_Align (FE_D, CTI.Align) else CTI.Align)))));
                                                 end if;
                                              end;
                                           else
                                              declare
                                                 IE_U : TREE := IE;
                                                 Need_Exact : Boolean := False;
+                                                Comp_Al    : constant Natural :=
+                                                  Natural'Max (1, Natural'Min (Max_Align, (if Has_FE_D and then FE_D.Has_Explicit_Offset then 1 else Natural'Max (1, CTI.Align))));
                                              begin
                                                 while not Is_Void_Tree (IE_U) and then KIND (IE_U) = DN_PARENTHESIZED loop
                                                    IE_U := D (AS_EXP, IE_U);
@@ -3075,7 +3119,7 @@ package body Cg_Expr.Composite is
                                                 then
                                                    Need_Exact := True;
                                                 end if;
-                                                Emit_Init_Composite (Ctx, FP, CT, IE, Exact_Bounds => Need_Exact);
+                                                Emit_Init_Composite (Ctx, FP, CT, IE, Exact_Bounds => Need_Exact, Max_Align => Comp_Al);
                                                 if CTI.Kind = TK_Record then
                                                    Emit_Discriminant_Check (Ctx, FP, CT, Is_Access => False);
                                                 end if;
@@ -3088,6 +3132,10 @@ package body Cg_Expr.Composite is
                                     then
                                        declare
                                           CK_D : constant Unsigned_32 := Tree_Key (Canonical_Def (CID));
+                                          Comp_Al : constant Natural :=
+                                            Natural'Max (1, Natural'Min (Max_Align,
+                                              (if Ctx.Fields.Contains (CK_D) and then Ctx.Fields.Element (CK_D).Has_Explicit_Offset
+                                               then 1 else Natural'Max (1, CTI.Align))));
                                        begin
                                           if Ctx.Fields.Contains (CK_D)
                                             and then (Ctx.Fields.Element (CK_D).In_Union or else Ctx.Fields.Element (CK_D).Has_Explicit_Offset)
@@ -3103,8 +3151,8 @@ package body Cg_Expr.Composite is
                                                FP & " = field_ptr " & To_String (DTI.Pir_Type) & ", " &
                                                Dst_Ptr & ", " & Img (FIdx));
                                           end if;
+                                          Emit_Default_Init (Ctx, FP, CT, Activate_Tasks => Activate_Tasks, Max_Align => Comp_Al);
                                        end;
-                                       Emit_Default_Init (Ctx, FP, CT, Activate_Tasks => Activate_Tasks);
                                     end if;
                                     if not Is_Void_Tree (RT_C) and then Ctx.Saved_Type_Discs.Contains (CID_K) then
                                        if Has_SD_Save then
@@ -3263,7 +3311,7 @@ package body Cg_Expr.Composite is
                                                                                  Emit_Index_Bounds (Ctx, VCTI.Dims (D_I).Idx_Type, Firsts (D_I), Lasts (D_I));
                                                                                  if Ctx.Enable_Checks then
                                                                                     declare
-                                                                                       BA  : constant TREE := Resolve_Type_Spec (Base_Type_Spec (VCT));
+                                                                                       BA  : constant TREE := Subst_Base_Type (Ctx, VCT);
                                                                                        BTI : constant Type_Info := (if not Is_Void_Tree (BA) and then KIND (BA) = DN_ARRAY then Get_Type_Info (Ctx, BA) else VCTI);
                                                                                     begin
                                                                                        if D_I <= BTI.NDims and then not Is_Void_Tree (BTI.Dims (D_I).Idx_Type) then
@@ -3276,11 +3324,23 @@ package body Cg_Expr.Composite is
                                                                               Emit_Inst (Ctx.E, Nz & " = cmp_gt_s.i64 " & To_String (Byt) & ", 0");
                                                                               Emit_Inst (Ctx.E, AlB & " = select.i64 " & Nz & ", " & To_String (Byt) & ", " & Img (EAl));
                                                                               Emit_Call_Or_Invoke (Ctx, "@__ada_alloc", AlB, "ptr", DataP);
-                                                                              Emit_Store_Arr_Desc (Ctx, FP, To_String (DataP), Firsts, Lasts, ND_A);
+                                                                              Emit_Store_Arr_Desc (Ctx, FP, To_String (DataP), Firsts, Lasts, ND_A,
+                                                                                Align => Natural'Max (1, Natural'Min (Max_Align, (if FE.Has_Explicit_Offset then 1 else 8))));
                                                                               if not Is_Void_Tree (VIE) then
-                                                                                 Emit_Init_Composite (Ctx, To_String (DataP), VCT, VIE, Firsts, Lasts);
-                                                                              elsif Is_Access_Type (VCTI.Elem_Type) or else Is_Record_Type (VCTI.Elem_Type)
-                                                                                or else Is_Task_Type (VCTI.Elem_Type) or else ETI.Kind = TK_Constrained_Array
+                                                                                 declare
+                                                                                    VIE_U : TREE := VIE;
+                                                                                    Need_Exact_V : Boolean := False;
+                                                                                 begin
+                                                                                    while not Is_Void_Tree (VIE_U) and then KIND (VIE_U) = DN_PARENTHESIZED loop
+                                                                                       VIE_U := D (AS_EXP, VIE_U);
+                                                                                    end loop;
+                                                                                    if Is_Void_Tree (VIE_U) or else KIND (VIE_U) not in DN_AGGREGATE | DN_STRING_LITERAL then
+                                                                                       Need_Exact_V := True;
+                                                                                    end if;
+                                                                                    Emit_Init_Composite (Ctx, To_String (DataP), VCT, VIE, Firsts, Lasts, Exact_Bounds => Need_Exact_V);
+                                                                                 end;
+                                                                              elsif Is_Access_Type (Subst_Resolve_Type (Ctx, VCTI.Elem_Type)) or else Is_Record_Type (Subst_Resolve_Type (Ctx, VCTI.Elem_Type))
+                                                                                or else Is_Task_Type (Subst_Resolve_Type (Ctx, VCTI.Elem_Type)) or else ETI.Kind = TK_Constrained_Array
                                                                               then
                                                                                  declare
                                                                                     L_H : constant String := Next_Label (Ctx.E, "vdi_h");
@@ -3321,14 +3381,28 @@ package body Cg_Expr.Composite is
                                                                                  VR := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, To_String (VV.Reg), VP, DP, Is_Unsigned => VU));
                                                                                  Emit_Range_Check (Ctx, To_String (VR), DP, VCT);
                                                                                  Emit_Discriminant_Check (Ctx, To_String (VR), VCT, Is_Access => True);
-                                                                                 if Is_Bitfield (FE) then
+                                                                                 if Uses_Bitfield_Access (Ctx, FE, VCT) then
                                                                                     Emit_Bitfield_Store (Ctx, Dst_Ptr, FE, To_String (VR), DP, VCT);
                                                                                  else
-                                                                                    Emit_Inst (Ctx.E, "store." & DP & " " & To_String (VR) & ", " & FP & ", align " & Img (Explicit_Field_Align (FE, VCTI.Align)));
+                                                                                    Emit_Inst (Ctx.E, "store." & DP & " " & To_String (VR) & ", " & FP & ", align " & Img (Natural'Max (1, Natural'Min (Max_Align, Explicit_Field_Align (FE, VCTI.Align)))));
                                                                                  end if;
                                                                               end;
                                                                            else
-                                                                              Emit_Init_Composite (Ctx, FP, VCT, VIE);
+                                                                              declare
+                                                                                 VIE_U : TREE := VIE;
+                                                                                 Need_Exact_V : Boolean := False;
+                                                                                 VAl   : constant Natural := Natural'Max (1, Natural'Min (Max_Align, (if FE.Has_Explicit_Offset then 1 else Natural'Max (1, VCTI.Align))));
+                                                                              begin
+                                                                                 while not Is_Void_Tree (VIE_U) and then KIND (VIE_U) = DN_PARENTHESIZED loop
+                                                                                    VIE_U := D (AS_EXP, VIE_U);
+                                                                                 end loop;
+                                                                                 if VCTI.Kind = TK_Constrained_Array
+                                                                                   and then (Is_Void_Tree (VIE_U) or else KIND (VIE_U) not in DN_AGGREGATE | DN_STRING_LITERAL)
+                                                                                 then
+                                                                                    Need_Exact_V := True;
+                                                                                 end if;
+                                                                                 Emit_Init_Composite (Ctx, FP, VCT, VIE, Exact_Bounds => Need_Exact_V, Max_Align => VAl);
+                                                                              end;
                                                                               if VCTI.Kind = TK_Record then
                                                                                  Emit_Discriminant_Check (Ctx, FP, VCT, Is_Access => False);
                                                                               end if;
@@ -3337,7 +3411,8 @@ package body Cg_Expr.Composite is
                                                                           or else Is_Task_Type (Subst_Resolve_Type (Ctx, VCT))
                                                                           or else VCTI.Kind = TK_Constrained_Array
                                                                         then
-                                                                           Emit_Default_Init (Ctx, FP, VCT, Activate_Tasks => Activate_Tasks);
+                                                                           Emit_Default_Init (Ctx, FP, VCT, Activate_Tasks => Activate_Tasks,
+                                                                             Max_Align => Natural'Max (1, Natural'Min (Max_Align, (if FE.Has_Explicit_Offset then 1 else Natural'Max (1, VCTI.Align)))));
                                                                         end if;
                                                                      end;
                                                                   end if;
@@ -3450,8 +3525,8 @@ package body Cg_Expr.Composite is
          declare
             ETI : constant Type_Info := Get_Type_Info (Ctx, DTI.Elem_Type);
          begin
-            if Is_Access_Type (DTI.Elem_Type) or else Is_Record_Type (DTI.Elem_Type)
-              or else Is_Task_Type (DTI.Elem_Type)
+            if Is_Access_Type (Subst_Resolve_Type (Ctx, DTI.Elem_Type)) or else Is_Record_Type (Subst_Resolve_Type (Ctx, DTI.Elem_Type))
+              or else Is_Task_Type (Subst_Resolve_Type (Ctx, DTI.Elem_Type))
               or else ETI.Kind = TK_Constrained_Array
             then
                declare
@@ -3482,7 +3557,8 @@ package body Cg_Expr.Composite is
                         declare
                            EP2 : constant String := Emit_Elem_Ptr (Ctx, ETI, Dst_Ptr, I_Reg);
                         begin
-                           Emit_Default_Init (Ctx, EP2, DTI.Elem_Type, Activate_Tasks => Activate_Tasks);
+                           Emit_Default_Init (Ctx, EP2, DTI.Elem_Type, Activate_Tasks => Activate_Tasks,
+                             Max_Align => Natural'Max (1, Natural'Min (Max_Align, Natural'Max (1, ETI.Align))));
                         end;
                         Emit_Inst (Ctx.E, Nx & " = add.i64 " & I_Reg & ", 1 [unsafe_s]");
                         Emit_Term (Ctx.E, "jmp " & L_Hdr & "(" & Nx & ")");
@@ -3493,7 +3569,7 @@ package body Cg_Expr.Composite is
             elsif DTI.Byte_Size > 0 and then DTI.Byte_Size <= 65_536 then
                -- Zero uninitialized local scalar/enum arrays (e.g. String in cc3126a) so
                -- reading an uninitialized Character element cannot hit stack garbage > 127.
-               Emit_Inst (Ctx.E, "memset " & Dst_Ptr & ", 0, " & Img (DTI.Byte_Size) & ", align " & Img (Natural'Max (1, DTI.Align)));
+               Emit_Inst (Ctx.E, "memset " & Dst_Ptr & ", 0, " & Img (DTI.Byte_Size) & ", align " & Img (Natural'Max (1, Natural'Min (Natural'Max (1, DTI.Align), Max_Align))));
             end if;
          end;
       end if;

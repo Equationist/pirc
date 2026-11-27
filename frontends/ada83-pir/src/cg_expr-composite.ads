@@ -4,10 +4,11 @@
 private package Cg_Expr.Composite is
 
    procedure Emit_Copy_Composite
-     (Ctx      : in out Context;
-      Dst_Ptr  : String;
-      Src      : Expr_Val;
-      Dst_Type : TREE);
+     (Ctx       : in out Context;
+      Dst_Ptr   : String;
+      Src       : Expr_Val;
+      Dst_Type  : TREE;
+      Max_Align : Natural := 8);
 
    procedure Emit_Init_Composite
      (Ctx          : in out Context;
@@ -16,13 +17,15 @@ private package Cg_Expr.Composite is
       Init_Node    : TREE;
       Dst_Firsts   : Str_Array_4 := (others => Null_Unbounded_String);
       Dst_Lasts    : Str_Array_4 := (others => Null_Unbounded_String);
-      Exact_Bounds : Boolean := False);
+      Exact_Bounds : Boolean := False;
+      Max_Align    : Natural := 8);
 
    procedure Emit_Default_Init
      (Ctx            : in out Context;
       Dst_Ptr        : String;
       Dst_Type       : TREE;
-      Activate_Tasks : Boolean := False);
+      Activate_Tasks : Boolean := False;
+      Max_Align      : Natural := 8);
 
    function Find_Enum_Rep_Type (Ctx : Context; T : TREE) return TREE;
    function Enum_Rep_Has_Negative (BT : TREE) return Boolean;
@@ -104,6 +107,7 @@ private package Cg_Expr.Composite is
       Dst_T      : TREE;
       Src_Ptr    : String;
       Src_T      : TREE;
-      Discs_Only : Boolean := False);
+      Discs_Only : Boolean := False;
+      Max_Align  : Natural := 8);
 
 end Cg_Expr.Composite;

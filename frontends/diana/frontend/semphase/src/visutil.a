@@ -1085,19 +1085,19 @@ package body VISUTIL is
 
     procedure ADVANCE_PARAM_CURSOR (CURSOR: in out PARAM_CURSOR_TYPE) is
     begin
-	if IS_EMPTY(CURSOR.ID_LIST) then
+	while IS_EMPTY(CURSOR.ID_LIST) loop
 	    if IS_EMPTY(CURSOR.PARAM_LIST) then
 		CURSOR.ID := CONST_VOID;
 		return;
-	    else
-		POP(CURSOR.PARAM_LIST, CURSOR.PARAM);
-		if KIND(CURSOR.PARAM) = DN_NULL_COMP_DECL then
-		    CURSOR.ID := CONST_VOID;
-		    return;
-		end if;
+	    end if;
+	    POP(CURSOR.PARAM_LIST, CURSOR.PARAM);
+	    if KIND(CURSOR.PARAM) = DN_NULL_COMP_DECL then
+		CURSOR.ID := CONST_VOID;
+		return;
+	    elsif KIND(CURSOR.PARAM) /= DN_PRAGMA then
 		CURSOR.ID_LIST := LIST(D(AS_SOURCE_NAME_S, CURSOR.PARAM));
 	    end if;
-	end if;
+	end loop;
 	POP(CURSOR.ID_LIST, CURSOR.ID);
     end ADVANCE_PARAM_CURSOR;
 

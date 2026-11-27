@@ -36,6 +36,24 @@ procedure SEMPHASE is
 	COMPILATION_UNIT:	TREE;
     begin
 	INITIALIZE_GLOBAL_DATA;
+	if IS_EMPTY(COMPLTN_UNIT_LIST) then
+	    declare
+		SL_LIST: SEQ_TYPE := LIST(CONST_ROOT);
+		SL: TREE;
+	    begin
+		if IS_EMPTY(SL_LIST) then
+		    SL := MAKE(DN_SOURCELINE);
+		    DI(XD_NUMBER, SL, 1);
+		    LIST(SL, MAKE);
+		    SL_LIST := APPEND(SL_LIST, SL);
+		    LIST(CONST_ROOT, SL_LIST);
+		else
+		    SL := HEAD(SL_LIST);
+		end if;
+		ERROR(MAKE_SOURCE_POSITION(SL, 1), "Empty compilation");
+	    end;
+	    return;
+	end if;
 	INITIALIZE_PRAGMA_ATTRIBUTE_DEFS;
 
 	while not IS_EMPTY(COMPLTN_UNIT_LIST) loop
@@ -87,6 +105,74 @@ procedure SEMPHASE is
                         , "$$$ empty unit not implemented yet");
 	    return;
 	end if;
+
+	-- LRM 2.3: reject user identifiers with a leading underscore (allowed only in _STANDRD and SYSTEM)
+	declare
+	    IS_SYS_UNIT: BOOLEAN := FALSE;
+	    procedure CHECK_NO_LEADING_UNDERSCORE(N: TREE; DEPTH: NATURAL) is
+		K: NODE_NAME;
+	    begin
+		if N = CONST_VOID or else N = CONST_VIRGIN or else DEPTH > 256 then
+		    return;
+		end if;
+		K := KIND(N);
+		if K not in CLASS_ALL_SOURCE then
+		    return;
+		end if;
+		if K in CLASS_DEF_NAME or else K in CLASS_USED_NAME or else K = DN_USED_OBJECT_ID then
+		    declare
+			SYM: constant TREE := D(LX_SYMREP, N);
+		    begin
+			if SYM /= CONST_VOID and then (KIND(SYM) = DN_SYMBOL_REP or else KIND(SYM) = DN_TXTREP) then
+			    declare
+				TXT: constant STRING := PRINTNAME(SYM);
+			    begin
+				if TXT'LENGTH > 0 and then TXT(TXT'FIRST) = '_' then
+				    ERROR(D(LX_SRCPOS, N), "Identifier cannot start with underscore");
+				end if;
+			    end;
+			end if;
+		    end;
+		end if;
+		if ARITY(N) = ARBITRARY then
+		    declare
+			L: SEQ_TYPE := LIST(N);
+			IT: TREE;
+		    begin
+			while not IS_EMPTY(L) loop
+			    POP(L, IT);
+			    CHECK_NO_LEADING_UNDERSCORE(IT, DEPTH + 1);
+			end loop;
+		    end;
+		else
+		    for I in 1 .. ARITIES'POS(ARITY(N)) loop
+			CHECK_NO_LEADING_UNDERSCORE(DABS(I, N), DEPTH + 1);
+		    end loop;
+		end if;
+	    end CHECK_NO_LEADING_UNDERSCORE;
+	begin
+	    if KIND(ALL_DECL) = DN_PACKAGE_DECL
+	    and then D(AS_SOURCE_NAME, ALL_DECL) /= CONST_VOID then
+		declare
+		    UN_S: constant TREE := D(LX_SYMREP, D(AS_SOURCE_NAME, ALL_DECL));
+		begin
+		    if UN_S /= CONST_VOID and then (KIND(UN_S) = DN_SYMBOL_REP or else KIND(UN_S) = DN_TXTREP) then
+			declare
+			    UN: constant STRING := PRINTNAME(UN_S);
+			begin
+			    if UN = "_STANDRD" or else UN = "SYSTEM" then
+				IS_SYS_UNIT := TRUE;
+			    end if;
+			end;
+		    end if;
+		end;
+	    end if;
+	    if not IS_SYS_UNIT then
+		CHECK_NO_LEADING_UNDERSCORE(CONTEXT_ELEM_S, 0);
+		CHECK_NO_LEADING_UNDERSCORE(ALL_DECL, 0);
+		CHECK_NO_LEADING_UNDERSCORE(PRAGMA_S, 0);
+	    end if;
+	end;
 
 	USED_PACKAGE_LIST := MAKE;
 	SYSTEM_IS_WITHED := FALSE;
@@ -420,21 +506,28 @@ procedure SEMPHASE is
     ------------------------------------------------------------------------
 
     procedure INITIALIZE_PRAGMA_ATTRIBUTE_DEFS is
-        PREDEF_UNIT: TREE := HEAD(LIST(STORESYM("_STANDRD.DCL")));
-	PREDEF_HEADER: TREE := D(AS_HEADER, D(AS_ALL_DECL,PREDEF_UNIT));
-	ID_LIST: SEQ_TYPE := LIST(D(AS_DECL_S2,PREDEF_HEADER));
-	ID: TREE;
-	DEF: TREE;
+        STD_LIST: constant SEQ_TYPE := LIST(STORESYM("_STANDRD.DCL"));
     begin
-	while not IS_EMPTY(ID_LIST) loop
-	    POP(ID_LIST, ID);
-	    if KIND(ID) in DN_ATTRIBUTE_ID .. DN_PRAGMA_ID
-	    and then KIND(D(LX_SYMREP,ID)) = DN_SYMBOL_REP then
-		DEF := MAKE_DEF_FOR_ID(ID, INITIAL_H);
-		D(XD_REGION_DEF, DEF, CONST_VOID);
-		DB(XD_IS_IN_SPEC, DEF, FALSE);
-	    end if;
-	end loop;
+	if IS_EMPTY(STD_LIST) then
+	    return;
+	end if;
+	declare
+	    PREDEF_UNIT: constant TREE := HEAD(STD_LIST);
+	    PREDEF_HEADER: constant TREE := D(AS_HEADER, D(AS_ALL_DECL,PREDEF_UNIT));
+	    ID_LIST: SEQ_TYPE := LIST(D(AS_DECL_S2,PREDEF_HEADER));
+	    ID: TREE;
+	    DEF: TREE;
+	begin
+	    while not IS_EMPTY(ID_LIST) loop
+		POP(ID_LIST, ID);
+		if KIND(ID) in DN_ATTRIBUTE_ID .. DN_PRAGMA_ID
+		and then KIND(D(LX_SYMREP,ID)) = DN_SYMBOL_REP then
+		    DEF := MAKE_DEF_FOR_ID(ID, INITIAL_H);
+		    D(XD_REGION_DEF, DEF, CONST_VOID);
+		    DB(XD_IS_IN_SPEC, DEF, FALSE);
+		end if;
+	    end loop;
+	end;
     end INITIALIZE_PRAGMA_ATTRIBUTE_DEFS;
 
     ------------------------------------------------------------------------

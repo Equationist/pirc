@@ -136,229 +136,11 @@ package body Cg_Expr.Call is
                   return CONST_VOID;
                end if;
             end Attr_Pfx_Type;
-
-            procedure Ensure_Enum_Tables
-              (Base_Enum : TREE;
-               Ptrs_Sym  : out Unbounded_String;
-               Count     : out Natural)
-            is
-            begin
-               Ensure_Enum_Tables_Pkg (Ctx, Base_Enum, Ptrs_Sym, Count);
-            end Ensure_Enum_Tables;
          begin
             if not IS_EMPTY (PL) then
                POP (PL, Arg_N);
             end if;
-            if AName = "POS" then
-               declare
-                  V : constant Expr_Val := Emit_Expr (Ctx, Arg_N);
-                  Is_U : constant Boolean := Is_Unsigned_Scalar (V.Ada_Type, To_String (V.Pir_Type));
-               begin
-                  Res.Kind := EK_Scalar; Res.Ada_Type := ET; Res.Pir_Type := TI.Pir_Type; Res.Align := TI.Align;
-                  Res.Reg := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (V.Reg), To_String (V.Pir_Type), To_String (TI.Pir_Type), Is_Unsigned => Is_U));
-                  return Res;
-               end;
-            elsif AName = "VAL" then
-               declare
-                  PT : constant TREE := Attr_Pfx_Type (Pfx_N);
-                  Chk_T : constant TREE := (if not Is_Void_Tree (PT) then Subst_Base_Type (Ctx, PT) else Subst_Base_Type (Ctx, ET));
-                  V  : constant Expr_Val := Emit_Expr (Ctx, Arg_N);
-                  Is_VU : constant Boolean := Is_Unsigned_Scalar (V.Ada_Type, To_String (V.Pir_Type));
-                  I64 : constant String := Emit_Int_Convert (Ctx, To_String (V.Reg), To_String (V.Pir_Type), "i64", Is_Unsigned => Is_VU);
-                  Cv : constant String := Emit_Int_Convert (Ctx, I64, "i64", To_String (TI.Pir_Type));
-               begin
-                  -- Range check against base type bounds in i64 before narrowing!
-                  Emit_Range_Check (Ctx, I64, "i64", Chk_T);
-                  Res.Kind := EK_Scalar; Res.Ada_Type := ET; Res.Pir_Type := TI.Pir_Type; Res.Align := TI.Align;
-                  Res.Reg := To_Unbounded_String (Cv);
-                  return Res;
-               end;
-            elsif AName = "SUCC" or else AName = "PRED" then
-               declare
-                  PT_Sub : constant TREE := Attr_Pfx_Type (Pfx_N);
-                  Chk_T  : constant TREE := (if not Is_Void_Tree (PT_Sub) then Subst_Base_Type (Ctx, PT_Sub) else Subst_Base_Type (Ctx, ET));
-                  V    : constant Expr_Val := Emit_Expr (Ctx, Arg_N, ET);
-                  PT   : constant String := To_String (TI.Pir_Type);
-                  OutR : constant String := Next_Reg (Ctx.E, "sp");
-                  Op   : constant String := (if AName = "SUCC" then "add" else "sub");
-               begin
-                  if Ctx.Enable_Checks then
-                     if Is_Unsigned_Scalar (Chk_T, PT) and then PT /= "i64" then
-                        declare
-                           W64 : constant String := Emit_Int_Convert (Ctx, To_String (V.Reg), PT, "i64", Is_Unsigned => True);
-                           R64 : constant String := Next_Reg (Ctx.E, "spu");
-                           Tr  : Unbounded_String;
-                        begin
-                           Emit_Inst (Ctx.E, R64 & " = " & Op & ".i64 " & W64 & ", 1");
-                           Emit_Range_Check (Ctx, R64, "i64", Chk_T);
-                           Tr := To_Unbounded_String (Emit_Int_Convert (Ctx, R64, "i64", PT));
-                           Res.Kind := EK_Scalar; Res.Reg := Tr;
-                           Res.Pir_Type := TI.Pir_Type; Res.Ada_Type := ET; Res.Align := TI.Align;
-                           return Res;
-                        end;
-                     end if;
-                     declare
-                        Ovf : constant String := Next_Reg (Ctx.E, "ov");
-                     begin
-                        Emit_Inst (Ctx.E, OutR & ", " & Ovf & " = " & Op & "_ovf_s." & PT & " " & To_String (V.Reg) & ", 1");
-                        Emit_Check_Fail_If (Ctx, Ovf);
-                     end;
-                     Emit_Range_Check (Ctx, OutR, PT, Chk_T);
-                  else
-                     Emit_Inst (Ctx.E, OutR & " = " & Op & "." & PT & " " & To_String (V.Reg) & ", 1");
-                  end if;
-                  Res.Kind := EK_Scalar; Res.Reg := To_Unbounded_String (OutR);
-                  Res.Pir_Type := TI.Pir_Type; Res.Ada_Type := ET; Res.Align := TI.Align;
-                  return Res;
-               end;
-            elsif AName = "IMAGE" then
-               declare
-                  PT  : constant TREE := Attr_Pfx_Type (Pfx_N);
-                  BT  : constant TREE := Subst_Base_Type (Ctx, PT);
-                  V   : constant Expr_Val := Emit_Expr (Ctx, Arg_N, PT);
-                  One : constant String := Next_Reg (Ctx.E, "imf");
-               begin
-                  Emit_Inst (Ctx.E, One & " = const.i64 1");
-                  if Is_Integer_Type (BT) then
-                     declare
-                        Is_IU : constant Boolean := Is_Unsigned_Scalar (BT, To_String (V.Pir_Type));
-                        V64 : constant String := Emit_Int_Convert (Ctx, To_String (V.Reg), To_String (V.Pir_Type), "i64", Is_Unsigned => Is_IU);
-                        Buf, Len : Unbounded_String;
-                     begin
-                        Emit_Call_Or_Invoke (Ctx, "@__ada_ss_alloc", "32, 8", "ptr", Buf);
-                        Emit_Call_Or_Invoke (Ctx, "@__ada_img_i64", V64 & ", " & To_String (Buf), "i32", Len, Nounwind => True);
-                        Res.Kind := EK_Slice; Res.Reg := Buf; Res.Pir_Type := To_Unbounded_String ("ptr");
-                        Res.Ada_Type := ET; Res.Align := 1; Res.NDims := 1;
-                        Res.First_Regs (1) := To_Unbounded_String (One);
-                        Res.Last_Regs (1)  := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (Len), "i32", "i64"));
-                        return Res;
-                     end;
-                  elsif Is_Character_Type (BT) then
-                     declare
-                        C8  : constant String := Emit_Int_Convert (Ctx, To_String (V.Reg), To_String (V.Pir_Type), "i8");
-                        Buf, Len : Unbounded_String;
-                     begin
-                        Emit_Call_Or_Invoke (Ctx, "@__ada_ss_alloc", "8, 8", "ptr", Buf);
-                        Emit_Call_Or_Invoke (Ctx, "@__ada_img_char", C8 & ", " & To_String (Buf), "i32", Len, Nounwind => True);
-                        Res.Kind := EK_Slice; Res.Reg := Buf; Res.Pir_Type := To_Unbounded_String ("ptr");
-                        Res.Ada_Type := ET; Res.Align := 1; Res.NDims := 1;
-                        Res.First_Regs (1) := To_Unbounded_String (One);
-                        Res.Last_Regs (1)  := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (Len), "i32", "i64"));
-                        return Res;
-                     end;
-                  elsif not Is_Void_Tree (BT) and then KIND (BT) = DN_ENUMERATION then
-                     declare
-                        PS     : Unbounded_String;
-                        Cnt    : Natural;
-                        Idx64  : constant String := Emit_Int_Convert (Ctx, To_String (V.Reg), To_String (V.Pir_Type), "i64", Is_Unsigned => True);
-                        PA     : constant String := Next_Reg (Ctx.E, "epa");
-                        PE     : constant String := Next_Reg (Ctx.E, "epe");
-                        SP     : constant String := Next_Reg (Ctx.E, "esp");
-                        SL     : Unbounded_String;
-                     begin
-                        Ensure_Enum_Tables (BT, PS, Cnt);
-                        pragma Unreferenced (Cnt);
-                        Emit_Inst (Ctx.E, PA & " = addr " & To_String (PS));
-                        Emit_Inst (Ctx.E, PE & " = elem_ptr ptr, " & PA & ", " & Idx64);
-                        Emit_Inst (Ctx.E, SP & " = load.ptr " & PE & ", align 8");
-                        Emit_Call_Or_Invoke (Ctx, "@__ada_cstr_len", SP, "i32", SL, Nounwind => True);
-                        Res.Kind := EK_Slice; Res.Reg := To_Unbounded_String (SP);
-                        Res.Pir_Type := To_Unbounded_String ("ptr");
-                        Res.Ada_Type := ET; Res.Align := 1; Res.NDims := 1;
-                        Res.First_Regs (1) := To_Unbounded_String (One);
-                        Res.Last_Regs (1)  := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (SL), "i32", "i64"));
-                        return Res;
-                     end;
-                  else
-                     declare
-                        Empty : constant String := Next_Reg (Ctx.E, "ime");
-                        Zero  : constant String := Next_Reg (Ctx.E, "imz");
-                     begin
-                        Emit_Inst (Ctx.E, Empty & " = const.ptr 0");
-                        Emit_Inst (Ctx.E, Zero & " = const.i64 0");
-                        Res.Kind := EK_Slice; Res.Reg := To_Unbounded_String (Empty);
-                        Res.Pir_Type := To_Unbounded_String ("ptr");
-                        Res.Ada_Type := ET; Res.Align := 1; Res.NDims := 1;
-                        Res.First_Regs (1) := To_Unbounded_String (One);
-                        Res.Last_Regs (1)  := To_Unbounded_String (Zero);
-                        return Res;
-                     end;
-                  end if;
-               end;
-            elsif AName = "VALUE" then
-               declare
-                  PT  : constant TREE := Attr_Pfx_Type (Pfx_N);
-                  BT  : constant TREE := Subst_Base_Type (Ctx, PT);
-                  S   : constant Expr_Val := Emit_Expr (Ctx, Arg_N);
-                  SF, SL : Unbounded_String;
-                  L64 : Unbounded_String;
-                  Cl  : Unbounded_String;
-               begin
-                  Get_Array_Dim_Bounds (Ctx, S, 1, SF, SL);
-                  L64 := To_Unbounded_String (Emit_Dim_Len_I64 (Ctx, To_String (SF), To_String (SL)));
-                  Cl  := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (L64), "i64", "i32"));
-                  if Is_Integer_Type (BT) then
-                     declare
-                        BTI : constant Type_Info := Get_Type_Info (Ctx, BT);
-                        RV : Unbounded_String;
-                        Cv : Unbounded_String;
-                     begin
-                        Emit_Call_Or_Invoke (Ctx, "@__ada_val_i64", To_String (S.Reg) & ", " & To_String (Cl), "i64", RV);
-                        Emit_Range_Check (Ctx, To_String (RV), "i64", BT);
-                        Cv := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RV), "i64", To_String (BTI.Pir_Type)));
-                        Res.Kind := EK_Scalar; Res.Reg := Cv;
-                        Res.Pir_Type := BTI.Pir_Type; Res.Ada_Type := BT; Res.Align := BTI.Align;
-                        return Res;
-                     end;
-                  elsif Is_Character_Type (BT) then
-                     declare
-                        RV : Unbounded_String;
-                     begin
-                        Emit_Call_Or_Invoke (Ctx, "@__ada_val_char", To_String (S.Reg) & ", " & To_String (Cl), "i8", RV);
-                        Res.Kind := EK_Scalar; Res.Reg := RV;
-                        Res.Pir_Type := To_Unbounded_String ("i8"); Res.Ada_Type := BT; Res.Align := 1;
-                        return Res;
-                     end;
-                  elsif not Is_Void_Tree (BT) and then KIND (BT) = DN_ENUMERATION then
-                     declare
-                        BTI    : constant Type_Info := Get_Type_Info (Ctx, BT);
-                        PS     : Unbounded_String;
-                        Cnt    : Natural;
-                        TA     : constant String := Next_Reg (Ctx.E, "eta");
-                        RV     : Unbounded_String;
-                        Cv     : Unbounded_String;
-                     begin
-                        Ensure_Enum_Tables (BT, PS, Cnt);
-                        Emit_Inst (Ctx.E, TA & " = addr " & To_String (PS));
-                        Emit_Call_Or_Invoke (Ctx, "@__ada_val_enum",
-                          To_String (S.Reg) & ", " & To_String (Cl) & ", " & TA & ", " & Img (Cnt), "i32", RV);
-                        Cv := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RV), "i32", To_String (BTI.Pir_Type)));
-                        Res.Kind := EK_Scalar; Res.Reg := Cv;
-                        Res.Pir_Type := BTI.Pir_Type; Res.Ada_Type := BT; Res.Align := BTI.Align;
-                        return Res;
-                     end;
-                  else
-                     declare
-                        R : constant String := Next_Reg (Ctx.E, "vz");
-                     begin
-                        Emit_Inst (Ctx.E, R & " = const." & To_String (TI.Pir_Type) & " 0");
-                        Res.Kind := EK_Scalar; Res.Reg := To_Unbounded_String (R);
-                        Res.Pir_Type := TI.Pir_Type; Res.Ada_Type := ET; Res.Align := TI.Align;
-                        return Res;
-                     end;
-                  end if;
-               end;
-            else
-               declare
-                  R : constant String := Next_Reg (Ctx.E, "af");
-                  PT : constant String := (if To_String (TI.Pir_Type) = "void" then "i32" else To_String (TI.Pir_Type));
-               begin
-                  Emit_Inst (Ctx.E, R & " = const." & PT & " 0");
-                  Res.Kind := EK_Scalar; Res.Reg := To_Unbounded_String (R);
-                  Res.Pir_Type := To_Unbounded_String (PT); Res.Ada_Type := ET; Res.Align := TI.Align;
-                  return Res;
-               end;
-            end if;
+            return Emit_Discrete_Attr_Op (Ctx, AName, Attr_Pfx_Type (Pfx_N), ET, Arg_N);
          end;
       end if;
       Def := Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (Des_Node)));
@@ -385,190 +167,26 @@ package body Cg_Expr.Call is
                   if KIND (RN) = DN_ATTRIBUTE then
                      -- Renamed attribute function (e.g. function Next renames T'Succ, T'Image, T'Value)
                      declare
-                        Attr_Id   : constant TREE := D (AS_USED_NAME_ID, RN);
-                        AName     : constant String := Sym_Name (Attr_Id);
-                        Pfx_N     : constant TREE := D (AS_NAME, RN);
-                        TI        : constant Type_Info := Get_Type_Info (Ctx, Res_Type);
-                        Arg_N     : TREE := CONST_VOID;
-                        PL        : SEQ_TYPE := Param_L;
+                        Attr_Id  : constant TREE := D (AS_USED_NAME_ID, RN);
+                        AName    : constant String := Sym_Name (Attr_Id);
+                        Pfx_N    : constant TREE := D (AS_NAME, RN);
+                        Pfx_Base : constant TREE :=
+                          (if not Is_Void_Tree (Pfx_N) and then KIND (Pfx_N) = DN_ATTRIBUTE
+                           then D (AS_NAME, Pfx_N) else Pfx_N);
+                        Pfx_Def  : constant TREE := Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (Pfx_Base)));
+                        Pfx_TS   : constant TREE :=
+                          (if Is_Void_Tree (Pfx_Def) then CONST_VOID
+                           elsif KIND (Pfx_Def) in CLASS_TYPE_NAME
+                           then Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_TYPE_SPEC, Pfx_Def)))
+                           else Resolve_Type_Spec (Pfx_Def));
+                        Arg_N    : TREE := CONST_VOID;
+                        PL       : SEQ_TYPE := Param_L;
                      begin
                         if not IS_EMPTY (PL) then POP (PL, Arg_N); end if;
-                        if AName = "POS" then
-                           declare
-                              V : constant Expr_Val := Emit_Expr (Ctx, Arg_N);
-                              Is_U : constant Boolean := Is_Unsigned_Scalar (V.Ada_Type, To_String (V.Pir_Type));
-                           begin
-                              Res.Kind := EK_Scalar; Res.Ada_Type := Res_Type;
-                              Res.Pir_Type := TI.Pir_Type; Res.Align := TI.Align;
-                              Res.Reg := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (V.Reg), To_String (V.Pir_Type), To_String (TI.Pir_Type), Is_Unsigned => Is_U));
-                              return Res;
-                           end;
-                        elsif AName = "VAL" then
-                           declare
-                              V    : constant Expr_Val := Emit_Expr (Ctx, Arg_N);
-                              Is_U : constant Boolean := Is_Unsigned_Scalar (V.Ada_Type, To_String (V.Pir_Type));
-                              I64  : constant String := Emit_Int_Convert (Ctx, To_String (V.Reg), To_String (V.Pir_Type), "i64", Is_Unsigned => Is_U);
-                              Cv   : constant String := Emit_Int_Convert (Ctx, I64, "i64", To_String (TI.Pir_Type));
-                           begin
-                              Emit_Range_Check (Ctx, I64, "i64", Subst_Base_Type (Ctx, Res_Type));
-                              Res.Kind := EK_Scalar; Res.Ada_Type := Res_Type;
-                              Res.Pir_Type := TI.Pir_Type; Res.Align := TI.Align;
-                              Res.Reg := To_Unbounded_String (Cv);
-                              return Res;
-                           end;
-                        elsif AName = "SUCC" or else AName = "PRED" then
-                           declare
-                              Chk_T : constant TREE := Subst_Base_Type (Ctx, Res_Type);
-                              V     : constant Expr_Val := Emit_Expr (Ctx, Arg_N, Res_Type);
-                              PT    : constant String := To_String (TI.Pir_Type);
-                              VR    : constant String := Emit_Scalar_Coerce (Ctx, To_String (V.Reg), To_String (V.Pir_Type), PT);
-                              OutR  : constant String := Next_Reg (Ctx.E, "sp");
-                              Op    : constant String := (if AName = "SUCC" then "add" else "sub");
-                           begin
-                              if Ctx.Enable_Checks then
-                                 if Is_Unsigned_Scalar (Chk_T, PT) and then PT /= "i64" then
-                                    declare
-                                       W64 : constant String := Emit_Int_Convert (Ctx, VR, PT, "i64", Is_Unsigned => True);
-                                       R64 : constant String := Next_Reg (Ctx.E, "spu");
-                                    begin
-                                       Emit_Inst (Ctx.E, R64 & " = " & Op & ".i64 " & W64 & ", 1");
-                                       Emit_Range_Check (Ctx, R64, "i64", Chk_T);
-                                       Res.Kind := EK_Scalar;
-                                       Res.Reg := To_Unbounded_String (Emit_Int_Convert (Ctx, R64, "i64", PT));
-                                       Res.Pir_Type := TI.Pir_Type; Res.Ada_Type := Res_Type; Res.Align := TI.Align;
-                                       return Res;
-                                    end;
-                                 end if;
-                                 declare
-                                    Ovf : constant String := Next_Reg (Ctx.E, "ov");
-                                 begin
-                                    Emit_Inst (Ctx.E, OutR & ", " & Ovf & " = " & Op & "_ovf_s." & PT & " " & VR & ", 1");
-                                    Emit_Check_Fail_If (Ctx, Ovf);
-                                 end;
-                                 Emit_Range_Check (Ctx, OutR, PT, Chk_T);
-                              else
-                                 Emit_Inst (Ctx.E, OutR & " = " & Op & "." & PT & " " & VR & ", 1");
-                              end if;
-                              Res.Kind := EK_Scalar; Res.Reg := To_Unbounded_String (OutR);
-                              Res.Pir_Type := TI.Pir_Type; Res.Ada_Type := Res_Type; Res.Align := TI.Align;
-                              return Res;
-                           end;
-                        elsif AName = "IMAGE" or else AName = "VALUE" then
-                           declare
-                              Pfx_Base : constant TREE :=
-                                (if not Is_Void_Tree (Pfx_N) and then KIND (Pfx_N) = DN_ATTRIBUTE
-                                 then D (AS_NAME, Pfx_N) else Pfx_N);
-                              Pfx_Def  : constant TREE := Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (Pfx_Base)));
-                              Pfx_TS   : constant TREE :=
-                                (if Is_Void_Tree (Pfx_Def) then CONST_VOID
-                                 elsif KIND (Pfx_Def) in CLASS_TYPE_NAME
-                                 then Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_TYPE_SPEC, Pfx_Def)))
-                                 else Resolve_Type_Spec (Pfx_Def));
-                              Pfx_BT   : constant TREE := Base_Type_Spec (Pfx_TS);
-                           begin
-                              if AName = "IMAGE" then
-                                 declare
-                                    V      : constant Expr_Val := Emit_Expr (Ctx, Arg_N, Pfx_TS);
-                                    One_R  : constant String := Next_Reg (Ctx.E, "im1");
-                                 begin
-                                    Emit_Inst (Ctx.E, One_R & " = const.i64 1");
-                                    if Is_Integer_Type (Pfx_BT) then
-                                       declare
-                                          V64 : constant String := Emit_Int_Convert (Ctx, To_String (V.Reg), To_String (V.Pir_Type), "i64");
-                                          Buf, Len : Unbounded_String;
-                                       begin
-                                          Emit_Call_Or_Invoke (Ctx, "@__ada_ss_alloc", "32, 8", "ptr", Buf);
-                                          Emit_Call_Or_Invoke (Ctx, "@__ada_img_i64", V64 & ", " & To_String (Buf), "i32", Len, Nounwind => True);
-                                          Res.Kind := EK_Slice; Res.Reg := Buf; Res.Pir_Type := To_Unbounded_String ("ptr");
-                                          Res.Ada_Type := Res_Type; Res.Align := 1; Res.NDims := 1;
-                                          Res.First_Regs (1) := To_Unbounded_String (One_R);
-                                          Res.Last_Regs (1)  := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (Len), "i32", "i64"));
-                                          return Res;
-                                       end;
-                                    elsif Is_Character_Type (Pfx_BT) then
-                                       declare
-                                          C8 : constant String := Emit_Int_Convert (Ctx, To_String (V.Reg), To_String (V.Pir_Type), "i8");
-                                          Buf, Len : Unbounded_String;
-                                       begin
-                                          Emit_Call_Or_Invoke (Ctx, "@__ada_ss_alloc", "8, 8", "ptr", Buf);
-                                          Emit_Call_Or_Invoke (Ctx, "@__ada_img_char", C8 & ", " & To_String (Buf), "i32", Len, Nounwind => True);
-                                          Res.Kind := EK_Slice; Res.Reg := Buf; Res.Pir_Type := To_Unbounded_String ("ptr");
-                                          Res.Ada_Type := Res_Type; Res.Align := 1; Res.NDims := 1;
-                                          Res.First_Regs (1) := To_Unbounded_String (One_R);
-                                          Res.Last_Regs (1)  := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (Len), "i32", "i64"));
-                                          return Res;
-                                       end;
-                                    elsif not Is_Void_Tree (Pfx_BT) and then KIND (Pfx_BT) = DN_ENUMERATION then
-                                       declare
-                                          PS    : Unbounded_String;
-                                          Cnt   : Natural;
-                                          Idx64 : constant String := Emit_Int_Convert (Ctx, To_String (V.Reg), To_String (V.Pir_Type), "i64", Is_Unsigned => True);
-                                          PA    : constant String := Next_Reg (Ctx.E, "epa");
-                                          PE    : constant String := Next_Reg (Ctx.E, "epe");
-                                          SP    : constant String := Next_Reg (Ctx.E, "esp");
-                                          SL    : Unbounded_String;
-                                       begin
-                                          Ensure_Enum_Tables_Pkg (Ctx, Pfx_BT, PS, Cnt);
-                                          pragma Unreferenced (Cnt);
-                                          Emit_Inst (Ctx.E, PA & " = addr " & To_String (PS));
-                                          Emit_Inst (Ctx.E, PE & " = elem_ptr ptr, " & PA & ", " & Idx64);
-                                          Emit_Inst (Ctx.E, SP & " = load.ptr " & PE & ", align 8");
-                                          Emit_Call_Or_Invoke (Ctx, "@__ada_cstr_len", SP, "i32", SL, Nounwind => True);
-                                          Res.Kind := EK_Slice; Res.Reg := To_Unbounded_String (SP);
-                                          Res.Pir_Type := To_Unbounded_String ("ptr");
-                                          Res.Ada_Type := Res_Type; Res.Align := 1; Res.NDims := 1;
-                                          Res.First_Regs (1) := To_Unbounded_String (One_R);
-                                          Res.Last_Regs (1)  := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (SL), "i32", "i64"));
-                                          return Res;
-                                       end;
-                                    end if;
-                                 end;
-                              else -- VALUE
-                                 declare
-                                    SV : constant Expr_Val := Emit_Expr (Ctx, Arg_N);
-                                    F, L : Unbounded_String;
-                                    Df : constant String := Next_Reg (Ctx.E, "vdf");
-                                    Ln : constant String := Next_Reg (Ctx.E, "vln");
-                                    Ps : constant String := Next_Reg (Ctx.E, "vps");
-                                    Cl : constant String := Next_Reg (Ctx.E, "vcl");
-                                    RV : Unbounded_String;
-                                    Cv : Unbounded_String;
-                                 begin
-                                    Get_Array_Dim_Bounds (Ctx, SV, 1, F, L);
-                                    declare
-                                       BTI : constant Type_Info := Get_Type_Info (Ctx, Pfx_BT);
-                                       L64 : constant String := Emit_Dim_Len_I64 (Ctx, To_String (F), To_String (L));
-                                       Cl  : constant String := Emit_Int_Convert (Ctx, L64, "i64", "i32");
-                                    begin
-                                       if Is_Character_Type (Pfx_BT) then
-                                          Emit_Call_Or_Invoke (Ctx, "@__ada_val_char", To_String (SV.Reg) & ", " & Cl, "i8", RV);
-                                          Cv := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RV), "i8", To_String (BTI.Pir_Type)));
-                                       elsif not Is_Void_Tree (Pfx_BT) and then KIND (Pfx_BT) = DN_ENUMERATION then
-                                          declare
-                                             PS  : Unbounded_String;
-                                             Cnt : Natural;
-                                             TA  : constant String := Next_Reg (Ctx.E, "evt");
-                                          begin
-                                             Ensure_Enum_Tables_Pkg (Ctx, Pfx_BT, PS, Cnt);
-                                             Emit_Inst (Ctx.E, TA & " = addr " & To_String (PS));
-                                             Emit_Call_Or_Invoke (Ctx, "@__ada_val_enum",
-                                               To_String (SV.Reg) & ", " & Cl & ", " & TA & ", " & Img (Cnt), "i32", RV);
-                                             Cv := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RV), "i32", To_String (BTI.Pir_Type)));
-                                          end;
-                                       else
-                                          Emit_Call_Or_Invoke (Ctx, "@__ada_val_i64",
-                                            To_String (SV.Reg) & ", " & Cl, "i64", RV);
-                                          Emit_Range_Check (Ctx, To_String (RV), "i64", Pfx_BT);
-                                          Cv := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RV), "i64", To_String (BTI.Pir_Type)));
-                                       end if;
-                                       -- LRM 8.5(7) & 3.5.5(10): 'VALUE returns T'Base; renaming's return subtype mark is ignored!
-                                       Res.Kind := EK_Scalar; Res.Reg := Cv;
-                                       Res.Pir_Type := BTI.Pir_Type; Res.Ada_Type := Pfx_BT; Res.Align := BTI.Align;
-                                       return Res;
-                                    end;
-                                 end;
-                              end if;
-                           end;
+                        if AName = "POS" or else AName = "VAL" or else AName = "SUCC"
+                          or else AName = "PRED" or else AName = "IMAGE" or else AName = "VALUE"
+                        then
+                           return Emit_Discrete_Attr_Op (Ctx, AName, Pfx_TS, Res_Type, Arg_N);
                         end if;
                         exit;
                      end;
@@ -630,8 +248,9 @@ package body Cg_Expr.Call is
                         R   : constant String := Next_Reg (Ctx.E, "urf");
                      begin
                         if Is_Float_Type (Res_Type) then
-                           Emit_Inst (Ctx.E, R & " = const." & To_String (RTI.Pir_Type) & " " & Format_Float64 (Eval_Float64 (SV)));
-                           Res.Kind := EK_Scalar; Res.Reg := To_Unbounded_String (R);
+                           Res.Kind := EK_Scalar;
+                           Res.Reg := To_Unbounded_String
+                             (Emit_Float_Const_Safe (Ctx, Eval_Float64 (SV), To_String (RTI.Pir_Type), "urf"));
                            Res.Pir_Type := RTI.Pir_Type; Res.Ada_Type := Res_Type; Res.Align := RTI.Align;
                            return Res;
                         elsif Is_Fixed_Type (Res_Type) then
@@ -982,13 +601,16 @@ package body Cg_Expr.Call is
                            else Pfx_Ts);
                         Dummy_RTI : constant Type_Info := Get_Type_Info (Ctx, Rec_Ts);
                         pragma Unreferenced (Dummy_RTI);
-                        CK : constant Unsigned_32 := Tree_Key (Def);
+                        CK : constant Unsigned_32 := Lookup_Record_Field_Key (Ctx, Rec_Ts, Def);
                      begin
-                        if not Ctx.Fields.Contains (CK) or else not Is_Bitfield (Ctx.Fields.Element (CK)) then
+                        if not Ctx.Fields.Contains (CK) then
                            return False;
                         end if;
                         FE_Out   := Ctx.Fields.Element (CK);
                         Comp_Typ := Subst_Tree (Ctx, D (SM_OBJ_TYPE, Def));
+                        if not Uses_Bitfield_Access (Ctx, FE_Out, Comp_Typ) then
+                           return False;
+                        end if;
                         if Get_Type_Info (Ctx, Comp_Typ).Kind /= TK_Scalar then
                            return False;
                         end if;
@@ -1078,45 +700,6 @@ package body Cg_Expr.Call is
                                  begin
                                     if Mode = DN_IN then
                                        AV := Emit_Expr (Ctx, Act, FT);
-                                    elsif FTI.Kind = TK_Record and then KIND (Act) = DN_CONVERSION then
-                                       -- P3-6.7: Handle OUT/IN OUT record view conversion across differing record representations!
-                                       declare
-                                          In_A : TREE := D (AS_EXP, Act);
-                                          In_T : TREE;
-                                          Src_BR, Dst_BR : TREE;
-                                       begin
-                                          while not Is_Void_Tree (In_A) and then KIND (In_A) = DN_CONVERSION loop
-                                             In_A := D (AS_EXP, In_A);
-                                          end loop;
-                                          In_T   := (if not Is_Void_Tree (In_A) then Subst_Tree (Ctx, D (SM_EXP_TYPE, In_A)) else CONST_VOID);
-                                          Src_BR := Subst_Base_Type (Ctx, In_T);
-                                          Dst_BR := Subst_Base_Type (Ctx, FT);
-                                          if not Is_Void_Tree (Src_BR) and then not Is_Void_Tree (Dst_BR)
-                                            and then KIND (Src_BR) = DN_RECORD and then KIND (Dst_BR) = DN_RECORD
-                                            and then Src_BR /= Dst_BR
-                                            and then (not Is_Void_Tree (D (SM_REPRESENTATION, Src_BR))
-                                                      or else not Is_Void_Tree (D (SM_REPRESENTATION, Dst_BR))
-                                                      or else Get_Type_Info (Ctx, Src_BR).Byte_Size /= Get_Type_Info (Ctx, Dst_BR).Byte_Size)
-                                          then
-                                             declare
-                                                In_LV : constant Expr_Val := Emit_LValue (Ctx, In_A);
-                                                Tmp_R : constant String := Next_Reg (Ctx.E, "rcot");
-                                                Sz_F  : constant Natural := Natural'Max (1, FTI.Byte_Size);
-                                                Al_F  : constant Natural := Natural'Max (1, FTI.Align);
-                                             begin
-                                                Emit_Entry_Alloca (Ctx.E, Tmp_R & " = alloca [" & Img (Sz_F) & " x i8], align " & Img (Al_F));
-                                                Emit_Inst (Ctx.E, "memset " & Tmp_R & ", 0, " & Img (Sz_F) & ", align " & Img (Al_F));
-                                                if Mode = DN_IN_OUT then
-                                                   Emit_Record_Rep_Copy_Into (Ctx, Tmp_R, FT, To_String (In_LV.Reg), In_T);
-                                                end if;
-                                                AV.Kind := EK_Addr; AV.Reg := To_Unbounded_String (Tmp_R);
-                                                AV.Pir_Type := FTI.Pir_Type; AV.Ada_Type := FT; AV.Align := Al_F;
-                                                Rec_Convs.Append ((Tmp_Ptr => AV.Reg, Dst_Ptr => In_LV.Reg, Src_T => FT, Dst_T => In_T, Check_Dst_Disc => False));
-                                             end;
-                                          else
-                                             AV := Emit_LValue (Ctx, Act);
-                                          end if;
-                                       end;
                                     else
                                        AV := Emit_LValue (Ctx, Act);
                                     end if;
@@ -1195,43 +778,71 @@ package body Cg_Expr.Call is
                                  begin
                                     if Mode = DN_IN then
                                        AV := Emit_Expr (Ctx, Act, FT);
-                                    elsif FTI.Kind = TK_Record and then KIND (Act) = DN_CONVERSION then
-                                       -- P3-6.7: Handle OUT/IN OUT record view conversion across differing record representations!
+                                       -- P5-R4: Derived subprogram call on derived record with changed representation (IN)
+                                       if FTI.Kind = TK_Record and then Needs_Record_Rep_Conv (Ctx, AV.Ada_Type, FT) then
+                                          declare
+                                             Tmp_I : constant String := Next_Reg (Ctx.E, "rcin");
+                                             Sz_I  : constant Natural := Natural'Max (1, FTI.Byte_Size);
+                                             Al_I  : constant Natural := Natural'Max (1, FTI.Align);
+                                          begin
+                                             Emit_Entry_Alloca (Ctx.E, Tmp_I & " = alloca [" & Img (Sz_I) & " x i8], align " & Img (Al_I));
+                                             Emit_Inst (Ctx.E, "memset " & Tmp_I & ", 0, " & Img (Sz_I) & ", align " & Img (Al_I));
+                                             Emit_Record_Rep_Copy_Into (Ctx, Tmp_I, FT, To_String (AV.Reg), AV.Ada_Type);
+                                             AV.Kind := EK_Addr; AV.Reg := To_Unbounded_String (Tmp_I);
+                                             AV.Pir_Type := FTI.Pir_Type; AV.Ada_Type := FT; AV.Align := Al_I;
+                                          end;
+                                       end if;
+                                    elsif FTI.Kind = TK_Record then
+                                       -- P3-6.7 / P5-R4: Handle OUT/IN OUT record view conversions AND derived subprogram calls across differing record reps!
                                        declare
-                                          In_A : TREE := D (AS_EXP, Act);
+                                          In_A : TREE := Act;
                                           In_T : TREE;
-                                          Src_BR, Dst_BR : TREE;
                                        begin
-                                          while not Is_Void_Tree (In_A) and then KIND (In_A) = DN_CONVERSION loop
+                                          while not Is_Void_Tree (In_A) and then KIND (In_A) in DN_CONVERSION | DN_PARENTHESIZED loop
                                              In_A := D (AS_EXP, In_A);
                                           end loop;
-                                          In_T   := (if not Is_Void_Tree (In_A) then Subst_Tree (Ctx, D (SM_EXP_TYPE, In_A)) else CONST_VOID);
-                                          Src_BR := Subst_Base_Type (Ctx, In_T);
-                                          Dst_BR := Subst_Base_Type (Ctx, FT);
-                                          if not Is_Void_Tree (Src_BR) and then not Is_Void_Tree (Dst_BR)
-                                            and then KIND (Src_BR) = DN_RECORD and then KIND (Dst_BR) = DN_RECORD
-                                            and then Src_BR /= Dst_BR
-                                            and then (not Is_Void_Tree (D (SM_REPRESENTATION, Src_BR))
-                                                      or else not Is_Void_Tree (D (SM_REPRESENTATION, Dst_BR))
-                                                      or else Get_Type_Info (Ctx, Src_BR).Byte_Size /= Get_Type_Info (Ctx, Dst_BR).Byte_Size)
-                                          then
+                                          In_T := (if not Is_Void_Tree (In_A) then Subst_Tree (Ctx, D (SM_EXP_TYPE, In_A)) else CONST_VOID);
+                                          if Needs_Record_Rep_Conv (Ctx, In_T, FT) then
                                              declare
-                                                In_LV : constant Expr_Val := Emit_LValue (Ctx, In_A);
-                                                Tmp_R : constant String := Next_Reg (Ctx.E, "rcot");
-                                                Sz_F  : constant Natural := Natural'Max (1, FTI.Byte_Size);
-                                                Al_F  : constant Natural := Natural'Max (1, FTI.Align);
+                                                In_LV  : constant Expr_Val := Emit_LValue (Ctx, In_A);
+                                                Tmp_R  : constant String := Next_Reg (Ctx.E, "rcot");
+                                                Sz_F   : constant Natural := Natural'Max (1, FTI.Byte_Size);
+                                                Al_F   : constant Natural := Natural'Max (1, FTI.Align);
+                                                Dst_BR : constant TREE := Subst_Base_Type (Ctx, FT);
                                              begin
                                                 Is_Rep_Conv := True;
                                                 Emit_Entry_Alloca (Ctx.E, Tmp_R & " = alloca [" & Img (Sz_F) & " x i8], align " & Img (Al_F));
                                                 Emit_Inst (Ctx.E, "memset " & Tmp_R & ", 0, " & Img (Sz_F) & ", align " & Img (Al_F));
                                                 if Mode = DN_IN_OUT then
                                                    Emit_Record_Rep_Copy_Into (Ctx, Tmp_R, FT, To_String (In_LV.Reg), In_T);
-                                                elsif not Is_Void_Tree (D (SM_DISCRIMINANT_S, Dst_BR)) then
-                                                   -- LRM 6.4.1(4): discriminants of an OUT record formal are readable on entry!
+                                                else
+                                                   -- LRM 6.4.1(4) / P5-R4: copy discriminants AND allocate nested dynamic-array descriptors on OUT!
                                                    Emit_Record_Rep_Copy_Into (Ctx, Tmp_R, FT, To_String (In_LV.Reg), In_T, Discs_Only => True);
                                                 end if;
                                                 AV.Kind := EK_Addr; AV.Reg := To_Unbounded_String (Tmp_R);
                                                 AV.Pir_Type := FTI.Pir_Type; AV.Ada_Type := FT; AV.Align := Al_F;
+                                                -- Check constrained conversion types on entry (including intermediate conversions)
+                                                declare
+                                                   Walk_C : TREE := Act;
+                                                begin
+                                                   while not Is_Void_Tree (Walk_C) and then KIND (Walk_C) in DN_CONVERSION | DN_PARENTHESIZED loop
+                                                      if KIND (Walk_C) = DN_CONVERSION then
+                                                         declare
+                                                            CT_C : constant TREE := Subst_Tree (Ctx, D (SM_EXP_TYPE, Walk_C));
+                                                         begin
+                                                            if not Is_Void_Tree (CT_C) and then KIND (Resolve_Type_Spec (CT_C)) = DN_CONSTRAINED_RECORD then
+                                                               if not Needs_Record_Rep_Conv (Ctx, CT_C, FT) then
+                                                                  Emit_Discriminant_Check (Ctx, Tmp_R, CT_C, Is_Access => False);
+                                                               elsif not Needs_Record_Rep_Conv (Ctx, CT_C, In_T) then
+                                                                  Emit_Discriminant_Check (Ctx, To_String (In_LV.Reg), CT_C, Is_Access => False);
+                                                               end if;
+                                                            end if;
+                                                         end;
+                                                      end if;
+                                                      Walk_C := D (AS_EXP, Walk_C);
+                                                   end loop;
+                                                end;
+                                                pragma Unreferenced (Dst_BR);
                                                 Rec_Convs.Append ((
                                                   Tmp_Ptr        => AV.Reg,
                                                   Dst_Ptr        => In_LV.Reg,
@@ -1249,25 +860,33 @@ package body Cg_Expr.Call is
                                     if FTI.Kind = TK_Record then
                                        Emit_Discriminant_Check (Ctx, To_String (AV.Reg), FT, Is_Access => False);
                                        if not Is_Void_Tree (DFT) then
-                                          Emit_Discriminant_Check (Ctx, To_String (AV.Reg), DFT, Is_Access => False);
+                                          if not Needs_Record_Rep_Conv (Ctx, DFT, FT) then
+                                             Emit_Discriminant_Check (Ctx, To_String (AV.Reg), DFT, Is_Access => False);
+                                          end if;
                                        end if;
-                                       -- P3-3.4: On record OUT/IN OUT view conversion, verify discriminants on return!
+                                       -- P3-3.4 / P5-R4: On record OUT/IN OUT view conversion, verify discriminants across ALL constrained conversions on return!
                                        if (Mode = DN_OUT or else Mode = DN_IN_OUT) and then KIND (Act) = DN_CONVERSION then
                                           declare
-                                             Conv_RT : constant TREE := Subst_Tree (Ctx, D (SM_EXP_TYPE, Act));
-                                             In_Act  : TREE := D (AS_EXP, Act);
+                                             Walk_A : TREE := Act;
                                           begin
-                                             while not Is_Void_Tree (In_Act) and then KIND (In_Act) = DN_CONVERSION loop
-                                                In_Act := D (AS_EXP, In_Act);
+                                             while not Is_Void_Tree (Walk_A) and then KIND (Walk_A) in DN_CONVERSION | DN_PARENTHESIZED loop
+                                                if KIND (Walk_A) = DN_CONVERSION then
+                                                   declare
+                                                      Conv_RT : constant TREE := Subst_Tree (Ctx, D (SM_EXP_TYPE, Walk_A));
+                                                   begin
+                                                      if not Is_Void_Tree (Conv_RT)
+                                                        and then KIND (Resolve_Type_Spec (Conv_RT)) = DN_CONSTRAINED_RECORD
+                                                        and then not Needs_Record_Rep_Conv (Ctx, Conv_RT, FT)
+                                                      then
+                                                         Post_Checks.Append ((Act_Ptr => AV.Reg, Act_Type => Conv_RT, Is_Record => True));
+                                                      end if;
+                                                   end;
+                                                end if;
+                                                Walk_A := D (AS_EXP, Walk_A);
                                              end loop;
-                                             if not Is_Void_Tree (Conv_RT)
-                                               and then KIND (Resolve_Type_Spec (Conv_RT)) = DN_CONSTRAINED_RECORD
-                                             then
-                                                Post_Checks.Append ((Act_Ptr => AV.Reg, Act_Type => Conv_RT, Is_Record => True));
-                                             end if;
-                                             if not Is_Rep_Conv and then not Is_Void_Tree (In_Act) then
+                                             if not Is_Rep_Conv and then not Is_Void_Tree (Walk_A) then
                                                 declare
-                                                   In_T : constant TREE := Subst_Tree (Ctx, D (SM_EXP_TYPE, In_Act));
+                                                   In_T : constant TREE := Subst_Tree (Ctx, D (SM_EXP_TYPE, Walk_A));
                                                 begin
                                                    if not Is_Void_Tree (In_T)
                                                      and then KIND (Resolve_Type_Spec (In_T)) = DN_CONSTRAINED_RECORD
@@ -1371,10 +990,10 @@ package body Cg_Expr.Call is
                                                 declare
                                                    Tgt_T  : constant TREE := Conv_Chain (CI);
                                                    Tgt_TI : constant Type_Info := Get_Type_Info (Ctx, Tgt_T);
-                                                   Tgt_P  : constant String := (if CI = 1 then To_String (FTI.Pir_Type) else To_String (Tgt_TI.Pir_Type));
-                                                   Next_R : constant String := Emit_Typed_Scalar_Convert (Ctx, To_String (Cur_Reg), Cur_T, To_String (Cur_Pir), Tgt_T, Tgt_P);
+                                                   Tgt_P  : constant String := To_String (Tgt_TI.Pir_Type);
+                                                   Next_R : constant String :=
+                                                     Emit_Typed_Scalar_Convert (Ctx, To_String (Cur_Reg), Cur_T, To_String (Cur_Pir), Tgt_T, Tgt_P, Check_Range => True);
                                                 begin
-                                                   Emit_Range_Check (Ctx, Next_R, Tgt_P, Tgt_T);
                                                    Emit_Discriminant_Check (Ctx, Next_R, Tgt_T, Is_Access => True);
                                                    Cur_Reg := To_Unbounded_String (Next_R);
                                                    Cur_T   := Tgt_T;
@@ -1382,10 +1001,19 @@ package body Cg_Expr.Call is
                                                 end;
                                              end loop;
                                              if not Is_Void_Tree (DFT) then
-                                                Emit_Range_Check (Ctx, To_String (Cur_Reg), To_String (FTI.Pir_Type), DFT);
-                                                Emit_Discriminant_Check (Ctx, To_String (Cur_Reg), DFT, Is_Access => True);
+                                                declare
+                                                   DFTI : constant Type_Info := Get_Type_Info (Ctx, DFT);
+                                                   DF_R : constant String :=
+                                                     Emit_Typed_Scalar_Convert (Ctx, To_String (Cur_Reg), Cur_T, To_String (Cur_Pir), DFT, To_String (DFTI.Pir_Type), Check_Range => True);
+                                                begin
+                                                   Emit_Discriminant_Check (Ctx, DF_R, DFT, Is_Access => True);
+                                                   Cur_Reg := To_Unbounded_String (DF_R);
+                                                   Cur_T   := DFT;
+                                                   Cur_Pir := DFTI.Pir_Type;
+                                                end;
                                              end if;
-                                             Emit_Range_Check (Ctx, To_String (Cur_Reg), To_String (FTI.Pir_Type), FT);
+                                             Cur_Reg := To_Unbounded_String
+                                               (Emit_Typed_Scalar_Convert (Ctx, To_String (Cur_Reg), Cur_T, To_String (Cur_Pir), FT, To_String (FTI.Pir_Type), Check_Range => True));
                                              Emit_Discriminant_Check (Ctx, To_String (Cur_Reg), FT, Is_Access => True);
                                              Emit_Inst (Ctx.E, "store." & To_String (FTI.Pir_Type) & " " & To_String (Cur_Reg) & ", " & Tmp_Slot & ", align " & Img (Natural'Max (1, FTI.Align)));
                                           end;
@@ -1629,13 +1257,38 @@ package body Cg_Expr.Call is
                         RTI : constant Type_Info := Get_Type_Info (Ctx, SI.Ret_Type);
                      begin
                         if not Is_Void_Tree (Orig_Derived_Ret) and then RTI.Kind = TK_Record then
-                           Emit_Discriminant_Check (Ctx, To_String (Ret_Buf), Orig_Derived_Ret, Is_Access => False);
+                           if Needs_Record_Rep_Conv (Ctx, SI.Ret_Type, Orig_Derived_Ret) then
+                              declare
+                                 DRTI : constant Type_Info := Get_Type_Info (Ctx, Orig_Derived_Ret);
+                                 CBuf : constant String := Next_Reg (Ctx.E, "rcret");
+                                 Sz_R : constant Natural := Natural'Max (1, DRTI.Byte_Size);
+                                 Al_R : constant Natural := Natural'Max (1, DRTI.Align);
+                              begin
+                                 Emit_Entry_Alloca (Ctx.E, CBuf & " = alloca [" & Img (Sz_R) & " x i8], align " & Img (Al_R));
+                                 Emit_Inst (Ctx.E, "memset " & CBuf & ", 0, " & Img (Sz_R) & ", align " & Img (Al_R));
+                                 Emit_Record_Rep_Copy_Into (Ctx, CBuf, Orig_Derived_Ret, To_String (Ret_Buf), SI.Ret_Type);
+                                 Emit_Discriminant_Check (Ctx, CBuf, Orig_Derived_Ret, Is_Access => False);
+                                 Res.Kind     := EK_Addr;
+                                 Res.Reg      := To_Unbounded_String (CBuf);
+                                 Res.Pir_Type := DRTI.Pir_Type;
+                                 Res.Ada_Type := Orig_Derived_Ret;
+                                 Res.Align    := Al_R;
+                              end;
+                           else
+                              Emit_Discriminant_Check (Ctx, To_String (Ret_Buf), Orig_Derived_Ret, Is_Access => False);
+                              Res.Kind     := EK_Addr;
+                              Res.Reg      := Ret_Buf;
+                              Res.Pir_Type := RTI.Pir_Type;
+                              Res.Ada_Type := Orig_Derived_Ret;
+                              Res.Align    := RTI.Align;
+                           end if;
+                        else
+                           Res.Kind     := EK_Addr;
+                           Res.Reg      := Ret_Buf;
+                           Res.Pir_Type := RTI.Pir_Type;
+                           Res.Ada_Type := (if not Is_Void_Tree (Orig_Derived_Ret) then Orig_Derived_Ret else SI.Ret_Type);
+                           Res.Align    := RTI.Align;
                         end if;
-                        Res.Kind     := EK_Addr;
-                        Res.Reg      := Ret_Buf;
-                        Res.Pir_Type := RTI.Pir_Type;
-                        Res.Ada_Type := (if not Is_Void_Tree (Orig_Derived_Ret) then Orig_Derived_Ret else SI.Ret_Type);
-                        Res.Align    := RTI.Align;
                      end;
                   end if;
                else

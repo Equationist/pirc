@@ -21,22 +21,26 @@ package body Diana_Util is
    function To_F64 is new Ada.Unchecked_Conversion (Unsigned_64, IEEE_Float_64);
    function To_U64 is new Ada.Unchecked_Conversion (IEEE_Float_64, Unsigned_64);
 
-   Max_Big_Limbs : constant Natural := 512;
+   Max_Big_Limbs : constant Natural := 520;
+   Decode_Cap    : constant Natural := 512;
    type Big_Limb_Arr is array (1 .. Max_Big_Limbs) of Natural;
 
    -- Unified base-10000 DIANA DN_NUM_VAL limb decoder (replaces 4 duplicated decoders)
    procedure Decode_Num_Val_Limbs
-     (Node   : TREE;
-      Limbs  : out Big_Limb_Arr;
-      Len    : out Natural;
-      Is_Neg : out Boolean;
-      Trunc  : out Boolean)
+     (Node        : TREE;
+      Limbs       : out Big_Limb_Arr;
+      Len         : out Natural;
+      Is_Neg      : out Boolean;
+      Trunc       : out Boolean;
+      Skip_Low    : Natural := 0;
+      Total_Limbs : out Natural)
    is
    begin
-      Limbs  := (others => 0);
-      Len    := 1;
-      Is_Neg := False;
-      Trunc  := False;
+      Limbs       := (others => 0);
+      Len         := 1;
+      Is_Neg      := False;
+      Trunc       := False;
+      Total_Limbs := 1;
       if Is_Void_Tree (Node) or else KIND (Node) /= DN_NUM_VAL then
          return;
       end if;
@@ -48,53 +52,90 @@ package body Diana_Util is
                Is_Neg := True;
                V := -V;
             end if;
-            Limbs (1) := V mod 10000;
             if V >= 10000 then
-               Limbs (2) := V / 10000;
-               Len := 2;
+               Total_Limbs := 2;
+            end if;
+            if Skip_Low = 0 then
+               Limbs (1) := V mod 10000;
+               if V >= 10000 then
+                  Limbs (2) := V / 10000;
+                  Len := 2;
+               end if;
+            elsif Skip_Low = 1 then
+               Limbs (1) := V / 10000;
+               Len := 1;
             end if;
          end;
          return;
       end if;
       declare
-         Hdr  : constant TREE := DABS (0, Node);
-         Wlen : constant Integer := Integer (Hdr.TLN);
-         ND   : Integer := 2 * Wlen;
+         Hdr      : constant TREE := DABS (0, Node);
+         Wlen     : constant Integer := Integer (Hdr.TLN);
+         Highest  : Natural := 1;
+         Out_High : Natural := 1;
       begin
          if Wlen <= 0 then
             return;
          end if;
-         if ND > Max_Big_Limbs then
-            Trunc := True;
-            ND := Max_Big_Limbs;
-         end if;
          for J in 1 .. Wlen loop
             declare
                Pair : constant UDigit_Pair := To_UDigit_Pair (DABS (J, Node));
-               D1   : constant Integer := Integer (Pair.D1);
+               D1   : Integer := Integer (Pair.D1);
                D2   : constant Integer := Integer (Pair.D2);
+               Idx1 : constant Natural := Natural (J * 2 - 1);
+               Idx2 : constant Natural := Natural (J * 2);
             begin
-               if J * 2 - 1 <= Max_Big_Limbs then
-                  Limbs (J * 2 - 1) := (if D1 >= 0 then D1 else 0);
-               elsif D1 /= 0 then
-                  Trunc := True;
+               if J = 1 and then D1 >= 10000 then
+                  D1 := D1 - 10000;
+                  Is_Neg := True;
                end if;
-               if J * 2 <= Max_Big_Limbs then
-                  Limbs (J * 2) := (if D2 >= 0 then D2 else 0);
-               elsif D2 /= 0 then
-                  Trunc := True;
+               if D1 < 0 then D1 := 0; end if;
+               if D1 /= 0 then Highest := Idx1; end if;
+               if D2 > 0 then Highest := Idx2; end if;
+               if Idx1 > Skip_Low then
+                  declare
+                     Dst : constant Natural := Idx1 - Skip_Low;
+                  begin
+                     if Dst <= Decode_Cap then
+                        Limbs (Dst) := D1;
+                        if D1 /= 0 and then Dst > Out_High then Out_High := Dst; end if;
+                     elsif D1 /= 0 then
+                        Trunc := True;
+                     end if;
+                  end;
+               end if;
+               if Idx2 > Skip_Low then
+                  declare
+                     Dst : constant Natural := Idx2 - Skip_Low;
+                  begin
+                     if Dst <= Decode_Cap then
+                        Limbs (Dst) := (if D2 >= 0 then D2 else 0);
+                        if D2 > 0 and then Dst > Out_High then Out_High := Dst; end if;
+                     elsif D2 > 0 then
+                        Trunc := True;
+                     end if;
+                  end;
                end if;
             end;
          end loop;
-         if Limbs (1) >= 10000 then
-            Limbs (1) := Limbs (1) - 10000;
-            Is_Neg := True;
-         end if;
-         while ND > 1 and then Limbs (ND) = 0 loop
-            ND := ND - 1;
-         end loop;
-         Len := Natural (ND);
+         Total_Limbs := Highest;
+         Len := Out_High;
       end;
+   end Decode_Num_Val_Limbs;
+
+   procedure Decode_Num_Val_Limbs
+     (Node   : TREE;
+      Limbs  : out Big_Limb_Arr;
+      Len    : out Natural;
+      Is_Neg : out Boolean;
+      Trunc  : out Boolean)
+   is
+      Tot : Natural;
+   begin
+      Decode_Num_Val_Limbs (Node, Limbs, Len, Is_Neg, Trunc, 0, Tot);
+      if Tot = 0 then
+         null;
+      end if;
    end Decode_Num_Val_Limbs;
 
    function Cmp_Big (A : Big_Limb_Arr; AL : Natural; B : Big_Limb_Arr; BL : Natural) return Integer is
@@ -539,7 +580,7 @@ package body Diana_Util is
          return;
       end if;
       if KIND (Val_Node) = DN_REAL_VAL then
-         -- Exact rational evaluation when denominator is 1 or small, falling back to safe f64 check
+         -- Exact rational evaluation when denominator is 1 or both fit in Unsigned_64, falling back to f64
          declare
             NNode : constant TREE := D (XD_NUMER, Val_Node);
             DNode : constant TREE := D (XD_DENOM, Val_Node);
@@ -550,6 +591,80 @@ package body Diana_Util is
                Eval_Int64_Checked (NNode, Val, Overflowed);
                return;
             end if;
+            declare
+               N_Digs, D_Digs : Big_Limb_Arr;
+               N_Len, D_Len   : Natural;
+               N_Neg, D_Neg   : Boolean;
+               N_Tr, D_Tr     : Boolean;
+               NU, DU         : Unsigned_64 := 0;
+               N_Fits, D_Fits : Boolean := True;
+            begin
+               Decode_Num_Val_Limbs (NNode, N_Digs, N_Len, N_Neg, N_Tr);
+               Decode_Num_Val_Limbs (DNode, D_Digs, D_Len, D_Neg, D_Tr);
+               if N_Tr then N_Fits := False; end if;
+               if D_Tr then D_Fits := False; end if;
+               if N_Fits then
+                  for I in reverse 1 .. N_Len loop
+                     declare
+                        D_U : constant Unsigned_64 := Unsigned_64 (N_Digs (I));
+                     begin
+                        if NU > (Unsigned_64'Last - D_U) / 10000 then
+                           N_Fits := False;
+                           exit;
+                        end if;
+                        NU := NU * 10000 + D_U;
+                     end;
+                  end loop;
+               end if;
+               if D_Fits then
+                  for I in reverse 1 .. D_Len loop
+                     declare
+                        D_U : constant Unsigned_64 := Unsigned_64 (D_Digs (I));
+                     begin
+                        if DU > (Unsigned_64'Last - D_U) / 10000 then
+                           D_Fits := False;
+                           exit;
+                        end if;
+                        DU := DU * 10000 + D_U;
+                     end;
+                  end loop;
+               end if;
+               if N_Fits and then D_Fits and then DU > 0 then
+                  declare
+                     Neg : constant Boolean := N_Neg xor D_Neg;
+                     Q   : Unsigned_64 := NU / DU;
+                     Rem_U : constant Unsigned_64 := NU mod DU;
+                     Half  : constant Unsigned_64 := DU / 2 + (DU mod 2);
+                  begin
+                     if Rem_U >= Half then
+                        if Q = Unsigned_64'Last then
+                           Val := (if Neg then Integer_64'First else Integer_64'Last);
+                           Overflowed := True;
+                           return;
+                        end if;
+                        Q := Q + 1;
+                     end if;
+                     if Neg then
+                        if Q > 16#8000_0000_0000_0000# then
+                           Val := Integer_64'First;
+                           Overflowed := True;
+                        elsif Q = 16#8000_0000_0000_0000# then
+                           Val := Integer_64'First;
+                        else
+                           Val := -Integer_64 (Q);
+                        end if;
+                     else
+                        if Q >= 16#8000_0000_0000_0000# then
+                           Val := Integer_64'Last;
+                           Overflowed := True;
+                        else
+                           Val := Integer_64 (Q);
+                        end if;
+                     end if;
+                     return;
+                  end;
+               end if;
+            end;
             declare
                F : constant IEEE_Float_64 := Eval_Float64 (Val_Node);
                R : IEEE_Float_64;
@@ -629,13 +744,31 @@ package body Diana_Util is
             DNode  : constant TREE := D (XD_DENOM, Val_Node);
             N_Digs, D_Digs : Big_Limb_Arr;
             N_Len, D_Len   : Natural;
+            N_Tot, D_Tot   : Natural;
             N_Neg, D_Neg   : Boolean;
             N_Tr, D_Tr     : Boolean;
+            Neg            : Boolean;
          begin
-            Decode_Num_Val_Limbs (NNode, N_Digs, N_Len, N_Neg, N_Tr);
-            Decode_Num_Val_Limbs (DNode, D_Digs, D_Len, D_Neg, D_Tr);
-            pragma Unreferenced (N_Tr, D_Tr);
-            return Eval_Rational_To_F64 (N_Digs, N_Len, D_Digs, D_Len, N_Neg xor D_Neg);
+            Decode_Num_Val_Limbs (NNode, N_Digs, N_Len, N_Neg, N_Tr, 0, N_Tot);
+            Decode_Num_Val_Limbs (DNode, D_Digs, D_Len, D_Neg, D_Tr, 0, D_Tot);
+            Neg := N_Neg xor D_Neg;
+            if N_Tr or else D_Tr then
+               -- Base-10000: 90 limbs = 360 decimal digits, strictly exceeding IEEE-754 f64 exponent range
+               if N_Tot > D_Tot + 90 then
+                  return To_F64 (if Neg then 16#FFF0_0000_0000_0000# else 16#7FF0_0000_0000_0000#);
+               elsif D_Tot > N_Tot + 90 then
+                  return To_F64 (if Neg then 16#8000_0000_0000_0000# else 0);
+               else
+                  declare
+                     Max_Tot : constant Natural := Natural'Max (N_Tot, D_Tot);
+                     Skip    : constant Natural := (if Max_Tot > 400 then Max_Tot - 400 else 0);
+                  begin
+                     Decode_Num_Val_Limbs (NNode, N_Digs, N_Len, N_Neg, N_Tr, Skip, N_Tot);
+                     Decode_Num_Val_Limbs (DNode, D_Digs, D_Len, D_Neg, D_Tr, Skip, D_Tot);
+                  end;
+               end if;
+            end if;
+            return Eval_Rational_To_F64 (N_Digs, N_Len, D_Digs, D_Len, Neg);
          end;
       end if;
       return 0.0;
@@ -882,37 +1015,48 @@ package body Diana_Util is
             return 64;
          when DN_ENUMERATION =>
             declare
-               Sz : Integer_64 := 0;
+               Sz : Integer_64 := Safe_Impl_Size (R);
             begin
-               if not Is_Void_Tree (B) and then KIND (B) = DN_ENUMERATION then
+               if Sz = 0 and then not Is_Void_Tree (B) and then KIND (B) = DN_ENUMERATION then
                   Sz := Safe_Impl_Size (B);
                end if;
                if Sz <= 8 then return 8;
                elsif Sz <= 16 then return 16;
-               else return 32;
+               elsif Sz <= 32 then return 32;
+               else return 64;
                end if;
             end;
          when DN_INTEGER =>
             declare
                Sz : Integer_64 := Safe_Impl_Size (R);
+               St : Boolean;
+               Lo, Hi : Integer_64;
+               Fits_Sz : Boolean := True;
             begin
                if Sz = 0 and then not Is_Void_Tree (B) and then KIND (B) = DN_INTEGER then
                   Sz := Safe_Impl_Size (B);
                end if;
-               if Sz <= 0 then
-                  -- Infer from base type range
-                  declare
-                     St : Boolean;
-                     Lo, Hi : Integer_64;
-                  begin
-                     Get_Discrete_Bounds (B, St, Lo, Hi);
-                     if St then
-                        if Lo >= -32768 and then Hi <= 32767 then return 16;
-                        elsif Lo >= -2147483648 and then Hi <= 2147483647 then return 32;
-                        else return 64;
-                        end if;
+               Get_Discrete_Bounds (R, St, Lo, Hi);
+               if not St and then not Is_Void_Tree (B) then
+                  Get_Discrete_Bounds (B, St, Lo, Hi);
+               end if;
+               if Sz > 0 and then St then
+                  if Sz <= 8 then
+                     Fits_Sz := (Lo >= -128 and then Hi <= 127) or else (Lo >= 0 and then Hi <= 255);
+                  elsif Sz <= 16 then
+                     Fits_Sz := (Lo >= -32768 and then Hi <= 32767) or else (Lo >= 0 and then Hi <= 65535);
+                  elsif Sz <= 32 then
+                     Fits_Sz := (Lo >= -2147483648 and then Hi <= 2147483647)
+                       or else (Lo >= 0 and then Hi <= 4294967295);
+                  end if;
+               end if;
+               if Sz <= 0 or else not Fits_Sz then
+                  if St then
+                     if Lo >= -32768 and then Hi <= 32767 then return 16;
+                     elsif Lo >= -2147483648 and then Hi <= 2147483647 then return 32;
+                     else return 64;
                      end if;
-                  end;
+                  end if;
                   return 32;
                elsif Sz <= 8 then return 8;
                elsif Sz <= 16 then return 16;
@@ -1427,16 +1571,28 @@ package body Diana_Util is
             end Fits_Unsigned;
             St_R : Boolean := False;
             Lo_R, Hi_R : Integer_64 := 0;
+            BT   : constant TREE := Base_Type_Spec (R);
          begin
             -- Check subtype R first (handles `type U8 is range 0..255; for U8'Size use 8;` where
             -- DIANA's anonymous base type is signed -32768..32767), then fall back to base type
-            -- when R is non-negative or dynamic.
+            -- and its first-named subtype when R is non-negative, dynamic, or the anonymous base type.
             if Fits_Unsigned (R) then
                return True;
             end if;
             Get_Discrete_Bounds (R, St_R, Lo_R, Hi_R);
-            if not St_R or else Lo_R >= 0 then
-               return Fits_Unsigned (Base_Type_Spec (R));
+            if not St_R or else Lo_R >= 0 or else R = BT then
+               if Fits_Unsigned (BT) then
+                  return True;
+               end if;
+               if not Is_Void_Tree (BT) and then KIND (BT) in CLASS_NON_TASK then
+                  declare
+                     SN : constant TREE := D (XD_SOURCE_NAME, BT);
+                  begin
+                     if not Is_Void_Tree (SN) and then KIND (SN) = DN_TYPE_ID then
+                        return Fits_Unsigned (D (SM_TYPE_SPEC, SN));
+                     end if;
+                  end;
+               end if;
             end if;
          end;
       end if;

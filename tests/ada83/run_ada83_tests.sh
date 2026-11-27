@@ -254,6 +254,71 @@ run_p4_driver_case() {
     echo "  PASS p4_driver"
 }
 
+run_p5_driver_binder_case() {
+    # P5-R6: Driver CLI hardening + >96-char library main symbol parity + user-named ACVC support unit
+    if "$ADA_CC" --lib="" "$TDIR/01_checked_arith_and_exceptions.ada" >/dev/null 2>&1; then
+        echo "FAIL [p5_driver_empty_lib] --lib=\"\" did not fail"
+        FAIL=$((FAIL + 1))
+    else
+        PASS=$((PASS + 1))
+    fi
+    if "$ADA_CC" -c --emit-pir "$TDIR/01_checked_arith_and_exceptions.ada" >/dev/null 2>&1; then
+        echo "FAIL [p5_driver_c_emit_pir] -c --emit-pir did not fail"
+        FAIL=$((FAIL + 1))
+    else
+        PASS=$((PASS + 1))
+    fi
+    # >96-char library main procedure compiled with -L -c and bound with --bind
+    local ldir="$TMP/p5_long_main_lib"
+    local long_name="p5_very_long_library_main_procedure_identifier_exceeding_ninety_six_characters_for_fnv1a_symbol_hash_check"
+    mkdir -p "$ldir"
+    cat >"$TMP/long_main.ada" <<EOF
+with Text_IO; use Text_IO;
+procedure ${long_name} is
+begin
+   Put_Line ("LONG_MAIN_OK");
+end ${long_name};
+EOF
+    if "$ADA_CC" --pirc="$PIRC" --target="aarch64-apple-darwin" -O2 -L "$ldir" -c "$TMP/long_main.ada" 2>"$TMP/cc.err" &&
+       "$ADA_CC" --pirc="$PIRC" --target="aarch64-apple-darwin" -O2 -L "$ldir" --bind "$long_name" -o "$TMP/long_main_bin" 2>"$TMP/cc.err" &&
+       "$TMP/long_main_bin" | grep -qx "LONG_MAIN_OK"; then
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL [p5_long_main_bind] >96-char main procedure bind/run failed:"
+        cat "$TMP/cc.err"
+        FAIL=$((FAIL + 1))
+    fi
+    # User-defined package named Check_File must be elaborated and linked cleanly
+    local udir="$TMP/p5_user_checkfile_lib"
+    mkdir -p "$udir"
+    cat >"$TMP/check_file.ads" <<'EOF'
+package Check_File is
+   Val : Integer := 41;
+end Check_File;
+EOF
+    cat >"$TMP/use_cf.adb" <<'EOF'
+with Text_IO; use Text_IO;
+with Check_File;
+procedure Use_CF is
+begin
+   if Check_File.Val = 41 then
+      Put_Line ("USER_CHECK_FILE_OK");
+   end if;
+end Use_CF;
+EOF
+    if "$ADA_CC" --pirc="$PIRC" --target="aarch64-apple-darwin" -O2 -L "$udir" -c "$TMP/check_file.ads" 2>"$TMP/cc.err" &&
+       "$ADA_CC" --pirc="$PIRC" --target="aarch64-apple-darwin" -O2 -L "$udir" -c "$TMP/use_cf.adb" 2>"$TMP/cc.err" &&
+       "$ADA_CC" --pirc="$PIRC" --target="aarch64-apple-darwin" -O2 -L "$udir" --bind use_cf -o "$TMP/use_cf_bin" 2>"$TMP/cc.err" &&
+       "$TMP/use_cf_bin" | grep -qx "USER_CHECK_FILE_OK"; then
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL [p5_user_check_file] user-defined Check_File bind/run failed:"
+        cat "$TMP/cc.err"
+        FAIL=$((FAIL + 1))
+    fi
+    echo "  PASS p5_driver_binder"
+}
+
 echo "=== Ada 83 -> DIANA -> PIR Conformance Suite (PIRC=$PIRC, WITH_GNAT=$WITH_GNAT) ==="
 run_case "01_exc"     "$TDIR/01_checked_arith_and_exceptions.ada"
 run_case "02_nested"  "$TDIR/02_nested_subprograms_static_link.ada"
@@ -280,9 +345,13 @@ run_case "23_p4_rt"   "$TDIR/23_pass4_rt_task_io_core.ada"
 run_case "24_p4_expr" "$TDIR/24_pass4_expr_checks_rep.ada"
 run_case "25_p4_stmt" "$TDIR/25_pass4_stmt_task.ada"
 run_case "26_64bit"   "$TDIR/26_refactor_64bit_bounds.ada"
+run_case "27_p5_sc"   "$TDIR/27_p5_scalar_array.ada"
+run_case "28_p5_cmp"  "$TDIR/28_p5_composite_call_rtl.ada"
+run_case "29_p5_stm"  "$TDIR/29_p5_stmt_task_rt.ada"
 run_multi_sep_case
 run_c_iface_case
 run_p4_driver_case
+run_p5_driver_binder_case
 
 NEG_OK=0
 NEG_FAIL_BEFORE=$FAIL

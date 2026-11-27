@@ -2,6 +2,7 @@
 -- SPDX-License-Identifier: BSD-3-Clause
 
 with Ada.Strings.Fixed;
+with Ada_Sym_Util;
 with DIANA; use DIANA;
 with DIANAMAN; use DIANAMAN;
 with DIANATTR; use DIANATTR;
@@ -226,9 +227,13 @@ package body Cg_State is
          Cur_Task_Exit_Lbl           => Ctx.Cur_Task_Exit_Lbl,
          Cur_Task_Base_Cleanup_Depth => Ctx.Cur_Task_Base_Cleanup_Depth,
          Cur_Is_Func                 => Ctx.Cur_Is_Func,
+         Has_Stubs                   => Ctx.Has_Stubs,
+         In_Lib_Pkg_Body             => Ctx.In_Lib_Pkg_Body,
+         Cur_Task_Group_Id           => Ctx.Cur_Task_Group_Id,
          Loops                       => Ctx.Loops,
          Handlers                    => Ctx.Handlers,
          Copy_Outs                   => Ctx.Copy_Outs,
+         Stub_Restores               => Ctx.Stub_Restores,
          Cleanups                    => Ctx.Cleanups,
          Accept_Frames               => Ctx.Accept_Frames,
          Label_Cleanup_Depths        => Ctx.Label_Cleanup_Depths,
@@ -242,9 +247,13 @@ package body Cg_State is
       Ctx.Cur_Task_Reg                := Null_Unbounded_String;
       Ctx.Cur_Task_Exit_Lbl           := Null_Unbounded_String;
       Ctx.Cur_Task_Base_Cleanup_Depth := 0;
+      Ctx.Has_Stubs                   := False;
+      Ctx.In_Lib_Pkg_Body             := False;
+      Ctx.Cur_Task_Group_Id           := 0;
       Ctx.Loops.Clear;
       Ctx.Handlers.Clear;
       Ctx.Copy_Outs.Clear;
+      Ctx.Stub_Restores.Clear;
       Ctx.Cleanups.Clear;
       Ctx.Accept_Frames.Clear;
       Ctx.Label_Cleanup_Depths.Clear;
@@ -266,14 +275,38 @@ package body Cg_State is
       Ctx.Cur_Task_Exit_Lbl           := Snap.Cur_Task_Exit_Lbl;
       Ctx.Cur_Task_Base_Cleanup_Depth := Snap.Cur_Task_Base_Cleanup_Depth;
       Ctx.Cur_Is_Func                 := Snap.Cur_Is_Func;
+      Ctx.Has_Stubs                   := Snap.Has_Stubs;
+      Ctx.In_Lib_Pkg_Body             := Snap.In_Lib_Pkg_Body;
+      Ctx.Cur_Task_Group_Id           := Snap.Cur_Task_Group_Id;
       Ctx.Loops                       := Snap.Loops;
       Ctx.Handlers                    := Snap.Handlers;
       Ctx.Copy_Outs                   := Snap.Copy_Outs;
+      Ctx.Stub_Restores               := Snap.Stub_Restores;
       Ctx.Cleanups                    := Snap.Cleanups;
       Ctx.Accept_Frames               := Snap.Accept_Frames;
       Ctx.Label_Cleanup_Depths        := Snap.Label_Cleanup_Depths;
       Ctx.Uplevel_Cache               := Snap.Uplevel_Cache;
    end Restore_Subp_State;
+
+   procedure Emit_Stub_Restores (Ctx : in out Context) is
+   begin
+      for SR of Ctx.Stub_Restores loop
+         if To_String (SR.Pir_Type) = "@__ada_arr_desc" then
+            Emit_Inst (Ctx.E, "memcpy " & To_String (SR.Ptr_Reg) & ", " & To_String (SR.Loc_Reg) & ", " & Img (Arr_Desc_Size) & ", align 8");
+         else
+            declare
+               V : constant String := Next_Reg (Ctx.E, "srr");
+            begin
+               Emit_Inst (Ctx.E,
+                 V & " = load." & To_String (SR.Pir_Type) & " " &
+                 To_String (SR.Loc_Reg) & ", align " & Img (SR.Align));
+               Emit_Inst (Ctx.E,
+                 "store." & To_String (SR.Pir_Type) & " " & V &
+                 ", " & To_String (SR.Ptr_Reg) & ", align " & Img (SR.Align));
+            end;
+         end if;
+      end loop;
+   end Emit_Stub_Restores;
 
    function Emit_Elem_Ptr
      (Ctx      : in out Context;
@@ -313,7 +346,7 @@ package body Cg_State is
       Add_Extern_Func (Ctx.E, "@__ada_unhandled_exception",
         "extern func @__ada_unhandled_exception(%tag: ptr) -> void cc ""c"" noreturn");
       Add_Extern_Func (Ctx.E, "@__ada_clock_ns",
-        "extern func @__ada_clock_ns() -> i64 cc ""c"" nounwind");
+        "extern func @__ada_clock_ns() -> i64 cc ""c""");
       Add_Extern_Func (Ctx.E, "@__ada_cal_time_of",
         "extern func @__ada_cal_time_of(%y: i32, %m: i32, %d: i32, %s: i64) -> i64 cc ""c""");
       Add_Extern_Func (Ctx.E, "@__ada_cal_split",
@@ -529,7 +562,7 @@ package body Cg_State is
       Add_Extern_Func (Ctx.E, "@__ada_master_abort_unactivated",
         "extern func @__ada_master_abort_unactivated(%m: ptr) -> void cc ""c"" nounwind");
       Add_Extern_Func (Ctx.E, "@__ada_master_mark",
-        "extern func @__ada_master_mark(%m: ptr) -> ptr cc ""c"" nounwind");
+        "extern func @__ada_master_mark(%m: ptr) -> ptr cc ""c""");
       Add_Extern_Func (Ctx.E, "@__ada_master_activate_since",
         "extern func @__ada_master_activate_since(%m: ptr, %mk: ptr) -> void cc ""c""");
       Add_Extern_Func (Ctx.E, "@__ada_master_abort_since",
@@ -619,9 +652,11 @@ package body Cg_State is
             return;
          end if;
       end if;
-      -- Follow SM_DERIVED to root task spec so derived task types share their parent's task body
+      -- Follow SM_DERIVED to root task spec so derived task types share their parent's task body & dynamic entry symbols
       declare
-         Root_TS : TREE := TS;
+         Root_TS      : TREE := TS;
+         Is_Der_TS    : Boolean := False;
+         Root_Entries : U32_Vecs.Vector;
       begin
          for Step in 1 .. 16 loop
             exit when Is_Void_Tree (D (SM_DERIVED, Root_TS));
@@ -632,50 +667,66 @@ package body Cg_State is
                Root_TS := Par;
             end;
          end loop;
-          if Root_TS /= TS then
-             Register_Task_Spec (Ctx, Root_TS, Parent_Subp, Force_Rebind => False);
-             declare
-                Root_TI : constant Task_Info := Ctx.Tasks.Element (Tree_Key (Root_TS));
-             begin
-                TI.Body_Fn          := Root_TI.Body_Fn;
-                TI.Parent_Subp      := Root_TI.Parent_Subp;
-                TI.Needs_SL         := Root_TI.Needs_SL;
-                TI.Elab_Flag        := Root_TI.Elab_Flag;
-                TI.Elab_Is_Local    := Root_TI.Elab_Is_Local;
-                TI.Elab_Owner       := Root_TI.Elab_Owner;
-                TI.Elab_Cap_Slot    := Root_TI.Elab_Cap_Slot;
-                TI.Elab_Fallback    := Root_TI.Elab_Fallback;
-                TI.Has_Priority     := Root_TI.Has_Priority;
-                TI.Priority         := Root_TI.Priority;
-                TI.Storage_Size     := Root_TI.Storage_Size;
-                TI.Storage_Size_Exp := Root_TI.Storage_Size_Exp;
-                TI.Has_Dyn_Entries  := Root_TI.Has_Dyn_Entries;
-                TI.Dyn_Entries_Sym  := Root_TI.Dyn_Entries_Sym;
-                TI.Dyn_Entries_Exp  := Root_TI.Dyn_Entries_Exp;
-             end;
-          else
-             declare
-                Src : constant TREE := D (XD_SOURCE_NAME, TS);
-                Nm  : constant String := (if not Is_Void_Tree (Src) then Qualified_Ada_Name (Src) else "task");
-                Is_Sep_Task : constant Boolean :=
-                  Length (Ctx.Gen_Inst_Tag) = 0 and then not Ctx.In_Gen_Body
-                  and then (Ctx.Has_Stubs or else Ctx.In_Subunit or else not Is_Void_Tree (D (XD_STUB, TS)));
-             begin
-                if not Is_Void_Tree (Src) and then (Is_Library_Level (Src) or else Is_Sep_Task) then
-                   TI.Body_Fn := To_Unbounded_String ("@ada_task__" & Nm);
-                   if Is_Library_Level (Src) and then Ctx.Enable_Checks then
-                      TI.Elab_Flag := To_Unbounded_String ("@ada_telab__" & Nm);
-                   end if;
-                else
-                   TI.Body_Fn := To_Unbounded_String ("@ada_task__" & Nm & "_" & Tree_Key_Str (TS) & To_String (Ctx.Gen_Inst_Tag));
-                end if;
-                TI.Parent_Subp := Parent_Subp;
-             end;
-          end if;
-      end;
+         if Root_TS /= TS then
+            Is_Der_TS := True;
+            Register_Task_Spec (Ctx, Root_TS, Parent_Subp, Force_Rebind => False);
+            declare
+               Root_TI : constant Task_Info := Ctx.Tasks.Element (Tree_Key (Root_TS));
+               RDS     : constant TREE := D (SM_DECL_S, Root_TS);
+            begin
+               TI.Body_Fn          := Root_TI.Body_Fn;
+               TI.Parent_Subp      := Root_TI.Parent_Subp;
+               TI.Needs_SL         := Root_TI.Needs_SL;
+               TI.Elab_Flag        := Root_TI.Elab_Flag;
+               TI.Elab_Is_Local    := Root_TI.Elab_Is_Local;
+               TI.Elab_Owner       := Root_TI.Elab_Owner;
+               TI.Elab_Cap_Slot    := Root_TI.Elab_Cap_Slot;
+               TI.Elab_Fallback    := Root_TI.Elab_Fallback;
+               TI.Has_Priority     := Root_TI.Has_Priority;
+               TI.Priority         := Root_TI.Priority;
+               TI.Storage_Size     := Root_TI.Storage_Size;
+               TI.Storage_Size_Exp := Root_TI.Storage_Size_Exp;
+               TI.Has_Dyn_Entries  := Root_TI.Has_Dyn_Entries;
+               TI.Dyn_Entries_Sym  := Root_TI.Dyn_Entries_Sym;
+               TI.Dyn_Entries_Exp  := Root_TI.Dyn_Entries_Exp;
+               TI.Num_Entries      := Root_TI.Num_Entries;
+               if not Is_Void_Tree (RDS) then
+                  declare
+                     RL : SEQ_TYPE := LIST (RDS);
+                     RI : TREE;
+                  begin
+                     while not IS_EMPTY (RL) loop
+                        POP (RL, RI);
+                        if KIND (RI) = DN_SUBPROG_ENTRY_DECL then
+                           Root_Entries.Append (Tree_Key (Canonical_Def (D (AS_SOURCE_NAME, RI))));
+                        end if;
+                     end loop;
+                  end;
+               end if;
+            end;
+         else
+            declare
+               Src : constant TREE := D (XD_SOURCE_NAME, TS);
+               Nm  : constant String := (if not Is_Void_Tree (Src) then Qualified_Ada_Name (Src) else "task");
+               Is_Sep_Task : constant Boolean :=
+                 Length (Ctx.Gen_Inst_Tag) = 0 and then not Ctx.In_Gen_Body
+                 and then (Ctx.Has_Stubs or else Ctx.In_Subunit or else not Is_Void_Tree (D (XD_STUB, TS)));
+            begin
+               if not Is_Void_Tree (Src) and then (Is_Library_Level (Src) or else Is_Sep_Task) then
+                  TI.Body_Fn := To_Unbounded_String ("@ada_task__" & Nm);
+                  if Is_Library_Level (Src) and then Ctx.Enable_Checks then
+                     TI.Elab_Flag := To_Unbounded_String ("@ada_telab__" & Nm);
+                  end if;
+               else
+                  TI.Body_Fn := To_Unbounded_String ("@ada_task__" & Nm & "_" & Tree_Key_Str (TS) & To_String (Ctx.Gen_Inst_Tag));
+               end if;
+               TI.Parent_Subp := Parent_Subp;
+            end;
+         end if;
       -- Walk SM_DECL_S for entries and entry families
       declare
-         DS : constant TREE := D (SM_DECL_S, TS);
+         DS        : constant TREE := D (SM_DECL_S, TS);
+         Entry_Ord : Natural := 0;
       begin
          if not Is_Void_Tree (DS) then
             declare
@@ -798,7 +849,22 @@ package body Cg_State is
                         else
                            Next_Slot := Next_Slot + 1;
                         end if;
-                        if TI.Has_Dyn_Entries then
+                        if Is_Der_TS and then Entry_Ord < Natural (Root_Entries.Length)
+                          and then Ctx.Entries.Contains (Root_Entries.Element (Entry_Ord))
+                        then
+                           declare
+                              REI : constant Entry_Info := Ctx.Entries.Element (Root_Entries.Element (Entry_Ord));
+                           begin
+                              EI.Base_Idx      := REI.Base_Idx;
+                              EI.Fam_Is_Static := REI.Fam_Is_Static;
+                              EI.Fam_Lo        := REI.Fam_Lo;
+                              EI.Fam_Hi        := REI.Fam_Hi;
+                              EI.Fam_Base_Sym  := REI.Fam_Base_Sym;
+                              EI.Fam_Lo_Sym    := REI.Fam_Lo_Sym;
+                              EI.Fam_Hi_Sym    := REI.Fam_Hi_Sym;
+                              EI.Fam_Exported  := REI.Fam_Exported;
+                           end;
+                        elsif TI.Has_Dyn_Entries then
                            declare
                               Src_T  : constant TREE := D (XD_SOURCE_NAME, TS);
                               Is_Lib : constant Boolean := not Is_Void_Tree (Src_T) and then Is_Library_Level (Src_T);
@@ -827,6 +893,7 @@ package body Cg_State is
                               end if;
                            end;
                         end if;
+                        Entry_Ord := Entry_Ord + 1;
 
                         -- Build PIR parameter packet struct type for entry formal parameters
                         if not Is_Void_Tree (Hdr) and then not Is_Void_Tree (D (AS_PARAM_S, Hdr)) then
@@ -889,7 +956,10 @@ package body Cg_State is
             end;
          end if;
       end;
-      TI.Num_Entries := Natural'Max (1, Next_Slot);
+      if not Is_Der_TS then
+         TI.Num_Entries := Natural'Max (1, Next_Slot);
+      end if;
+      end;
       declare
          SS_E : TREE := D (SM_STORAGE_SIZE, TS);
       begin
@@ -1126,6 +1196,13 @@ package body Cg_State is
          FE.Byte_Offset := Off_Al;
          FE.Field_Size  := F_Sz;
          Ctx.Fields.Include (Tree_Key (Comp_Id), FE);
+         declare
+            Can_K : constant Unsigned_32 := Tree_Key (Canonical_Def (Comp_Id));
+         begin
+            if Can_K /= Tree_Key (Comp_Id) then
+               Ctx.Fields.Include (Can_K, FE);
+            end if;
+         end;
          FIdx := FIdx + 1;
       end Append_Field;
 
@@ -1455,6 +1532,9 @@ package body Cg_State is
                                        FE.Bit_Offset  := 0;
                                        FE.Bit_Size    := 0;
                                        Ctx.Fields.Include (CK, FE);
+                                       if Tree_Key (CID) /= CK then
+                                          Ctx.Fields.Include (Tree_Key (CID), FE);
+                                       end if;
                                        Placed.Append (CK);
                                        Max_End := Off + Natural'Max (1, FE.Field_Size);
                                        if Al > Rep_Al then Rep_Al := Al; end if;
@@ -1553,11 +1633,43 @@ package body Cg_State is
                                           FE.Bit_Size := Natural (End_Bit - Start_Bit + 1);
                                        else
                                           FE.Bit_Size := 0;
-                                          if FE.Byte_Offset + FT_R.Byte_Size > Comp_End then
-                                             Comp_End := FE.Byte_Offset + FT_R.Byte_Size;
-                                          end if;
+                                          declare
+                                             Comp_Sz : constant Natural := Elem_Storage_Size (FT_R);
+                                          begin
+                                             if FE.Byte_Offset + Comp_Sz > Comp_End then
+                                                Comp_End := FE.Byte_Offset + Comp_Sz;
+                                             end if;
+                                          end;
                                        end if;
                                        Ctx.Fields.Include (CK, FE);
+                                       -- Sync raw full-view discriminant ID if private/incomplete record differs from Canonical_Def
+                                       declare
+                                          DS_Sync : constant TREE := D (SM_DISCRIMINANT_S, Base_Rec);
+                                       begin
+                                          if not Is_Void_Tree (DS_Sync) then
+                                             declare
+                                                DL_S : SEQ_TYPE := LIST (DS_Sync);
+                                                DD_S : TREE;
+                                             begin
+                                                while not IS_EMPTY (DL_S) loop
+                                                   POP (DL_S, DD_S);
+                                                   if KIND (DD_S) = DN_DSCRMT_DECL then
+                                                      declare
+                                                         NS_S : SEQ_TYPE := LIST (D (AS_SOURCE_NAME_S, DD_S));
+                                                         ID_S : TREE;
+                                                      begin
+                                                         while not IS_EMPTY (NS_S) loop
+                                                            POP (NS_S, ID_S);
+                                                            if Tree_Key (Canonical_Def (ID_S)) = CK and then Tree_Key (ID_S) /= CK then
+                                                               Ctx.Fields.Include (Tree_Key (ID_S), FE);
+                                                            end if;
+                                                         end loop;
+                                                      end;
+                                                   end if;
+                                                end loop;
+                                             end;
+                                          end if;
+                                       end;
                                        Placed.Append (CK);
                                        if Comp_End > Max_End then
                                           Max_End := Comp_End;
@@ -1861,7 +1973,7 @@ package body Cg_State is
       Sig  : Unbounded_String := To_Unbounded_String ("@ada__" & Base);
 
       function Ada_Type_Tag (T : TREE) return String is
-         BT  : constant TREE := Subst_Base_Type (Ctx, T);
+         BT  : constant TREE := Base_Of_Type (Ctx, Subst_Resolve_Type (Ctx, T));
          TI  : constant Type_Info := Get_Type_Info (Ctx, T);
          Src : TREE := CONST_VOID;
       begin
@@ -1934,34 +2046,12 @@ package body Cg_State is
          end if;
       end if;
       declare
-         Full : constant String := To_String (Sig);
+         Full   : constant String := To_String (Sig);
+         GI_Sfx : constant String :=
+           (if not Is_Library_Level (Can) and then not Is_Subunit then To_String (Ctx.Gen_Inst_Tag) else "");
       begin
-         -- Cap very long symbol names (> 96 chars) deterministically with 64-bit FNV-1a hash
-         -- so 200-char ACVC identifiers never truncate/collide in PIR lexer or assembler!
-         if Full'Length > 96 then
-            declare
-               H : Unsigned_64 := 16#CBF2_9CE4_8422_2325#;
-               Hex : constant String := "0123456789abcdef";
-               HStr : String (1 .. 16);
-               Tmp : Unsigned_64;
-            begin
-               for C of Full loop
-                  H := (H xor Character'Pos (C)) * 16#0000_0100_0000_01B3#;
-               end loop;
-               Tmp := H;
-               for I in reverse 1 .. 16 loop
-                  HStr (I) := Hex (Natural (Tmp and 15) + 1);
-                  Tmp := Shift_Right (Tmp, 4);
-               end loop;
-               declare
-                  GI_Sfx : constant String :=
-                    (if not Is_Library_Level (Can) and then not Is_Subunit then To_String (Ctx.Gen_Inst_Tag) else "");
-               begin
-                  return Full (Full'First .. Full'First + 47) & "_h" & HStr & GI_Sfx;
-               end;
-            end;
-         end if;
-         return Full;
+         -- Cap very long symbol names (> 96 chars) deterministically with shared 64-bit FNV-1a hash
+         return Ada_Sym_Util.Cap_Pir_Sym (Full, Suffix => GI_Sfx);
       end;
    end Mangle_Subp_Name;
 
@@ -2018,7 +2108,7 @@ package body Cg_State is
       if Is_Terminated (Ctx.E) then
          if Ret_Type'Length > 0 and then Ret_Type /= "void" then
             if Ret_Type = "ptr" then
-               Res_Reg := To_Unbounded_String ("null");
+               Res_Reg := To_Unbounded_String ("0");
             elsif Ret_Type = "f32" or else Ret_Type = "f64" then
                Res_Reg := To_Unbounded_String ("0.0");
             else

@@ -26,6 +26,28 @@ package body REPCLAU is
     SEEN_SIZE: array (1 .. MAX_SEEN_REP) of TREE;
     SEEN_SIZE_CNT: NATURAL := 0;
 
+    function SAFE_U_POS (V : TREE) return INTEGER is
+    begin
+	if V = CONST_VOID then
+	    return 0;
+	end if;
+	return UARITH.U_POS(V);
+    end SAFE_U_POS;
+
+    function SAFE_IMPL_SIZE (TS : TREE) return TREE is
+	SZ : TREE;
+    begin
+	if TS = CONST_VOID then
+	    return CONST_VOID;
+	end if;
+	SZ := D(CD_IMPL_SIZE, TS);
+	if SZ /= CONST_VOID and then KIND(SZ) = DN_NUM_VAL
+	and then SAFE_U_POS(UARITH."<"(UARITH.U_VAL(0), SZ)) /= 0 then
+	    return SZ;
+	end if;
+	return CONST_VOID;
+    end SAFE_IMPL_SIZE;
+
     procedure CHECK_TYPE_IN_CURRENT_REGION(ID: TREE; SRCPOS: TREE; H: H_TYPE) is
 	DEF: TREE;
     begin
@@ -281,7 +303,7 @@ package body REPCLAU is
 		    end loop;
 		    if KIND(UNDER_T) in CLASS_SCALAR then
 		        -- LRM 13.2(6): reject 'SIZE smaller than minimum bits required for scalar subtype
-		        if STATIC_VALUE /= CONST_VOID and then UARITH.U_POS(UARITH."<"(STATIC_VALUE, UARITH.U_VAL(0))) = 0 then
+		        if STATIC_VALUE /= CONST_VOID and then SAFE_U_POS(UARITH."<"(STATIC_VALUE, UARITH.U_VAL(0))) = 0 then
 			    declare
 			        use UARITH;
 			        PFX_SUB: TREE := D(SM_TYPE_SPEC, GET_NAME_DEFN(PREFIX));
@@ -343,12 +365,12 @@ package body REPCLAU is
 						    end if;
 						end;
 					    end if;
-					    if U_POS(V1 < U_VAL(0)) /= 0 then
+					    if SAFE_U_POS(V1 < U_VAL(0)) /= 0 then
 					        -- Signed 2's complement: need 2**(B-1) > V2 and -2**(B-1) <= V1
 					        REQ_BITS := 1;
 					        while REQ_BITS < 64
 					        and then (not (V2 <= U_VAL(2) ** U_VAL(REQ_BITS - 1) - U_VAL(1))
-						          or else U_POS(V1 < -(U_VAL(2) ** U_VAL(REQ_BITS - 1))) /= 0)
+						          or else SAFE_U_POS(V1 < -(U_VAL(2) ** U_VAL(REQ_BITS - 1))) /= 0)
 					        loop
 						    REQ_BITS := REQ_BITS + 1;
 					        end loop;
@@ -361,14 +383,14 @@ package body REPCLAU is
 						    REQ_BITS := REQ_BITS + 1;
 					        end loop;
 					    end if;
-					    if U_POS(STATIC_VALUE < U_VAL(REQ_BITS)) /= 0 then
+					    if SAFE_U_POS(STATIC_VALUE < U_VAL(REQ_BITS)) /= 0 then
 					        ERROR(D(LX_SRCPOS, EXP), "Size too small for type");
 					    end if;
 				        end if;
 				    end if;
 			        elsif PFX_SUB /= CONST_VOID and then KIND(PFX_SUB) = DN_FLOAT then
-				    if DI(CD_IMPL_SIZE, UNDER_T) > 0
-				    and then U_POS(STATIC_VALUE < U_VAL(DI(CD_IMPL_SIZE, UNDER_T))) /= 0 then
+				    if SAFE_IMPL_SIZE(UNDER_T) /= CONST_VOID
+				    and then SAFE_U_POS(STATIC_VALUE < SAFE_IMPL_SIZE(UNDER_T)) /= 0 then
 					ERROR(D(LX_SRCPOS, EXP), "Size too small for floating point type");
 				    end if;
 			        elsif PFX_SUB /= CONST_VOID and then KIND(PFX_SUB) = DN_FIXED then
@@ -382,7 +404,7 @@ package body REPCLAU is
 					    if V1 /= CONST_VOID and then V2 /= CONST_VOID and then V1 <= V2 then
 						declare
 						    ZERO_R: constant TREE := SM * U_VAL(0);
-						    IS_NEG: constant BOOLEAN := (U_POS(V1 < ZERO_R) /= 0);
+						    IS_NEG: constant BOOLEAN := (SAFE_U_POS(V1 < ZERO_R) /= 0);
 						begin
 						    REQ_BITS := 1;
 						    if IS_NEG then
@@ -399,7 +421,7 @@ package body REPCLAU is
 							    REQ_BITS := REQ_BITS + 1;
 							end loop;
 						    end if;
-						    if U_POS(STATIC_VALUE < U_VAL(REQ_BITS)) /= 0 then
+						    if SAFE_U_POS(STATIC_VALUE < U_VAL(REQ_BITS)) /= 0 then
 							ERROR(D(LX_SRCPOS, EXP), "Size too small for fixed point type");
 						    end if;
 						end;
@@ -497,41 +519,41 @@ package body REPCLAU is
 						    CV1 := GET_STATIC_VALUE(D(AS_EXP1, CRNG));
 						    CV2 := GET_STATIC_VALUE(D(AS_EXP2, CRNG));
 						    if CV1 /= CONST_VOID and then CV2 /= CONST_VOID
-						    and then U_POS(CV1 <= CV2) /= 0 then
-							if U_POS(CV1 < U_VAL(0)) /= 0 then
+						    and then SAFE_U_POS(CV1 <= CV2) /= 0 then
+							if SAFE_U_POS(CV1 < U_VAL(0)) /= 0 then
 							    CDIFF := U_VAL(0) - CV1;
-							    if U_POS(CV2 >= CDIFF) /= 0 then
+							    if SAFE_U_POS(CV2 >= CDIFF) /= 0 then
 								CDIFF := CV2 + U_VAL(1);
 							    end if;
 							    CPOW2 := U_VAL(1);
 							    COMP_BITS := 1;
-							    while U_POS(CPOW2 < CDIFF) /= 0 and then COMP_BITS < 64 loop
+							    while SAFE_U_POS(CPOW2 < CDIFF) /= 0 and then COMP_BITS < 64 loop
 								CPOW2 := CPOW2 + CPOW2;
 								COMP_BITS := COMP_BITS + 1;
 							    end loop;
 							else
 							    CPOW2 := U_VAL(2);
 							    COMP_BITS := 1;
-							    while U_POS(CPOW2 <= CV2) /= 0 and then COMP_BITS < 64 loop
+							    while SAFE_U_POS(CPOW2 <= CV2) /= 0 and then COMP_BITS < 64 loop
 								CPOW2 := CPOW2 + CPOW2;
 								COMP_BITS := COMP_BITS + 1;
 							    end loop;
 							end if;
 						    elsif KIND(COMP_T) = DN_ENUMERATION then
 							COMP_BITS := 1;
-						    elsif DI(CD_IMPL_SIZE, COMP_T) > 0 then
-							COMP_BITS := DI(CD_IMPL_SIZE, COMP_T);
+						    elsif SAFE_IMPL_SIZE(COMP_T) /= CONST_VOID then
+							COMP_BITS := SAFE_U_POS(SAFE_IMPL_SIZE(COMP_T));
 						    end if;
 						elsif KIND(COMP_T) = DN_ENUMERATION then
 						    COMP_BITS := 1;
-						elsif DI(CD_IMPL_SIZE, COMP_T) > 0 then
-						    COMP_BITS := DI(CD_IMPL_SIZE, COMP_T);
+						elsif SAFE_IMPL_SIZE(COMP_T) /= CONST_VOID then
+						    COMP_BITS := SAFE_U_POS(SAFE_IMPL_SIZE(COMP_T));
 						end if;
 					    end;
-					elsif KIND(COMP_T) in CLASS_SCALAR and then DI(CD_IMPL_SIZE, COMP_T) > 0 then
-					    COMP_BITS := DI(CD_IMPL_SIZE, COMP_T);
+					elsif KIND(COMP_T) in CLASS_SCALAR and then SAFE_IMPL_SIZE(COMP_T) /= CONST_VOID then
+					    COMP_BITS := SAFE_U_POS(SAFE_IMPL_SIZE(COMP_T));
 					end if;
-					if U_POS(STATIC_VALUE < TOT_EL * U_VAL(COMP_BITS)) /= 0 then
+					if SAFE_U_POS(STATIC_VALUE < TOT_EL * U_VAL(COMP_BITS)) /= 0 then
 					    ERROR(D(LX_SRCPOS, EXP), "Size too small for array type");
 					end if;
 				    end if;
@@ -573,22 +595,22 @@ package body REPCLAU is
 							CBITS: INTEGER := 1;
 							V1, V2, DIFF, POW2: TREE;
 						    begin
-							if CBT = CT and then DI(CD_IMPL_SIZE, CT) > 0 then
-							    CBITS := DI(CD_IMPL_SIZE, CT);
+							if CBT = CT and then SAFE_IMPL_SIZE(CT) /= CONST_VOID then
+							    CBITS := SAFE_U_POS(SAFE_IMPL_SIZE(CT));
 							elsif CRNG /= CONST_VOID and then KIND(CRNG) = DN_RANGE then
 							    V1 := GET_STATIC_VALUE(D(AS_EXP1, CRNG));
 							    V2 := GET_STATIC_VALUE(D(AS_EXP2, CRNG));
 							    if V1 /= CONST_VOID and then V2 /= CONST_VOID
-							    and then U_POS(V1 <= V2) /= 0 then
-								if U_POS(V1 < U_VAL(0)) /= 0 then
+							    and then SAFE_U_POS(V1 <= V2) /= 0 then
+								if SAFE_U_POS(V1 < U_VAL(0)) /= 0 then
 								    -- signed: need sign bit + magnitude bits
 								    DIFF := U_VAL(0) - V1;
-								    if U_POS(V2 >= DIFF) /= 0 then
+								    if SAFE_U_POS(V2 >= DIFF) /= 0 then
 									DIFF := V2 + U_VAL(1);
 								    end if;
 								    POW2 := U_VAL(1);
 								    CBITS := 1;
-								    while U_POS(POW2 < DIFF) /= 0 and then CBITS < 64 loop
+								    while SAFE_U_POS(POW2 < DIFF) /= 0 and then CBITS < 64 loop
 									POW2 := POW2 + POW2;
 									CBITS := CBITS + 1;
 								    end loop;
@@ -596,7 +618,7 @@ package body REPCLAU is
 								    -- non-negative: fit 0..V2
 								    POW2 := U_VAL(2);
 								    CBITS := 1;
-								    while U_POS(POW2 <= V2) /= 0 and then CBITS < 64 loop
+								    while SAFE_U_POS(POW2 <= V2) /= 0 and then CBITS < 64 loop
 									POW2 := POW2 + POW2;
 									CBITS := CBITS + 1;
 								    end loop;
@@ -616,7 +638,7 @@ package body REPCLAU is
 				end;
 			    end if;
 			    if STATIC_VALUE /= CONST_VOID and then MIN_BITS > 0
-			    and then U_POS(STATIC_VALUE < U_VAL(MIN_BITS)) /= 0 then
+			    and then SAFE_U_POS(STATIC_VALUE < U_VAL(MIN_BITS)) /= 0 then
 				ERROR(D(LX_SRCPOS, EXP), "Size too small for record type");
 			    end if;
 			    D(SM_SIZE, PREFIX_TYPE, STATIC_VALUE);
@@ -804,7 +826,11 @@ package body REPCLAU is
 		SN_CHK := D(AS_DESIGNATOR, SN_CHK);
 	    end if;
 	    if SN_CHK /= CONST_VOID and then KIND(SN_CHK) = DN_USED_NAME_ID then
-		CHECK_TYPE_IN_CURRENT_REGION(D(SM_DEFN, SN_CHK), D(LX_SRCPOS, SIMPLE_NAME), H);
+		if D(SM_DEFN, SN_CHK) /= CONST_VOID and then KIND(D(SM_DEFN, SN_CHK)) = DN_SUBTYPE_ID then
+		    ERROR(D(LX_SRCPOS, SIMPLE_NAME), "Enumeration representation clause not allowed for subtype");
+		else
+		    CHECK_TYPE_IN_CURRENT_REGION(D(SM_DEFN, SN_CHK), D(LX_SRCPOS, SIMPLE_NAME), H);
+		end if;
 	    end if;
 	    for K in 1 .. SEEN_ENUM_CNT loop
 		if SEEN_ENUM_REP(K) = ENUM_TYPE then
@@ -928,21 +954,21 @@ package body REPCLAU is
 		if not (MIN_64 <= FIRST_REP) or else not (LAST_REP <= MAX_64) then
 		    ERROR(D(LX_SRCPOS, EXP), "Enumeration representation code out of range");
 		else
-		    if U_POS(FIRST_REP < U_VAL(0)) /= 0 then
+		    if SAFE_U_POS(FIRST_REP < U_VAL(0)) /= 0 then
 			DIFF := U_VAL(0) - FIRST_REP;
-			if U_POS(LAST_REP >= DIFF) /= 0 then
+			if SAFE_U_POS(LAST_REP >= DIFF) /= 0 then
 			    DIFF := LAST_REP + U_VAL(1);
 			end if;
 			POW2 := U_VAL(1);
 			REQ_BITS := 1;
-			while U_POS(POW2 < DIFF) /= 0 and then REQ_BITS < 64 loop
+			while SAFE_U_POS(POW2 < DIFF) /= 0 and then REQ_BITS < 64 loop
 			    POW2 := POW2 + POW2;
 			    REQ_BITS := REQ_BITS + 1;
 			end loop;
 		    else
 			POW2 := U_VAL(2);
 			REQ_BITS := 1;
-			while U_POS(POW2 <= LAST_REP) /= 0 and then REQ_BITS < 64 loop
+			while SAFE_U_POS(POW2 <= LAST_REP) /= 0 and then REQ_BITS < 64 loop
 			    POW2 := POW2 + POW2;
 			    REQ_BITS := REQ_BITS + 1;
 			end loop;
@@ -1073,7 +1099,11 @@ package body REPCLAU is
 	FIND_DIRECT_VISIBILITY(SIMPLE_NAME, DEFSET);
 	REQUIRE_UNIQUE_DEF(SIMPLE_NAME, DEFSET);
 	NAME_ID := GET_THE_ID(DEFSET);
-	if KIND(NAME_ID) not in CLASS_TYPE_NAME
+	if KIND(NAME_ID) = DN_SUBTYPE_ID then
+	    NAME_ID := CONST_VOID;
+	    ERROR(D(LX_SRCPOS,SIMPLE_NAME), "Record representation clause not allowed for subtype");
+	    RECORD_DEF := CONST_VOID;
+	elsif KIND(NAME_ID) not in CLASS_TYPE_NAME
 	or else KIND(GET_BASE_TYPE(NAME_ID)) /= DN_RECORD then
 	    NAME_ID := CONST_VOID;
             ERROR(D(LX_SRCPOS,SIMPLE_NAME), "Must be record type");
@@ -1282,7 +1312,9 @@ package body REPCLAU is
 			LB_V: constant TREE := GET_STATIC_VALUE(D(AS_EXP2, REP_RANGE));
 			CID: constant TREE := D(SM_DEFN, REP_NAME);
 		    begin
-			if POS_V /= CONST_VOID and then CID /= CONST_VOID then
+			if POS_V = CONST_VOID then
+			    ERROR(D(LX_SRCPOS, REP_EXP), "Static position required in component clause");
+			elsif CID /= CONST_VOID then
 			    declare
 				CT_C: constant TREE := D(SM_OBJ_TYPE, CID);
 				CB_C: constant TREE := GET_BASE_STRUCT(CT_C);
@@ -1300,16 +1332,18 @@ package body REPCLAU is
 				HI_B: constant TREE := POS_V * U_VAL(8) + LB_V;
 				IS_V: constant BOOLEAN := not IS_IN_FIXED_PART(CID);
 			    begin
-				if U_POS(POS_V < U_VAL(0)) /= 0 or else U_POS(FB_V < U_VAL(0)) /= 0 then
+				if SAFE_U_POS(POS_V < U_VAL(0)) /= 0 or else SAFE_U_POS(FB_V < U_VAL(0)) /= 0 then
 				    ERROR(D(LX_SRCPOS, COMP_REP), "Negative position or bit in component clause");
+				elsif SAFE_U_POS(LB_V < FB_V) /= 0 then
+				    ERROR(D(LX_SRCPOS, REP_RANGE), "First bit exceeds last bit in component clause");
 				end if;
 				for K in 1 .. PLACED_CNT loop
 				    if PLACED(K).COMP_ID = CID then
 					ERROR(D(LX_SRCPOS, COMP_REP), "Duplicate component clause");
 				    elsif not (NAME_TYPE /= CONST_VOID and then KIND(NAME_TYPE) = DN_RECORD
 					       and then IN_DIFF_VARIANTS(CID, PLACED(K).COMP_ID, D(SM_COMP_LIST, NAME_TYPE)))
-				    and then U_POS(HI_B < PLACED(K).LO_BIT) = 0
-				    and then U_POS(PLACED(K).HI_BIT < LO_B) = 0 then
+				    and then SAFE_U_POS(HI_B < PLACED(K).LO_BIT) = 0
+				    and then SAFE_U_POS(PLACED(K).HI_BIT < LO_B) = 0 then
 					ERROR(D(LX_SRCPOS, COMP_REP), "Overlapping component clauses");
 				    end if;
 				end loop;

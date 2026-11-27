@@ -193,8 +193,8 @@ package body DEFWALK is
                 use UARITH;
 
                 RANGE_NODE:     constant TREE := D(AS_CONSTRAINT, TYPE_DEF);
-                EXP1:           TREE := D(AS_EXP1, RANGE_NODE);
-                EXP2:           TREE := D(AS_EXP2, RANGE_NODE);
+                EXP1:           TREE := CONST_VOID;
+                EXP2:           TREE := CONST_VOID;
 
                 TYPESET_1:      TYPESET_TYPE;
                 TYPESET_2:      TYPESET_TYPE;
@@ -204,6 +204,12 @@ package body DEFWALK is
                 ANCESTOR_TYPE:  TREE;
                 DERIVED_BASE:   TREE;
             begin
+                if RANGE_NODE = CONST_VOID or else KIND(RANGE_NODE) /= DN_RANGE then
+                    ERROR(D(LX_SRCPOS, TYPE_DEF), "Static range required");
+                    return CONST_VOID;
+                end if;
+                EXP1 := D(AS_EXP1, RANGE_NODE);
+                EXP2 := D(AS_EXP2, RANGE_NODE);
 
                 -- evaluate the lower bound expression
                 EVAL_EXP_TYPES(EXP1, TYPESET_1);
@@ -341,7 +347,11 @@ package body DEFWALK is
 
                 -- if a range is given
                 if RANGE_NODE /= CONST_VOID then
-
+                    if KIND(RANGE_NODE) /= DN_RANGE then
+                        ERROR(D(LX_SRCPOS, RANGE_NODE), "Static range required");
+                        LOWER_BOUND := CONST_VOID;
+                        UPPER_BOUND := CONST_VOID;
+                    else
                     -- evaluate the lower bound expression
                     EXP1 := D(AS_EXP1, RANGE_NODE);
                     EVAL_EXP_TYPES(EXP1, TYPESET_1);
@@ -359,6 +369,7 @@ package body DEFWALK is
                     EXP2 := RESOLVE_EXP(EXP2, TYPESET_2);
                     D(AS_EXP2, RANGE_NODE, EXP2);
                     UPPER_BOUND := GET_STATIC_VALUE(EXP2);
+                    end if;
                 end if;
 
                 -- if accuracy and both bounds (if given) are static
@@ -530,7 +541,7 @@ package body DEFWALK is
 
 
                 -- if no range is given
-                if RANGE_NODE = CONST_VOID then
+                if RANGE_NODE = CONST_VOID or else KIND(RANGE_NODE) /= DN_RANGE then
 
                     -- indicate error
                     ERROR(D(LX_SRCPOS, CONSTRAINT), "Range required");
@@ -611,8 +622,8 @@ package body DEFWALK is
                         IMPL_SMALL := IMPL_SMALL / P2_1;
                     end loop;
                 end if;
-                if IMPL_SMALL = CONST_VOID then
-                    ERROR(D(LX_SRCPOS, D(AS_EXP, TYPE_DEF)), "Fixed point delta out of implementation range");
+                if IMPL_SMALL = CONST_VOID or else not (IMPL_SMALL <= ACCURACY) then
+                    ERROR(D(LX_SRCPOS, EXP), "Fixed point delta out of implementation range");
                     return CONST_VOID;
                 end if;
 
@@ -1630,8 +1641,15 @@ package body DEFWALK is
                                                             and then D(SM_DEFN, NM) /= CONST_VOID
                                                             and then KIND(D(SM_DEFN, NM)) in CLASS_TYPE_NAME then
                                                                 declare
-                                                                    TS_N: constant TREE := D(SM_TYPE_SPEC, D(SM_DEFN, NM));
+                                                                    TS_N: TREE := D(SM_TYPE_SPEC, D(SM_DEFN, NM));
                                                                 begin
+                                                                    if TS_N /= CONST_VOID and then KIND(TS_N) in CLASS_PRIVATE_SPEC
+                                                                    and then D(SM_TYPE_SPEC, TS_N) /= CONST_VOID then
+                                                                        TS_N := D(SM_TYPE_SPEC, TS_N);
+                                                                    elsif TS_N /= CONST_VOID and then KIND(TS_N) = DN_INCOMPLETE
+                                                                    and then D(XD_FULL_TYPE_SPEC, TS_N) /= CONST_VOID then
+                                                                        TS_N := D(XD_FULL_TYPE_SPEC, TS_N);
+                                                                    end if;
                                                                     if TS_N /= CONST_VOID and then KIND(TS_N) in DN_ENUMERATION .. DN_INTEGER then
                                                                         R_NODE := D(SM_RANGE, TS_N);
                                                                     end if;

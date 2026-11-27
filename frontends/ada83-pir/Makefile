@@ -27,8 +27,11 @@ all: $(BIN) $(BIND_BIN) $(RTL_IMG)/PARSE.VM $(RT_ARM64) $(IO_ARM64) $(TK_ARM64) 
 
 diana2pir: $(BIN) $(BIND_BIN)
 
-$(BIN) $(BIND_BIN): ada83_pir.gpr src/*.ads src/*.adb $(DIANA_DIR)/lib/libdiana.a
+$(BIN): ada83_pir.gpr src/*.ads src/*.adb $(DIANA_DIR)/lib/libdiana.a
 	gprbuild -p -P ada83_pir.gpr -largs $(LINKER_FL)
+
+$(BIND_BIN): $(BIN)
+	@test -x $(BIND_BIN)
 
 rtl: $(RTL_IMG)/PARSE.VM
 

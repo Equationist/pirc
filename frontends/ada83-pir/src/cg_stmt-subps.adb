@@ -7,6 +7,7 @@ with Ada.Strings.Fixed;
 with Ada.Strings.Maps.Constants;
 with Ada.Strings.Unbounded; use Ada.Strings.Unbounded;
 with Ada.Text_IO;
+with Ada_Sym_Util;
 with DIANA; use DIANA;
 with DIANATTR; use DIANATTR;
 with Diana_Util; use Diana_Util;
@@ -290,8 +291,8 @@ package body Cg_Stmt.Subps is
                         GK     : constant Unsigned_32 := Tree_Key (Gen_Id);
                         GB     : TREE := CONST_VOID;
                      begin
-                        Collect_Local_Owners (D (SM_DECL_S, UK), False);
-                        Collect_Local_Owners (D (SM_SPEC, PID), False);
+                        Collect_Local_Owners (D (SM_DECL_S, UK), In_Gen_Bdy);
+                        Collect_Local_Owners (D (SM_SPEC, PID), In_Gen_Bdy);
                         -- P3-5.1: Propagate nested generic bodies in instantiated package spec
                         declare
                            GSp : constant TREE := (if not Is_Void_Tree (Gen_Id) and then KIND (Gen_Id) = DN_GENERIC_ID then D (SM_SPEC, Gen_Id) else CONST_VOID);
@@ -423,7 +424,8 @@ package body Cg_Stmt.Subps is
                begin
                   if CP.Inst_Key /= 0 then
                      Ctx.Gen_Cap_Slots.Include
-                       (Shift_Left (Unsigned_64 (CP.Inst_Key), 32) or Unsigned_64 (CK), Slot);
+                       (Shift_Left (Unsigned_64 (CP.Inst_Key), 32) or Unsigned_64 (CK),
+                        (Cap_Slot => Slot, Con_Cap_Slot => N_Cap + Slot));
                   else
                      declare
                         V : Var_Info;
@@ -646,11 +648,21 @@ package body Cg_Stmt.Subps is
                                  Emit_Store_Arr_Desc (Ctx, GA, PN & "_ptr", VInfo.First_Regs, VInfo.Last_Regs, TI.NDims);
                                  VInfo.Has_Desc    := True;
                                  VInfo.Desc_Global := To_Unbounded_String (GSym);
-                                 Ctx.Copy_Outs.Append ((Ptr_Reg  => To_Unbounded_String (GA),
-                                                        Loc_Reg  => To_Unbounded_String (Sav),
-                                                        Pir_Type => To_Unbounded_String ("@__ada_arr_desc"),
-                                                        Align    => 8,
-                                                        Ada_Type => CONST_VOID));
+                                 Ctx.Stub_Restores.Append ((Ptr_Reg  => To_Unbounded_String (GA),
+                                                            Loc_Reg  => To_Unbounded_String (Sav),
+                                                            Pir_Type => To_Unbounded_String ("@__ada_arr_desc"),
+                                                            Align    => 8,
+                                                            Ada_Type => CONST_VOID));
+                                 if VInfo.Captured_Slot > 0 and then SI.Has_Frame then
+                                    declare
+                                       FP : constant String := Next_Reg (Ctx.E, "pfp");
+                                    begin
+                                       Emit_Inst (Ctx.E,
+                                         FP & " = field_ptr " & To_String (SI.Frame_Type) & ", " &
+                                         To_String (Ctx.Cur_Frame_Reg) & ", " & Img (VInfo.Captured_Slot));
+                                       Emit_Inst (Ctx.E, "store.ptr " & GA & ", " & FP & ", align 8");
+                                    end;
+                                 end if;
                               end;
                            elsif VInfo.Captured_Slot > 0 and then SI.Has_Frame then
                               declare
@@ -687,13 +699,14 @@ package body Cg_Stmt.Subps is
                                  Emit_Inst (Ctx.E, OldV & " = load.ptr " & GA & ", align 8");
                                  Emit_Inst (Ctx.E, "store.ptr " & OldV & ", " & Sav & ", align 8");
                                  Emit_Inst (Ctx.E, "store.ptr " & PN & ", " & GA & ", align 8");
-                                 Ctx.Copy_Outs.Append ((Ptr_Reg  => To_Unbounded_String (GA),
-                                                        Loc_Reg  => To_Unbounded_String (Sav),
-                                                        Pir_Type => To_Unbounded_String ("ptr"),
-                                                        Align    => 8,
-                                                        Ada_Type => CONST_VOID));
+                                 Ctx.Stub_Restores.Append ((Ptr_Reg  => To_Unbounded_String (GA),
+                                                            Loc_Reg  => To_Unbounded_String (Sav),
+                                                            Pir_Type => To_Unbounded_String ("ptr"),
+                                                            Align    => 8,
+                                                            Ada_Type => CONST_VOID));
                               end;
-                           elsif VInfo.Captured_Slot > 0 and then SI.Has_Frame then
+                           end if;
+                           if VInfo.Captured_Slot > 0 and then SI.Has_Frame then
                               declare
                                  FP : constant String := Next_Reg (Ctx.E, "pfp");
                               begin
@@ -739,6 +752,16 @@ package body Cg_Stmt.Subps is
                                        Emit_Inst (Ctx.E, "store." & To_String (TI.Pir_Type) & " " & CI & ", " & GA & ", align " & Img (TI.Align));
                                     end;
                                  end if;
+                                 if VInfo.Captured_Slot > 0 and then SI.Has_Frame then
+                                    declare
+                                       FP : constant String := Next_Reg (Ctx.E, "pfp");
+                                    begin
+                                       Emit_Inst (Ctx.E,
+                                         FP & " = field_ptr " & To_String (SI.Frame_Type) & ", " &
+                                         To_String (Ctx.Cur_Frame_Reg) & ", " & Img (VInfo.Captured_Slot));
+                                       Emit_Inst (Ctx.E, "store.ptr " & GA & ", " & FP & ", align 8");
+                                    end;
+                                 end if;
                                  VInfo.Kind     := VK_Global;
                                  VInfo.Pir_Name := To_Unbounded_String (GSym);
                                  Ctx.Copy_Outs.Append ((Ptr_Reg  => To_Unbounded_String (PN),
@@ -746,11 +769,11 @@ package body Cg_Stmt.Subps is
                                                         Pir_Type => TI.Pir_Type,
                                                         Align    => TI.Align,
                                                         Ada_Type => PT));
-                                 Ctx.Copy_Outs.Append ((Ptr_Reg  => To_Unbounded_String (GA),
-                                                        Loc_Reg  => To_Unbounded_String (Sav),
-                                                        Pir_Type => TI.Pir_Type,
-                                                        Align    => TI.Align,
-                                                        Ada_Type => CONST_VOID));
+                                 Ctx.Stub_Restores.Append ((Ptr_Reg  => To_Unbounded_String (GA),
+                                                            Loc_Reg  => To_Unbounded_String (Sav),
+                                                            Pir_Type => TI.Pir_Type,
+                                                            Align    => TI.Align,
+                                                            Ada_Type => CONST_VOID));
                               end;
                            else
                               declare
@@ -800,13 +823,23 @@ package body Cg_Stmt.Subps is
                                  Emit_Inst (Ctx.E, OldV & " = load." & To_String (TI.Pir_Type) & " " & GA & ", align " & Img (TI.Align));
                                  Emit_Inst (Ctx.E, "store." & To_String (TI.Pir_Type) & " " & OldV & ", " & Sav & ", align " & Img (TI.Align));
                                  Emit_Inst (Ctx.E, "store." & To_String (TI.Pir_Type) & " " & PN & ", " & GA & ", align " & Img (TI.Align));
+                                 if VInfo.Captured_Slot > 0 and then SI.Has_Frame then
+                                    declare
+                                       FP : constant String := Next_Reg (Ctx.E, "pfp");
+                                    begin
+                                       Emit_Inst (Ctx.E,
+                                         FP & " = field_ptr " & To_String (SI.Frame_Type) & ", " &
+                                         To_String (Ctx.Cur_Frame_Reg) & ", " & Img (VInfo.Captured_Slot));
+                                       Emit_Inst (Ctx.E, "store.ptr " & GA & ", " & FP & ", align 8");
+                                    end;
+                                 end if;
                                  VInfo.Kind     := VK_Global;
                                  VInfo.Pir_Name := To_Unbounded_String (GSym);
-                                 Ctx.Copy_Outs.Append ((Ptr_Reg  => To_Unbounded_String (GA),
-                                                        Loc_Reg  => To_Unbounded_String (Sav),
-                                                        Pir_Type => TI.Pir_Type,
-                                                        Align    => TI.Align,
-                                                        Ada_Type => CONST_VOID));
+                                 Ctx.Stub_Restores.Append ((Ptr_Reg  => To_Unbounded_String (GA),
+                                                            Loc_Reg  => To_Unbounded_String (Sav),
+                                                            Pir_Type => TI.Pir_Type,
+                                                            Align    => TI.Align,
+                                                            Ada_Type => CONST_VOID));
                               end;
                            elsif VInfo.Captured_Slot > 0 and then SI.Has_Frame then
                               -- Spill to local alloca so nested subprogram can read via pointer
@@ -842,43 +875,80 @@ package body Cg_Stmt.Subps is
       -- Mark Secondary Stack at subprogram entry if it uses SS and does not return on SS
       declare
          Subp_SS_Mark : Unbounded_String;
+         Need_Stub_Unwind : constant Boolean := not Ctx.Stub_Restores.Is_Empty;
+         Stub_Exc_Lbl : Unbounded_String;
       begin
          if not SI.Ret_Uncon_Arr and then Tree_Uses_SS (Ctx, Block_B) then
             Emit_Call_Or_Invoke (Ctx, "@__ada_ss_mark", "", "i64", Subp_SS_Mark, Nounwind => True);
             Push_Cleanup (Ctx, CK_SS_Mark, To_String (Subp_SS_Mark));
          end if;
-      end;
 
-      -- Emit subprogram block body
-      Emit_Block_Body (Ctx, Block_B, Is_Subp => True);
-
-      if not Is_Terminated (Ctx.E) then
-         if SI.Is_Function then
-            -- Reaching end of function without return raises Program_Error in Ada!
-            Emit_Unwind_To (Ctx, 0, Leave_Masters => False, Release_SS => True, Restore_SP => False);
-            Emit_Raise_Tag (Ctx, Program_Error_Tag (Ctx));
-         else
-            for CO of Ctx.Copy_Outs loop
-               if To_String (CO.Pir_Type) = "@__ada_arr_desc" then
-                  Emit_Inst (Ctx.E, "memcpy " & To_String (CO.Ptr_Reg) & ", " & To_String (CO.Loc_Reg) & ", " & Img (Arr_Desc_Size) & ", align 8");
-               else
-                  declare
-                     V : constant String := Next_Reg (Ctx.E, "co");
-                  begin
-                     Emit_Inst (Ctx.E,
-                       V & " = load." & To_String (CO.Pir_Type) & " " &
-                       To_String (CO.Loc_Reg) & ", align " & Img (CO.Align));
-                     Emit_Range_Check (Ctx, V, To_String (CO.Pir_Type), CO.Ada_Type);
-                     Emit_Inst (Ctx.E,
-                       "store." & To_String (CO.Pir_Type) & " " & V &
-                       ", " & To_String (CO.Ptr_Reg) & ", align " & Img (CO.Align));
-                  end;
-               end if;
-            end loop;
-            Emit_Unwind_To (Ctx, 0, Leave_Masters => False, Release_SS => True, Restore_SP => False);
-            Emit_Term (Ctx.E, "ret");
+         if Need_Stub_Unwind then
+            Stub_Exc_Lbl := To_Unbounded_String (Next_Label (Ctx.E, "subp_sexc"));
+            Ctx.Handlers.Append ((Handler_Label => Stub_Exc_Lbl,
+                                  Current_Exn   => Null_Unbounded_String,
+                                  In_Handler    => False,
+                                  SS_Mark       => Null_Unbounded_String,
+                                  SP_Mark       => Null_Unbounded_String));
          end if;
-      end if;
+
+         -- Emit subprogram block body
+         Emit_Block_Body (Ctx, Block_B, Is_Subp => True);
+
+         if Need_Stub_Unwind then
+            Ctx.Handlers.Delete_Last;
+         end if;
+
+         if not Is_Terminated (Ctx.E) then
+            if SI.Is_Function then
+               -- Reaching end of function without return raises Program_Error in Ada!
+               Emit_Stub_Restores (Ctx);
+               Emit_Unwind_To (Ctx, 0, Leave_Masters => False, Release_SS => True, Restore_SP => False);
+               Emit_Raise_Tag (Ctx, Program_Error_Tag (Ctx));
+            else
+               declare
+                  N_CO    : constant Natural := Natural (Ctx.Copy_Outs.Length);
+                  CO_Vals : array (0 .. Natural'Max (0, N_CO - 1)) of Unbounded_String;
+               begin
+                  for I in 0 .. N_CO - 1 loop
+                     declare
+                        CO : constant Copy_Out_Entry := Ctx.Copy_Outs.Element (I);
+                        V  : constant String := Next_Reg (Ctx.E, "co");
+                     begin
+                        Emit_Inst (Ctx.E,
+                          V & " = load." & To_String (CO.Pir_Type) & " " &
+                          To_String (CO.Loc_Reg) & ", align " & Img (CO.Align));
+                        CO_Vals (I) := To_Unbounded_String (V);
+                     end;
+                  end loop;
+                  Emit_Stub_Restores (Ctx);
+                  Emit_Unwind_To (Ctx, 0, Leave_Masters => False, Release_SS => True, Restore_SP => False);
+                  for I in 0 .. N_CO - 1 loop
+                     declare
+                        CO : constant Copy_Out_Entry := Ctx.Copy_Outs.Element (I);
+                     begin
+                        Emit_Range_Check (Ctx, To_String (CO_Vals (I)), To_String (CO.Pir_Type), CO.Ada_Type);
+                        Emit_Inst (Ctx.E,
+                          "store." & To_String (CO.Pir_Type) & " " & To_String (CO_Vals (I)) &
+                          ", " & To_String (CO.Ptr_Reg) & ", align " & Img (CO.Align));
+                     end;
+                  end loop;
+                  Emit_Term (Ctx.E, "ret");
+               end;
+            end if;
+         end if;
+
+         if Need_Stub_Unwind then
+            declare
+               Sex_R : constant String := Next_Reg (Ctx.E, "ssex");
+            begin
+               Emit_Label (Ctx.E, To_String (Stub_Exc_Lbl), Sex_R & ": ptr");
+               Emit_Stub_Restores (Ctx);
+               Emit_Unwind_To (Ctx, 0, Leave_Masters => False, Release_SS => True, Restore_SP => False);
+               Emit_Raise_Reg (Ctx, Sex_R);
+            end;
+         end if;
+      end;
 
       End_Func (Ctx.E, Saved_Buf);
 
@@ -951,8 +1021,9 @@ package body Cg_Stmt.Subps is
    is
       Saved : Pir_Emit.Func_Buffer;
       type Elab_Node is record
-         Name    : Unbounded_String; -- UPPERCASE unit name
-         Is_Body : Boolean := False;
+         Name      : Unbounded_String; -- UPPERCASE unit name
+         Is_Body   : Boolean := False;
+         Emit_Call : Boolean := True;
       end record;
       package Elab_Node_Vecs is new Ada.Containers.Vectors (Positive, Elab_Node);
       type Edge_Pair is record
@@ -960,9 +1031,10 @@ package body Cg_Stmt.Subps is
          V : Positive; -- V must elaborate BEFORE U
       end record;
       package Edge_Vecs is new Ada.Containers.Vectors (Natural, Edge_Pair);
-      Nodes   : Elab_Node_Vecs.Vector;
-      Edges   : Edge_Vecs.Vector;
-      Lib_D   : constant String := To_String (Ctx.Lib_Dir);
+      Nodes       : Elab_Node_Vecs.Vector;
+      Edges       : Edge_Vecs.Vector;
+      Visited_CUs : U32_Sets.Set;
+      Lib_D       : constant String := To_String (Ctx.Lib_Dir);
 
       function Has_Edge (U, V : Positive) return Boolean is
       begin
@@ -979,6 +1051,31 @@ package body Cg_Stmt.Subps is
          end if;
       end Add_Edge;
 
+      function Can_Reach (From_Idx, To_Idx : Positive) return Boolean is
+         N_C : constant Natural := Natural (Nodes.Length);
+         Vis : array (1 .. Natural'Max (1, N_C)) of Boolean := (others => False);
+         function DFS (Cur : Positive) return Boolean is
+         begin
+            if Cur = To_Idx then
+               return True;
+            end if;
+            Vis (Cur) := True;
+            for E of Edges loop
+               if E.U = Cur and then not Vis (E.V) then
+                  if DFS (E.V) then
+                     return True;
+                  end if;
+               end if;
+            end loop;
+            return False;
+         end DFS;
+      begin
+         if From_Idx = To_Idx then
+            return True;
+         end if;
+         return DFS (From_Idx);
+      end Can_Reach;
+
       function Is_RTL_Pkg (PN : String) return Boolean is
       begin
          return PN = "_STANDRD" or else PN = "STANDARD" or else PN = "SYSTEM"
@@ -992,14 +1089,22 @@ package body Cg_Stmt.Subps is
          return PN = "REPORT" or else PN = "FCNDECL" or else PN = "SPPRT13";
       end Is_Support_Pkg;
 
-      function Find_Or_Add (PN : String; Is_Bdy : Boolean) return Natural is
+      function Find_Or_Add (PN : String; Is_Bdy : Boolean; Emit_Call : Boolean := True) return Natural is
       begin
          for I in 1 .. Natural (Nodes.Length) loop
             if Nodes.Element (I).Is_Body = Is_Bdy and then To_String (Nodes.Element (I).Name) = PN then
+               if Emit_Call and then not Nodes.Element (I).Emit_Call then
+                  declare
+                     N_Rec : Elab_Node := Nodes.Element (I);
+                  begin
+                     N_Rec.Emit_Call := True;
+                     Nodes.Replace_Element (I, N_Rec);
+                  end;
+               end if;
                return I;
             end if;
          end loop;
-         Nodes.Append ((Name => To_Unbounded_String (PN), Is_Body => Is_Bdy));
+         Nodes.Append ((Name => To_Unbounded_String (PN), Is_Body => Is_Bdy, Emit_Call => Emit_Call));
          return Natural (Nodes.Length);
       end Find_Or_Add;
 
@@ -1027,20 +1132,24 @@ package body Cg_Stmt.Subps is
          return "";
       end Root_Parent_Name;
 
-      procedure Register_Pkg (PN : String) is
+      procedure Register_Pkg (PN : String; Emit_Call : Boolean := True; Has_Body_Node : Boolean := False) is
          SI, BI : Natural;
       begin
          if PN'Length = 0 or else Is_RTL_Pkg (PN) then
             return;
          end if;
-         SI := Find_Or_Add (PN, False);
-         if Package_Has_Compiled_Body (PN, In_Unit_Bodies, Lib_D) then
-            BI := Find_Or_Add (PN, True);
+         SI := Find_Or_Add (PN, False, Emit_Call => Emit_Call);
+         if (Emit_Call and then Package_Has_Compiled_Body (PN, In_Unit_Bodies, Lib_D))
+           or else Has_Body_Node
+         then
+            BI := Find_Or_Add (PN, True, Emit_Call => Emit_Call and then Package_Has_Compiled_Body (PN, In_Unit_Bodies, Lib_D));
             if SI > 0 and then BI > 0 then
                Add_Edge (BI, SI);
             end if;
          end if;
       end Register_Pkg;
+
+      procedure Add_Context_Edges (CU : TREE; U_Idx : Natural);
 
       procedure Collect_Withs_From_CU (CU : TREE) is
          WL : SEQ_TYPE := LIST (CU);
@@ -1052,13 +1161,32 @@ package body Cg_Stmt.Subps is
                WCU : constant TREE := D (TW_COMP_UNIT, TW);
                WAD : constant TREE := (if not Is_Void_Tree (WCU) then D (AS_ALL_DECL, WCU) else CONST_VOID);
             begin
-               if not Is_Void_Tree (WAD) and then KIND (WAD) in DN_PACKAGE_DECL | DN_GENERIC_DECL then
-                  declare
-                     WPN : constant String :=
-                       Ada.Strings.Fixed.Translate (Sym_Name (D (AS_SOURCE_NAME, WAD)), Ada.Strings.Maps.Constants.Upper_Case_Map);
-                  begin
-                     Register_Pkg (WPN);
-                  end;
+               if not Is_Void_Tree (WAD) then
+                  if KIND (WAD) in DN_PACKAGE_DECL | DN_GENERIC_DECL then
+                     declare
+                        WPN : constant String :=
+                          Ada.Strings.Fixed.Translate (Sym_Name (D (AS_SOURCE_NAME, WAD)), Ada.Strings.Maps.Constants.Upper_Case_Map);
+                     begin
+                        Register_Pkg (WPN, Emit_Call => True);
+                     end;
+                  elsif KIND (WAD) = DN_SUBPROG_ENTRY_DECL then
+                     declare
+                        WPN : constant String :=
+                          Ada.Strings.Fixed.Translate (Sym_Name (D (AS_SOURCE_NAME, WAD)), Ada.Strings.Maps.Constants.Upper_Case_Map);
+                        Is_Inst : constant Boolean :=
+                          not Is_Void_Tree (D (AS_UNIT_KIND, WAD)) and then KIND (D (AS_UNIT_KIND, WAD)) = DN_INSTANTIATION;
+                     begin
+                        Register_Pkg (WPN, Emit_Call => Is_Inst);
+                     end;
+                  elsif KIND (WAD) = DN_SUBPROGRAM_BODY then
+                     declare
+                        SID : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, WAD));
+                        WPN : constant String :=
+                          Ada.Strings.Fixed.Translate (Sym_Name (SID), Ada.Strings.Maps.Constants.Upper_Case_Map);
+                     begin
+                        Register_Pkg (WPN, Emit_Call => (KIND (SID) = DN_GENERIC_ID), Has_Body_Node => True);
+                     end;
+                  end if;
                end if;
             end;
          end loop;
@@ -1134,42 +1262,76 @@ package body Cg_Stmt.Subps is
          Scan_List (D (AS_CONTEXT_ELEM_S, CU));
       end Add_Context_Edges;
 
+      procedure Add_Ext_With_Edges (CU : TREE) is
+         WL : SEQ_TYPE := LIST (CU);
+         TW : TREE;
+      begin
+         while not IS_EMPTY (WL) loop
+            POP (WL, TW);
+            declare
+               WCU : constant TREE := D (TW_COMP_UNIT, TW);
+               WAD : constant TREE := (if not Is_Void_Tree (WCU) then D (AS_ALL_DECL, WCU) else CONST_VOID);
+            begin
+               if not Is_Void_Tree (WCU) and then not Is_Void_Tree (WAD)
+                 and then not Visited_CUs.Contains (Tree_Key (WCU))
+               then
+                  Visited_CUs.Include (Tree_Key (WCU));
+                  if KIND (WAD) in DN_PACKAGE_DECL | DN_GENERIC_DECL | DN_SUBPROG_ENTRY_DECL then
+                     Add_Context_Edges (WCU, Find_Node (Ada.Strings.Fixed.Translate (Sym_Name (D (AS_SOURCE_NAME, WAD)), Ada.Strings.Maps.Constants.Upper_Case_Map), False));
+                  elsif KIND (WAD) in DN_PACKAGE_BODY | DN_SUBPROGRAM_BODY then
+                     Add_Context_Edges (WCU, Find_Node (Ada.Strings.Fixed.Translate (Sym_Name (Canonical_Def (D (AS_SOURCE_NAME, WAD))), Ada.Strings.Maps.Constants.Upper_Case_Map), True));
+                  end if;
+               end if;
+            end;
+         end loop;
+      end Add_Ext_With_Edges;
+
       L1 : SEQ_TYPE := LIST (D (AS_COMPLTN_UNIT_S, Comp_Node));
       CU : TREE;
    begin
       Begin_Func (Ctx.E, Saved, "export func @main() -> i32 cc ""c""");
 
-      -- Pass 1: discover all non-RTL library packages across ALL CUs (specs, bodies, subunits, and their WITHs)
+      -- Pass 1: discover all non-RTL library units across ALL CUs (specs, bodies, subprograms, subunits, and their WITHs)
       while not IS_EMPTY (L1) loop
          POP (L1, CU);
          Collect_Withs_From_CU (CU);
          declare
             AD : constant TREE := D (AS_ALL_DECL, CU);
          begin
-            if not Is_Void_Tree (AD) and then (KIND (AD) = DN_PACKAGE_DECL
-              or else KIND (AD) = DN_GENERIC_DECL
-              or else (KIND (AD) = DN_SUBPROG_ENTRY_DECL and then not Is_Void_Tree (D (AS_UNIT_KIND, AD))
-                       and then KIND (D (AS_UNIT_KIND, AD)) = DN_INSTANTIATION))
-            then
-               Register_Pkg (Ada.Strings.Fixed.Translate (Sym_Name (D (AS_SOURCE_NAME, AD)), Ada.Strings.Maps.Constants.Upper_Case_Map));
+            if not Is_Void_Tree (AD) then
+               if KIND (AD) = DN_PACKAGE_DECL or else KIND (AD) = DN_GENERIC_DECL then
+                  Register_Pkg (Ada.Strings.Fixed.Translate (Sym_Name (D (AS_SOURCE_NAME, AD)), Ada.Strings.Maps.Constants.Upper_Case_Map), Emit_Call => True);
+               elsif KIND (AD) = DN_SUBPROG_ENTRY_DECL then
+                  declare
+                     Is_Inst : constant Boolean :=
+                       not Is_Void_Tree (D (AS_UNIT_KIND, AD)) and then KIND (D (AS_UNIT_KIND, AD)) = DN_INSTANTIATION;
+                  begin
+                     Register_Pkg (Ada.Strings.Fixed.Translate (Sym_Name (D (AS_SOURCE_NAME, AD)), Ada.Strings.Maps.Constants.Upper_Case_Map), Emit_Call => Is_Inst);
+                  end;
+               elsif KIND (AD) = DN_SUBPROGRAM_BODY then
+                  declare
+                     SID : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, AD));
+                  begin
+                     Register_Pkg (Ada.Strings.Fixed.Translate (Sym_Name (SID), Ada.Strings.Maps.Constants.Upper_Case_Map),
+                       Emit_Call => (KIND (SID) = DN_GENERIC_ID), Has_Body_Node => True);
+                  end;
+               end if;
             end if;
          end;
       end loop;
 
-      -- Pass 2: add WITH and PRAGMA ELABORATE edges from every CU (spec, body, and subunit -> root parent body)
+      -- Pass 2: add WITH and PRAGMA ELABORATE edges from every CU (in-file and external WITHed CUs)
       L1 := LIST (D (AS_COMPLTN_UNIT_S, Comp_Node));
       while not IS_EMPTY (L1) loop
          POP (L1, CU);
+         Add_Ext_With_Edges (CU);
          declare
             AD : constant TREE := D (AS_ALL_DECL, CU);
          begin
             if not Is_Void_Tree (AD) then
-               if KIND (AD) = DN_PACKAGE_DECL or else KIND (AD) = DN_GENERIC_DECL
-                 or else (KIND (AD) = DN_SUBPROG_ENTRY_DECL and then not Is_Void_Tree (D (AS_UNIT_KIND, AD))
-                          and then KIND (D (AS_UNIT_KIND, AD)) = DN_INSTANTIATION)
-               then
+               if KIND (AD) in DN_PACKAGE_DECL | DN_GENERIC_DECL | DN_SUBPROG_ENTRY_DECL then
                   Add_Context_Edges (CU, Find_Node (Ada.Strings.Fixed.Translate (Sym_Name (D (AS_SOURCE_NAME, AD)), Ada.Strings.Maps.Constants.Upper_Case_Map), False));
-               elsif KIND (AD) = DN_PACKAGE_BODY or else (KIND (AD) = DN_SUBPROGRAM_BODY and then KIND (Canonical_Def (D (AS_SOURCE_NAME, AD))) = DN_GENERIC_ID) then
+               elsif KIND (AD) in DN_PACKAGE_BODY | DN_SUBPROGRAM_BODY then
                   Add_Context_Edges (CU, Find_Node (Ada.Strings.Fixed.Translate (Sym_Name (Canonical_Def (D (AS_SOURCE_NAME, AD))), Ada.Strings.Maps.Constants.Upper_Case_Map), True));
                elsif KIND (AD) = DN_SUBUNIT then
                   declare
@@ -1185,14 +1347,14 @@ package body Cg_Stmt.Subps is
          end;
       end loop;
 
-      -- Support packages (REPORT, FCNDECL, SPPRT13) elaborate before user packages when unconstrained
+      -- Support packages (REPORT, FCNDECL, SPPRT13) elaborate before user packages when unconstrained (transitively!)
       declare
          N_Count : constant Natural := Natural (Nodes.Length);
       begin
          for U in 1 .. N_Count loop
             if not Is_Support_Pkg (To_String (Nodes.Element (U).Name)) then
                for V in 1 .. N_Count loop
-                  if Is_Support_Pkg (To_String (Nodes.Element (V).Name)) and then not Has_Edge (V, U) then
+                  if Is_Support_Pkg (To_String (Nodes.Element (V).Name)) and then not Can_Reach (V, U) then
                      Add_Edge (U, V);
                   end if;
                end loop;
@@ -1243,16 +1405,18 @@ package body Cg_Stmt.Subps is
                   exit when Pick = 0;
                   Done (Pick) := True;
                   Emitted := Emitted + 1;
-                  Step_No := Step_No + 1;
-                  declare
-                     PN_Low : constant String := Lower_Name (To_String (Nodes.Element (Pick).Name));
-                     Sym    : constant String := "@ada__" & PN_Low & (if Nodes.Element (Pick).Is_Body then "__elab_body" else "__elab_spec");
-                  NxtL   : constant String := ".el_" & Img (Step_No);
-               begin
-                  Add_Extern_Func (Ctx.E, Sym, "extern func " & Sym & "() -> void cc ""internal""");
-                  Emit_Term (Ctx.E, "invoke " & Sym & "() then " & NxtL & " unwind .unhandled(exn)");
-                  Emit_Label (Ctx.E, NxtL);
-               end;
+                  if Nodes.Element (Pick).Emit_Call then
+                     Step_No := Step_No + 1;
+                     declare
+                        PN_Low : constant String := Ada_Sym_Util.Sanitize_Ada_Ident (To_String (Nodes.Element (Pick).Name));
+                        Sym    : constant String := "@ada__" & PN_Low & (if Nodes.Element (Pick).Is_Body then "__elab_body" else "__elab_spec");
+                        NxtL   : constant String := ".el_" & Img (Step_No);
+                     begin
+                        Add_Extern_Func (Ctx.E, Sym, "extern func " & Sym & "() -> void cc ""internal""");
+                        Emit_Term (Ctx.E, "invoke " & Sym & "() then " & NxtL & " unwind .unhandled(exn)");
+                        Emit_Label (Ctx.E, NxtL);
+                     end;
+                  end if;
                end;
             end loop;
          end;
@@ -1489,8 +1653,8 @@ package body Cg_Stmt.Subps is
                         GK     : constant Unsigned_32 := Tree_Key (Gen_Id);
                         GB     : TREE := CONST_VOID;
                      begin
-                        Collect_Task_Owners (D (SM_DECL_S, UK), False);
-                        Collect_Task_Owners (D (SM_SPEC, PID), False);
+                        Collect_Task_Owners (D (SM_DECL_S, UK), In_Gen_Bdy);
+                        Collect_Task_Owners (D (SM_SPEC, PID), In_Gen_Bdy);
                         -- P3-5.1: Propagate nested generic bodies in instantiated package spec
                         declare
                            GSp : constant TREE := (if not Is_Void_Tree (Gen_Id) and then KIND (Gen_Id) = DN_GENERIC_ID then D (SM_SPEC, Gen_Id) else CONST_VOID);
@@ -1624,7 +1788,8 @@ package body Cg_Stmt.Subps is
                   begin
                      if CP.Inst_Key /= 0 then
                         Ctx.Gen_Cap_Slots.Include
-                          (Shift_Left (Unsigned_64 (CP.Inst_Key), 32) or Unsigned_64 (CK), Slot + 1);
+                          (Shift_Left (Unsigned_64 (CP.Inst_Key), 32) or Unsigned_64 (CK),
+                           (Cap_Slot => Slot + 1, Con_Cap_Slot => N_Cap + Slot + 1));
                      else
                         declare
                            V : Var_Info;
@@ -1905,9 +2070,14 @@ package body Cg_Stmt.Subps is
                if KIND (It) = DN_GENERIC_DECL then
                   declare
                      GID : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, It));
+                     Hdr : constant TREE := D (AS_HEADER, It);
                   begin
                      if not Is_Void_Tree (GID) then
                         Ctx.Generic_Decls.Include (Tree_Key (GID), It);
+                     end if;
+                     if not Is_Void_Tree (Hdr) and then KIND (Hdr) = DN_PACKAGE_SPEC then
+                        Scan_Nested_Generics (D (AS_DECL_S1, Hdr));
+                        Scan_Nested_Generics (D (AS_DECL_S2, Hdr));
                      end if;
                   end;
                elsif KIND (It) = DN_PACKAGE_DECL then
@@ -1931,7 +2101,8 @@ package body Cg_Stmt.Subps is
                         then
                            Ctx.Generic_Body.Include (Tree_Key (NPID), It);
                         end if;
-                     elsif not Is_Void_Tree (NBdy) and then KIND (NBdy) = DN_BLOCK_BODY then
+                     end if;
+                     if not Is_Void_Tree (NBdy) and then KIND (NBdy) = DN_BLOCK_BODY then
                         Scan_Nested_Generics (D (AS_ITEM_S, NBdy));
                      end if;
                   end;
@@ -2005,6 +2176,9 @@ package body Cg_Stmt.Subps is
                         then
                            Ctx.Generic_Body.Include (Tree_Key (PID), AD);
                         end if;
+                        if not Is_Void_Tree (PBdy) and then KIND (PBdy) = DN_BLOCK_BODY then
+                           Scan_Nested_Generics (D (AS_ITEM_S, PBdy));
+                        end if;
                         if not Was_Subu then
                            declare
                               UPN : constant String := Ada.Strings.Fixed.Translate (Sym_Name (PID), Ada.Strings.Maps.Constants.Upper_Case_Map);
@@ -2030,8 +2204,13 @@ package body Cg_Stmt.Subps is
                elsif KIND (AD) = DN_GENERIC_DECL then
                   declare
                      GID : constant TREE := Canonical_Def (D (AS_SOURCE_NAME, AD));
+                     Hdr : constant TREE := D (AS_HEADER, AD);
                   begin
                      Ctx.Generic_Decls.Include (Tree_Key (GID), AD);
+                     if not Is_Void_Tree (Hdr) and then KIND (Hdr) = DN_PACKAGE_SPEC then
+                        Scan_Nested_Generics (D (AS_DECL_S1, Hdr));
+                        Scan_Nested_Generics (D (AS_DECL_S2, Hdr));
+                     end if;
                      if not Was_Subu then
                         Set_Latest ("PS:" & Ada.Strings.Fixed.Translate (Sym_Name (GID), Ada.Strings.Maps.Constants.Upper_Case_Map), CU_Idx);
                      end if;
@@ -2185,7 +2364,7 @@ package body Cg_Stmt.Subps is
             elsif K = DN_SUBPROG_ENTRY_DECL then
                declare
                   SID   : constant TREE := D (AS_SOURCE_NAME, All_Decl);
-                  PName : constant String := Lower_Name (Sym_Name (SID));
+                  PName : constant String := Ada_Sym_Util.Sanitize_Ada_Ident (Sym_Name (SID));
                   UK    : constant TREE := D (AS_UNIT_KIND, All_Decl);
                   Saved : Pir_Emit.Func_Buffer;
                begin
@@ -2200,7 +2379,7 @@ package body Cg_Stmt.Subps is
                      end if;
                      End_Func (Ctx.E, Saved);
                      if Ctx.Emit_Main and then not Is_Subu and then CU_Idx = Main_CU_Idx then
-                        Emit_Main_Wrapper (Ctx, "@ada__" & PName, Comp_Node, To_String (In_Unit_Bodies));
+                        Emit_Main_Wrapper (Ctx, Ada_Sym_Util.Main_Entry_Sym (Sym_Name (SID)), Comp_Node, To_String (In_Unit_Bodies));
                      end if;
                   end if;
                end;

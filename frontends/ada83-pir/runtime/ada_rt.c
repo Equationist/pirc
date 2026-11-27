@@ -538,10 +538,15 @@ void *__ada_alloc(int64_t bytes) {
     if (sz > lim || sz > SIZE_MAX - sizeof(AdaHeapHdr)) {
         __ada_raise(__ada_exc_storage_error);
     }
-    size_t prev = __atomic_fetch_add(&g_ada_heap_used, sz, __ATOMIC_ACQ_REL);
-    if (prev > lim || sz > lim - prev) {
-        __atomic_fetch_sub(&g_ada_heap_used, sz, __ATOMIC_ACQ_REL);
-        __ada_raise(__ada_exc_storage_error);
+    size_t cur = __atomic_load_n(&g_ada_heap_used, __ATOMIC_ACQUIRE);
+    for (;;) {
+        if (cur > lim || sz > lim - cur) {
+            __ada_raise(__ada_exc_storage_error);
+        }
+        if (__atomic_compare_exchange_n(&g_ada_heap_used, &cur, cur + sz, 1,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            break;
+        }
     }
     AdaHeapHdr *hdr = (AdaHeapHdr *)calloc(1u, sizeof(AdaHeapHdr) + sz);
     if (!hdr) {
@@ -583,11 +588,16 @@ void *__ada_pool_alloc(int64_t *used_p, int64_t limit, int64_t bytes) {
         __ada_raise(__ada_exc_storage_error);
     }
     void *p = __ada_alloc(req);
-    int64_t prev = __atomic_fetch_add(used_p, req, __ATOMIC_ACQ_REL);
-    if (prev < 0 || prev > limit - req) {
-        __atomic_fetch_sub(used_p, req, __ATOMIC_ACQ_REL);
-        __ada_free(p);
-        __ada_raise(__ada_exc_storage_error);
+    cur = __atomic_load_n(used_p, __ATOMIC_ACQUIRE);
+    for (;;) {
+        if (cur < 0 || cur > limit - req) {
+            __ada_free(p);
+            __ada_raise(__ada_exc_storage_error);
+        }
+        if (__atomic_compare_exchange_n(used_p, &cur, cur + req, 1,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            break;
+        }
     }
     return p;
 }
@@ -908,15 +918,17 @@ void __ada_ss_release(uint64_t mark) {
     } else {
         g_ada_ss_cur->used = 0u;
     }
-    /* Reclaim oversized (> 1 MiB) cached tail chunks to prevent permanent spike retention */
-    if (g_ada_ss_cur->next && g_ada_ss_cur->next->cap > (size_t)1024u * 1024u) {
-        AdaSSChunk *tail = g_ada_ss_cur->next;
-        g_ada_ss_cur->next = NULL;
-        while (tail) {
-            AdaSSChunk *nx = tail->next;
-            free(tail);
-            tail = nx;
-        }
+    /* Keep at most one small (<= 1 MiB) cached tail chunk and reclaim everything beyond it */
+    AdaSSChunk *keep = g_ada_ss_cur;
+    if (keep->next && keep->next->cap <= (size_t)1024u * 1024u) {
+        keep = keep->next;
+    }
+    AdaSSChunk *tail = keep->next;
+    keep->next = NULL;
+    while (tail) {
+        AdaSSChunk *nx = tail->next;
+        free(tail);
+        tail = nx;
     }
     (void)pthread_setspecific(g_ada_ss_key, g_ada_ss_cur);
 }

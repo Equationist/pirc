@@ -330,7 +330,11 @@ static int spawn_task_thread(AdaTask *t) {
                 req = (req + p - 1u) & ~(p - 1u);
             }
         }
-        (void)pthread_attr_setstacksize(&attr, req);
+        int ssrc = pthread_attr_setstacksize(&attr, req);
+        if (ssrc != 0) {
+            pthread_attr_destroy(&attr);
+            return ssrc;
+        }
     }
     if (t->has_priority) {
         int policy = SCHED_OTHER;
@@ -533,13 +537,6 @@ static void check_quiescence_tree_under_qmtx(AdaMaster *start) {
     }
 }
 
-static void check_quiescence_tree(AdaMaster *start) {
-    if (!start) return;
-    pthread_mutex_lock(&g_quiesce_mtx);
-    check_quiescence_tree_under_qmtx(start);
-    pthread_mutex_unlock(&g_quiesce_mtx);
-}
-
 static void task_finish_cleanup(AdaTask *self) {
     /* Mark task terminated and notify any waiting callers & master */
     pthread_mutex_lock(&self->mtx);
@@ -576,6 +573,7 @@ static void task_finish_cleanup(AdaTask *self) {
 void __ada_task_completed(void *self_ptr);
 void __ada_master_abort_unactivated(void *master_ptr);
 void __ada_master_abort_since(void *master_ptr, void *mark);
+static void ada_task_abort_impl(AdaTask *t, int *self_aborted);
 
 static void abort_exit_self(AdaTask *self) {
     /* LRM 9.10(6) & 9.4(5) (P3-4.2, P3-4.13): abort any in-flight allocator group tasks
@@ -593,6 +591,41 @@ static void abort_exit_self(AdaTask *self) {
         AdaMaster *cm = self->child_masters;
         pthread_mutex_unlock(&self->mtx);
         if (!cm) break;
+        /* LRM 9.10(4): abort any non-terminated dependent tasks linked into cm
+           concurrently after the initial ada_task_abort_impl snapshot */
+        AdaTask *deps_stack[64];
+        AdaTask **deps = deps_stack;
+        int n_deps = 0;
+        int cap_deps = 64;
+        pthread_mutex_lock(&cm->mtx);
+        for (AdaTask *dt = cm->tasks; dt != NULL; dt = dt->next_in_master) {
+            if (dt != self && !dt->is_terminated) {
+                if (n_deps >= cap_deps) {
+                    int ncap = cap_deps * 2;
+                    AdaTask **nd = (deps == deps_stack)
+                        ? (AdaTask **)malloc((size_t)ncap * sizeof(AdaTask *))
+                        : (AdaTask **)realloc(deps, (size_t)ncap * sizeof(AdaTask *));
+                    if (nd) {
+                        if (deps == deps_stack) {
+                            memcpy(nd, deps_stack, (size_t)n_deps * sizeof(AdaTask *));
+                        }
+                        deps = nd;
+                        cap_deps = ncap;
+                    }
+                }
+                if (n_deps < cap_deps) {
+                    deps[n_deps++] = dt;
+                }
+            }
+        }
+        pthread_mutex_unlock(&cm->mtx);
+        int dummy_self = 0;
+        for (int i = 0; i < n_deps; ++i) {
+            ada_task_abort_impl(deps[i], &dummy_self);
+        }
+        if (deps != deps_stack) {
+            free(deps);
+        }
         __ada_master_abort_unactivated(cm);
     }
     task_finish_cleanup(self);
@@ -795,6 +828,7 @@ void __ada_master_activate(void *master_ptr) {
 static void master_finish_and_free(AdaMaster *m, int abort_created) {
     if (!m) return;
 
+    pthread_mutex_lock(&g_quiesce_mtx);
     pthread_mutex_lock(&m->mtx);
     if (abort_created) {
         for (AdaTask *t = m->tasks; t != NULL; t = t->next_in_master) {
@@ -811,7 +845,8 @@ static void master_finish_and_free(AdaMaster *m, int abort_created) {
     }
     m->master_completed = 1;
     pthread_mutex_unlock(&m->mtx);
-    check_quiescence_tree(m);
+    check_quiescence_tree_under_qmtx(m);
+    pthread_mutex_unlock(&g_quiesce_mtx);
     pthread_mutex_lock(&m->mtx);
     while (m->active_count > 0) {
         pthread_cond_wait(&m->cv, &m->mtx);
@@ -966,7 +1001,9 @@ void *__ada_task_create_and_activate(void *master_ptr,
     pthread_mutex_lock(&m->mtx);
     pthread_mutex_lock(&t->mtx);
     t->is_alloc_task = 1;
-    if (t->state != TS_CREATED || __atomic_load_n(&t->aborted, __ATOMIC_ACQUIRE)) {
+    int owner_aborted = (m->owner_task != NULL
+                         && __atomic_load_n(&m->owner_task->aborted, __ATOMIC_ACQUIRE));
+    if (t->state != TS_CREATED || __atomic_load_n(&t->aborted, __ATOMIC_ACQUIRE) || owner_aborted) {
         if (t->state == TS_CREATED) {
             t->state = TS_TERMINATED;
             t->is_callable = 0;
@@ -1059,6 +1096,7 @@ void __ada_task_completed(void *self_ptr) {
     AdaTask *t = (AdaTask *)self_ptr;
     if (!t) t = g_current_task;
     if (!t) return;
+    pthread_mutex_lock(&g_quiesce_mtx);
     pthread_mutex_lock(&t->mtx);
     t->is_callable = 0;
     if (t->state == TS_RUNNING || t->state == TS_ACTIVATING || t->state == TS_ABNORMAL) {
@@ -1067,12 +1105,15 @@ void __ada_task_completed(void *self_ptr) {
     cancel_all_queued_calls(t);
     AdaMaster *m = t->master;
     pthread_mutex_unlock(&t->mtx);
-    if (m) check_quiescence_tree(m);
+    if (m) check_quiescence_tree_under_qmtx(m);
+    pthread_mutex_unlock(&g_quiesce_mtx);
 }
 
 static void unlink_waiting_callee_call(AdaTask *callee, int32_t c_entry, AdaEntryCall *c_call) {
     int wt = 0;
     AdaMaster *cm = NULL;
+    /* Hold g_quiesce_mtx across unlink and quiescence check so cm cannot be freed concurrently */
+    pthread_mutex_lock(&g_quiesce_mtx);
     pthread_mutex_lock(&callee->mtx);
     if (c_call->state == EC_WAITING && unlink_call_locked(callee, c_entry, c_call)) {
         c_call->state = EC_CANCELLED;
@@ -1083,8 +1124,9 @@ static void unlink_waiting_callee_call(AdaTask *callee, int32_t c_entry, AdaEntr
     }
     pthread_mutex_unlock(&callee->mtx);
     if (wt && cm) {
-        check_quiescence_tree(cm);
+        check_quiescence_tree_under_qmtx(cm);
     }
+    pthread_mutex_unlock(&g_quiesce_mtx);
 }
 
 static void ada_task_abort_impl(AdaTask *t, int *self_aborted) {
@@ -1483,6 +1525,38 @@ int8_t __ada_entry_call_cond(void *target_ptr, int32_t entry_idx, void *params) 
     return 1;
 }
 
+static int cancel_timed_call_locked(AdaTask *t, int32_t entry_idx, AdaEntryCall *call) {
+    /* Caller holds t->mtx. Returns 1 (with t->mtx UNLOCKED) if call was unlinked & cancelled,
+       or 0 (with t->mtx STILL HELD) if call is no longer EC_WAITING. */
+    if (!t->waiting_terminate) {
+        if (call->state == EC_WAITING && unlink_call_locked(t, entry_idx, call)) {
+            call->state = EC_CANCELLED;
+            entry_call_release(call);
+            pthread_cond_broadcast(&t->cv);
+            pthread_mutex_unlock(&t->mtx);
+            return 1;
+        }
+        return 0;
+    }
+    /* Acquire g_quiesce_mtx before t->mtx to preserve lock order and pin t->master */
+    pthread_mutex_unlock(&t->mtx);
+    pthread_mutex_lock(&g_quiesce_mtx);
+    pthread_mutex_lock(&t->mtx);
+    if (call->state == EC_WAITING && unlink_call_locked(t, entry_idx, call)) {
+        int wt = t->waiting_terminate;
+        AdaMaster *cm = t->master;
+        call->state = EC_CANCELLED;
+        entry_call_release(call);
+        pthread_cond_broadcast(&t->cv);
+        pthread_mutex_unlock(&t->mtx);
+        if (wt && cm) check_quiescence_tree_under_qmtx(cm);
+        pthread_mutex_unlock(&g_quiesce_mtx);
+        return 1;
+    }
+    pthread_mutex_unlock(&g_quiesce_mtx);
+    return 0;
+}
+
 int8_t __ada_entry_call_timed(void *target_ptr, int32_t entry_idx, void *params, int64_t delay_ns) {
     if (delay_ns <= 0) {
         return __ada_entry_call_cond(target_ptr, entry_idx, params);
@@ -1508,14 +1582,7 @@ int8_t __ada_entry_call_timed(void *target_ptr, int32_t entry_idx, void *params,
     while (call->state == EC_WAITING) {
         int64_t rem_ns = end_mono - get_monotonic_ns();
         if (rem_ns <= 0) {
-            if (unlink_call_locked(t, entry_idx, call)) {
-                int wt = t->waiting_terminate;
-                AdaMaster *cm = t->master;
-                call->state = EC_CANCELLED;
-                entry_call_release(call);
-                pthread_cond_broadcast(&t->cv);
-                pthread_mutex_unlock(&t->mtx);
-                if (wt && cm) check_quiescence_tree(cm);
+            if (cancel_timed_call_locked(t, entry_idx, call)) {
                 entry_call_finish_waiter(self, call, 1);
                 return 0;
             }
@@ -1525,6 +1592,10 @@ int8_t __ada_entry_call_timed(void *target_ptr, int32_t entry_idx, void *params,
         get_realtime_deadline(&deadline, rem_ns);
         int rc = pthread_cond_timedwait(&t->cv, &t->mtx, &deadline);
         if (rc != 0 && rc != ETIMEDOUT && rc != EINTR) {
+            if (cancel_timed_call_locked(t, entry_idx, call)) {
+                entry_call_finish_waiter(self, call, 1);
+                return 0;
+            }
             break;
         }
     }
@@ -1746,7 +1817,9 @@ int32_t __ada_select_wait(void *self_ptr,
     if (has_open_terminate && m) {
         t->waiting_terminate = 1;
         pthread_mutex_unlock(&t->mtx);
-        check_quiescence_tree(m);
+        pthread_mutex_lock(&g_quiesce_mtx);
+        check_quiescence_tree_under_qmtx(m);
+        pthread_mutex_unlock(&g_quiesce_mtx);
         pthread_mutex_lock(&t->mtx);
     }
 

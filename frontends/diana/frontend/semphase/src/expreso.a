@@ -917,38 +917,49 @@ package body EXPRESO is
 				    and then not (D(XD_NUMER, BASE_SM) <= U_VAL(0)) then
 					SUB_SMALL := BASE_SM;
 					if SUB_SMALL <= ACCURACY then
-					    while SUB_SMALL * P2_16 <= ACCURACY loop
+					    for STEP in 1 .. 64 loop
+						exit when SUB_SMALL = CONST_VOID or else not (SUB_SMALL * P2_16 <= ACCURACY);
 						SUB_SMALL := SUB_SMALL * P2_16;
 					    end loop;
-					    while SUB_SMALL * P2_1 <= ACCURACY loop
+					    for STEP in 1 .. 20 loop
+						exit when SUB_SMALL = CONST_VOID or else not (SUB_SMALL * P2_1 <= ACCURACY);
 						SUB_SMALL := SUB_SMALL * P2_1;
 					    end loop;
 					end if;
 				    else
 					SUB_SMALL := REAL_ONE;
 					if ACCURACY >= REAL_ONE then
-					    while SUB_SMALL * P2_16 <= ACCURACY loop
+					    for STEP in 1 .. 64 loop
+						exit when SUB_SMALL = CONST_VOID or else not (SUB_SMALL * P2_16 <= ACCURACY);
 						SUB_SMALL := SUB_SMALL * P2_16;
 					    end loop;
-					    while SUB_SMALL * P2_1 <= ACCURACY loop
+					    for STEP in 1 .. 20 loop
+						exit when SUB_SMALL = CONST_VOID or else not (SUB_SMALL * P2_1 <= ACCURACY);
 						SUB_SMALL := SUB_SMALL * P2_1;
 					    end loop;
 					else
-					    while not (SUB_SMALL / P2_16 <= ACCURACY) loop
+					    for STEP in 1 .. 64 loop
+						exit when SUB_SMALL = CONST_VOID or else (SUB_SMALL / P2_16 <= ACCURACY);
 						SUB_SMALL := SUB_SMALL / P2_16;
 					    end loop;
-					    while not (SUB_SMALL <= ACCURACY) loop
+					    for STEP in 1 .. 20 loop
+						exit when SUB_SMALL = CONST_VOID or else (SUB_SMALL <= ACCURACY);
 						SUB_SMALL := SUB_SMALL / P2_1;
 					    end loop;
 					end if;
 				    end if;
 				end;
-				D(CD_IMPL_SMALL, NEW_TYPE_SPEC, SUB_SMALL);
+				if SUB_SMALL /= CONST_VOID then
+				    D(CD_IMPL_SMALL, NEW_TYPE_SPEC, SUB_SMALL);
+				end if;
 			    end if;
 			end;
 		    end if;
 
 		    if D(AS_RANGE, CONSTRAINT) /= CONST_VOID then
+			if KIND(RANGE_NODE) /= DN_RANGE then
+			    ERROR(D(LX_SRCPOS, RANGE_NODE), "Range required");
+			else
 			declare
 			    ORIG_PAR_T: constant TREE := D(SM_TYPE_SPEC, GET_NAME_DEFN(D(AS_NAME, RESOLVE_SUBTYPE_INDICATION.EXP)));
 			begin
@@ -960,6 +971,7 @@ package body EXPRESO is
 			    end if;
 			    D(SM_RANGE, NEW_TYPE_SPEC, RANGE_NODE);
 			end;
+			end if;
 		    end if;
 		end;
 	    else
@@ -992,6 +1004,9 @@ package body EXPRESO is
 		    end if;
 
 		    if D(AS_RANGE, CONSTRAINT) /= CONST_VOID then
+			if KIND(RANGE_NODE) /= DN_RANGE then
+			    ERROR(D(LX_SRCPOS, RANGE_NODE), "Range required");
+			else
 			declare
 			    ORIG_PAR_T: constant TREE := D(SM_TYPE_SPEC, GET_NAME_DEFN(D(AS_NAME, RESOLVE_SUBTYPE_INDICATION.EXP)));
 			begin
@@ -1003,6 +1018,7 @@ package body EXPRESO is
 			    end if;
 			    D(SM_RANGE, NEW_TYPE_SPEC, RANGE_NODE);
 			end;
+			end if;
 		    end if;
 		end;
 	    else

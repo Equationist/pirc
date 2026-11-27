@@ -58,11 +58,17 @@ package body ATTWALK is
     -- $$$$ extensions to uarith
     function "<" (L,R: TREE) return BOOLEAN is
     begin
+        if L = CONST_VOID or else R = CONST_VOID then
+            return FALSE;
+        end if;
         return not (L >= R);
     end "<";
 
     function ">" (L,R: TREE) return BOOLEAN is
     begin
+        if L = CONST_VOID or else R = CONST_VOID then
+            return FALSE;
+        end if;
         return not (L <= R);
     end ">";
 
@@ -97,11 +103,13 @@ package body ATTWALK is
         TEMP: TREE := REAL;
         RESULT: INTEGER := 0;
     begin
-        while TEMP > U_REAL(2**14) loop
+        for STEP in 1 .. 128 loop
+            exit when TEMP = CONST_VOID or else not (TEMP > U_REAL(2**14));
             TEMP := TEMP / U_VAL(2**14);
             RESULT := RESULT + 14;
         end loop;
-        while TEMP > U_REAL(1) loop
+        for STEP in 1 .. 20 loop
+            exit when TEMP = CONST_VOID or else not (TEMP > U_REAL(1));
             TEMP := TEMP / U_VAL(2);
             RESULT := RESULT + 1;
         end loop;
@@ -117,11 +125,13 @@ package body ATTWALK is
         TEMP: TREE := REAL;
         RESULT: INTEGER := 0;
     begin
-        while TEMP > U_REAL(10**4) loop
+        for STEP in 1 .. 128 loop
+            exit when TEMP = CONST_VOID or else not (TEMP > U_REAL(10**4));
             TEMP := TEMP / U_VAL(10**4);
             RESULT := RESULT + 4;
         end loop;
-        while TEMP > U_REAL(1) loop
+        for STEP in 1 .. 10 loop
+            exit when TEMP = CONST_VOID or else not (TEMP > U_REAL(1));
             TEMP := TEMP / U_VAL(10);
             RESULT := RESULT + 1;
         end loop;
@@ -159,17 +169,21 @@ package body ATTWALK is
             and then D(XD_NUMER, ACC) > U_VAL(0) then
                 SMALL := U_REAL(1);
                 if ACC >= U_REAL(1) then
-                    while SMALL * P2_16 <= ACC loop
+                    for STEP in 1 .. 64 loop
+                        exit when SMALL = CONST_VOID or else not (SMALL * P2_16 <= ACC);
                         SMALL := SMALL * P2_16;
                     end loop;
-                    while SMALL * P2_1 <= ACC loop
+                    for STEP in 1 .. 20 loop
+                        exit when SMALL = CONST_VOID or else not (SMALL * P2_1 <= ACC);
                         SMALL := SMALL * P2_1;
                     end loop;
                 else
-                    while SMALL / P2_16 > ACC loop
+                    for STEP in 1 .. 64 loop
+                        exit when SMALL = CONST_VOID or else not (SMALL / P2_16 > ACC);
                         SMALL := SMALL / P2_16;
                     end loop;
-                    while SMALL > ACC loop
+                    for STEP in 1 .. 20 loop
+                        exit when SMALL = CONST_VOID or else not (SMALL > ACC);
                         SMALL := SMALL / P2_1;
                     end loop;
                 end if;
@@ -899,7 +913,8 @@ package body ATTWALK is
                             P10: TREE := U_VAL(10);
                             DEL: constant TREE := D(SM_ACCURACY, PREFIX_SUBSTRUCT);
                         begin
-                            while P10 * DEL < U_REAL(1) loop
+                            for STEP in 1 .. 256 loop
+                                exit when DEL = CONST_VOID or else P10 = CONST_VOID or else not (P10 * DEL < U_REAL(1));
                                 N := N + 1;
                                 P10 := P10 * U_VAL(10);
                             end loop;
@@ -911,7 +926,8 @@ package body ATTWALK is
                             P10: TREE := U_VAL(10);
                             BND: constant TREE := GET_FIXED_BOUND(PREFIX_SUBSTRUCT);
                         begin
-                            while BND >= U_REAL(1) * P10 loop
+                            for STEP in 1 .. 256 loop
+                                exit when BND = CONST_VOID or else P10 = CONST_VOID or else not (BND >= U_REAL(1) * P10);
                                 N := N + 1;
                                 P10 := P10 * U_VAL(10);
                             end loop;
@@ -1046,7 +1062,8 @@ package body ATTWALK is
                         ATTRIBUTE_VALUE := U_VAL(4)
                                 * GET_FLOAT_MANTISSA(PREFIX_SUBSTRUCT);
                     when SAFE_EMAX =>
-                        if DI(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) <= 32
+                        if (D(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) /= CONST_VOID
+                            and then D(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) <= U_VAL(32))
                         or else (D(SM_ACCURACY, GET_BASE_STRUCT(PREFIX_TYPE)) /= CONST_VOID
                                  and then D(SM_ACCURACY, GET_BASE_STRUCT(PREFIX_TYPE)) <= U_VAL(6)) then
                             ATTRIBUTE_VALUE := U_VAL(125);
@@ -1054,19 +1071,22 @@ package body ATTWALK is
                             ATTRIBUTE_VALUE := U_VAL(1021);
                         end if;
                     when MACHINE_EMAX =>
-                        if DI(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) <= 32 then
+                        if D(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) /= CONST_VOID
+                        and then D(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) <= U_VAL(32) then
                             ATTRIBUTE_VALUE := U_VAL(128);
                         else
                             ATTRIBUTE_VALUE := U_VAL(1024);
                         end if;
                     when MACHINE_EMIN =>
-                        if DI(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) <= 32 then
+                        if D(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) /= CONST_VOID
+                        and then D(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) <= U_VAL(32) then
                             ATTRIBUTE_VALUE := U_VAL(-125);
                         else
                             ATTRIBUTE_VALUE := U_VAL(-1021);
                         end if;
                     when MACHINE_MANTISSA =>
-                        if DI(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) <= 32 then
+                        if D(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) /= CONST_VOID
+                        and then D(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) <= U_VAL(32) then
                             ATTRIBUTE_VALUE := U_VAL(24);
                         else
                             ATTRIBUTE_VALUE := U_VAL(53);
@@ -1126,7 +1146,8 @@ package body ATTWALK is
                                 * U_VAL(16) ** GET_FLOAT_MANTISSA
                                           (PREFIX_SUBSTRUCT);
                     when SAFE_LARGE =>
-                        if DI(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) <= 32
+                        if (D(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) /= CONST_VOID
+                            and then D(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) <= U_VAL(32))
                         or else (D(SM_ACCURACY, GET_BASE_STRUCT(PREFIX_TYPE)) /= CONST_VOID
                                  and then D(SM_ACCURACY, GET_BASE_STRUCT(PREFIX_TYPE)) <= U_VAL(6)) then
                             ATTRIBUTE_VALUE :=
@@ -1140,7 +1161,8 @@ package body ATTWALK is
                                     * U_VAL(2) ** U_VAL(1021);
                         end if;
                     when SAFE_SMALL =>
-                        if DI(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) <= 32
+                        if (D(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) /= CONST_VOID
+                            and then D(CD_IMPL_SIZE, GET_BASE_STRUCT(PREFIX_TYPE)) <= U_VAL(32))
                         or else (D(SM_ACCURACY, GET_BASE_STRUCT(PREFIX_TYPE)) /= CONST_VOID
                                  and then D(SM_ACCURACY, GET_BASE_STRUCT(PREFIX_TYPE)) <= U_VAL(6)) then
                             ATTRIBUTE_VALUE :=
@@ -1246,10 +1268,7 @@ package body ATTWALK is
             end if;
         when RANGE_X =>
             if ( KIND(PREFIX_ID) in CLASS_TYPE_NAME
-                    and then (KIND(GET_SUBSTRUCT(D(SM_TYPE_SPEC,PREFIX_ID))))
-                                in CLASS_CONSTRAINED
-                    and then KIND(GET_APPROPRIATE_BASE(PREFIX_ID))
-                                = DN_ARRAY )
+                    and then KIND(GET_SUBSTRUCT(D(SM_TYPE_SPEC,PREFIX_ID))) = DN_CONSTRAINED_ARRAY )
             or else ( PREFIX_ID = CONST_VOID
                     and then KIND(GET_APPROPRIATE_BASE(PREFIX_TYPE))
                                 = DN_ARRAY )
@@ -1273,7 +1292,10 @@ package body ATTWALK is
         when STORAGE_SIZE =>
             if KIND(GET_BASE_STRUCT(PREFIX_TYPE)) = DN_TASK_SPEC
             or else (KIND(GET_BASE_STRUCT(PREFIX_TYPE)) = DN_ACCESS
-                    and then KIND(PREFIX_ID) in CLASS_TYPE_NAME)
+                    and then (KIND(PREFIX_ID) in CLASS_TYPE_NAME
+                              or else (PREFIX_ID = CONST_VOID
+                                       and then not IS_ACC_DEREF_BLOCKED(GET_BASE_STRUCT(PREFIX_TYPE))
+                                       and then KIND(GET_BASE_STRUCT(D(SM_DESIG_TYPE, GET_BASE_STRUCT(PREFIX_TYPE)))) = DN_TASK_SPEC)))
             then
                 null;
             else
@@ -1453,7 +1475,22 @@ package body ATTWALK is
                 PREFIX_SUBSTRUCT: TREE := PREFIX_TYPE;
             begin
                 PREFIX_SUBSTRUCT := GET_SUBSTRUCT(PREFIX_SUBSTRUCT);
-                if KIND(PREFIX_SUBSTRUCT) = DN_ACCESS
+                if KIND(PREFIX_ID) in CLASS_TYPE_NAME then
+                    if KIND(PREFIX_SUBSTRUCT) = DN_ACCESS
+                    or else KIND(PREFIX_SUBSTRUCT) = DN_CONSTRAINED_ACCESS then
+                        if not PREFIX_ERROR then
+                            ERROR(D(LX_SRCPOS, ATTRIBUTE_NODE),
+                                    "Access type mark not allowed for array attribute");
+                        end if;
+                        return;
+                    elsif KIND(PREFIX_SUBSTRUCT) = DN_ARRAY then
+                        if not PREFIX_ERROR then
+                            ERROR(D(LX_SRCPOS, ATTRIBUTE_NODE),
+                                    "Constrained array subtype required");
+                        end if;
+                        return;
+                    end if;
+                elsif KIND(PREFIX_SUBSTRUCT) = DN_ACCESS
                 or else KIND(PREFIX_SUBSTRUCT) = DN_CONSTRAINED_ACCESS then
                     PREFIX_SUBSTRUCT := D(SM_DESIG_TYPE,PREFIX_SUBSTRUCT);
                 end if;

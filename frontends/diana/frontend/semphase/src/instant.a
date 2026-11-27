@@ -11,6 +11,7 @@ with REQUTIL; use REQUTIL;
 with SETUTIL; use SETUTIL;
 with NODWALK; use NODWALK;
 with NEWSNAM;
+with DERIVED;
 
 package body INSTANT is
 
@@ -1567,6 +1568,7 @@ package body INSTANT is
             POP(DECL_LIST, DECL);
             SUBSTITUTE(DECL, NODE_HASH, H);
             if KIND(DECL) = DN_TYPE_DECL then
+                DERIVED.REMEMBER_DERIVED_DECL(DECL);
                 TYPE_ID := D(AS_SOURCE_NAME, DECL);
                 TYPE_SPEC := D(SM_TYPE_SPEC, TYPE_ID);
                 if KIND(TYPE_SPEC) = DN_ENUMERATION

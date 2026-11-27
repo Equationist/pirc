@@ -11,6 +11,7 @@ with Ada.Strings.Hash;
 with Ada.Strings.Maps.Constants;
 with Ada.Strings.Unbounded; use Ada.Strings.Unbounded;
 with Ada.Text_IO;
+with Ada_Sym_Util;
 with Interfaces; use Interfaces;
 with DIANA; use DIANA;
 with DIANAMAN; use DIANAMAN;
@@ -70,7 +71,7 @@ package body Lib_Binder is
       Hash                => UHash,
       Equivalent_Elements => "=");
 
-   function Is_Std_Unit (Name_Low : String; User_Has_Standard : Boolean := False) return Boolean is
+   function Is_Predefined_Unit (Name_Low : String; User_Has_Standard : Boolean := False) return Boolean is
    begin
       if Name_Low = "standard" then
          return not User_Has_Standard;
@@ -80,25 +81,36 @@ package body Lib_Binder is
         or else Name_Low = "io_exceptions" or else Name_Low = "calendar"
         or else Name_Low = "sequential_io" or else Name_Low = "direct_io"
         or else Name_Low = "unchecked_conversion" or else Name_Low = "unchecked_deallocation"
-        or else Name_Low = "machine_code" or else Name_Low = "low_level_io"
-        or else Name_Low = "report" or else Name_Low = "spprt13"
+        or else Name_Low = "machine_code" or else Name_Low = "low_level_io";
+   end Is_Predefined_Unit;
+
+   function Is_Acvc_Support_Name (Name_Low : String) return Boolean is
+   begin
+      return Name_Low = "report" or else Name_Low = "spprt13"
         or else Name_Low = "fcndecl" or else Name_Low = "length_check"
         or else Name_Low = "enum_check" or else Name_Low = "check_file";
+   end Is_Acvc_Support_Name;
+
+   function Is_Std_Unit
+     (Name_Low          : String;
+      User_Has_Standard : Boolean := False;
+      User_Has_Unit     : Boolean := False) return Boolean
+   is
+   begin
+      return Is_Predefined_Unit (Name_Low, User_Has_Standard)
+        or else (not User_Has_Unit and then Is_Acvc_Support_Name (Name_Low));
    end Is_Std_Unit;
 
-   function Is_RTL_Unit (Name_Low : String; User_Has_Standard : Boolean) return Boolean is
+   function Is_RTL_Unit
+     (Name_Low          : String;
+      User_Has_Standard : Boolean;
+      User_Has_Unit     : Boolean := False) return Boolean
+   is
    begin
-      if Name_Low = "standard" then
-         return not User_Has_Standard;
-      end if;
-      return Name_Low = "_standrd"
-        or else Name_Low = "system" or else Name_Low = "text_io"
-        or else Name_Low = "io_exceptions" or else Name_Low = "calendar"
-        or else Name_Low = "sequential_io" or else Name_Low = "direct_io"
-        or else Name_Low = "unchecked_conversion" or else Name_Low = "unchecked_deallocation"
-        or else Name_Low = "machine_code" or else Name_Low = "low_level_io"
-        or else Name_Low = "length_check" or else Name_Low = "enum_check"
-        or else Name_Low = "check_file";
+      return Is_Predefined_Unit (Name_Low, User_Has_Standard)
+        or else (not User_Has_Unit
+                 and then (Name_Low = "length_check" or else Name_Low = "enum_check"
+                           or else Name_Low = "check_file"));
    end Is_RTL_Unit;
 
    function Is_Support_Pkg (Name_Low : String) return Boolean is
@@ -727,12 +739,17 @@ package body Lib_Binder is
 
                   when DN_SUBPROG_ENTRY_DECL =>
                      declare
-                        SID : constant TREE := D (AS_SOURCE_NAME, Raw_AD);
-                        UK  : constant TREE := D (AS_UNIT_KIND, Raw_AD);
-                        Hdr : constant TREE := D (AS_HEADER, Raw_AD);
-                        Is_Fn : constant Boolean :=
+                        SID     : constant TREE := D (AS_SOURCE_NAME, Raw_AD);
+                        Can_SID : constant TREE := Canonical_Def (SID);
+                        SID_Sp  : constant TREE :=
+                          (if not Is_Void_Tree (Can_SID) and then KIND (Can_SID) in CLASS_SUBPROG_NAME
+                           then D (SM_SPEC, Can_SID) else CONST_VOID);
+                        UK      : constant TREE := D (AS_UNIT_KIND, Raw_AD);
+                        Hdr     : constant TREE := D (AS_HEADER, Raw_AD);
+                        Is_Fn   : constant Boolean :=
                           (not Is_Void_Tree (Hdr) and then KIND (Hdr) = DN_FUNCTION_SPEC)
-                          or else KIND (Canonical_Def (SID)) = DN_FUNCTION_ID;
+                          or else (not Is_Void_Tree (Can_SID) and then KIND (Can_SID) in DN_FUNCTION_ID | DN_OPERATOR_ID)
+                          or else (not Is_Void_Tree (SID_Sp) and then KIND (SID_Sp) = DN_FUNCTION_SPEC);
                      begin
                         UName := To_Unbounded_String (To_Lower (Sym_Name (SID)));
                         if not Is_Void_Tree (UK) and then KIND (UK) = DN_INSTANTIATION then
@@ -978,6 +995,13 @@ package body Lib_Binder is
          return False;
       end Is_Active_Unit;
 
+      function Is_Std (Name_Low : String) return Boolean is
+         UN : constant Unbounded_String := To_Unbounded_String (Name_Low);
+      begin
+         return Is_Std_Unit (Name_Low, User_Has_Std,
+           User_Has_Unit => Specs.Contains (UN) or else Bodies.Contains (UN));
+      end Is_Std;
+
       procedure Fail (Msg : String) is
       begin
          Ada.Text_IO.Put_Line (Ada.Text_IO.Standard_Error, Msg);
@@ -1051,6 +1075,7 @@ package body Lib_Binder is
                                  BK     : constant String := To_String (EB.Kind);
                                  Compat : constant Boolean :=
                                    (U.Is_Gen = EB.Is_Gen)
+                                   and then not ((K = "procedure_spec" or else K = "function_spec") and then not U.Req_Body)
                                    and then ((K = "package_spec" and then BK = "package_body")
                                              or else (K = "procedure_spec" and then BK = "procedure_body")
                                              or else (K = "function_spec" and then BK = "function_body"));
@@ -1177,10 +1202,12 @@ package body Lib_Binder is
          end loop;
       end;
 
-      -- Prune truly orphaned subunits whose parent root body no longer exists or no longer declares them
+      -- Prune truly orphaned subunits via fixed-point BFS from live root bodies
       declare
          Live_Stub_Keys : USet.Set;
+         Live_Subs      : USet.Set;
          Sub_Drop       : Str_Vecs.Vector;
+         Changed        : Boolean := True;
       begin
          for C in Bodies.Iterate loop
             declare
@@ -1192,26 +1219,32 @@ package body Lib_Binder is
                end loop;
             end;
          end loop;
-         for C in Subunits.Iterate loop
-            declare
-               SU : constant Unit_Rec := Unit_Maps.Element (C);
-               PN : constant String := To_String (SU.Parent) & "." & To_String (SU.Name);
-            begin
-               for ST of SU.Stubs loop
-                  Live_Stub_Keys.Include (To_Unbounded_String (PN & "." & To_String (ST)));
-               end loop;
-            end;
+         while Changed loop
+            Changed := False;
+            for C in Subunits.Iterate loop
+               declare
+                  SK : constant Unbounded_String := Unit_Maps.Key (C);
+                  SU : constant Unit_Rec := Unit_Maps.Element (C);
+               begin
+                  if Live_Stub_Keys.Contains (SK) and then not Live_Subs.Contains (SK) then
+                     Live_Subs.Include (SK);
+                     Changed := True;
+                     declare
+                        PN : constant String := To_String (SU.Parent) & "." & To_String (SU.Name);
+                     begin
+                        for ST of SU.Stubs loop
+                           Live_Stub_Keys.Include (To_Unbounded_String (PN & "." & To_String (ST)));
+                        end loop;
+                     end;
+                  end if;
+               end;
+            end loop;
          end loop;
          for C in Subunits.Iterate loop
             declare
-               SK    : constant Unbounded_String := Unit_Maps.Key (C);
-               SU    : constant Unit_Rec := Unit_Maps.Element (C);
-               PRoot : constant Unbounded_String := To_Unbounded_String (Root_Of_Parent (To_String (SU.Parent)));
+               SK : constant Unbounded_String := Unit_Maps.Key (C);
             begin
-               if not Bodies.Contains (PRoot) then
-                  Sub_Drop.Append (SK);
-               elsif not Live_Stub_Keys.Contains (SK) then
-                  -- Only prune if root body exists and none of its active stubs match this subunit
+               if not Live_Subs.Contains (SK) then
                   Sub_Drop.Append (SK);
                end if;
             end;
@@ -1313,7 +1346,7 @@ package body Lib_Binder is
                UN : constant String := To_String (Unit_Maps.Key (C));
                SP : constant Unit_Rec := Unit_Maps.Element (C);
             begin
-               if Is_Reachable (Unit_Maps.Key (C)) and then not Is_Std_Unit (UN, User_Has_Std) and then SP.Req_Body then
+               if Is_Reachable (Unit_Maps.Key (C)) and then not Is_Std (UN) and then SP.Req_Body then
                   if not Bodies.Contains (Unit_Maps.Key (C)) then
                      Fail ("binder error: missing body for library unit '" & UN & "'");
                      return;
@@ -1334,7 +1367,7 @@ package body Lib_Binder is
                Is_Inst_Unit : constant Boolean :=
                  SK = "package_inst" or else SK = "procedure_inst" or else SK = "function_inst";
             begin
-               if Is_Reachable (Unit_Maps.Key (C)) and then not Is_Std_Unit (UN, User_Has_Std) then
+               if Is_Reachable (Unit_Maps.Key (C)) and then not Is_Std (UN) then
                   for W of SP.Withs loop
                      if Spec_Time.Contains (W) and then Spec_Time.Element (W) > SP.Seq then
                         Fail ("binder error: unit '" & UN & "' is obsolete (withed unit '" & To_String (W) & "' was recompiled)");
@@ -1369,7 +1402,7 @@ package body Lib_Binder is
                UN : constant String := To_String (Unit_Maps.Key (C));
                BD : constant Unit_Rec := Unit_Maps.Element (C);
             begin
-               if Is_Reachable (Unit_Maps.Key (C)) and then not Is_Std_Unit (UN, User_Has_Std) then
+               if Is_Reachable (Unit_Maps.Key (C)) and then not Is_Std (UN) then
                   for W of BD.Withs loop
                      if Spec_Time.Contains (W) and then Spec_Time.Element (W) > BD.Seq then
                         Fail ("binder error: unit '" & UN & "' is obsolete (withed unit '" & To_String (W) & "' was recompiled)");
@@ -1454,21 +1487,6 @@ package body Lib_Binder is
                      if Subunits.Contains (Full_Key) then
                         Found := True;
                         Sub_Seq := Subunits.Element (Full_Key).Seq;
-                     else
-                        for SC in Subunits.Iterate loop
-                           declare
-                              SU : constant Unit_Rec := Unit_Maps.Element (SC);
-                           begin
-                              if To_String (SU.Name) = ST_Str
-                                and then Root_Of_Parent (To_String (SU.Parent)) = Root_Of_Parent (Parent_Name)
-                                and then Ends_With_Unit (To_String (SU.Parent), Parent_Name)
-                              then
-                                 Found := True;
-                                 Sub_Seq := SU.Seq;
-                                 exit;
-                              end if;
-                           end;
-                        end loop;
                      end if;
                      if not Found then
                         Fail ("binder error: missing separate subunit '" & ST_Str & "' of '" & Parent_Name & "'");
@@ -1549,15 +1567,15 @@ package body Lib_Binder is
                   SP : constant Unit_Rec := Unit_Maps.Element (C);
                   UI : Natural;
                begin
-                  if Is_Reachable (Unit_Maps.Key (C)) and then not Is_Std_Unit (UN, User_Has_Std) then
+                  if Is_Reachable (Unit_Maps.Key (C)) and then not Is_Std (UN) then
                      UI := Get_Node ("S", UN);
                      for W of SP.Withs loop
-                        if not Is_Std_Unit (To_String (W), User_Has_Std) then
+                        if not Is_Std (To_String (W)) then
                            Add_Edge (UI, Get_Node ("S", To_String (W)));
                         end if;
                      end loop;
                      for E of SP.Elabs loop
-                        if not Is_Std_Unit (To_String (E), User_Has_Std) and then Bodies.Contains (E) then
+                        if not Is_Std (To_String (E)) and then Bodies.Contains (E) then
                            Add_Edge (UI, Get_Node ("B", To_String (E)));
                         end if;
                      end loop;
@@ -1571,7 +1589,7 @@ package body Lib_Binder is
                   BD : constant Unit_Rec := Unit_Maps.Element (C);
                   UI : Natural;
                begin
-                  if Is_Reachable (Unit_Maps.Key (C)) and then not Is_Std_Unit (UN, User_Has_Std) then
+                  if Is_Reachable (Unit_Maps.Key (C)) and then not Is_Std (UN) then
                      UI := Get_Node ("B", UN);
                      if Specs.Contains (Unit_Maps.Key (C)) then
                         Add_Edge (UI, Get_Node ("S", UN));
@@ -1580,12 +1598,12 @@ package body Lib_Binder is
                         Add_Edge (Get_Node ("S", UN), UI);
                      end if;
                      for W of BD.Withs loop
-                        if not Is_Std_Unit (To_String (W), User_Has_Std) then
+                        if not Is_Std (To_String (W)) then
                            Add_Edge (UI, Get_Node ("S", To_String (W)));
                         end if;
                      end loop;
                      for E of BD.Elabs loop
-                        if not Is_Std_Unit (To_String (E), User_Has_Std) and then Bodies.Contains (E) then
+                        if not Is_Std (To_String (E)) and then Bodies.Contains (E) then
                            Add_Edge (UI, Get_Node ("B", To_String (E)));
                         end if;
                      end loop;
@@ -1600,17 +1618,17 @@ package body Lib_Binder is
                   UI    : Natural;
                begin
                   if Is_Reachable (To_Unbounded_String (PRoot))
-                    and then not Is_Std_Unit (PRoot, User_Has_Std)
+                    and then not Is_Std (PRoot)
                     and then Bodies.Contains (To_Unbounded_String (PRoot))
                   then
                      UI := Get_Node ("B", PRoot);
                      for W of SU.Withs loop
-                        if not Is_Std_Unit (To_String (W), User_Has_Std) then
+                        if not Is_Std (To_String (W)) then
                            Add_Edge (UI, Get_Node ("S", To_String (W)));
                         end if;
                      end loop;
                      for E of SU.Elabs loop
-                        if not Is_Std_Unit (To_String (E), User_Has_Std) and then Bodies.Contains (E) then
+                        if not Is_Std (To_String (E)) and then Bodies.Contains (E) then
                            Add_Edge (UI, Get_Node ("B", To_String (E)));
                         end if;
                      end loop;
@@ -1684,9 +1702,7 @@ package body Lib_Binder is
                               else U.Name);
                            UN_S : constant String := To_String (U.Name);
                         begin
-                           if Is_Reachable (Reach_Key)
-                             and then UN_S /= "length_check" and then UN_S /= "enum_check"
-                           then
+                           if Is_Reachable (Reach_Key) then
                               Has_Live_NonGen := True;
                               exit;
                            end if;
@@ -1750,7 +1766,7 @@ package body Lib_Binder is
                   K  : constant String := To_String (SP.Kind);
                begin
                   if Is_Reachable (Unit_Maps.Key (C)) then
-                     if not Is_RTL_Unit (UN, User_Has_Standard) then
+                     if not Is_RTL_Unit (UN, User_Has_Standard, User_Has_Unit => Specs.Contains (Unit_Maps.Key (C)) or else Bodies.Contains (Unit_Maps.Key (C))) then
                         Graph_Units.Include (Unit_Maps.Key (C));
                         if SP.Is_Gen and then UN /= "length_check" and then UN /= "enum_check" then
                            Gen_Units.Include (Unit_Maps.Key (C));
@@ -1775,7 +1791,7 @@ package body Lib_Binder is
                   BD : constant Unit_Rec := Unit_Maps.Element (C);
                begin
                   if Is_Reachable (Unit_Maps.Key (C)) then
-                     if not Is_RTL_Unit (UN, User_Has_Standard) then
+                     if not Is_RTL_Unit (UN, User_Has_Standard, User_Has_Unit => Specs.Contains (Unit_Maps.Key (C)) or else Bodies.Contains (Unit_Maps.Key (C))) then
                         Graph_Units.Include (Unit_Maps.Key (C));
                         Graph_Bodies.Include (Unit_Maps.Key (C));
                         if BD.Is_Gen and then UN /= "length_check" and then UN /= "enum_check" then
@@ -2031,6 +2047,7 @@ package body Lib_Binder is
                   PF       : Ada.Text_IO.File_Type;
                   Main_Low : constant String := To_String (Chosen_Main);
                   Step_No  : Natural := 0;
+                  Main_Sym : constant String := Ada_Sym_Util.Main_Entry_Sym (Main_Low);
                begin
                   Ada.Text_IO.Create (PF, Ada.Text_IO.Out_File, Pir_Out_Path);
                   Ada.Text_IO.Put_Line (PF, "target """ & Target_Triple & """");
@@ -2039,10 +2056,10 @@ package body Lib_Binder is
                   Ada.Text_IO.Put_Line (PF, "extern func @__ada_master_activate_group(%m: ptr, %gid: i64) -> void cc ""c""");
                   Ada.Text_IO.Put_Line (PF, "extern func @__ada_master_leave(%m: ptr) -> void cc ""c""");
                   Ada.Text_IO.Put_Line (PF, "extern func @__ada_unhandled_exception(%e: ptr) -> void cc ""c""");
-                  Ada.Text_IO.Put_Line (PF, "extern func @ada__" & Main_Low & "() -> void cc ""internal""");
+                  Ada.Text_IO.Put_Line (PF, "extern func " & Main_Sym & "() -> void cc ""internal""");
 
                   for G of Gen_Units loop
-                     Ada.Text_IO.Put_Line (PF, "export @ada_gelab__" & To_String (G) & " = global i8 = 0, align 1");
+                     Ada.Text_IO.Put_Line (PF, "export @ada_gelab__" & Ada_Sym_Util.Sanitize_Ada_Ident (To_String (G)) & " = global i8 = 0, align 1");
                   end loop;
 
                   for Idx of Order loop
@@ -2052,7 +2069,7 @@ package body Lib_Binder is
                         if EN.Emit_Call and then not EN.Is_Gen then
                            declare
                               Sfx : constant String := (if EN.Is_Body then "elab_body" else "elab_spec");
-                              Sym : constant String := "@ada__" & To_String (EN.Name) & "__" & Sfx;
+                              Sym : constant String := "@ada__" & Ada_Sym_Util.Sanitize_Ada_Ident (To_String (EN.Name)) & "__" & Sfx;
                            begin
                               Ada.Text_IO.Put_Line (PF, "extern func " & Sym & "() -> void cc ""internal""");
                            end;
@@ -2071,13 +2088,13 @@ package body Lib_Binder is
                         if EN.Emit_Call and then EN.Is_Gen then
                            if EN.Is_Body then
                               Step_No := Step_No + 1;
-                              Ada.Text_IO.Put_Line (PF, "  %ge_" & Trim_Img (Step_No) & " = addr @ada_gelab__" & To_String (EN.Name));
+                              Ada.Text_IO.Put_Line (PF, "  %ge_" & Trim_Img (Step_No) & " = addr @ada_gelab__" & Ada_Sym_Util.Sanitize_Ada_Ident (To_String (EN.Name)));
                               Ada.Text_IO.Put_Line (PF, "  store.i8 1, %ge_" & Trim_Img (Step_No) & ", align 1");
                            end if;
                         elsif EN.Emit_Call then
                            declare
                               Sfx : constant String := (if EN.Is_Body then "elab_body" else "elab_spec");
-                              Sym : constant String := "@ada__" & To_String (EN.Name) & "__" & Sfx;
+                              Sym : constant String := "@ada__" & Ada_Sym_Util.Sanitize_Ada_Ident (To_String (EN.Name)) & "__" & Sfx;
                            begin
                               Step_No := Step_No + 1;
                               Ada.Text_IO.Put_Line (PF, "  invoke " & Sym & "() then .el_" & Trim_Img (Step_No) & " unwind .unhandled(exn)");
@@ -2100,7 +2117,7 @@ package body Lib_Binder is
 
                   Ada.Text_IO.Put_Line (PF, "  invoke @__ada_master_activate(%__gm) then .run_main unwind .unhandled(exn)");
                   Ada.Text_IO.Put_Line (PF, ".run_main:");
-                  Ada.Text_IO.Put_Line (PF, "  invoke @ada__" & Main_Low & "() then .done unwind .unhandled(exn)");
+                  Ada.Text_IO.Put_Line (PF, "  invoke " & Main_Sym & "() then .done unwind .unhandled(exn)");
                   Ada.Text_IO.Put_Line (PF, ".done:");
                   Ada.Text_IO.Put_Line (PF, "  call @__ada_master_leave(%__gm)");
                   Ada.Text_IO.Put_Line (PF, "  ret 0");

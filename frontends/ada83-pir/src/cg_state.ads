@@ -344,9 +344,14 @@ package Cg_State is
       Equivalent_Keys => "=",
       "="             => Task_Maps."=");
 
-   package U64_Nat_Maps is new Ada.Containers.Hashed_Maps
+   type Cap_Slot_Pair is record
+      Cap_Slot     : Natural := 0;
+      Con_Cap_Slot : Natural := 0;
+   end record;
+
+   package U64_Cap_Maps is new Ada.Containers.Hashed_Maps
      (Key_Type        => Unsigned_64,
-      Element_Type    => Natural,
+      Element_Type    => Cap_Slot_Pair,
       Hash            => Hash_U64,
       Equivalent_Keys => "=");
 
@@ -429,7 +434,7 @@ package Cg_State is
       Gen_Env_Vars     : Var_Map_Maps.Map;  -- captured outer generic body Vars for nested generics
       Gen_Env_Subps    : Subp_Map_Maps.Map; -- captured outer generic body Subps for nested generics
       Gen_Env_Tasks    : Task_Map_Maps.Map; -- captured outer generic body Tasks for nested generics
-      Gen_Cap_Slots    : U64_Nat_Maps.Map;  -- (Inst_Key << 32 | Var_Key) -> parent frame slot for multi-inst local generics
+      Gen_Cap_Slots    : U64_Cap_Maps.Map;  -- (Inst_Key << 32 | Var_Key) -> parent frame slots for multi-inst local generics
       Gen_Body_Nested_Gens : U32_Vecs.Vector; -- nested generic keys registered during active outer generic body
       Gen_Elab_Flags   : U32_Str_Maps.Map; -- generic key -> @ada_gelab_... global
       Generic_Subst    : Tree_Maps.Map; -- active formal -> actual during generic emission
@@ -470,6 +475,7 @@ package Cg_State is
       Loops                : Loop_Vecs.Vector;
       Handlers             : Handler_Vecs.Vector;
       Copy_Outs            : Copy_Out_Vecs.Vector;
+      Stub_Restores        : Copy_Out_Vecs.Vector;
       Cleanups             : Cleanup_Vecs.Vector;
       Accept_Frames        : Accept_Vecs.Vector;
       Label_Cleanup_Depths : I64_Maps.Map;
@@ -506,9 +512,13 @@ package Cg_State is
       Cur_Task_Exit_Lbl           : Unbounded_String;
       Cur_Task_Base_Cleanup_Depth : Natural := 0;
       Cur_Is_Func                 : Boolean := False;
+      Has_Stubs                   : Boolean := False;
+      In_Lib_Pkg_Body             : Boolean := False;
+      Cur_Task_Group_Id           : Integer_64 := 0;
       Loops                       : Loop_Vecs.Vector;
       Handlers                    : Handler_Vecs.Vector;
       Copy_Outs                   : Copy_Out_Vecs.Vector;
+      Stub_Restores               : Copy_Out_Vecs.Vector;
       Cleanups                    : Cleanup_Vecs.Vector;
       Accept_Frames               : Accept_Vecs.Vector;
       Label_Cleanup_Depths        : I64_Maps.Map;
@@ -540,6 +550,9 @@ package Cg_State is
    function Save_Subp_State (Ctx : Context) return Subp_State_Snapshot;
    procedure Reset_Subp_State (Ctx : in out Context);
    procedure Restore_Subp_State (Ctx : in out Context; Snap : Subp_State_Snapshot);
+
+   -- Restore saved display-global slots for subprograms with separate subunits
+   procedure Emit_Stub_Restores (Ctx : in out Context);
 
    -- Emit element pointer for array of ETI (handles array-of-arrays via ptr_add byte stride!)
    function Emit_Elem_Ptr

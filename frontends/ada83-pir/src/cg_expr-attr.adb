@@ -189,7 +189,8 @@ package body Cg_Expr.Attr is
                Res.Pir_Type := To_Unbounded_String (PT_Str);
                Res.Align    := TI.Align;
                if Is_Float_Type (ET) then
-                  Emit_Inst (Ctx.E, R & " = const." & PT_Str & " " & Format_Float64 (Eval_Float64 (SV)));
+                  Res.Reg := To_Unbounded_String (Emit_Float_Const_Safe (Ctx, Eval_Float64 (SV), PT_Str, "ac"));
+                  return Res;
                elsif Is_Fixed_Type (ET) then
                   declare
                      Sc : constant Integer_64 := Eval_Fixed_Ticks_Exact (SV, Fixed_Small (ET));
@@ -197,7 +198,33 @@ package body Cg_Expr.Attr is
                      Emit_Inst (Ctx.E, R & " = const." & PT_Str & " " & Img (Long_Long_Integer (Sc)));
                   end;
                else
-                  Emit_Inst (Ctx.E, R & " = const." & PT_Str & " " & Img (Long_Long_Integer (Eval_Int64 (SV))));
+                  declare
+                     V_I : Integer_64;
+                     Ovf : Boolean;
+                     Is_U : constant Boolean := Is_Unsigned_Scalar (ET, PT_Str);
+                     MinB : constant Integer_64 := (if Is_U then 0 else Integer_64 (Min_Signed_For_Pir (PT_Str)));
+                     MaxB : constant Integer_64 :=
+                       (if Is_U and then PT_Str = "i8" then 255
+                        elsif Is_U and then PT_Str = "i16" then 65535
+                        elsif Is_U and then PT_Str = "i32" then 4294967295
+                        elsif PT_Str = "i8" then 127 elsif PT_Str = "i16" then 32767
+                        elsif PT_Str = "i32" then 2147483647 else Integer_64'Last);
+                  begin
+                     Eval_Int64_Checked (SV, V_I, Ovf);
+                     if Ovf or else V_I < MinB or else V_I > MaxB then
+                        if Ctx.Enable_Checks then
+                           declare
+                              Bd : constant String := Next_Reg (Ctx.E, "aov");
+                           begin
+                              Emit_Inst (Ctx.E, Bd & " = const.i8 1");
+                              Emit_Check_Fail_If (Ctx, Bd);
+                           end;
+                        end if;
+                        Emit_Inst (Ctx.E, R & " = const." & PT_Str & " 0");
+                     else
+                        Emit_Inst (Ctx.E, R & " = const." & PT_Str & " " & Format_Int_Imm_For_Pir (V_I, PT_Str));
+                     end if;
+                  end;
                end if;
                Res.Reg := To_Unbounded_String (R);
                return Res;
@@ -247,7 +274,9 @@ package body Cg_Expr.Attr is
                                           RV0   : constant String := Load_Saved_Slot (Ctx, SlotP, To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
                                        begin
                                           Res.Kind := EK_Scalar;
-                                          Res.Reg  := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, RV0, To_String (SR.Pir_Type), PT_Str));
+                                          Res.Reg  := To_Unbounded_String
+                                            (Emit_Scalar_Coerce (Ctx, RV0, To_String (SR.Pir_Type), PT_Str,
+                                               Is_Unsigned => Is_Unsigned_Scalar (TS, To_String (SR.Pir_Type))));
                                           Res.Pir_Type := To_Unbounded_String (PT_Str); Res.Ada_Type := ET; Res.Align := TI.Align;
                                           return Res;
                                        end;
@@ -260,7 +289,9 @@ package body Cg_Expr.Attr is
                                     BV : constant Expr_Val := Emit_Expr (Ctx, E_Bound, ET);
                                  begin
                                     Res.Kind := EK_Scalar;
-                                    Res.Reg := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, To_String (BV.Reg), To_String (BV.Pir_Type), PT_Str));
+                                    Res.Reg := To_Unbounded_String
+                                      (Emit_Scalar_Coerce (Ctx, To_String (BV.Reg), To_String (BV.Pir_Type), PT_Str,
+                                         Is_Unsigned => Is_Unsigned_Scalar (BV.Ada_Type, To_String (BV.Pir_Type))));
                                     Res.Pir_Type := To_Unbounded_String (PT_Str); Res.Ada_Type := ET; Res.Align := TI.Align;
                                     return Res;
                                  end;
@@ -273,7 +304,9 @@ package body Cg_Expr.Attr is
                                        Pick : constant String := (if AName = "FIRST" then To_String (Lo_U) else To_String (Hi_U));
                                     begin
                                        Res.Kind := EK_Scalar;
-                                       Res.Reg  := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, Pick, To_String (RT_U), PT_Str));
+                                       Res.Reg  := To_Unbounded_String
+                                         (Emit_Scalar_Coerce (Ctx, Pick, To_String (RT_U), PT_Str,
+                                            Is_Unsigned => Is_Unsigned_Scalar (TS, To_String (RT_U))));
                                        Res.Pir_Type := To_Unbounded_String (PT_Str); Res.Ada_Type := ET; Res.Align := TI.Align;
                                        return Res;
                                     end;
@@ -282,7 +315,7 @@ package body Cg_Expr.Attr is
                                  declare
                                     R : constant String := Next_Reg (Ctx.E, "dbz");
                                  begin
-                                    Emit_Inst (Ctx.E, R & " = const." & PT_Str & " 0");
+                                    Emit_Inst (Ctx.E, R & " = const." & PT_Str & (if PT_Str = "f32" or else PT_Str = "f64" then " 0.0" else " 0"));
                                     Res.Kind := EK_Scalar; Res.Reg := To_Unbounded_String (R);
                                     Res.Pir_Type := To_Unbounded_String (PT_Str); Res.Ada_Type := ET; Res.Align := TI.Align;
                                     return Res;
@@ -327,8 +360,9 @@ package body Cg_Expr.Attr is
                                     end;
                                  else
                                     if Has_Static_Val (Safe_SM_Value (E_B)) then
-                                       Emit_Inst (Ctx.E, R & " = const." & PT_Str & " " & Format_Float64 (Eval_Float64 (Safe_SM_Value (E_B))));
-                                       Res.Kind := EK_Scalar; Res.Reg := To_Unbounded_String (R);
+                                       Res.Kind := EK_Scalar;
+                                       Res.Reg := To_Unbounded_String
+                                         (Emit_Float_Const_Safe (Ctx, Eval_Float64 (Safe_SM_Value (E_B)), PT_Str, "rfb"));
                                        Res.Pir_Type := To_Unbounded_String (PT_Str); Res.Ada_Type := ET; Res.Align := TI.Align;
                                        return Res;
                                     end if;
@@ -343,7 +377,7 @@ package body Cg_Expr.Attr is
                                  end if;
                               end;
                            end if;
-                           Emit_Inst (Ctx.E, R & " = const." & PT_Str & " 0");
+                           Emit_Inst (Ctx.E, R & " = const." & PT_Str & (if PT_Str = "f32" or else PT_Str = "f64" then " 0.0" else " 0"));
                            Res.Kind := EK_Scalar; Res.Reg := To_Unbounded_String (R);
                            Res.Pir_Type := To_Unbounded_String (PT_Str); Res.Ada_Type := ET; Res.Align := TI.Align;
                            return Res;
@@ -354,16 +388,50 @@ package body Cg_Expr.Attr is
                         begin
                            if Dim <= ATI.NDims and then ATI.Dims (Dim).Is_Static then
                               declare
-                                 LoV : constant Integer_64 := ATI.Dims (Dim).First;
-                                 HiV : constant Integer_64 := ATI.Dims (Dim).Last;
-                                 Val : Integer_64;
-                                 R   : constant String := Next_Reg (Ctx.E, "ab");
+                                 LoV  : constant Integer_64 := ATI.Dims (Dim).First;
+                                 HiV  : constant Integer_64 := ATI.Dims (Dim).Last;
+                                 Val  : Integer_64 := 0;
+                                 Ovf  : Boolean := False;
+                                 Is_U : constant Boolean := Is_Unsigned_Scalar (ET, PT_Str);
+                                 MinB : constant Integer_64 := (if Is_U then 0 else Integer_64 (Min_Signed_For_Pir (PT_Str)));
+                                 MaxB : constant Integer_64 :=
+                                   (if Is_U and then PT_Str = "i8" then 255
+                                    elsif Is_U and then PT_Str = "i16" then 65535
+                                    elsif Is_U and then PT_Str = "i32" then 4294967295
+                                    elsif PT_Str = "i8" then 127 elsif PT_Str = "i16" then 32767
+                                    elsif PT_Str = "i32" then 2147483647 else Integer_64'Last);
+                                 R    : constant String := Next_Reg (Ctx.E, "ab");
                               begin
-                                 if AName = "FIRST" then Val := LoV;
-                                 elsif AName = "LAST" then Val := HiV;
-                                 else Val := (if HiV >= LoV then HiV - LoV + 1 else 0);
+                                 if AName = "FIRST" then
+                                    Val := LoV;
+                                 elsif AName = "LAST" then
+                                    Val := HiV;
+                                 elsif HiV >= LoV then
+                                    declare
+                                       Diff : constant Unsigned_64 := Unsigned_64'Mod (HiV) - Unsigned_64'Mod (LoV);
+                                    begin
+                                       if Diff >= Unsigned_64 (Integer_64'Last) then
+                                          Ovf := True;
+                                       else
+                                          Val := Integer_64 (Diff + 1);
+                                       end if;
+                                    end;
+                                 else
+                                    Val := 0;
                                  end if;
-                                 Emit_Inst (Ctx.E, R & " = const." & PT_Str & " " & Img (Long_Long_Integer (Val)));
+                                 if Ovf or else Val < MinB or else Val > MaxB then
+                                    if Ctx.Enable_Checks then
+                                       declare
+                                          Bd : constant String := Next_Reg (Ctx.E, "abov");
+                                       begin
+                                          Emit_Inst (Ctx.E, Bd & " = const.i8 1");
+                                          Emit_Check_Fail_If (Ctx, Bd);
+                                       end;
+                                    end if;
+                                    Emit_Inst (Ctx.E, R & " = const." & PT_Str & " 0");
+                                 else
+                                    Emit_Inst (Ctx.E, R & " = const." & PT_Str & " " & Format_Int_Imm_For_Pir (Val, PT_Str));
+                                 end if;
                                  Res.Kind := EK_Scalar; Res.Reg := To_Unbounded_String (R);
                                  Res.Pir_Type := To_Unbounded_String (PT_Str); Res.Ada_Type := ET; Res.Align := TI.Align;
                                  return Res;
@@ -381,8 +449,24 @@ package body Cg_Expr.Attr is
                                     Res.Reg := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (L_R), "i64", PT_Str));
                                  else
                                     declare
-                                       L64 : constant String := Emit_Dim_Len_I64 (Ctx, To_String (F_R), To_String (L_R));
+                                       L64 : constant String := Emit_Dim_Len_Checked_I64 (Ctx, To_String (F_R), To_String (L_R));
                                     begin
+                                       if Ctx.Enable_Checks and then Int_Bits_Of_Pir (PT_Str) < 64 then
+                                          Emit_Range_Check (Ctx, L64, "i64", ET);
+                                          declare
+                                             Is_U : constant Boolean := Is_Unsigned_Scalar (ET, PT_Str);
+                                             MaxB : constant Long_Long_Integer :=
+                                               (if Is_U and then PT_Str = "i8" then 255
+                                                elsif Is_U and then PT_Str = "i16" then 65535
+                                                elsif Is_U and then PT_Str = "i32" then 4294967295
+                                                elsif PT_Str = "i8" then 127 elsif PT_Str = "i16" then 32767
+                                                else 2147483647);
+                                             Gt : constant String := Next_Reg (Ctx.E, "lgt");
+                                          begin
+                                             Emit_Inst (Ctx.E, Gt & " = cmp_gt_s.i64 " & L64 & ", " & Img (MaxB));
+                                             Emit_Check_Fail_If (Ctx, Gt);
+                                          end;
+                                       end if;
                                        Res.Reg := To_Unbounded_String (Emit_Int_Convert (Ctx, L64, "i64", PT_Str));
                                     end;
                                  end if;
@@ -432,8 +516,24 @@ package body Cg_Expr.Attr is
                      Res.Reg := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (L_R), "i64", PT_Str));
                   else
                      declare
-                        L64 : constant String := Emit_Dim_Len_I64 (Ctx, To_String (F_R), To_String (L_R));
+                        L64 : constant String := Emit_Dim_Len_Checked_I64 (Ctx, To_String (F_R), To_String (L_R));
                      begin
+                        if Ctx.Enable_Checks and then Int_Bits_Of_Pir (PT_Str) < 64 then
+                           Emit_Range_Check (Ctx, L64, "i64", ET);
+                           declare
+                              Is_U : constant Boolean := Is_Unsigned_Scalar (ET, PT_Str);
+                              MaxB : constant Long_Long_Integer :=
+                                (if Is_U and then PT_Str = "i8" then 255
+                                 elsif Is_U and then PT_Str = "i16" then 65535
+                                 elsif Is_U and then PT_Str = "i32" then 4294967295
+                                 elsif PT_Str = "i8" then 127 elsif PT_Str = "i16" then 32767
+                                 else 2147483647);
+                              Gt : constant String := Next_Reg (Ctx.E, "lgt");
+                           begin
+                              Emit_Inst (Ctx.E, Gt & " = cmp_gt_s.i64 " & L64 & ", " & Img (MaxB));
+                              Emit_Check_Fail_If (Ctx, Gt);
+                           end;
+                        end if;
                         Res.Reg := To_Unbounded_String (Emit_Int_Convert (Ctx, L64, "i64", PT_Str));
                      end;
                   end if;
@@ -441,53 +541,8 @@ package body Cg_Expr.Attr is
                end;
             end;
 
-         elsif AName = "POS" then
-            declare
-               V : constant Expr_Val := Emit_Expr (Ctx, Arg);
-            begin
-               Res.Kind     := EK_Scalar;
-               Res.Ada_Type := ET;
-               Res.Pir_Type := To_Unbounded_String (PT_Str);
-               Res.Align    := TI.Align;
-               Res.Reg      := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (V.Reg), To_String (V.Pir_Type), PT_Str));
-               return Res;
-            end;
-
-         elsif AName = "VAL" then
-            declare
-               V : constant Expr_Val := Emit_Expr (Ctx, Arg);
-               Cv : constant String := Emit_Int_Convert (Ctx, To_String (V.Reg), To_String (V.Pir_Type), PT_Str);
-            begin
-               Emit_Range_Check (Ctx, Cv, PT_Str, ET);
-               Res.Kind     := EK_Scalar;
-               Res.Ada_Type := ET;
-               Res.Pir_Type := To_Unbounded_String (PT_Str);
-               Res.Align    := TI.Align;
-               Res.Reg      := To_Unbounded_String (Cv);
-               return Res;
-            end;
-
-         elsif AName = "SUCC" or else AName = "PRED" then
-            declare
-               V   : constant Expr_Val := Emit_Expr (Ctx, Arg, ET);
-               OutR : constant String := Next_Reg (Ctx.E, "sp");
-               Op  : constant String := (if AName = "SUCC" then "add" else "sub");
-            begin
-               if Ctx.Enable_Checks then
-                  declare
-                     Ovf : constant String := Next_Reg (Ctx.E, "ov");
-                  begin
-                     Emit_Inst (Ctx.E, OutR & ", " & Ovf & " = " & Op & "_ovf_s." & PT_Str & " " & To_String (V.Reg) & ", 1");
-                     Emit_Check_Fail_If (Ctx, Ovf);
-                  end;
-                  Emit_Range_Check (Ctx, OutR, PT_Str, ET);
-               else
-                  Emit_Inst (Ctx.E, OutR & " = " & Op & "." & PT_Str & " " & To_String (V.Reg) & ", 1");
-               end if;
-               Res.Kind := EK_Scalar; Res.Reg := To_Unbounded_String (OutR);
-               Res.Pir_Type := To_Unbounded_String (PT_Str); Res.Ada_Type := ET; Res.Align := TI.Align;
-               return Res;
-            end;
+         elsif AName = "POS" or else AName = "VAL" or else AName = "SUCC" or else AName = "PRED" then
+            return Emit_Discrete_Attr_Op (Ctx, AName, Resolve_Prefix_Type (Pfx), ET, Arg);
 
          elsif AName = "SIZE" then
             declare
@@ -644,34 +699,42 @@ package body Cg_Expr.Attr is
                     or else (PTI.Kind = TK_Constrained_Array and then PTI.Is_Dynamic)
                   then
                      declare
-                        AV   : constant Expr_Val := Obj_Pfx;
-                        ETI  : constant Type_Info := Get_Type_Info (Ctx, PTI.Elem_Type);
-                        ESzB : constant Natural := Elem_Storage_Size (ETI) * 8;
-                        ND   : constant Natural := Natural'Max (1, Natural'Min (PTI.NDims, Max_Array_Dims));
-                        Tot64 : Unbounded_String;
+                        AV     : constant Expr_Val := Obj_Pfx;
+                        ETI    : constant Type_Info := Get_Type_Info (Ctx, PTI.Elem_Type);
+                        ESz    : constant Natural := Elem_Storage_Size (ETI);
+                        ND     : constant Natural := Natural'Max (1, Natural'Min (PTI.NDims, Max_Array_Dims));
+                        Fs, Ls : Str_Array_4;
+                        Tot64, Byt64 : Unbounded_String;
                         Bits64 : constant String := Next_Reg (Ctx.E, "dszb");
+                        OvfB   : constant String := Next_Reg (Ctx.E, "dszo");
                         Conv_R : Unbounded_String;
                      begin
                         for D_I in 1 .. ND loop
-                           declare
-                              F_R, L_R : Unbounded_String;
-                              DL       : Unbounded_String;
-                           begin
-                              Get_Array_Dim_Bounds (Ctx, AV, D_I, F_R, L_R);
-                              DL := To_Unbounded_String (Emit_Dim_Len_I64 (Ctx, To_String (F_R), To_String (L_R)));
-                              if D_I = 1 then
-                                 Tot64 := DL;
-                              else
-                                 declare
-                                    M : constant String := Next_Reg (Ctx.E, "dszm");
-                                 begin
-                                    Emit_Inst (Ctx.E, M & " = mul.i64 " & To_String (Tot64) & ", " & To_String (DL));
-                                    Tot64 := To_Unbounded_String (M);
-                                 end;
-                              end if;
-                           end;
+                           Get_Array_Dim_Bounds (Ctx, AV, D_I, Fs (D_I), Ls (D_I));
                         end loop;
-                        Emit_Inst (Ctx.E, Bits64 & " = mul.i64 " & To_String (Tot64) & ", " & Img (ESzB));
+                        Emit_Array_Byte_Size_I64 (Ctx, Fs, Ls, ND, ESz, Tot64, Byt64);
+                        if Ctx.Enable_Checks then
+                           Emit_Inst (Ctx.E, Bits64 & ", " & OvfB & " = mul_ovf_s.i64 " & To_String (Byt64) & ", 8");
+                           Emit_Check_Fail_If (Ctx, OvfB);
+                           if Int_Bits_Of_Pir (PT_Str) < 64 then
+                              Emit_Range_Check (Ctx, Bits64, "i64", ET);
+                              declare
+                                 Is_U : constant Boolean := Is_Unsigned_Scalar (ET, PT_Str);
+                                 MaxB : constant Long_Long_Integer :=
+                                   (if Is_U and then PT_Str = "i8" then 255
+                                    elsif Is_U and then PT_Str = "i16" then 65535
+                                    elsif Is_U and then PT_Str = "i32" then 4294967295
+                                    elsif PT_Str = "i8" then 127 elsif PT_Str = "i16" then 32767
+                                    else 2147483647);
+                                 Gt : constant String := Next_Reg (Ctx.E, "sgt");
+                              begin
+                                 Emit_Inst (Ctx.E, Gt & " = cmp_gt_s.i64 " & Bits64 & ", " & Img (MaxB));
+                                 Emit_Check_Fail_If (Ctx, Gt);
+                              end;
+                           end if;
+                        else
+                           Emit_Inst (Ctx.E, Bits64 & " = mul.i64 " & To_String (Byt64) & ", 8");
+                        end if;
                         Conv_R := To_Unbounded_String (Emit_Int_Convert (Ctx, Bits64, "i64", PT_Str));
                         Res.Kind := EK_Scalar; Res.Reg := Conv_R;
                         Res.Pir_Type := To_Unbounded_String (PT_Str); Res.Ada_Type := ET; Res.Align := TI.Align;
@@ -1242,7 +1305,10 @@ package body Cg_Expr.Attr is
                            FV := Fixed_Attr_Small (TS);
                         end if;
                         if PT_Str = "f32" or else PT_Str = "f64" then
-                           Emit_Inst (Ctx.E, R & " = const." & PT_Str & " " & Format_Float64 (FV));
+                           Res.Kind := EK_Scalar;
+                           Res.Reg := To_Unbounded_String (Emit_Float_Const_Safe (Ctx, FV, PT_Str, "fxa"));
+                           Res.Pir_Type := To_Unbounded_String (PT_Str); Res.Ada_Type := ET; Res.Align := TI.Align;
+                           return Res;
                         elsif Is_Fixed_Type (ET) then
                            declare
                               FVal : constant IEEE_Float_64 := FV / Fixed_Small (ET);
@@ -1255,7 +1321,7 @@ package body Cg_Expr.Attr is
                               Emit_Inst (Ctx.E, R & " = const." & PT_Str & " " & Img (Long_Long_Integer (Sc)));
                            end;
                         else
-                           Emit_Inst (Ctx.E, R & " = const." & PT_Str & " 0");
+                           Emit_Inst (Ctx.E, R & " = const." & PT_Str & (if PT_Str = "f32" or else PT_Str = "f64" then " 0.0" else " 0"));
                         end if;
                         Res.Kind := EK_Scalar; Res.Reg := To_Unbounded_String (R);
                         Res.Pir_Type := To_Unbounded_String (PT_Str); Res.Ada_Type := ET; Res.Align := TI.Align;
@@ -1305,7 +1371,10 @@ package body Cg_Expr.Attr is
                      FV := 2.0 ** (1 - Mant);
                   end if;
                   if PT_Str = "f32" or else PT_Str = "f64" then
-                     Emit_Inst (Ctx.E, R & " = const." & PT_Str & " " & Format_Float64 (FV));
+                     Res.Kind := EK_Scalar;
+                     Res.Reg := To_Unbounded_String (Emit_Float_Const_Safe (Ctx, FV, PT_Str, "fl"));
+                     Res.Pir_Type := To_Unbounded_String (PT_Str); Res.Ada_Type := ET; Res.Align := TI.Align;
+                     return Res;
                   elsif Is_Fixed_Type (ET) then
                      declare
                         FR  : constant String := Next_Reg (Ctx.E, "flf");
@@ -1374,11 +1443,18 @@ package body Cg_Expr.Attr is
                   -- P3-3.3: Object'CONSTRAINED evaluates prefix when it may have side effects/null checks (e.g. P.all, F),
                   -- but NOT for simple constant names (e.g. deferred constant in package spec before private part: c74208b)!
                   declare
-                     PDef : constant TREE := Get_Name_Defn (Pfx);
-                     Need_Eval : constant Boolean :=
-                       KIND (Pfx) in DN_ALL | DN_FUNCTION_CALL | DN_INDEXED | DN_SLICE | DN_SELECTED
-                       and then (Is_Void_Tree (PDef) or else KIND (PDef) /= DN_CONSTANT_ID);
+                     Unw_Pfx : TREE := Pfx;
+                     PDef    : TREE;
+                     Need_Eval : Boolean;
                   begin
+                     while not Is_Void_Tree (Unw_Pfx) and then KIND (Unw_Pfx) = DN_PARENTHESIZED loop
+                        Unw_Pfx := D (AS_EXP, Unw_Pfx);
+                     end loop;
+                     PDef := Get_Name_Defn (Unw_Pfx);
+                     Need_Eval :=
+                       KIND (Pfx) in DN_ALL | DN_FUNCTION_CALL | DN_NULLARY_CALL | DN_INDEXED | DN_SLICE
+                                   | DN_SELECTED | DN_PARENTHESIZED | DN_CONVERSION | DN_QUALIFIED
+                       and then (Is_Void_Tree (PDef) or else KIND (PDef) /= DN_CONSTANT_ID);
                      if Need_Eval then
                         declare
                            Dummy_CP : constant Expr_Val := Emit_LValue (Ctx, Pfx);
@@ -1448,7 +1524,7 @@ package body Cg_Expr.Attr is
                                           POP (CRL, CR);
                                           if KIND (CR) = DN_COMP_REP then
                                              declare
-                                                CN : constant TREE := Canonical_Def (Get_Name_Defn (D (AS_NAME, CR)));
+                                                CN : constant TREE := Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (D (AS_NAME, CR))));
                                              begin
                                                 if CN = Def then
                                                    declare
@@ -1481,9 +1557,10 @@ package body Cg_Expr.Attr is
                                  if AName = "POSITION" then
                                     Val := Integer_64 (FE.Byte_Offset);
                                  elsif AName = "FIRST_BIT" then
-                                    Val := 0;
+                                    Val := Integer_64 (if FE.Bit_Size > 0 then FE.Bit_Offset else 0);
                                  else
-                                    Val := Integer_64 (Natural'Max (1, FE.Field_Size) * 8 - 1);
+                                    Val := Integer_64 (if FE.Bit_Size > 0 then FE.Bit_Offset + FE.Bit_Size - 1
+                                                       else Natural'Max (1, FE.Field_Size) * 8 - 1);
                                  end if;
                               end;
                            end if;

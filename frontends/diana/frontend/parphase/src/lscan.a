@@ -629,7 +629,7 @@ package body LSCAN is
 
   <<ACCEPT_NUMBER>>
     if CHR in 'A' .. 'Z' or else CHR in 'a' .. 'z'
-    or else CHR in '0' .. '9' then
+    or else CHR in '0' .. '9' or else CHR = '_' then
       TTYPE := ERROR;
     end if;
     -- goto ACCEPT_TOKEN;

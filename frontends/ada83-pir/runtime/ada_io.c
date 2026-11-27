@@ -142,7 +142,7 @@ static void ada_io_cleanup_temps(void) {
     if (pthread_mutex_trylock(&g_io_table_mtx) != 0) return;
     for (int32_t i = 3; i < ADA_MAX_FILES; ++i) {
         if (g_files[i].is_open && g_files[i].is_temp) {
-            int locked = (pthread_mutex_trylock(&g_file_mtx[i]) == 0);
+            if (pthread_mutex_trylock(&g_file_mtx[i]) != 0) continue;
             if (g_files[i].fp) {
                 fclose(g_files[i].fp);
                 g_files[i].fp = NULL;
@@ -151,7 +151,7 @@ static void ada_io_cleanup_temps(void) {
                 unlink(g_files[i].name);
             }
             g_files[i].is_open = 0;
-            if (locked) pthread_mutex_unlock(&g_file_mtx[i]);
+            pthread_mutex_unlock(&g_file_mtx[i]);
         }
     }
     pthread_mutex_unlock(&g_io_table_mtx);
@@ -248,7 +248,9 @@ static AdaFile *acquire_target_file(const int32_t *f_ptr, int is_output) {
         h = *f_ptr;
     } else {
         pthread_mutex_lock(&g_io_table_mtx);
-        h = is_output ? g_cur_output : g_cur_input;
+        h = is_output
+            ? __atomic_load_n(&g_cur_output, __ATOMIC_ACQUIRE)
+            : __atomic_load_n(&g_cur_input, __ATOMIC_ACQUIRE);
         pthread_mutex_unlock(&g_io_table_mtx);
     }
     return acquire_open_file(h);
@@ -482,8 +484,8 @@ void __ada_tio_create(int32_t *f_ptr, int32_t mode,
     af->page = 1;
     int32_t h = make_handle(slot, af->gen);
     *f_ptr = h;
-    if (f_ptr == g_cur_input_var) g_cur_input = h;
-    if (f_ptr == g_cur_output_var) g_cur_output = h;
+    if (f_ptr == g_cur_input_var) __atomic_store_n(&g_cur_input, h, __ATOMIC_RELEASE);
+    if (f_ptr == g_cur_output_var) __atomic_store_n(&g_cur_output, h, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&g_io_table_mtx);
 }
 
@@ -534,8 +536,8 @@ void __ada_tio_open(int32_t *f_ptr, int32_t mode,
     af->page = 1;
     int32_t h = make_handle(slot, af->gen);
     *f_ptr = h;
-    if (f_ptr == g_cur_input_var) g_cur_input = h;
-    if (f_ptr == g_cur_output_var) g_cur_output = h;
+    if (f_ptr == g_cur_input_var) __atomic_store_n(&g_cur_input, h, __ATOMIC_RELEASE);
+    if (f_ptr == g_cur_output_var) __atomic_store_n(&g_cur_output, h, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&g_io_table_mtx);
 }
 
@@ -796,32 +798,47 @@ int32_t __ada_tio_standard_output(void) { io_init(); return 2; }
 int32_t __ada_tio_current_input(void)   { io_init(); return __atomic_load_n(&g_cur_input, __ATOMIC_ACQUIRE); }
 int32_t __ada_tio_current_output(void)  { io_init(); return __atomic_load_n(&g_cur_output, __ATOMIC_ACQUIRE); }
 
-void __ada_tio_set_input(const int32_t *f_ptr) {
+static void tio_set_default_file(const int32_t *f_ptr, int is_output) {
+    io_init();
     int32_t h = read_handle(f_ptr);
-    AdaFile *af = acquire_open_file(h);
-    if (af->mode != 0) __ada_raise(__ada_exc_mode_error);
-    int is_std = af->is_std;
-    release_open_file(af);
     pthread_mutex_lock(&g_io_table_mtx);
-    if (h != g_cur_input) {
-        __atomic_store_n(&g_cur_input, h, __ATOMIC_RELEASE);
-        g_cur_input_var = is_std ? NULL : (int32_t *)f_ptr;
+    int32_t slot = handle_slot(h);
+    uint32_t gen = handle_gen(h);
+    if (h <= 0 || slot <= 0 || slot >= ADA_MAX_FILES
+        || !g_files[slot].is_open || !g_files[slot].fp
+        || g_files[slot].gen != gen) {
+        pthread_mutex_unlock(&g_io_table_mtx);
+        __ada_raise(__ada_exc_status_error);
     }
+    AdaFile *af = &g_files[slot];
+    pthread_mutex_lock(&g_file_mtx[slot]);
+    if (af->mode != (is_output ? 1 : 0)) {
+        pthread_mutex_unlock(&g_file_mtx[slot]);
+        pthread_mutex_unlock(&g_io_table_mtx);
+        __ada_raise(__ada_exc_mode_error);
+    }
+    int is_std = af->is_std;
+    if (is_output) {
+        if (h != __atomic_load_n(&g_cur_output, __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&g_cur_output, h, __ATOMIC_RELEASE);
+            g_cur_output_var = is_std ? NULL : (int32_t *)f_ptr;
+        }
+    } else {
+        if (h != __atomic_load_n(&g_cur_input, __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&g_cur_input, h, __ATOMIC_RELEASE);
+            g_cur_input_var = is_std ? NULL : (int32_t *)f_ptr;
+        }
+    }
+    pthread_mutex_unlock(&g_file_mtx[slot]);
     pthread_mutex_unlock(&g_io_table_mtx);
 }
 
+void __ada_tio_set_input(const int32_t *f_ptr) {
+    tio_set_default_file(f_ptr, 0);
+}
+
 void __ada_tio_set_output(const int32_t *f_ptr) {
-    int32_t h = read_handle(f_ptr);
-    AdaFile *af = acquire_open_file(h);
-    if (af->mode != 1) __ada_raise(__ada_exc_mode_error);
-    int is_std = af->is_std;
-    release_open_file(af);
-    pthread_mutex_lock(&g_io_table_mtx);
-    if (h != g_cur_output) {
-        __atomic_store_n(&g_cur_output, h, __ATOMIC_RELEASE);
-        g_cur_output_var = is_std ? NULL : (int32_t *)f_ptr;
-    }
-    pthread_mutex_unlock(&g_io_table_mtx);
+    tio_set_default_file(f_ptr, 1);
 }
 
 /* =========================================================================

@@ -42,6 +42,13 @@ package Cg_Expr is
       Pir_Ty : String;
       Prefix : String := "c") return String;
 
+   -- Widen any discrete scalar register to canonical signed i64 using its own Ada_Type signedness
+   function Emit_Widen_To_I64
+     (Ctx      : in out Context;
+      Val_Reg  : String;
+      Pir_Ty   : String;
+      Ada_Type : TREE) return String;
+
    function Emit_Int_Convert
      (Ctx         : in out Context;
       Val_Reg     : String;
@@ -63,7 +70,8 @@ package Cg_Expr is
      (Ctx        : in out Context;
       Rec_Ptr    : String;
       Target_Rec : TREE;
-      Is_Access  : Boolean := False);
+      Is_Access  : Boolean := False;
+      Tag        : String := "");
 
    -- Emit runtime subtype range check on a scalar register against Ada_Type's bounds
    procedure Emit_Range_Check
@@ -80,7 +88,8 @@ package Cg_Expr is
       Init_Node    : TREE;
       Dst_Firsts   : Str_Array_4 := (others => Null_Unbounded_String);
       Dst_Lasts    : Str_Array_4 := (others => Null_Unbounded_String);
-      Exact_Bounds : Boolean := False);
+      Exact_Bounds : Boolean := False;
+      Max_Align    : Natural := 8);
 
    -- Elaborate subtype/type constraints & pre-evaluate record component non-discriminant constraints (LRM 3.2.1/3.7.2)
    procedure Emit_Type_Elab_Checks
@@ -125,7 +134,8 @@ package Cg_Expr is
      (Ctx            : in out Context;
       Dst_Ptr        : String;
       Dst_Type       : TREE;
-      Activate_Tasks : Boolean := False);
+      Activate_Tasks : Boolean := False;
+      Max_Align      : Natural := 8);
 
    -- Create an Ada 83 task handle (ptr) for Task_Spec in current master
    function Emit_Create_Task_Handle
@@ -149,13 +159,60 @@ package Cg_Expr is
 
    -- Emit composite copy from Src to Dst
    procedure Emit_Copy_Composite
-     (Ctx      : in out Context;
-      Dst_Ptr  : String;
-      Src      : Expr_Val;
-      Dst_Type : TREE);
+     (Ctx       : in out Context;
+      Dst_Ptr   : String;
+      Src       : Expr_Val;
+      Dst_Type  : TREE;
+      Max_Align : Natural := 8);
+
+   -- True if Src_T and Dst_T are distinct derived record base types with differing representation
+   function Needs_Record_Rep_Conv
+     (Ctx   : in out Context;
+      Src_T : TREE;
+      Dst_T : TREE) return Boolean;
 
    -- Bitfield helpers for record representation clauses (LRM 13.4)
    function Is_Bitfield (FE : Field_Entry) return Boolean;
+   function Uses_Bitfield_Access
+     (Ctx       : Context;
+      FE        : Field_Entry;
+      Comp_Type : TREE) return Boolean;
+   function Lookup_Record_Field_Key
+     (Ctx   : Context;
+      Rec_T : TREE;
+      Def   : TREE) return Unsigned_32;
+
+   -- Unified scalar writable target (DN_CONVERSION chains, bitfields, SM_REP enums, variant checks, pragma Shared)
+   type Tree_Arr_8 is array (1 .. 8) of TREE;
+   type Scalar_Target is record
+      Is_BF      : Boolean := False;
+      Is_Shared  : Boolean := False;
+      Dst_Ptr    : Unbounded_String;
+      BF_FE      : Field_Entry;
+      Inner_T    : TREE := CONST_VOID;
+      Inner_Pir  : Unbounded_String;
+      Inner_Al   : Natural := 4;
+      N_Convs    : Natural := 0;
+      Conv_Ts    : Tree_Arr_8 := (others => CONST_VOID);
+      Outer_T    : TREE := CONST_VOID;
+   end record;
+
+   function Resolve_Scalar_Target
+     (Ctx   : in out Context;
+      Act_N : TREE) return Scalar_Target;
+
+   function Emit_Load_Scalar_Target
+     (Ctx     : in out Context;
+      Tgt     : Scalar_Target;
+      Dst_T   : TREE := CONST_VOID;
+      Dst_Pir : String := "") return String;
+
+   procedure Emit_Store_Scalar_Target
+     (Ctx     : in out Context;
+      Tgt     : Scalar_Target;
+      Val_Reg : String;
+      Val_Pir : String;
+      Val_T   : TREE);
 
    procedure Emit_Variant_Check_For_Field
      (Ctx       : in out Context;
@@ -206,14 +263,16 @@ package Cg_Expr is
       Firsts   : Str_Array_4;
       Lasts    : Str_Array_4;
       ND       : Natural;
-      Desc_Ty  : String := "@__ada_arr_desc");
+      Desc_Ty  : String := "@__ada_arr_desc";
+      Align    : Natural := 8);
 
    procedure Emit_Unpack_Arr_Desc
      (Ctx      : in out Context;
       Desc_Ptr : String;
       Des_T    : TREE;
       Out_Val  : out Expr_Val;
-      Desc_Ty  : String := "@__ada_arr_desc");
+      Desc_Ty  : String := "@__ada_arr_desc";
+      Align    : Natural := 8);
 
    -- Check exact i64 First/Last bounds equality across dims 1..NDims (raises Constraint_Error on mismatch)
    procedure Emit_Exact_Bounds_Check
@@ -249,6 +308,38 @@ package Cg_Expr is
      (Ctx      : in out Context;
       First_64 : String;
       Last_64  : String) return String;
+
+   -- Compute exact 64-bit dimension length; raises Exc_Tag (Constraint_Error by default) if >= 2**63
+   function Emit_Dim_Len_Checked_I64
+     (Ctx      : in out Context;
+      First_64 : String;
+      Last_64  : String;
+      Exc_Tag  : String := "") return String;
+
+   -- Compute positional/string upper bound Lo_64 + Count - 1 with 64-bit overflow & LRM 4.2(4) underflow checks
+   function Emit_Range_End_Checked_I64
+     (Ctx        : in out Context;
+      Lo_64      : String;
+      Count      : Integer_64;
+      Hi_64      : String;
+      Base_Idx_T : TREE) return String;
+
+   -- Unified Pass-1 array aggregate bounds resolver & choice validator (shared by DN_AGGREGATE and DN_RETURN)
+   procedure Emit_Agg_Pass1_Bounds
+     (Ctx      : in out Context;
+      Agg_Node : TREE;
+      Tgt_TI   : Type_Info;
+      Base_TI  : Type_Info;
+      ND       : Natural;
+      Firsts   : out Str_Array_4;
+      Lasts    : out Str_Array_4;
+      Rng_Keys : in out U32_Vecs.Vector;
+      Exp_Keys : in out U32_Vecs.Vector);
+
+   procedure Release_Agg_Pass1_Cache
+     (Ctx      : in out Context;
+      Rng_Keys : U32_Vecs.Vector;
+      Exp_Keys : U32_Vecs.Vector);
 
    -- Compute super-null-safe, overflow-checked total element count & byte size (raises STORAGE_ERROR on overflow)
    procedure Emit_Array_Byte_Size_I64
@@ -296,6 +387,23 @@ private
       Src_T : TREE;
       Dst_T : TREE;
       Depth : Natural := 0);
+
+   -- Emit a float constant safely without overflowing f32 PIR immediates
+   function Emit_Float_Const_Safe
+     (Ctx               : in out Context;
+      FV                : IEEE_Float_64;
+      Pir_Ty            : String;
+      Reg_Pfx           : String;
+      Raise_On_Overflow : Boolean := True) return String;
+
+   -- Canonical discrete attribute function emitter ('POS, 'VAL, 'SUCC, 'PRED, 'IMAGE, 'VALUE)
+   -- shared by Cg_Expr.Attr and Cg_Expr.Call (both direct and renamed attribute functions)
+   function Emit_Discrete_Attr_Op
+     (Ctx      : in out Context;
+      AName    : String;
+      Pfx_T    : TREE;
+      Res_Type : TREE;
+      Arg_N    : TREE) return Expr_Val;
 
    procedure Ensure_Enum_Tables_Pkg
      (Ctx       : in out Context;
@@ -362,6 +470,7 @@ private
       Dst_T      : TREE;
       Src_Ptr    : String;
       Src_T      : TREE;
-      Discs_Only : Boolean := False);
+      Discs_Only : Boolean := False;
+      Max_Align  : Natural := 8);
 
 end Cg_Expr;

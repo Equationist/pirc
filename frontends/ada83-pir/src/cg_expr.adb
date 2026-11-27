@@ -86,6 +86,17 @@ package body Cg_Expr is
       end if;
    end Min_Signed_For_Pir;
 
+   function Emit_Widen_To_I64
+     (Ctx      : in out Context;
+      Val_Reg  : String;
+      Pir_Ty   : String;
+      Ada_Type : TREE) return String
+   is
+      Uns : constant Boolean := Is_Unsigned_Scalar (Subst_Resolve_Type (Ctx, Ada_Type), Pir_Ty);
+   begin
+      return Emit_Int_Convert (Ctx, Val_Reg, Pir_Ty, "i64", Is_Unsigned => Uns);
+   end Emit_Widen_To_I64;
+
    function Emit_Int_Convert
      (Ctx         : in out Context;
       Val_Reg     : String;
@@ -171,6 +182,7 @@ package body Cg_Expr is
             MaxB : constant Long_Long_Integer :=
               (if Is_Unsigned and then To_Ty = "i8" then 255
                elsif Is_Unsigned and then To_Ty = "i16" then 65535
+               elsif Is_Unsigned and then To_Ty = "i32" then 4294967295
                elsif To_Ty = "i8" then 127 elsif To_Ty = "i16" then 32767
                elsif To_Ty = "i32" then 2147483647 else Long_Long_Integer'Last);
          begin
@@ -315,14 +327,14 @@ package body Cg_Expr is
                   LR0 : constant String := Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
                   HR0 : constant String := Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
                   SR_U : constant Boolean := Is_Unsigned_Scalar (R, To_String (SR.Pir_Type));
-                  L_R : constant String := Emit_Scalar_Coerce (Ctx, LR0, To_String (SR.Pir_Type), Val_Pir_Ty, Is_Unsigned => SR_U);
-                  H_R : constant String := Emit_Scalar_Coerce (Ctx, HR0, To_String (SR.Pir_Type), Val_Pir_Ty, Is_Unsigned => SR_U);
                   C1  : constant String := Next_Reg (Ctx.E, "srlo");
                   C2  : constant String := Next_Reg (Ctx.E, "srhi");
                   Bad : constant String := Next_Reg (Ctx.E, "srbad");
                begin
                   if Val_Pir_Ty = "f32" or else Val_Pir_Ty = "f64" then
                      declare
+                        L_R : constant String := Emit_Scalar_Coerce (Ctx, LR0, To_String (SR.Pir_Type), Val_Pir_Ty);
+                        H_R : constant String := Emit_Scalar_Coerce (Ctx, HR0, To_String (SR.Pir_Type), Val_Pir_Ty);
                         InR : constant String := Next_Reg (Ctx.E, "srin");
                      begin
                         Emit_Inst (Ctx.E, C1 & " = fcmp_oge." & Val_Pir_Ty & " " & Val_Reg & ", " & L_R);
@@ -331,13 +343,17 @@ package body Cg_Expr is
                         Emit_Inst (Ctx.E, Bad & " = xor.i8 " & InR & ", 1");
                      end;
                   else
+                     -- Compare discrete saved bounds in canonical signed i64 so wider bounds never truncate
                      declare
-                        Is_U  : constant Boolean := Is_Unsigned_Scalar (R, Val_Pir_Ty);
-                        Lt_Op : constant String := (if Is_U then "cmp_lt_u." else "cmp_lt_s.");
-                        Gt_Op : constant String := (if Is_U then "cmp_gt_u." else "cmp_gt_s.");
+                        V64 : constant String := Emit_Int_Convert (Ctx, Val_Reg, Val_Pir_Ty, "i64",
+                                                 Is_Unsigned => Is_Unsigned_Scalar (R, Val_Pir_Ty));
+                        L64 : constant String := Emit_Int_Convert (Ctx, LR0, To_String (SR.Pir_Type), "i64",
+                                                 Is_Unsigned => SR_U);
+                        H64 : constant String := Emit_Int_Convert (Ctx, HR0, To_String (SR.Pir_Type), "i64",
+                                                 Is_Unsigned => SR_U);
                      begin
-                        Emit_Inst (Ctx.E, C1 & " = " & Lt_Op & Val_Pir_Ty & " " & Val_Reg & ", " & L_R);
-                        Emit_Inst (Ctx.E, C2 & " = " & Gt_Op & Val_Pir_Ty & " " & Val_Reg & ", " & H_R);
+                        Emit_Inst (Ctx.E, C1 & " = cmp_lt_s.i64 " & V64 & ", " & L64);
+                        Emit_Inst (Ctx.E, C2 & " = cmp_gt_s.i64 " & V64 & ", " & H64);
                         Emit_Inst (Ctx.E, Bad & " = or.i8 " & C1 & ", " & C2);
                      end;
                   end if;
@@ -431,12 +447,10 @@ package body Cg_Expr is
                         F2  : constant IEEE_Float_64 :=
                           (if Scalar_Bits (R) <= 32 and then Val_Pir_Ty = "f64"
                            then IEEE_Float_64 (IEEE_Float_32 (F2_Raw)) else F2_Raw);
-                        L_C : constant String := Next_Reg (Ctx.E, "fllc");
-                        H_C : constant String := Next_Reg (Ctx.E, "flhc");
+                        L_C : constant String := Emit_Float_Const_Safe (Ctx, F1, Val_Pir_Ty, "fllc", Raise_On_Overflow => False);
+                        H_C : constant String := Emit_Float_Const_Safe (Ctx, F2, Val_Pir_Ty, "flhc", Raise_On_Overflow => False);
                         InR : constant String := Next_Reg (Ctx.E, "flin");
                      begin
-                        Emit_Inst (Ctx.E, L_C & " = const." & Val_Pir_Ty & " " & Format_Float64 (F1));
-                        Emit_Inst (Ctx.E, H_C & " = const." & Val_Pir_Ty & " " & Format_Float64 (F2));
                         Emit_Inst (Ctx.E, C1 & " = fcmp_oge." & Val_Pir_Ty & " " & Val_Reg & ", " & L_C);
                         Emit_Inst (Ctx.E, C2 & " = fcmp_ole." & Val_Pir_Ty & " " & Val_Reg & ", " & H_C);
                         Emit_Inst (Ctx.E, InR & " = and.i8 " & C1 & ", " & C2);
@@ -474,21 +488,18 @@ package body Cg_Expr is
             begin
                if not Is_Void_Tree (Rng) and then KIND (Rng) = DN_RANGE then
                   declare
-                     E1 : constant Expr_Val := Emit_Expr (Ctx, D (AS_EXP1, Rng));
-                     E2 : constant Expr_Val := Emit_Expr (Ctx, D (AS_EXP2, Rng));
-                     U1 : constant Boolean := Is_Unsigned_Scalar (E1.Ada_Type, To_String (E1.Pir_Type));
-                     U2 : constant Boolean := Is_Unsigned_Scalar (E2.Ada_Type, To_String (E2.Pir_Type));
-                     L_R : constant String := Emit_Int_Convert (Ctx, To_String (E1.Reg), To_String (E1.Pir_Type), Val_Pir_Ty, Is_Unsigned => U1);
-                     H_R : constant String := Emit_Int_Convert (Ctx, To_String (E2.Reg), To_String (E2.Pir_Type), Val_Pir_Ty, Is_Unsigned => U2);
+                     E1  : constant Expr_Val := Emit_Expr (Ctx, D (AS_EXP1, Rng));
+                     E2  : constant Expr_Val := Emit_Expr (Ctx, D (AS_EXP2, Rng));
+                     V64 : constant String := Emit_Int_Convert (Ctx, Val_Reg, Val_Pir_Ty, "i64",
+                                              Is_Unsigned => Is_Unsigned_Scalar (R, Val_Pir_Ty));
+                     L64 : constant String := Emit_Widen_To_I64 (Ctx, To_String (E1.Reg), To_String (E1.Pir_Type), E1.Ada_Type);
+                     H64 : constant String := Emit_Widen_To_I64 (Ctx, To_String (E2.Reg), To_String (E2.Pir_Type), E2.Ada_Type);
                      C1  : constant String := Next_Reg (Ctx.E, "rlo");
                      C2  : constant String := Next_Reg (Ctx.E, "rhi");
                      Bad : constant String := Next_Reg (Ctx.E, "rbad");
-                     Is_U  : constant Boolean := Is_Unsigned_Scalar (R, Val_Pir_Ty);
-                     Lt_Op : constant String := (if Is_U then "cmp_lt_u." else "cmp_lt_s.");
-                     Gt_Op : constant String := (if Is_U then "cmp_gt_u." else "cmp_gt_s.");
                   begin
-                     Emit_Inst (Ctx.E, C1 & " = " & Lt_Op & Val_Pir_Ty & " " & Val_Reg & ", " & L_R);
-                     Emit_Inst (Ctx.E, C2 & " = " & Gt_Op & Val_Pir_Ty & " " & Val_Reg & ", " & H_R);
+                     Emit_Inst (Ctx.E, C1 & " = cmp_lt_s.i64 " & V64 & ", " & L64);
+                     Emit_Inst (Ctx.E, C2 & " = cmp_gt_s.i64 " & V64 & ", " & H64);
                      Emit_Inst (Ctx.E, Bad & " = or.i8 " & C1 & ", " & C2);
                      Emit_Check_Fail_If (Ctx, Bad);
                   end;
@@ -499,17 +510,16 @@ package body Cg_Expr is
                      Emit_Discrete_Range (Ctx, Rng, RT_U, Lo_U, Hi_U);
                      declare
                         RU  : constant Boolean := Is_Unsigned_Scalar (R, To_String (RT_U));
-                        L_R : constant String := Emit_Int_Convert (Ctx, To_String (Lo_U), To_String (RT_U), Val_Pir_Ty, Is_Unsigned => RU);
-                        H_R : constant String := Emit_Int_Convert (Ctx, To_String (Hi_U), To_String (RT_U), Val_Pir_Ty, Is_Unsigned => RU);
+                        V64 : constant String := Emit_Int_Convert (Ctx, Val_Reg, Val_Pir_Ty, "i64",
+                                                 Is_Unsigned => Is_Unsigned_Scalar (R, Val_Pir_Ty));
+                        L64 : constant String := Emit_Int_Convert (Ctx, To_String (Lo_U), To_String (RT_U), "i64", Is_Unsigned => RU);
+                        H64 : constant String := Emit_Int_Convert (Ctx, To_String (Hi_U), To_String (RT_U), "i64", Is_Unsigned => RU);
                         C1  : constant String := Next_Reg (Ctx.E, "rlo");
                         C2  : constant String := Next_Reg (Ctx.E, "rhi");
                         Bad : constant String := Next_Reg (Ctx.E, "rbad");
-                        Is_U  : constant Boolean := Is_Unsigned_Scalar (R, Val_Pir_Ty);
-                        Lt_Op : constant String := (if Is_U then "cmp_lt_u." else "cmp_lt_s.");
-                        Gt_Op : constant String := (if Is_U then "cmp_gt_u." else "cmp_gt_s.");
                      begin
-                        Emit_Inst (Ctx.E, C1 & " = " & Lt_Op & Val_Pir_Ty & " " & Val_Reg & ", " & L_R);
-                        Emit_Inst (Ctx.E, C2 & " = " & Gt_Op & Val_Pir_Ty & " " & Val_Reg & ", " & H_R);
+                        Emit_Inst (Ctx.E, C1 & " = cmp_lt_s.i64 " & V64 & ", " & L64);
+                        Emit_Inst (Ctx.E, C2 & " = cmp_gt_s.i64 " & V64 & ", " & H64);
                         Emit_Inst (Ctx.E, Bad & " = or.i8 " & C1 & ", " & C2);
                         Emit_Check_Fail_If (Ctx, Bad);
                      end;
@@ -764,12 +774,16 @@ package body Cg_Expr is
                         SR : constant Saved_Range_Info := Ctx.Saved_Type_Ranges.Element (Tree_Key (RTS));
                      begin
                         if SR.Is_Global or else SR.Owner_Subp = Ctx.Cur_Subp_Key then
-                           Low_Reg  := To_Unbounded_String
-                             (Emit_Scalar_Coerce (Ctx, Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global),
-                                                  To_String (SR.Pir_Type), To_String (Pir_Ty)));
-                           High_Reg := To_Unbounded_String
-                             (Emit_Scalar_Coerce (Ctx, Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global),
-                                                  To_String (SR.Pir_Type), To_String (Pir_Ty)));
+                           declare
+                              SR_U : constant Boolean := Is_Unsigned_Scalar (TS, To_String (SR.Pir_Type));
+                           begin
+                              Low_Reg  := To_Unbounded_String
+                                (Emit_Scalar_Coerce (Ctx, Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global),
+                                                     To_String (SR.Pir_Type), To_String (Pir_Ty), Is_Unsigned => SR_U));
+                              High_Reg := To_Unbounded_String
+                                (Emit_Scalar_Coerce (Ctx, Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global),
+                                                     To_String (SR.Pir_Type), To_String (Pir_Ty), Is_Unsigned => SR_U));
+                           end;
                            return;
                         end if;
                      end;
@@ -804,12 +818,16 @@ package body Cg_Expr is
                         SR : constant Saved_Range_Info := Ctx.Saved_Type_Ranges.Element (Tree_Key (RTS));
                      begin
                         if SR.Is_Global or else SR.Owner_Subp = Ctx.Cur_Subp_Key then
-                           Low_Reg  := To_Unbounded_String
-                             (Emit_Scalar_Coerce (Ctx, Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global),
-                                                  To_String (SR.Pir_Type), To_String (Pir_Ty)));
-                           High_Reg := To_Unbounded_String
-                             (Emit_Scalar_Coerce (Ctx, Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global),
-                                                  To_String (SR.Pir_Type), To_String (Pir_Ty)));
+                           declare
+                              SR_U : constant Boolean := Is_Unsigned_Scalar (TS, To_String (SR.Pir_Type));
+                           begin
+                              Low_Reg  := To_Unbounded_String
+                                (Emit_Scalar_Coerce (Ctx, Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global),
+                                                     To_String (SR.Pir_Type), To_String (Pir_Ty), Is_Unsigned => SR_U));
+                              High_Reg := To_Unbounded_String
+                                (Emit_Scalar_Coerce (Ctx, Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global),
+                                                     To_String (SR.Pir_Type), To_String (Pir_Ty), Is_Unsigned => SR_U));
+                           end;
                            return;
                         end if;
                      end;
@@ -985,6 +1003,278 @@ package body Cg_Expr is
       return Res;
    end Emit_Dim_Len_I64;
 
+   function Emit_Dim_Len_Checked_I64
+     (Ctx      : in out Context;
+      First_64 : String;
+      Last_64  : String;
+      Exc_Tag  : String := "") return String
+   is
+      Ge  : constant String := Next_Reg (Ctx.E, "dlcg");
+      D64 : constant String := Next_Reg (Ctx.E, "dlcd");
+      N64 : constant String := Next_Reg (Ctx.E, "dlcn");
+      Res : constant String := Next_Reg (Ctx.E, "dlcr");
+   begin
+      Emit_Inst (Ctx.E, Ge  & " = cmp_ge_s.i64 " & Last_64 & ", " & First_64);
+      Emit_Inst (Ctx.E, D64 & " = sub.i64 " & Last_64 & ", " & First_64);
+      if Ctx.Enable_Checks then
+         declare
+            Ovf : constant String := Next_Reg (Ctx.E, "dlco");
+            Bad : constant String := Next_Reg (Ctx.E, "dlcb");
+         begin
+            Emit_Inst (Ctx.E, Ovf & " = cmp_ge_u.i64 " & D64 & ", 9223372036854775807");
+            Emit_Inst (Ctx.E, Bad & " = and.i8 " & Ge & ", " & Ovf);
+            Emit_Check_Fail_If (Ctx, Bad, Tag => Exc_Tag);
+         end;
+      end if;
+      Emit_Inst (Ctx.E, N64 & " = add.i64 " & D64 & ", 1");
+      Emit_Inst (Ctx.E, Res & " = select.i64 " & Ge & ", " & N64 & ", 0");
+      return Res;
+   end Emit_Dim_Len_Checked_I64;
+
+   function Emit_Range_End_Checked_I64
+     (Ctx        : in out Context;
+      Lo_64      : String;
+      Count      : Integer_64;
+      Hi_64      : String;
+      Base_Idx_T : TREE) return String
+   is
+      En64 : constant String := Next_Reg (Ctx.E, "re64");
+   begin
+      if Count = 0 then
+         -- LRM 4.2(4): null string/positional subaggregate raises CONSTRAINT_ERROR if Idx'First <= Base'First
+         if Ctx.Enable_Checks and then not Is_Void_Tree (Base_Idx_T) then
+            declare
+               BT_St : Boolean := False;
+               BT_Lo, BT_Hi : Integer_64 := 0;
+            begin
+               Get_Discrete_Bounds (Base_Type_Spec (Subst_Tree (Ctx, Base_Idx_T)), BT_St, BT_Lo, BT_Hi);
+               if BT_St then
+                  declare
+                     Und : constant String := Next_Reg (Ctx.E, "reund");
+                  begin
+                     Emit_Inst (Ctx.E, Und & " = cmp_le_s.i64 " & Lo_64 & ", " & Img (Long_Long_Integer (BT_Lo)));
+                     Emit_Check_Fail_If (Ctx, Und);
+                  end;
+               end if;
+            end;
+         end if;
+         Emit_Inst (Ctx.E, En64 & " = sub.i64 " & Lo_64 & ", 1");
+      else
+         if Ctx.Enable_Checks then
+            declare
+               Ovf : constant String := Next_Reg (Ctx.E, "reov");
+               Oob : constant String := Next_Reg (Ctx.E, "reoob");
+               Bad : constant String := Next_Reg (Ctx.E, "rebad");
+            begin
+               Emit_Inst (Ctx.E, En64 & ", " & Ovf & " = add_ovf_s.i64 " & Lo_64 & ", " & Img (Long_Long_Integer (Count - 1)));
+               Emit_Inst (Ctx.E, Oob & " = cmp_gt_s.i64 " & En64 & ", " & Hi_64);
+               Emit_Inst (Ctx.E, Bad & " = or.i8 " & Ovf & ", " & Oob);
+               Emit_Check_Fail_If (Ctx, Bad);
+            end;
+         else
+            Emit_Inst (Ctx.E, En64 & " = add.i64 " & Lo_64 & ", " & Img (Long_Long_Integer (Count - 1)));
+         end if;
+      end if;
+      return En64;
+   end Emit_Range_End_Checked_I64;
+
+   procedure Emit_Agg_Pass1_Bounds
+     (Ctx      : in out Context;
+      Agg_Node : TREE;
+      Tgt_TI   : Type_Info;
+      Base_TI  : Type_Info;
+      ND       : Natural;
+      Firsts   : out Str_Array_4;
+      Lasts    : out Str_Array_4;
+      Rng_Keys : in out U32_Vecs.Vector;
+      Exp_Keys : in out U32_Vecs.Vector)
+   is
+      Cur_Agg : TREE := Agg_Node;
+   begin
+      for Dim_I in 1 .. ND loop
+         declare
+            Assocs  : SEQ_TYPE :=
+              (if not Is_Void_Tree (Cur_Agg) and then KIND (Cur_Agg) = DN_AGGREGATE
+               then LIST (D (AS_GENERAL_ASSOC_S, Cur_Agg)) else MAKE);
+            Item    : TREE;
+            Count   : Integer_64 := 0;
+            Got_R   : Boolean := False;
+            Has_NN  : Unbounded_String;
+            Next_A  : TREE := CONST_VOID;
+            Base_IT : constant TREE :=
+              (if Dim_I <= Base_TI.NDims then Base_TI.Dims (Dim_I).Idx_Type else CONST_VOID);
+         begin
+            while not IS_EMPTY (Assocs) loop
+               POP (Assocs, Item);
+               if KIND (Item) = DN_ASSOC or else KIND (Item) = DN_NAMED then
+                  if Is_Void_Tree (Next_A) then
+                     Next_A := D (AS_EXP, Item);
+                  end if;
+                  declare
+                     CS : SEQ_TYPE := LIST (D (AS_CHOICE_S, Item));
+                     Ch : TREE;
+                  begin
+                     while not IS_EMPTY (CS) loop
+                        POP (CS, Ch);
+                        if KIND (Ch) = DN_CHOICE_RANGE then
+                           declare
+                              RT, RL, RH : Unbounded_String;
+                              L64, H64   : Unbounded_String;
+                              SR         : Saved_Range_Info;
+                              Cur_NN     : constant String := Next_Reg (Ctx.E, "acnn");
+                           begin
+                              Emit_Discrete_Range (Ctx, D (AS_DISCRETE_RANGE, Ch), RT, RL, RH);
+                              L64 := To_Unbounded_String (Emit_Widen_To_I64 (Ctx, To_String (RL), To_String (RT), Base_IT));
+                              H64 := To_Unbounded_String (Emit_Widen_To_I64 (Ctx, To_String (RH), To_String (RT), Base_IT));
+                              -- Cache Pass-1 choice range so Pass 2 does NOT re-evaluate side effects
+                              Save_Scalar_Slot (Ctx, To_String (L64), "i64", 8, SR.Lo_Ptr, SR.Is_Global);
+                              Save_Scalar_Slot (Ctx, To_String (H64), "i64", 8, SR.Hi_Ptr, SR.Is_Global);
+                              SR.Pir_Type   := To_Unbounded_String ("i64");
+                              SR.Align      := 8;
+                              SR.Owner_Subp := Ctx.Cur_Subp_Key;
+                              Ctx.Saved_Type_Ranges.Include (Tree_Key (Ch), SR);
+                              Rng_Keys.Append (Tree_Key (Ch));
+                              -- Check non-null choice range against BASE index subtype even if outer dim is null
+                              if Ctx.Enable_Checks and then not Is_Void_Tree (Base_IT) then
+                                 Emit_Non_Null_Index_Check (Ctx, To_String (L64), To_String (H64), Base_IT);
+                              end if;
+                              Emit_Inst (Ctx.E, Cur_NN & " = cmp_le_s.i64 " & To_String (L64) & ", " & To_String (H64));
+                              if not Got_R then
+                                 Firsts (Dim_I) := L64;
+                                 Lasts (Dim_I)  := H64;
+                                 Has_NN         := To_Unbounded_String (Cur_NN);
+                                 Got_R          := True;
+                              else
+                                 -- LRM 4.3.2(4): null choice ranges do NOT expand aggregate bounds when non-null choices exist!
+                                 declare
+                                    Both_NN : constant String := Next_Reg (Ctx.E, "abnn");
+                                    No_Old  : constant String := Next_Reg (Ctx.E, "anoo");
+                                    Only_C  : constant String := Next_Reg (Ctx.E, "aocn");
+                                    CL      : constant String := Next_Reg (Ctx.E, "amn");
+                                    ML      : constant String := Next_Reg (Ctx.E, "alo");
+                                    CH      : constant String := Next_Reg (Ctx.E, "amx");
+                                    MH      : constant String := Next_Reg (Ctx.E, "ahi");
+                                    LF_Tmp  : constant String := Next_Reg (Ctx.E, "alt");
+                                    LH_Tmp  : constant String := Next_Reg (Ctx.E, "aht");
+                                    New_F   : constant String := Next_Reg (Ctx.E, "anf");
+                                    New_L   : constant String := Next_Reg (Ctx.E, "anl");
+                                    New_NN  : constant String := Next_Reg (Ctx.E, "ann");
+                                 begin
+                                    Emit_Inst (Ctx.E, Both_NN & " = and.i8 " & To_String (Has_NN) & ", " & Cur_NN);
+                                    Emit_Inst (Ctx.E, No_Old  & " = xor.i8 " & To_String (Has_NN) & ", 1");
+                                    Emit_Inst (Ctx.E, Only_C  & " = and.i8 " & No_Old & ", " & Cur_NN);
+                                    Emit_Inst (Ctx.E, CL & " = cmp_lt_s.i64 " & To_String (L64) & ", " & To_String (Firsts (Dim_I)));
+                                    Emit_Inst (Ctx.E, ML & " = select.i64 " & CL & ", " & To_String (L64) & ", " & To_String (Firsts (Dim_I)));
+                                    Emit_Inst (Ctx.E, CH & " = cmp_gt_s.i64 " & To_String (H64) & ", " & To_String (Lasts (Dim_I)));
+                                    Emit_Inst (Ctx.E, MH & " = select.i64 " & CH & ", " & To_String (H64) & ", " & To_String (Lasts (Dim_I)));
+                                    Emit_Inst (Ctx.E, LF_Tmp & " = select.i64 " & Only_C & ", " & To_String (L64) & ", " & To_String (Firsts (Dim_I)));
+                                    Emit_Inst (Ctx.E, LH_Tmp & " = select.i64 " & Only_C & ", " & To_String (H64) & ", " & To_String (Lasts (Dim_I)));
+                                    Emit_Inst (Ctx.E, New_F  & " = select.i64 " & Both_NN & ", " & ML & ", " & LF_Tmp);
+                                    Emit_Inst (Ctx.E, New_L  & " = select.i64 " & Both_NN & ", " & MH & ", " & LH_Tmp);
+                                    Emit_Inst (Ctx.E, New_NN & " = or.i8 " & To_String (Has_NN) & ", " & Cur_NN);
+                                    Firsts (Dim_I) := To_Unbounded_String (New_F);
+                                    Lasts (Dim_I)  := To_Unbounded_String (New_L);
+                                    Has_NN         := To_Unbounded_String (New_NN);
+                                 end;
+                              end if;
+                           end;
+                        elsif KIND (Ch) = DN_CHOICE_EXP then
+                           declare
+                              ChE : constant TREE := D (AS_EXP, Ch);
+                              CE  : constant Expr_Val := Emit_Expr (Ctx, ChE);
+                              C64 : constant String := Emit_Widen_To_I64 (Ctx, To_String (CE.Reg), To_String (CE.Pir_Type), CE.Ada_Type);
+                              SE  : Saved_Expr_Info;
+                              One : constant String := Next_Reg (Ctx.E, "ac1");
+                           begin
+                              if CE.Kind = EK_Scalar then
+                                 Save_Scalar_Slot (Ctx, To_String (CE.Reg), To_String (CE.Pir_Type), CE.Align, SE.Ptr_Reg, SE.Is_Global);
+                                 SE.Pir_Type   := CE.Pir_Type;
+                                 SE.Ada_Type   := CE.Ada_Type;
+                                 SE.Align      := CE.Align;
+                                 SE.Owner_Subp := Ctx.Cur_Subp_Key;
+                                 Ctx.Saved_Expr_Vals.Include (Tree_Key (ChE), SE);
+                                 Exp_Keys.Append (Tree_Key (ChE));
+                              end if;
+                              if Ctx.Enable_Checks and then not Is_Void_Tree (Base_IT) then
+                                 Emit_Range_Check (Ctx, C64, "i64", Base_IT);
+                              end if;
+                              Emit_Inst (Ctx.E, One & " = const.i8 1");
+                              if not Got_R then
+                                 Firsts (Dim_I) := To_Unbounded_String (C64);
+                                 Lasts (Dim_I)  := To_Unbounded_String (C64);
+                                 Has_NN         := To_Unbounded_String (One);
+                                 Got_R          := True;
+                              else
+                                 declare
+                                    CL    : constant String := Next_Reg (Ctx.E, "amn");
+                                    ML    : constant String := Next_Reg (Ctx.E, "alo");
+                                    CH    : constant String := Next_Reg (Ctx.E, "amx");
+                                    MH    : constant String := Next_Reg (Ctx.E, "ahi");
+                                    New_F : constant String := Next_Reg (Ctx.E, "anf");
+                                    New_L : constant String := Next_Reg (Ctx.E, "anl");
+                                 begin
+                                    Emit_Inst (Ctx.E, CL & " = cmp_lt_s.i64 " & C64 & ", " & To_String (Firsts (Dim_I)));
+                                    Emit_Inst (Ctx.E, ML & " = select.i64 " & CL & ", " & C64 & ", " & To_String (Firsts (Dim_I)));
+                                    Emit_Inst (Ctx.E, CH & " = cmp_gt_s.i64 " & C64 & ", " & To_String (Lasts (Dim_I)));
+                                    Emit_Inst (Ctx.E, MH & " = select.i64 " & CH & ", " & C64 & ", " & To_String (Lasts (Dim_I)));
+                                    Emit_Inst (Ctx.E, New_F & " = select.i64 " & To_String (Has_NN) & ", " & ML & ", " & C64);
+                                    Emit_Inst (Ctx.E, New_L & " = select.i64 " & To_String (Has_NN) & ", " & MH & ", " & C64);
+                                    Firsts (Dim_I) := To_Unbounded_String (New_F);
+                                    Lasts (Dim_I)  := To_Unbounded_String (New_L);
+                                    Has_NN         := To_Unbounded_String (One);
+                                 end;
+                              end if;
+                           end;
+                        end if;
+                     end loop;
+                  end;
+               else
+                  if Is_Void_Tree (Next_A) then
+                     Next_A := Item;
+                  end if;
+                  Count := Count + 1;
+               end if;
+            end loop;
+            if not Got_R then
+               if not Is_Void_Tree (Cur_Agg) and then KIND (Cur_Agg) = DN_STRING_LITERAL then
+                  Count := Integer_64 (Decode_Ada_String_Lit (Sym_Name (Cur_Agg))'Length);
+               end if;
+               declare
+                  Idx_Lo_R, Idx_Hi_R : Unbounded_String;
+                  Idx_T : constant TREE :=
+                    (if Dim_I <= Tgt_TI.NDims then Tgt_TI.Dims (Dim_I).Idx_Type else Base_IT);
+                  En64  : Unbounded_String;
+               begin
+                  Emit_Index_Bounds (Ctx, Idx_T, Idx_Lo_R, Idx_Hi_R);
+                  En64 := To_Unbounded_String (Emit_Range_End_Checked_I64 (Ctx, To_String (Idx_Lo_R), Count, To_String (Idx_Hi_R), Idx_T));
+                  Firsts (Dim_I) := Idx_Lo_R;
+                  Lasts (Dim_I)  := En64;
+               end;
+            end if;
+            Cur_Agg := Next_A;
+            while not Is_Void_Tree (Cur_Agg)
+              and then (KIND (Cur_Agg) = DN_PARENTHESIZED or else KIND (Cur_Agg) = DN_QUALIFIED)
+            loop
+               Cur_Agg := D (AS_EXP, Cur_Agg);
+            end loop;
+         end;
+      end loop;
+   end Emit_Agg_Pass1_Bounds;
+
+   procedure Release_Agg_Pass1_Cache
+     (Ctx      : in out Context;
+      Rng_Keys : U32_Vecs.Vector;
+      Exp_Keys : U32_Vecs.Vector)
+   is
+   begin
+      for K_Tmp of Rng_Keys loop
+         Ctx.Saved_Type_Ranges.Exclude (K_Tmp);
+      end loop;
+      for K_Tmp of Exp_Keys loop
+         Ctx.Saved_Expr_Vals.Exclude (K_Tmp);
+      end loop;
+   end Release_Agg_Pass1_Cache;
+
    procedure Emit_Array_Byte_Size_I64
      (Ctx       : in out Context;
       Firsts    : Str_Array_4;
@@ -996,16 +1286,28 @@ package body Cg_Expr is
    is
       ND    : constant Natural := Natural'Max (1, Natural'Min (NDims, Max_Array_Dims));
       ESz   : constant Natural := Natural'Max (1, Elem_Sz);
-      Lens  : Str_Array_4;
       Any_Z : Unbounded_String;
    begin
-      for D_I in 1 .. ND loop
-         Lens (D_I) := To_Unbounded_String (Emit_Dim_Len_I64 (Ctx, To_String (Firsts (D_I)), To_String (Lasts (D_I))));
-         if ND > 1 then
+      if ND = 1 then
+         declare
+            Len1 : constant String := Emit_Dim_Len_Checked_I64 (Ctx, To_String (Firsts (1)), To_String (Lasts (1)), Storage_Error_Tag (Ctx));
+            Byt  : constant String := Next_Reg (Ctx.E, "asb");
+            Ovf  : constant String := Next_Reg (Ctx.E, "asov");
+         begin
+            Tot_Elems := To_Unbounded_String (Len1);
+            Emit_Inst (Ctx.E, Byt & ", " & Ovf & " = mul_ovf_s.i64 " & Len1 & ", " & Img (ESz));
+            if Ctx.Enable_Checks then
+               Emit_Check_Fail_If (Ctx, Ovf, Storage_Error_Tag (Ctx));
+            end if;
+            Tot_Bytes := To_Unbounded_String (Byt);
+         end;
+      else
+         -- Super-null safe: check if ANY dimension is null (Last < First) BEFORE checking dim-length overflow!
+         for D_I in 1 .. ND loop
             declare
                IsZ : constant String := Next_Reg (Ctx.E, "asz");
             begin
-               Emit_Inst (Ctx.E, IsZ & " = cmp_eq.i64 " & To_String (Lens (D_I)) & ", 0");
+               Emit_Inst (Ctx.E, IsZ & " = cmp_lt_s.i64 " & To_String (Lasts (D_I)) & ", " & To_String (Firsts (D_I)));
                if D_I = 1 then
                   Any_Z := To_Unbounded_String (IsZ);
                else
@@ -1017,27 +1319,11 @@ package body Cg_Expr is
                   end;
                end if;
             end;
-         end if;
-      end loop;
-
-      if ND = 1 then
-         declare
-            Byt : constant String := Next_Reg (Ctx.E, "asb");
-            Ovf : constant String := Next_Reg (Ctx.E, "asov");
-         begin
-            Tot_Elems := Lens (1);
-            Emit_Inst (Ctx.E, Byt & ", " & Ovf & " = mul_ovf_s.i64 " & To_String (Lens (1)) & ", " & Img (ESz));
-            if Ctx.Enable_Checks then
-               Emit_Check_Fail_If (Ctx, Ovf, Storage_Error_Tag (Ctx));
-            end if;
-            Tot_Bytes := To_Unbounded_String (Byt);
-         end;
-      else
-         -- Super-null safe: if ANY dimension has length 0, total elements & bytes are 0 without overflowing!
+         end loop;
          declare
             L_Nz   : constant String := Next_Label (Ctx.E, "asnz");
             L_Done : constant String := Next_Label (Ctx.E, "asdn");
-            Cur    : Unbounded_String := Lens (1);
+            Cur    : Unbounded_String;
             Byt    : constant String := Next_Reg (Ctx.E, "asb");
             OvfB   : constant String := Next_Reg (Ctx.E, "asob");
             Out_T  : constant String := Next_Reg (Ctx.E, "ast");
@@ -1045,12 +1331,14 @@ package body Cg_Expr is
          begin
             Emit_Term (Ctx.E, "br " & To_String (Any_Z) & ", " & L_Done & "(0, 0), " & L_Nz);
             Emit_Label (Ctx.E, L_Nz);
+            Cur := To_Unbounded_String (Emit_Dim_Len_Checked_I64 (Ctx, To_String (Firsts (1)), To_String (Lasts (1)), Storage_Error_Tag (Ctx)));
             for D_I in 2 .. ND loop
                declare
+                  DL  : constant String := Emit_Dim_Len_Checked_I64 (Ctx, To_String (Firsts (D_I)), To_String (Lasts (D_I)), Storage_Error_Tag (Ctx));
                   M   : constant String := Next_Reg (Ctx.E, "asm");
                   Ovf : constant String := Next_Reg (Ctx.E, "asov");
                begin
-                  Emit_Inst (Ctx.E, M & ", " & Ovf & " = mul_ovf_s.i64 " & To_String (Cur) & ", " & To_String (Lens (D_I)));
+                  Emit_Inst (Ctx.E, M & ", " & Ovf & " = mul_ovf_s.i64 " & To_String (Cur) & ", " & DL);
                   if Ctx.Enable_Checks then
                      Emit_Check_Fail_If (Ctx, Ovf, Storage_Error_Tag (Ctx));
                   end if;
@@ -1086,18 +1374,29 @@ package body Cg_Expr is
       for D_I in 1 .. ND loop
          declare
             LF, LL, RF, RL : Unbounded_String;
-            C1, C2 : Unbounded_String;
-            Mis : constant String := Next_Reg (Ctx.E, "almis");
             LZ  : constant String := Next_Reg (Ctx.E, "allz");
             RZ  : constant String := Next_Reg (Ctx.E, "alrz");
+            DL  : constant String := Next_Reg (Ctx.E, "aldl");
+            DR  : constant String := Next_Reg (Ctx.E, "aldr");
+            DN  : constant String := Next_Reg (Ctx.E, "aldn");
+            DS  : constant String := Next_Reg (Ctx.E, "alds");
+            LNN : constant String := Next_Reg (Ctx.E, "alln");
+            SM  : constant String := Next_Reg (Ctx.E, "alsm");
+            Mis : constant String := Next_Reg (Ctx.E, "almis");
          begin
+            -- Exact full-64-bit length comparison without saturation:
+            -- dims match iff (LZ = RZ) and (not LZ => (LL - LF) = (RL - RF)) using wrapping i64 sub
             Get_Array_Dim_Bounds (Ctx, LHS, D_I, LF, LL);
             Get_Array_Dim_Bounds (Ctx, RHS, D_I, RF, RL);
-            C1 := To_Unbounded_String (Emit_Dim_Len_I64 (Ctx, To_String (LF), To_String (LL)));
-            C2 := To_Unbounded_String (Emit_Dim_Len_I64 (Ctx, To_String (RF), To_String (RL)));
-            Emit_Inst (Ctx.E, Mis & " = cmp_ne.i64 " & To_String (C1) & ", " & To_String (C2));
-            Emit_Inst (Ctx.E, LZ  & " = cmp_eq.i64 " & To_String (C1) & ", 0");
-            Emit_Inst (Ctx.E, RZ  & " = cmp_eq.i64 " & To_String (C2) & ", 0");
+            Emit_Inst (Ctx.E, LZ  & " = cmp_lt_s.i64 " & To_String (LL) & ", " & To_String (LF));
+            Emit_Inst (Ctx.E, RZ  & " = cmp_lt_s.i64 " & To_String (RL) & ", " & To_String (RF));
+            Emit_Inst (Ctx.E, DL  & " = sub.i64 " & To_String (LL) & ", " & To_String (LF));
+            Emit_Inst (Ctx.E, DR  & " = sub.i64 " & To_String (RL) & ", " & To_String (RF));
+            Emit_Inst (Ctx.E, DN  & " = xor.i8 " & LZ & ", " & RZ);
+            Emit_Inst (Ctx.E, DS  & " = cmp_ne.i64 " & DL & ", " & DR);
+            Emit_Inst (Ctx.E, LNN & " = xor.i8 " & LZ & ", 1");
+            Emit_Inst (Ctx.E, SM  & " = and.i8 " & LNN & ", " & DS);
+            Emit_Inst (Ctx.E, Mis & " = or.i8 " & DN & ", " & SM);
             if D_I = 1 then
                Any_Mis := To_Unbounded_String (Mis);
                L_Null  := To_Unbounded_String (LZ);
@@ -1164,21 +1463,23 @@ package body Cg_Expr is
       Firsts   : Str_Array_4;
       Lasts    : Str_Array_4;
       ND       : Natural;
-      Desc_Ty  : String := "@__ada_arr_desc")
+      Desc_Ty  : String := "@__ada_arr_desc";
+      Align    : Natural := 8)
    is
       P0 : constant String := Next_Reg (Ctx.E, "adp0");
+      Al : constant String := Img (Natural'Max (1, Natural'Min (8, Align)));
    begin
       Emit_Inst (Ctx.E, P0 & " = field_ptr " & Desc_Ty & ", " & Desc_Ptr & ", 0");
-      Emit_Inst (Ctx.E, "store.ptr " & Data_Ptr & ", " & P0 & ", align 8");
+      Emit_Inst (Ctx.E, "store.ptr " & Data_Ptr & ", " & P0 & ", align " & Al);
       for D_Idx in 1 .. Natural'Min (ND, Max_Array_Dims) loop
          declare
             FP : constant String := Next_Reg (Ctx.E, "adfp");
             LP : constant String := Next_Reg (Ctx.E, "adlp");
          begin
             Emit_Inst (Ctx.E, FP & " = field_ptr " & Desc_Ty & ", " & Desc_Ptr & ", " & Img (2 * D_Idx - 1));
-            Emit_Inst (Ctx.E, "store.i64 " & To_String (Firsts (D_Idx)) & ", " & FP & ", align 8");
+            Emit_Inst (Ctx.E, "store.i64 " & To_String (Firsts (D_Idx)) & ", " & FP & ", align " & Al);
             Emit_Inst (Ctx.E, LP & " = field_ptr " & Desc_Ty & ", " & Desc_Ptr & ", " & Img (2 * D_Idx));
-            Emit_Inst (Ctx.E, "store.i64 " & To_String (Lasts (D_Idx)) & ", " & LP & ", align 8");
+            Emit_Inst (Ctx.E, "store.i64 " & To_String (Lasts (D_Idx)) & ", " & LP & ", align " & Al);
          end;
       end loop;
    end Emit_Store_Arr_Desc;
@@ -1188,16 +1489,18 @@ package body Cg_Expr is
       Desc_Ptr : String;
       Des_T    : TREE;
       Out_Val  : out Expr_Val;
-      Desc_Ty  : String := "@__ada_arr_desc")
+      Desc_Ty  : String := "@__ada_arr_desc";
+      Align    : Natural := 8)
    is
       DTI : constant Type_Info := Get_Type_Info (Ctx, Des_T);
       ETI : constant Type_Info := Get_Type_Info (Ctx, DTI.Elem_Type);
       ND  : constant Natural := Natural'Max (1, Natural'Min (DTI.NDims, Max_Array_Dims));
       P0  : constant String := Next_Reg (Ctx.E, "adp");
       D0  : constant String := Next_Reg (Ctx.E, "add");
+      Al  : constant String := Img (Natural'Max (1, Natural'Min (8, Align)));
    begin
       Emit_Inst (Ctx.E, P0 & " = field_ptr " & Desc_Ty & ", " & Desc_Ptr & ", 0");
-      Emit_Inst (Ctx.E, D0 & " = load.ptr " & P0 & ", align 8");
+      Emit_Inst (Ctx.E, D0 & " = load.ptr " & P0 & ", align " & Al);
       Out_Val.Kind     := EK_Slice;
       Out_Val.Reg      := To_Unbounded_String (D0);
       Out_Val.Pir_Type := To_Unbounded_String ("ptr");
@@ -1212,9 +1515,9 @@ package body Cg_Expr is
             LV : constant String := Next_Reg (Ctx.E, "adlv");
          begin
             Emit_Inst (Ctx.E, FP & " = field_ptr " & Desc_Ty & ", " & Desc_Ptr & ", " & Img (2 * D_Idx - 1));
-            Emit_Inst (Ctx.E, FV & " = load.i64 " & FP & ", align 8");
+            Emit_Inst (Ctx.E, FV & " = load.i64 " & FP & ", align " & Al);
             Emit_Inst (Ctx.E, LP & " = field_ptr " & Desc_Ty & ", " & Desc_Ptr & ", " & Img (2 * D_Idx));
-            Emit_Inst (Ctx.E, LV & " = load.i64 " & LP & ", align 8");
+            Emit_Inst (Ctx.E, LV & " = load.i64 " & LP & ", align " & Al);
             Out_Val.First_Regs (D_Idx) := To_Unbounded_String (FV);
             Out_Val.Last_Regs (D_Idx)  := To_Unbounded_String (LV);
          end;
@@ -1331,7 +1634,8 @@ package body Cg_Expr is
      (Ctx        : in out Context;
       Rec_Ptr    : String;
       Target_Rec : TREE;
-      Is_Access  : Boolean := False)
+      Is_Access  : Boolean := False;
+      Tag        : String := "")
    is
       RT : TREE := Resolve_Type_Spec (Subst_Tree (Ctx, Target_Rec));
       RT_Orig : constant TREE := RT;
@@ -1388,7 +1692,7 @@ package body Cg_Expr is
                   Emit_Inst (Ctx.E, CF & " = cmp_ne.i64 " & FV & ", " & To_String (TF));
                   Emit_Inst (Ctx.E, CL & " = cmp_ne.i64 " & LV & ", " & To_String (TL));
                   Emit_Inst (Ctx.E, Bad & " = or.i8 " & CF & ", " & CL);
-                  Emit_Check_Fail_If (Ctx, Bad);
+                  Emit_Check_Fail_If (Ctx, Bad, Tag);
                end;
             end loop;
             Emit_Term (Ctx.E, "jmp " & L_Skip);
@@ -1455,13 +1759,13 @@ package body Cg_Expr is
                                  SD : constant Saved_Disc_Info := Ctx.Saved_Type_Discs.Element (Tree_Key (RT));
                                  LV : constant String := Load_Saved_Slot (Ctx, To_String (SD.Ptrs (FIdx + 1)), To_String (SD.Pir_Types (FIdx + 1)), SD.Aligns (FIdx + 1), SD.Is_Global);
                               begin
-                                 ER := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, LV, To_String (SD.Pir_Types (FIdx + 1)), To_String (CTI.Pir_Type)));
+                                 ER := To_Unbounded_String (Emit_Widen_To_I64 (Ctx, LV, To_String (SD.Pir_Types (FIdx + 1)), CT));
                               end;
                            else
                               declare
                                  EV : constant Expr_Val := Emit_Expr (Ctx, Exp, CT);
                               begin
-                                 ER := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, To_String (EV.Reg), To_String (EV.Pir_Type), To_String (CTI.Pir_Type)));
+                                 ER := To_Unbounded_String (Emit_Widen_To_I64 (Ctx, To_String (EV.Reg), To_String (EV.Pir_Type), EV.Ada_Type));
                               end;
                            end if;
                            declare
@@ -1470,18 +1774,18 @@ package body Cg_Expr is
                            begin
                               if Ctx.Fields.Contains (DK) then
                                  declare
-                                    FE : constant Field_Entry := Ctx.Fields.Element (DK);
-                                    FV : constant String := Emit_Load_Field_Scalar (Ctx, Rec_Ptr, To_String (RTI.Pir_Type), FE, CT, CTI, "dca");
+                                    FE  : constant Field_Entry := Ctx.Fields.Element (DK);
+                                    FV6 : constant String := Emit_Load_Field_I64 (Ctx, Rec_Ptr, To_String (RTI.Pir_Type), FE, CT, CTI);
                                  begin
-                                    Emit_Inst (Ctx.E, Neq & " = cmp_ne." & To_String (CTI.Pir_Type) & " " & FV & ", " & To_String (ER));
+                                    Emit_Inst (Ctx.E, Neq & " = cmp_ne.i64 " & FV6 & ", " & To_String (ER));
                                  end;
                               else
                                  Emit_Inst (Ctx.E, FP & " = field_ptr " & To_String (RTI.Pir_Type) & ", " & Rec_Ptr & ", " & Img (FIdx));
                                  Emit_Inst (Ctx.E, Act & " = load." & To_String (CTI.Pir_Type) & " " & FP & ", align " & Img (CTI.Align));
-                                 Emit_Inst (Ctx.E, Neq & " = cmp_ne." & To_String (CTI.Pir_Type) & " " & Act & ", " & To_String (ER));
+                                 Emit_Inst (Ctx.E, Neq & " = cmp_ne.i64 " & Emit_Widen_To_I64 (Ctx, Act, To_String (CTI.Pir_Type), CT) & ", " & To_String (ER));
                               end if;
                            end;
-                           Emit_Check_Fail_If (Ctx, Neq);
+                           Emit_Check_Fail_If (Ctx, Neq, Tag);
                         end;
                         FIdx := FIdx + 1;
                      end loop;
@@ -1671,8 +1975,13 @@ package body Cg_Expr is
                               T2 := EV.Pir_Type; V2 := EV.Reg;
                            end;
                         end if;
-                        A1 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (V1), To_String (T1), "i64"));
-                        A2 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (V2), To_String (T2), "i64"));
+                        declare
+                           AT1 : constant TREE := (if not Is_Void_Tree (E1) and then KIND (E1) in CLASS_EXP then Subst_Tree (Ctx, D (SM_EXP_TYPE, E1)) else CONST_VOID);
+                           AT2 : constant TREE := (if not Is_Void_Tree (E2) and then KIND (E2) in CLASS_EXP then Subst_Tree (Ctx, D (SM_EXP_TYPE, E2)) else CONST_VOID);
+                        begin
+                           A1 := To_Unbounded_String (Emit_Widen_To_I64 (Ctx, To_String (V1), To_String (T1), AT1));
+                           A2 := To_Unbounded_String (Emit_Widen_To_I64 (Ctx, To_String (V2), To_String (T2), AT2));
+                        end;
                         Emit_Inst (Ctx.E, Ne & " = cmp_ne.i64 " & To_String (A1) & ", " & To_String (A2));
                         Emit_Check_Fail_If (Ctx, Ne);
                      end;
@@ -1731,11 +2040,29 @@ package body Cg_Expr is
               and then R1 /= R2
             then
                declare
-                  V1L : constant Expr_Val := Emit_Expr (Ctx, D (AS_EXP1, R1), ST);
-                  V1H : constant Expr_Val := Emit_Expr (Ctx, D (AS_EXP2, R1), ST);
-                  V2L : constant Expr_Val := Emit_Expr (Ctx, D (AS_EXP1, R2), DT);
-                  V2H : constant Expr_Val := Emit_Expr (Ctx, D (AS_EXP2, R2), DT);
+                  procedure Get_Real_Bounds (T_Node : TREE; R_Node : TREE; VL, VH : out Expr_Val) is
+                  begin
+                     if Ctx.Saved_Type_Ranges.Contains (Tree_Key (T_Node))
+                       and then (Ctx.Saved_Type_Ranges.Element (Tree_Key (T_Node)).Is_Global
+                                 or else Ctx.Saved_Type_Ranges.Element (Tree_Key (T_Node)).Owner_Subp = Ctx.Cur_Subp_Key)
+                     then
+                        declare
+                           SR : constant Saved_Range_Info := Ctx.Saved_Type_Ranges.Element (Tree_Key (T_Node));
+                        begin
+                           VL.Kind := EK_Scalar; VL.Pir_Type := SR.Pir_Type; VL.Ada_Type := T_Node; VL.Align := SR.Align;
+                           VL.Reg  := To_Unbounded_String (Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global));
+                           VH.Kind := EK_Scalar; VH.Pir_Type := SR.Pir_Type; VH.Ada_Type := T_Node; VH.Align := SR.Align;
+                           VH.Reg  := To_Unbounded_String (Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global));
+                           return;
+                        end;
+                     end if;
+                     VL := Emit_Expr (Ctx, D (AS_EXP1, R_Node), T_Node);
+                     VH := Emit_Expr (Ctx, D (AS_EXP2, R_Node), T_Node);
+                  end Get_Real_Bounds;
+                  V1L, V1H, V2L, V2H : Expr_Val;
                begin
+                  Get_Real_Bounds (ST, R1, V1L, V1H);
+                  Get_Real_Bounds (DT, R2, V2L, V2H);
                   if KIND (ST) = DN_FLOAT then
                      declare
                         A1 : constant String := Emit_Scalar_Coerce (Ctx, To_String (V1L.Reg), To_String (V1L.Pir_Type), "f64");
@@ -1773,10 +2100,10 @@ package body Cg_Expr is
                                 Is_Unsigned => Is_Unsigned_Scalar (EV.Ada_Type, PT));
                            end if;
                         end To_Fixed_I64;
-                        A1 : constant String := To_Fixed_I64 (V1L, R1);
-                        B1 : constant String := To_Fixed_I64 (V1H, R1);
-                        A2 : constant String := To_Fixed_I64 (V2L, R2);
-                        B2 : constant String := To_Fixed_I64 (V2H, R2);
+                        A1 : constant String := To_Fixed_I64 (V1L, ST);
+                        B1 : constant String := To_Fixed_I64 (V1H, ST);
+                        A2 : constant String := To_Fixed_I64 (V2L, DT);
+                        B2 : constant String := To_Fixed_I64 (V2H, DT);
                         N1 : constant String := Next_Reg (Ctx.E, "sxn1");
                         N2 : constant String := Next_Reg (Ctx.E, "sxn2");
                         BN : constant String := Next_Reg (Ctx.E, "sxbn");
@@ -1803,6 +2130,237 @@ package body Cg_Expr is
       end if;
    end Emit_Subtypes_Match_Check;
 
+   -- Shared helper: emit a float constant safely without overflowing f32 PIR immediates
+   function Emit_Float_Const_Safe
+     (Ctx               : in out Context;
+      FV                : IEEE_Float_64;
+      Pir_Ty            : String;
+      Reg_Pfx           : String;
+      Raise_On_Overflow : Boolean := True) return String
+   is
+      R       : constant String := Next_Reg (Ctx.E, Reg_Pfx);
+      F32_Max : constant IEEE_Float_64 := 3.4028234663852886E+38;
+   begin
+      if Pir_Ty = "f32" and then (not FV'Valid or else abs FV > F32_Max) then
+         if Raise_On_Overflow and then Ctx.Enable_Checks then
+            Emit_Raise_Tag (Ctx, "@__ada_exc_numeric_error");
+            Emit_Label (Ctx.E, Next_Label (Ctx.E, "flo_u"));
+            Emit_Inst (Ctx.E, R & " = const.f32 0.0");
+         else
+            declare
+               F64R : constant String := Next_Reg (Ctx.E, Reg_Pfx & "64");
+            begin
+               Emit_Inst (Ctx.E, F64R & " = const.f64 " & Format_Float64 (FV));
+               Emit_Inst (Ctx.E, R & " = fptrunc.f32 " & F64R);
+            end;
+         end if;
+      else
+         Emit_Inst (Ctx.E, R & " = const." & Pir_Ty & " " & Format_Float64 (FV));
+      end if;
+      return R;
+   end Emit_Float_Const_Safe;
+
+   -- Shared helper: emit a static scalar value (numeric literal, named number, or static constant)
+   function Emit_Static_Scalar_Value
+     (Ctx         : in out Context;
+      SV          : TREE;
+      Raw_ET      : TREE;
+      Target_Type : TREE;
+      Reg_Pfx     : String) return Expr_Val
+   is
+      Res : Expr_Val;
+      ET  : TREE := Raw_ET;
+   begin
+      if Is_Void_Tree (ET) or else KIND (ET) = DN_UNIVERSAL_INTEGER or else KIND (ET) = DN_UNIVERSAL_REAL then
+         if not Is_Void_Tree (Target_Type) and then Is_Scalar_Type (Target_Type) then
+            ET := Subst_Tree (Ctx, Target_Type);
+         end if;
+      end if;
+      declare
+         TI     : constant Type_Info := Get_Type_Info (Ctx, ET);
+         Out_PT : Unbounded_String := TI.Pir_Type;
+         R      : Unbounded_String;
+      begin
+         if Is_Float_Type (ET) then
+            R := To_Unbounded_String (Emit_Float_Const_Safe (Ctx, Eval_Float64 (SV), To_String (TI.Pir_Type), Reg_Pfx));
+         elsif Is_Fixed_Type (ET) then
+            declare
+               Sc  : Integer_64;
+               Ovf : Boolean;
+               Reg : constant String := Next_Reg (Ctx.E, Reg_Pfx);
+            begin
+               Eval_Fixed_Ticks_Exact_Checked (SV, ET, Sc, Ovf);
+               if Ctx.Enable_Checks and then Ovf then
+                  Emit_Raise_Tag (Ctx, Constraint_Error_Tag (Ctx));
+                  Emit_Label (Ctx.E, Next_Label (Ctx.E, "fxo_u"));
+               end if;
+               Emit_Inst (Ctx.E, Reg & " = const." & To_String (TI.Pir_Type) & " " & Img (Long_Long_Integer (Sc)));
+               R := To_Unbounded_String (Reg);
+            end;
+         else
+            declare
+               Val : Integer_64;
+               Ovf : Boolean;
+               RET : constant TREE := Subst_Resolve_Type (Ctx, ET);
+               Reg : constant String := Next_Reg (Ctx.E, Reg_Pfx);
+            begin
+               Eval_Int64_Checked (SV, Val, Ovf);
+               if Ctx.Enable_Checks and then not Is_Void_Tree (RET)
+                 and then KIND (RET) /= DN_UNIVERSAL_INTEGER
+               then
+                  declare
+                     BT  : constant TREE := Subst_Base_Type (Ctx, RET);
+                     StB : Boolean := False;
+                     BLo, BHi : Integer_64 := 0;
+                  begin
+                     if not Is_Void_Tree (BT) and then Is_Discrete_Type (BT) then
+                        Get_Discrete_Bounds (BT, StB, BLo, BHi);
+                     end if;
+                     if Ovf or else (StB and then (Val < BLo or else Val > BHi)) then
+                        Emit_Raise_Tag (Ctx, Constraint_Error_Tag (Ctx));
+                        Emit_Label (Ctx.E, Next_Label (Ctx.E, "nlo_u"));
+                        Val := 0;
+                     end if;
+                  end;
+               end if;
+               -- P3-1.3 / P5-R1: Never truncate a base-type integer literal into signed OR unsigned i8/i16/i32!
+               declare
+                  OPT  : constant String := To_String (Out_PT);
+                  Is_U : constant Boolean := Is_Unsigned_Scalar (ET, OPT);
+               begin
+                  if (OPT = "i8" and then ((Is_U and then (Val < 0 or else Val > 255))
+                                           or else (not Is_U and then (Val < -128 or else Val > 127))))
+                    or else (OPT = "i16" and then ((Is_U and then (Val < 0 or else Val > 65535))
+                                                   or else (not Is_U and then (Val < -32768 or else Val > 32767))))
+                    or else (OPT = "i32" and then ((Is_U and then (Val < 0 or else Val > 4294967295))
+                                                   or else (not Is_U and then (Val < -2147483648 or else Val > 2147483647))))
+                  then
+                     if Val >= -32768 and then Val <= 32767 and then OPT = "i8" then
+                        Out_PT := To_Unbounded_String ("i16");
+                     elsif Val >= -2147483648 and then Val <= 2147483647 and then OPT in "i8" | "i16" then
+                        Out_PT := To_Unbounded_String ("i32");
+                     else
+                        Out_PT := To_Unbounded_String ("i64");
+                     end if;
+                  end if;
+               end;
+               Emit_Inst (Ctx.E, Reg & " = const." & To_String (Out_PT) & " " & Format_Int_Imm_For_Pir (Val, To_String (Out_PT)));
+               R := To_Unbounded_String (Reg);
+            end;
+         end if;
+         Res.Kind     := EK_Scalar;
+         Res.Reg      := R;
+         Res.Pir_Type := Out_PT;
+         Res.Ada_Type := ET;
+         Res.Align    := TI.Align;
+         return Res;
+      end;
+   end Emit_Static_Scalar_Value;
+
+   -- Shared helper: resolve a bound Var_Info as either an lvalue (Load_Scalar=False)
+   -- or rvalue (Load_Scalar=True), always preserving the slot's true PIR width & alignment.
+   function Emit_Var_Ref
+     (Ctx         : in out Context;
+      V           : Var_Info;
+      Def         : TREE;
+      Load_Scalar : Boolean) return Expr_Val
+   is
+      Res    : Expr_Val;
+      ATy    : constant TREE := Subst_Tree (Ctx, V.Ada_Type);
+      TI     : constant Type_Info := Get_Type_Info (Ctx, ATy);
+      Eff_PT : constant Unbounded_String :=
+        (if TI.Kind = TK_Scalar and then not V.Is_Bitfield
+           and then Length (V.Pir_Type) > 0 and then To_String (V.Pir_Type) /= "void"
+         then V.Pir_Type else TI.Pir_Type);
+      Eff_Al : constant Natural :=
+        (if TI.Kind = TK_Scalar and then not V.Is_Bitfield and then V.Align > 0
+         then V.Align else TI.Align);
+   begin
+      Res.Ada_Type := ATy;
+      Res.Pir_Type := Eff_PT;
+      Res.Align    := (if V.Align > 0 then V.Align else TI.Align);
+
+      if V.Kind = VK_Uncon_Array_Param or else V.Kind = VK_Dyn_Array then
+         Res.Kind     := EK_Slice;
+         Res.Pir_Type := To_Unbounded_String ("ptr");
+         Res.NDims    := V.NDims;
+         if V.Has_Desc and then
+           (Length (V.Desc_Global) > 0
+            or else (V.Owner_Subp /= 0 and then V.Owner_Subp /= Ctx.Cur_Subp_Key))
+         then
+            declare
+               DP : Unbounded_String;
+            begin
+               if Length (V.Desc_Global) > 0 then
+                  declare
+                     GA : constant String := Next_Reg (Ctx.E, "dg");
+                  begin
+                     Emit_Inst (Ctx.E, GA & " = addr " & To_String (V.Desc_Global));
+                     DP := To_Unbounded_String (GA);
+                  end;
+               else
+                  DP := To_Unbounded_String (Emit_Var_Addr (Ctx, V));
+               end if;
+               Emit_Unpack_Arr_Desc (Ctx, To_String (DP), ATy, Res);
+               Res.Align := V.Align;
+               Res.NDims := V.NDims;
+            end;
+         else
+            Res.Reg        := To_Unbounded_String (Emit_Var_Addr (Ctx, V));
+            Res.First_Regs := V.First_Regs;
+            Res.Last_Regs  := V.Last_Regs;
+         end if;
+         return Res;
+      elsif V.Kind = VK_Param_Val then
+         Res.Kind  := EK_Scalar;
+         Res.Reg   := V.Pir_Name;
+         Res.Align := Eff_Al;
+         return Res;
+      elsif V.Kind = VK_Const_Int then
+         Res.Kind  := EK_Scalar;
+         Res.Reg   := To_Unbounded_String (Emit_Int_Const (Ctx, V.Const_I64, To_String (Eff_PT), "ci"));
+         Res.Align := Eff_Al;
+         return Res;
+      elsif V.Kind = VK_Const_Float then
+         Res.Kind  := EK_Scalar;
+         Res.Reg   := To_Unbounded_String (Emit_Float_Const_Safe (Ctx, V.Const_F64, To_String (Eff_PT), "cf"));
+         Res.Align := Eff_Al;
+         return Res;
+      elsif Load_Scalar and then TI.Kind = TK_Scalar then
+         declare
+            Addr      : constant String := Emit_Var_Addr (Ctx, V);
+            Is_Shared : constant Boolean :=
+              V.Is_Shared or else (not Is_Void_Tree (Def) and then KIND (Def) = DN_VARIABLE_ID and then DB (SM_IS_SHARED, Def));
+         begin
+            if V.Is_Bitfield then
+               Res.Kind     := EK_Scalar;
+               Res.Reg      := To_Unbounded_String (Emit_Bitfield_Load (Ctx, Addr, V.BF_FE, ATy));
+               Res.Pir_Type := TI.Pir_Type;
+               Res.Align    := TI.Align;
+               return Res;
+            end if;
+            declare
+               R : constant String := Next_Reg (Ctx.E, "ld");
+            begin
+               if Is_Shared then
+                  Emit_Inst (Ctx.E, R & " = load." & To_String (Eff_PT) & " " & Addr & ", align " & Img (Eff_Al) & " [volatile]");
+                  Emit_Inst (Ctx.E, "fence [seq_cst]");
+               else
+                  Emit_Inst (Ctx.E, R & " = load." & To_String (Eff_PT) & " " & Addr & ", align " & Img (Eff_Al));
+               end if;
+               Res.Kind  := EK_Scalar;
+               Res.Reg   := To_Unbounded_String (R);
+               Res.Align := Eff_Al;
+               return Res;
+            end;
+         end;
+      else
+         Res.Kind := EK_Addr;
+         Res.Reg  := To_Unbounded_String (Emit_Var_Addr (Ctx, V));
+         return Res;
+      end if;
+   end Emit_Var_Ref;
+
    function Emit_LValue (Ctx : in out Context; Node : TREE) return Expr_Val is
       Res : Expr_Val;
       K   : constant NODE_NAME := KIND (Node);
@@ -1815,69 +2373,7 @@ package body Cg_Expr is
                Key     : constant Unsigned_32 := Tree_Key (Def);
             begin
                if Ctx.Vars.Contains (Key) then
-                  declare
-                     V  : constant Var_Info := Ctx.Vars.Element (Key);
-                     ATy : constant TREE := Subst_Tree (Ctx, V.Ada_Type);
-                     TI : constant Type_Info := Get_Type_Info (Ctx, ATy);
-                  begin
-                     Res.Ada_Type := ATy;
-                     Res.Align    := V.Align;
-                     Res.Pir_Type := TI.Pir_Type;
-                     if V.Kind = VK_Uncon_Array_Param or else V.Kind = VK_Dyn_Array then
-                        Res.Kind  := EK_Slice;
-                        Res.NDims := V.NDims;
-                        if V.Has_Desc and then
-                          (Length (V.Desc_Global) > 0
-                           or else (V.Owner_Subp /= 0 and then V.Owner_Subp /= Ctx.Cur_Subp_Key))
-                        then
-                           declare
-                              DP : Unbounded_String;
-                           begin
-                              if Length (V.Desc_Global) > 0 then
-                                 declare
-                                    GA : constant String := Next_Reg (Ctx.E, "dg");
-                                 begin
-                                    Emit_Inst (Ctx.E, GA & " = addr " & To_String (V.Desc_Global));
-                                    DP := To_Unbounded_String (GA);
-                                 end;
-                              else
-                                 DP := To_Unbounded_String (Emit_Var_Addr (Ctx, V));
-                              end if;
-                              Emit_Unpack_Arr_Desc (Ctx, To_String (DP), V.Ada_Type, Res);
-                              Res.Align := V.Align;
-                              Res.NDims := V.NDims;
-                           end;
-                        else
-                           Res.Reg        := To_Unbounded_String (Emit_Var_Addr (Ctx, V));
-                           Res.First_Regs := V.First_Regs;
-                           Res.Last_Regs  := V.Last_Regs;
-                        end if;
-                     elsif V.Kind = VK_Param_Val then
-                        -- Shouldn't be modified, but return value
-                        Res.Kind := EK_Scalar;
-                        Res.Reg  := V.Pir_Name;
-                     elsif V.Kind = VK_Const_Int then
-                        declare
-                           CR : constant String := Next_Reg (Ctx.E, "lci");
-                        begin
-                           Emit_Inst (Ctx.E, CR & " = const." & To_String (TI.Pir_Type) & " " & Img (Long_Long_Integer (V.Const_I64)));
-                           Res.Kind := EK_Scalar;
-                           Res.Reg  := To_Unbounded_String (CR);
-                        end;
-                     elsif V.Kind = VK_Const_Float then
-                        declare
-                           CR : constant String := Next_Reg (Ctx.E, "lcf");
-                        begin
-                           Emit_Inst (Ctx.E, CR & " = const." & To_String (TI.Pir_Type) & " " & Format_Float64 (V.Const_F64));
-                           Res.Kind := EK_Scalar;
-                           Res.Reg  := To_Unbounded_String (CR);
-                        end;
-                     else
-                        Res.Kind := EK_Addr;
-                        Res.Reg  := To_Unbounded_String (Emit_Var_Addr (Ctx, V));
-                     end if;
-                     return Res;
-                  end;
+                  return Emit_Var_Ref (Ctx, Ctx.Vars.Element (Key), Def, Load_Scalar => False);
                else
                   -- External package variable from a with'd unit (never treat unbound discriminant as external global!)
                   if KIND (Def) in CLASS_TYPE_NAME | DN_TASK_BODY_ID then
@@ -2062,76 +2558,11 @@ package body Cg_Expr is
                      RTI : constant Type_Info := Get_Type_Info (Ctx, Rec_T);
                      CT  : constant TREE := Subst_Tree (Ctx, D (SM_OBJ_TYPE, Def));
                      CTI : constant Type_Info := Get_Type_Info (Ctx, CT);
-                     CK  : constant Unsigned_32 := Tree_Key (Def);
                      FP  : constant String := Next_Reg (Ctx.E, "fp");
                   begin
                      declare
-                        Use_CK : Unsigned_32 := CK;
+                        Use_CK : constant Unsigned_32 := Lookup_Record_Field_Key (Ctx, Rec_T, Def);
                      begin
-                        if not Ctx.Fields.Contains (Use_CK) then
-                           -- LRM 3.4 (c34009d/f/j/l): derived private/record type has copied discriminant IDs; match by name on base record
-                           declare
-                              Base_R : constant TREE := Subst_Base_Type (Ctx, Rec_T);
-                              Want   : constant String := Sym_Name (Def);
-                              procedure Find_In_List (List_Node : TREE) is
-                                 L : SEQ_TYPE;
-                                 It : TREE;
-                              begin
-                                 if Is_Void_Tree (List_Node) or else Ctx.Fields.Contains (Use_CK) then return; end if;
-                                 L := LIST (List_Node);
-                                 while not IS_EMPTY (L) and then not Ctx.Fields.Contains (Use_CK) loop
-                                    POP (L, It);
-                                    if KIND (It) in DN_DSCRMT_DECL | DN_VARIABLE_DECL then
-                                       declare
-                                          NS : SEQ_TYPE := LIST (D (AS_SOURCE_NAME_S, It));
-                                          ID : TREE;
-                                       begin
-                                          while not IS_EMPTY (NS) loop
-                                             POP (NS, ID);
-                                             if Sym_Name (ID) = Want and then Ctx.Fields.Contains (Tree_Key (ID)) then
-                                                Use_CK := Tree_Key (ID);
-                                                return;
-                                             end if;
-                                          end loop;
-                                       end;
-                                    end if;
-                                 end loop;
-                              end Find_In_List;
-                              procedure Find_In_Comp_List (CL : TREE) is
-                              begin
-                                 if Is_Void_Tree (CL) or else Ctx.Fields.Contains (Use_CK) then return; end if;
-                                 Find_In_List (D (AS_DECL_S, CL));
-                                 if not Ctx.Fields.Contains (Use_CK) then
-                                    declare
-                                       VP : constant TREE := D (AS_VARIANT_PART, CL);
-                                    begin
-                                       if not Is_Void_Tree (VP) and then KIND (VP) = DN_VARIANT_PART
-                                         and then not Is_Void_Tree (D (AS_VARIANT_S, VP))
-                                       then
-                                          declare
-                                             VL : SEQ_TYPE := LIST (D (AS_VARIANT_S, VP));
-                                             VN : TREE;
-                                          begin
-                                             while not IS_EMPTY (VL) and then not Ctx.Fields.Contains (Use_CK) loop
-                                                POP (VL, VN);
-                                                if KIND (VN) = DN_VARIANT then
-                                                   Find_In_Comp_List (D (AS_COMP_LIST, VN));
-                                                end if;
-                                             end loop;
-                                          end;
-                                       end if;
-                                    end;
-                                 end if;
-                              end Find_In_Comp_List;
-                           begin
-                              if not Is_Void_Tree (Base_R) and then KIND (Base_R) = DN_RECORD then
-                                 Find_In_List (D (SM_DISCRIMINANT_S, Base_R));
-                                 if not Ctx.Fields.Contains (Use_CK) and then not Is_Void_Tree (D (SM_COMP_LIST, Base_R)) then
-                                    Find_In_Comp_List (D (SM_COMP_LIST, Base_R));
-                                 end if;
-                              end if;
-                           end;
-                        end if;
                      if Ctx.Fields.Contains (Use_CK) then
                         declare
                            FE : constant Field_Entry := Ctx.Fields.Element (Use_CK);
@@ -2153,7 +2584,13 @@ package body Cg_Expr is
                      end if;
                      if CTI.Kind = TK_Constrained_Array and then CTI.Is_Dynamic then
                         -- Embedded @__ada_arr_desc inside record: unpack into EK_Slice!
-                        Emit_Unpack_Arr_Desc (Ctx, FP, CT, Res);
+                        declare
+                           Desc_Al : constant Natural :=
+                             (if Ctx.Fields.Contains (Use_CK) and then Ctx.Fields.Element (Use_CK).Has_Explicit_Offset
+                              then 1 else 8);
+                        begin
+                           Emit_Unpack_Arr_Desc (Ctx, FP, CT, Res, Align => Desc_Al);
+                        end;
                         return Res;
                      end if;
                      declare
@@ -2314,12 +2751,29 @@ package body Cg_Expr is
                            -- Advance base pointer by row stride (enables LICM hoisting out of inner dim loops!)
                            declare
                               All_St : Boolean := True;
-                              Prod   : Integer_64 := 1;
+                              Prod   : Unsigned_64 := 1;
                            begin
                               for Sub_D in Dim + 1 .. ATI.NDims loop
                                  if ATI.Dims (Sub_D).Is_Static then
                                     if ATI.Dims (Sub_D).Last >= ATI.Dims (Sub_D).First then
-                                       Prod := Prod * (ATI.Dims (Sub_D).Last - ATI.Dims (Sub_D).First + 1);
+                                       declare
+                                          Diff : constant Unsigned_64 :=
+                                            Unsigned_64'Mod (ATI.Dims (Sub_D).Last) - Unsigned_64'Mod (ATI.Dims (Sub_D).First);
+                                       begin
+                                          if Diff >= Unsigned_64 (Integer_64'Last) then
+                                             All_St := False;
+                                          else
+                                             declare
+                                                Span : constant Unsigned_64 := Diff + 1;
+                                             begin
+                                                if Prod > Unsigned_64 (Integer_64'Last) / Span then
+                                                   All_St := False;
+                                                else
+                                                   Prod := Prod * Span;
+                                                end if;
+                                             end;
+                                          end if;
+                                       end;
                                     else
                                        Prod := 0;
                                     end if;
@@ -2404,7 +2858,12 @@ package body Cg_Expr is
                         declare
                            LP : constant String := Next_Reg (Ctx.E, "sap");
                         begin
-                           Emit_Inst (Ctx.E, LP & " = load.ptr " & To_String (Arr_Ptr) & ", align 8");
+                           if Is_Shared_Object (Ctx, D (AS_NAME, Node)) then
+                              Emit_Inst (Ctx.E, LP & " = load.ptr " & To_String (Arr_Ptr) & ", align 8 [volatile]");
+                              Emit_Inst (Ctx.E, "fence [seq_cst]");
+                           else
+                              Emit_Inst (Ctx.E, LP & " = load.ptr " & To_String (Arr_Ptr) & ", align 8");
+                           end if;
                            Arr_Ptr := To_Unbounded_String (LP);
                         end;
                      end if;
@@ -2422,14 +2881,31 @@ package body Cg_Expr is
                declare
                   ATI : constant Type_Info := Get_Type_Info (Ctx, Arr_T);
                   ETI : constant Type_Info := Get_Type_Info (Ctx, ATI.Elem_Type);
+                  DR_S : constant TREE := D (AS_DISCRETE_RANGE, Node);
+                  Rng_Ada_T : TREE := (if ATI.NDims >= 1 then ATI.Dims (1).Idx_Type else CONST_VOID);
                begin
-               Emit_Discrete_Range (Ctx, D (AS_DISCRETE_RANGE, Node), Rng_T, Lo_R, Hi_R);
+               if not Is_Void_Tree (DR_S) then
+                  if KIND (DR_S) = DN_RANGE and then not Is_Void_Tree (D (AS_EXP1, DR_S))
+                    and then KIND (D (AS_EXP1, DR_S)) in CLASS_EXP
+                  then
+                     Rng_Ada_T := Subst_Tree (Ctx, D (SM_EXP_TYPE, D (AS_EXP1, DR_S)));
+                  elsif KIND (DR_S) = DN_DISCRETE_SUBTYPE then
+                     declare
+                        SI : constant TREE := D (AS_SUBTYPE_INDICATION, DR_S);
+                        Def : constant TREE := (if not Is_Void_Tree (SI) and then KIND (SI) = DN_SUBTYPE_INDICATION
+                                                then Get_Name_Defn (D (AS_NAME, SI))
+                                                else Get_Name_Defn (SI));
+                     begin
+                        if not Is_Void_Tree (Def) and then KIND (Def) in CLASS_TYPE_NAME then
+                           Rng_Ada_T := Subst_Tree (Ctx, D (SM_TYPE_SPEC, Def));
+                        end if;
+                     end;
+                  end if;
+               end if;
+               Emit_Discrete_Range (Ctx, DR_S, Rng_T, Lo_R, Hi_R);
                declare
-                  Uns  : constant Boolean :=
-                    ATI.NDims >= 1 and then not Is_Void_Tree (ATI.Dims (1).Idx_Type)
-                    and then Is_Unsigned_Scalar (ATI.Dims (1).Idx_Type, To_String (Rng_T));
-                  Lo64 : constant String := Emit_Int_Convert (Ctx, To_String (Lo_R), To_String (Rng_T), "i64", Is_Unsigned => Uns);
-                  Hi64 : constant String := Emit_Int_Convert (Ctx, To_String (Hi_R), To_String (Rng_T), "i64", Is_Unsigned => Uns);
+                  Lo64 : constant String := Emit_Widen_To_I64 (Ctx, To_String (Lo_R), To_String (Rng_T), Rng_Ada_T);
+                  Hi64 : constant String := Emit_Widen_To_I64 (Ctx, To_String (Hi_R), To_String (Rng_T), Rng_Ada_T);
                begin
                   Get_Array_Dim_Bounds (Ctx, Pfx_Val, 1, AF_R, AL_R);
 
@@ -2539,34 +3015,23 @@ package body Cg_Expr is
                      return Res;
                   end;
                else
-                  -- P3-6.7: Change of representation across derived record types must materialize converted buffer!
-                  declare
-                     Src_BR : constant TREE := Subst_Base_Type (Ctx, Inner.Ada_Type);
-                     Dst_BR : constant TREE := Subst_Base_Type (Ctx, ET);
-                     STI_R  : constant Type_Info := Get_Type_Info (Ctx, Src_BR);
-                     DTI_R  : constant Type_Info := Get_Type_Info (Ctx, Dst_BR);
-                  begin
-                     if not Is_Void_Tree (Src_BR) and then not Is_Void_Tree (Dst_BR)
-                       and then KIND (Src_BR) = DN_RECORD and then KIND (Dst_BR) = DN_RECORD
-                       and then Src_BR /= Dst_BR
-                       and then (not Is_Void_Tree (D (SM_REPRESENTATION, Src_BR))
-                                 or else not Is_Void_Tree (D (SM_REPRESENTATION, Dst_BR))
-                                 or else STI_R.Byte_Size /= DTI_R.Byte_Size)
-                     then
-                        declare
-                           Buf : constant String := Next_Reg (Ctx.E, "rconv");
-                           Sz  : constant Natural := Natural'Max (1, DTI_R.Byte_Size);
-                           Al  : constant Natural := Natural'Max (1, DTI_R.Align);
-                        begin
-                           Emit_Entry_Alloca (Ctx.E, Buf & " = alloca [" & Img (Sz) & " x i8], align " & Img (Al));
-                           Emit_Record_Rep_Copy_Into (Ctx, Buf, ET, To_String (Inner.Reg), Inner.Ada_Type);
-                           Emit_Discriminant_Check (Ctx, Buf, ET, Is_Access => False);
-                           Res.Kind := EK_Addr; Res.Reg := To_Unbounded_String (Buf);
-                           Res.Pir_Type := DTI_R.Pir_Type; Res.Ada_Type := ET; Res.Align := Al;
-                           return Res;
-                        end;
-                     end if;
-                  end;
+                  -- P3-6.7 / P5-R4: Change of representation across derived record types must materialize converted buffer!
+                  if Needs_Record_Rep_Conv (Ctx, Inner.Ada_Type, ET) then
+                     declare
+                        DTI_R : constant Type_Info := Get_Type_Info (Ctx, Subst_Base_Type (Ctx, ET));
+                        Buf   : constant String := Next_Reg (Ctx.E, "rconv");
+                        Sz    : constant Natural := Natural'Max (1, DTI_R.Byte_Size);
+                        Al    : constant Natural := Natural'Max (1, DTI_R.Align);
+                     begin
+                        Emit_Entry_Alloca (Ctx.E, Buf & " = alloca [" & Img (Sz) & " x i8], align " & Img (Al));
+                        Emit_Inst (Ctx.E, "memset " & Buf & ", 0, " & Img (Sz) & ", align " & Img (Al));
+                        Emit_Record_Rep_Copy_Into (Ctx, Buf, ET, To_String (Inner.Reg), Inner.Ada_Type);
+                        Emit_Discriminant_Check (Ctx, Buf, ET, Is_Access => False);
+                        Res.Kind := EK_Addr; Res.Reg := To_Unbounded_String (Buf);
+                        Res.Pir_Type := DTI_R.Pir_Type; Res.Ada_Type := ET; Res.Align := Al;
+                        return Res;
+                     end;
+                  end if;
                   Emit_Discriminant_Check (Ctx, To_String (Inner.Reg), ET, Is_Access => False);
                   Res := Inner;
                   Res.Ada_Type := ET;
@@ -2587,6 +3052,332 @@ package body Cg_Expr is
         and then FE.Bit_Size <= 64
         and then (FE.Bit_Offset > 0 or else FE.Bit_Size /= FE.Field_Size * 8);
    end Is_Bitfield;
+
+   function Uses_Bitfield_Access
+     (Ctx       : Context;
+      FE        : Field_Entry;
+      Comp_Type : TREE) return Boolean
+   is
+   begin
+      if Is_Bitfield (FE) then
+         return True;
+      end if;
+      return FE.Has_Explicit_Offset
+        and then FE.Bit_Size > 0
+        and then FE.Bit_Size <= 64
+        and then not Is_Void_Tree (Cg_Expr.Composite.Find_Enum_Rep_Type (Ctx, Comp_Type));
+   end Uses_Bitfield_Access;
+
+   function Lookup_Record_Field_Key
+     (Ctx   : Context;
+      Rec_T : TREE;
+      Def   : TREE) return Unsigned_32
+   is
+      Use_CK : Unsigned_32 := Tree_Key (Def);
+   begin
+      if Ctx.Fields.Contains (Use_CK) then
+         return Use_CK;
+      end if;
+      -- LRM 3.4 (c34009d/f/j/l): derived private/record type has copied discriminant/component IDs; match by name on base record
+      declare
+         Base_R : constant TREE := Subst_Base_Type (Ctx, Rec_T);
+         Want   : constant String := Sym_Name (Def);
+
+         procedure Find_In_List (List_Node : TREE) is
+            L  : SEQ_TYPE;
+            It : TREE;
+         begin
+            if Is_Void_Tree (List_Node) or else Ctx.Fields.Contains (Use_CK) then
+               return;
+            end if;
+            L := LIST (List_Node);
+            while not IS_EMPTY (L) and then not Ctx.Fields.Contains (Use_CK) loop
+               POP (L, It);
+               if KIND (It) in DN_DSCRMT_DECL | DN_VARIABLE_DECL then
+                  declare
+                     NS : SEQ_TYPE := LIST (D (AS_SOURCE_NAME_S, It));
+                     ID : TREE;
+                  begin
+                     while not IS_EMPTY (NS) loop
+                        POP (NS, ID);
+                        if Sym_Name (ID) = Want and then Ctx.Fields.Contains (Tree_Key (ID)) then
+                           Use_CK := Tree_Key (ID);
+                           return;
+                        end if;
+                     end loop;
+                  end;
+               end if;
+            end loop;
+         end Find_In_List;
+
+         procedure Find_In_Comp_List (CL : TREE) is
+         begin
+            if Is_Void_Tree (CL) or else Ctx.Fields.Contains (Use_CK) then
+               return;
+            end if;
+            Find_In_List (D (AS_DECL_S, CL));
+            if not Ctx.Fields.Contains (Use_CK) then
+               declare
+                  VP : constant TREE := D (AS_VARIANT_PART, CL);
+               begin
+                  if not Is_Void_Tree (VP) and then KIND (VP) = DN_VARIANT_PART
+                    and then not Is_Void_Tree (D (AS_VARIANT_S, VP))
+                  then
+                     declare
+                        VL : SEQ_TYPE := LIST (D (AS_VARIANT_S, VP));
+                        VN : TREE;
+                     begin
+                        while not IS_EMPTY (VL) and then not Ctx.Fields.Contains (Use_CK) loop
+                           POP (VL, VN);
+                           if KIND (VN) = DN_VARIANT then
+                              Find_In_Comp_List (D (AS_COMP_LIST, VN));
+                           end if;
+                        end loop;
+                     end;
+                  end if;
+               end;
+            end if;
+         end Find_In_Comp_List;
+      begin
+         if not Is_Void_Tree (Base_R) and then KIND (Base_R) = DN_RECORD then
+            Find_In_List (D (SM_DISCRIMINANT_S, Base_R));
+            if not Ctx.Fields.Contains (Use_CK) and then not Is_Void_Tree (D (SM_COMP_LIST, Base_R)) then
+               Find_In_Comp_List (D (SM_COMP_LIST, Base_R));
+            end if;
+         end if;
+      end;
+      return Use_CK;
+   end Lookup_Record_Field_Key;
+
+   function Resolve_Scalar_Target
+     (Ctx   : in out Context;
+      Act_N : TREE) return Scalar_Target
+   is
+      Tgt : Scalar_Target;
+      Cur : TREE := Act_N;
+   begin
+      while not Is_Void_Tree (Cur) and then KIND (Cur) = DN_PARENTHESIZED loop
+         Cur := D (AS_EXP, Cur);
+      end loop;
+      if not Is_Void_Tree (Cur) and then KIND (Cur) in CLASS_EXP then
+         Tgt.Outer_T := Subst_Tree (Ctx, D (SM_EXP_TYPE, Cur));
+      end if;
+      while not Is_Void_Tree (Cur) and then KIND (Cur) = DN_CONVERSION loop
+         if Tgt.N_Convs < 8 then
+            Tgt.N_Convs := Tgt.N_Convs + 1;
+            Tgt.Conv_Ts (Tgt.N_Convs) := Subst_Tree (Ctx, D (SM_EXP_TYPE, Cur));
+         end if;
+         Cur := D (AS_EXP, Cur);
+         while not Is_Void_Tree (Cur) and then KIND (Cur) = DN_PARENTHESIZED loop
+            Cur := D (AS_EXP, Cur);
+         end loop;
+      end loop;
+      Tgt.Is_Shared := Is_Shared_Object (Ctx, Cur);
+      -- Check if Cur is a bitfield renaming (either simple name or Pkg.BF_Ren) or selected bitfield component
+      if not Is_Void_Tree (Cur)
+        and then (KIND (Cur) = DN_USED_OBJECT_ID
+                  or else (KIND (Cur) = DN_SELECTED
+                           and then not Is_Void_Tree (Get_Name_Defn (D (AS_DESIGNATOR, Cur)))
+                           and then KIND (Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (D (AS_DESIGNATOR, Cur)))))
+                                    not in DN_COMPONENT_ID | DN_DISCRIMINANT_ID))
+      then
+         declare
+            OD : constant TREE := Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (Cur)));
+         begin
+            if not Is_Void_Tree (OD) and then Ctx.Vars.Contains (Tree_Key (OD))
+              and then Ctx.Vars.Element (Tree_Key (OD)).Is_Bitfield
+            then
+               declare
+                  VO : constant Var_Info := Ctx.Vars.Element (Tree_Key (OD));
+                  TI : constant Type_Info := Get_Type_Info (Ctx, VO.Ada_Type);
+               begin
+                  Tgt.Is_BF     := True;
+                  Tgt.Dst_Ptr   := To_Unbounded_String (Emit_Var_Addr (Ctx, VO));
+                  Tgt.BF_FE     := VO.BF_FE;
+                  Tgt.Inner_T   := VO.Ada_Type;
+                  Tgt.Inner_Pir := TI.Pir_Type;
+                  Tgt.Inner_Al  := 1;
+                  if Is_Void_Tree (Tgt.Outer_T) then
+                     Tgt.Outer_T := VO.Ada_Type;
+                  end if;
+                  return Tgt;
+               end;
+            end if;
+         end;
+      elsif not Is_Void_Tree (Cur) and then KIND (Cur) = DN_SELECTED then
+         declare
+            Des   : TREE := D (AS_DESIGNATOR, Cur);
+            Def_F : TREE;
+         begin
+            while not Is_Void_Tree (Des) and then KIND (Des) = DN_SELECTED loop
+               Des := D (AS_DESIGNATOR, Des);
+            end loop;
+            Def_F := Canonical_Def (Subst_Tree (Ctx, Get_Name_Defn (Des)));
+            if not Is_Void_Tree (Def_F) and then KIND (Def_F) in DN_COMPONENT_ID | DN_DISCRIMINANT_ID then
+               declare
+                  Pfx_E     : constant TREE := D (AS_NAME, Cur);
+                  Pfx_Ts    : constant TREE := Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_EXP_TYPE, Pfx_E)));
+                  Rec_Ts    : constant TREE :=
+                    (if Is_Access_Type (Pfx_Ts) then Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_DESIG_TYPE, Pfx_Ts)))
+                     else Pfx_Ts);
+                  Dummy_RTI : constant Type_Info := Get_Type_Info (Ctx, Rec_Ts);
+                  pragma Unreferenced (Dummy_RTI);
+                  CK        : constant Unsigned_32 := Lookup_Record_Field_Key (Ctx, Rec_Ts, Def_F);
+                  CT        : constant TREE := Subst_Tree (Ctx, D (SM_OBJ_TYPE, Def_F));
+                  CTI       : constant Type_Info := Get_Type_Info (Ctx, CT);
+               begin
+                  if Ctx.Fields.Contains (CK)
+                    and then Uses_Bitfield_Access (Ctx, Ctx.Fields.Element (CK), CT)
+                    and then CTI.Kind = TK_Scalar
+                  then
+                     declare
+                        PLV  : constant Expr_Val := Emit_LValue (Ctx, Pfx_E);
+                        PT_P : constant TREE := Resolve_Type_Spec (Subst_Tree (Ctx, PLV.Ada_Type));
+                        RP   : Unbounded_String := PLV.Reg;
+                     begin
+                        if Is_Access_Type (PT_P) then
+                           if PLV.Kind = EK_Addr then
+                              declare
+                                 LP : constant String := Next_Reg (Ctx.E, "rbfp");
+                              begin
+                                 if Is_Shared_Object (Ctx, Pfx_E) then
+                                    Emit_Inst (Ctx.E, LP & " = load.ptr " & To_String (RP) & ", align 8 [volatile]");
+                                    Emit_Inst (Ctx.E, "fence [seq_cst]");
+                                 else
+                                    Emit_Inst (Ctx.E, LP & " = load.ptr " & To_String (RP) & ", align 8");
+                                 end if;
+                                 RP := To_Unbounded_String (LP);
+                              end;
+                           end if;
+                           Emit_Null_Check (Ctx, To_String (RP));
+                        end if;
+                        if Ctx.Fields.Element (CK).In_Union then
+                           Emit_Variant_Check_For_Field (Ctx, To_String (RP), Rec_Ts, Def_F, CK);
+                        end if;
+                        Tgt.Is_BF     := True;
+                        Tgt.Dst_Ptr   := RP;
+                        Tgt.BF_FE     := Ctx.Fields.Element (CK);
+                        Tgt.Inner_T   := CT;
+                        Tgt.Inner_Pir := CTI.Pir_Type;
+                        Tgt.Inner_Al  := 1;
+                        if Is_Void_Tree (Tgt.Outer_T) then
+                           Tgt.Outer_T := CT;
+                        end if;
+                        return Tgt;
+                     end;
+                  end if;
+               end;
+            end if;
+         end;
+      end if;
+      declare
+         LV : constant Expr_Val := Emit_LValue (Ctx, Cur);
+         TI : constant Type_Info := Get_Type_Info (Ctx, LV.Ada_Type);
+      begin
+         Tgt.Dst_Ptr   := LV.Reg;
+         Tgt.Inner_T   := LV.Ada_Type;
+         Tgt.Inner_Pir := TI.Pir_Type;
+         Tgt.Inner_Al  := Natural'Max (1, LV.Align);
+         if Is_Void_Tree (Tgt.Outer_T) then
+            Tgt.Outer_T := LV.Ada_Type;
+         end if;
+         return Tgt;
+      end;
+   end Resolve_Scalar_Target;
+
+   function Emit_Load_Scalar_Target
+     (Ctx     : in out Context;
+      Tgt     : Scalar_Target;
+      Dst_T   : TREE := CONST_VOID;
+      Dst_Pir : String := "") return String
+   is
+      Cur_R : Unbounded_String;
+      Cur_P : Unbounded_String := Tgt.Inner_Pir;
+      Cur_T : TREE := Tgt.Inner_T;
+   begin
+      if Tgt.Is_BF then
+         Cur_R := To_Unbounded_String (Emit_Bitfield_Load (Ctx, To_String (Tgt.Dst_Ptr), Tgt.BF_FE, Tgt.Inner_T));
+      else
+         declare
+            R : constant String := Next_Reg (Ctx.E, "stld");
+         begin
+            if Tgt.Is_Shared then
+               Emit_Inst (Ctx.E, R & " = load." & To_String (Tgt.Inner_Pir) & " " & To_String (Tgt.Dst_Ptr) & ", align " & Img (Tgt.Inner_Al) & " [volatile]");
+               Emit_Inst (Ctx.E, "fence [seq_cst]");
+            else
+               Emit_Inst (Ctx.E, R & " = load." & To_String (Tgt.Inner_Pir) & " " & To_String (Tgt.Dst_Ptr) & ", align " & Img (Tgt.Inner_Al));
+            end if;
+            Cur_R := To_Unbounded_String (R);
+         end;
+      end if;
+      -- Walk conversion chain innermost -> outermost, preserving each intermediate conversion width!
+      for I in reverse 1 .. Tgt.N_Convs loop
+         declare
+            CT     : constant TREE := Tgt.Conv_Ts (I);
+            CTI    : constant Type_Info := Get_Type_Info (Ctx, CT);
+            CP     : constant String := To_String (CTI.Pir_Type);
+            Next_R : constant String :=
+              Emit_Typed_Scalar_Convert (Ctx, To_String (Cur_R), Cur_T, To_String (Cur_P), CT, CP, Check_Range => True);
+         begin
+            Emit_Discriminant_Check (Ctx, Next_R, CT, Is_Access => True);
+            Cur_R := To_Unbounded_String (Next_R);
+            Cur_P := To_Unbounded_String (CP);
+            Cur_T := CT;
+         end;
+      end loop;
+      if not Is_Void_Tree (Dst_T) and then Dst_Pir /= "" then
+         declare
+            Fin_R : constant String :=
+              Emit_Typed_Scalar_Convert (Ctx, To_String (Cur_R), Cur_T, To_String (Cur_P), Dst_T, Dst_Pir, Check_Range => True);
+         begin
+            Emit_Discriminant_Check (Ctx, Fin_R, Dst_T, Is_Access => True);
+            return Fin_R;
+         end;
+      end if;
+      return To_String (Cur_R);
+   end Emit_Load_Scalar_Target;
+
+   procedure Emit_Store_Scalar_Target
+     (Ctx     : in out Context;
+      Tgt     : Scalar_Target;
+      Val_Reg : String;
+      Val_Pir : String;
+      Val_T   : TREE)
+   is
+      Cur_R : Unbounded_String := To_Unbounded_String (Val_Reg);
+      Cur_P : Unbounded_String := To_Unbounded_String (Val_Pir);
+      Cur_T : TREE := Val_T;
+   begin
+      for I in 1 .. Tgt.N_Convs loop
+         declare
+            CT     : constant TREE := Tgt.Conv_Ts (I);
+            CTI    : constant Type_Info := Get_Type_Info (Ctx, CT);
+            CP     : constant String := To_String (CTI.Pir_Type);
+            Next_R : constant String :=
+              Emit_Typed_Scalar_Convert (Ctx, To_String (Cur_R), Cur_T, To_String (Cur_P), CT, CP, Check_Range => True);
+         begin
+            Emit_Discriminant_Check (Ctx, Next_R, CT, Is_Access => True);
+            Cur_R := To_Unbounded_String (Next_R);
+            Cur_P := To_Unbounded_String (CP);
+            Cur_T := CT;
+         end;
+      end loop;
+      declare
+         Fin_R : constant String :=
+           Emit_Typed_Scalar_Convert (Ctx, To_String (Cur_R), Cur_T, To_String (Cur_P), Tgt.Inner_T, To_String (Tgt.Inner_Pir), Check_Range => True);
+      begin
+         Emit_Discriminant_Check (Ctx, Fin_R, Tgt.Inner_T, Is_Access => True);
+         if Tgt.Is_BF then
+            Emit_Bitfield_Store (Ctx, To_String (Tgt.Dst_Ptr), Tgt.BF_FE, Fin_R, To_String (Tgt.Inner_Pir), Tgt.Inner_T);
+         elsif Tgt.Is_Shared then
+            Emit_Inst (Ctx.E, "fence [seq_cst]");
+            Emit_Inst (Ctx.E, "store." & To_String (Tgt.Inner_Pir) & " " & Fin_R & ", " & To_String (Tgt.Dst_Ptr) & ", align " & Img (Tgt.Inner_Al) & " [volatile]");
+            Emit_Inst (Ctx.E, "fence [seq_cst]");
+         else
+            Emit_Inst (Ctx.E, "store." & To_String (Tgt.Inner_Pir) & " " & Fin_R & ", " & To_String (Tgt.Dst_Ptr) & ", align " & Img (Tgt.Inner_Al));
+         end if;
+      end;
+   end Emit_Store_Scalar_Target;
 
    function Emit_Create_Task_Handle
      (Ctx          : in out Context;
@@ -2715,6 +3506,44 @@ package body Cg_Expr is
                NE_Arg := To_Unbounded_String (DV);
             end;
          end if;
+      declare
+         Has_Dyn_SS : constant Boolean :=
+           not Is_Void_Tree (TI.Storage_Size_Exp)
+           and then Ctx.Saved_Expr_Vals.Contains (Tree_Key (TI.Storage_Size_Exp))
+           and then (Ctx.Saved_Expr_Vals.Element (Tree_Key (TI.Storage_Size_Exp)).Is_Global
+                     or else Ctx.Saved_Expr_Vals.Element (Tree_Key (TI.Storage_Size_Exp)).Owner_Subp = Ctx.Cur_Subp_Key
+                     or else Ctx.Saved_Expr_Vals.Element (Tree_Key (TI.Storage_Size_Exp)).Cap_Slot > 0);
+         procedure Emit_Set_Task_SS (TH : String) is
+            Dummy_S : Unbounded_String;
+         begin
+            if TI.Storage_Size > 0 then
+               Emit_Call_Or_Invoke (Ctx, "@__ada_task_set_stack_size",
+                 TH & ", " & Img (Long_Long_Integer (TI.Storage_Size)), "", Dummy_S, Nounwind => True);
+            elsif Has_Dyn_SS then
+               declare
+                  SE   : constant Saved_Expr_Info := Ctx.Saved_Expr_Vals.Element (Tree_Key (TI.Storage_Size_Exp));
+                  SP   : Unbounded_String := SE.Ptr_Reg;
+                  SV_R : constant String := Next_Reg (Ctx.E, "tss");
+                  S64  : Unbounded_String;
+               begin
+                  if SE.Is_Global then
+                     declare
+                        GA : constant String := Next_Reg (Ctx.E, "tssa");
+                     begin
+                        Emit_Inst (Ctx.E, GA & " = addr " & To_String (SE.Ptr_Reg));
+                        SP := To_Unbounded_String (GA);
+                     end;
+                  elsif SE.Owner_Subp /= Ctx.Cur_Subp_Key and then SE.Cap_Slot > 0 then
+                     SP := To_Unbounded_String (Emit_Captured_Slot_Ptr (Ctx, SE.Owner_Subp, SE.Cap_Slot));
+                  end if;
+                  Emit_Inst (Ctx.E, SV_R & " = load." & To_String (SE.Pir_Type) & " " & To_String (SP) & ", align " & Img (SE.Align));
+                  S64 := To_Unbounded_String (Emit_Widen_To_I64 (Ctx, SV_R, To_String (SE.Pir_Type), SE.Ada_Type));
+                  Emit_Call_Or_Invoke (Ctx, "@__ada_task_set_stack_size",
+                    TH & ", " & To_String (S64), "", Dummy_S, Nounwind => True);
+               end;
+            end if;
+         end Emit_Set_Task_SS;
+      begin
       if Activate_Now then
          if Ctx.Enable_Checks and then Length (TI.Elab_Flag) > 0 then
             declare
@@ -2737,64 +3566,28 @@ package body Cg_Expr is
                end if;
             end;
          end if;
-         declare
-            Has_Dyn_SS : constant Boolean :=
-              not Is_Void_Tree (TI.Storage_Size_Exp)
-              and then Ctx.Saved_Expr_Vals.Contains (Tree_Key (TI.Storage_Size_Exp))
-              and then (Ctx.Saved_Expr_Vals.Element (Tree_Key (TI.Storage_Size_Exp)).Is_Global
-                        or else Ctx.Saved_Expr_Vals.Element (Tree_Key (TI.Storage_Size_Exp)).Owner_Subp = Ctx.Cur_Subp_Key);
-            procedure Emit_Set_Task_SS (TH : String) is
-               Dummy_S : Unbounded_String;
+         if TI.Has_Priority or else TI.Storage_Size > 0 or else Has_Dyn_SS then
+            declare
+               Mk    : Unbounded_String;
+               Dummy : Unbounded_String;
             begin
-               if TI.Storage_Size > 0 then
-                  Emit_Call_Or_Invoke (Ctx, "@__ada_task_set_stack_size",
-                    TH & ", " & Img (Long_Long_Integer (TI.Storage_Size)), "", Dummy_S, Nounwind => True);
-               elsif Has_Dyn_SS then
-                  declare
-                     SE   : constant Saved_Expr_Info := Ctx.Saved_Expr_Vals.Element (Tree_Key (TI.Storage_Size_Exp));
-                     SP   : Unbounded_String := SE.Ptr_Reg;
-                     SV_R : constant String := Next_Reg (Ctx.E, "tss");
-                     S64  : Unbounded_String;
-                  begin
-                     if SE.Is_Global then
-                        declare
-                           GA : constant String := Next_Reg (Ctx.E, "tssa");
-                        begin
-                           Emit_Inst (Ctx.E, GA & " = addr " & To_String (SE.Ptr_Reg));
-                           SP := To_Unbounded_String (GA);
-                        end;
-                     end if;
-                     Emit_Inst (Ctx.E, SV_R & " = load." & To_String (SE.Pir_Type) & " " & To_String (SP) & ", align " & Img (SE.Align));
-                     S64 := To_Unbounded_String (Emit_Int_Convert (Ctx, SV_R, To_String (SE.Pir_Type), "i64"));
-                     Emit_Call_Or_Invoke (Ctx, "@__ada_task_set_stack_size",
-                       TH & ", " & To_String (S64), "", Dummy_S, Nounwind => True);
-                  end;
-               end if;
-            end Emit_Set_Task_SS;
-         begin
-            if TI.Has_Priority or else TI.Storage_Size > 0 or else Has_Dyn_SS then
-               declare
-                  Mk    : Unbounded_String;
-                  Dummy : Unbounded_String;
-               begin
-                  Emit_Call_Or_Invoke (Ctx, "@__ada_master_mark", To_String (M_Reg), "ptr", Mk, Nounwind => True);
-                  Emit_Call_Or_Invoke (Ctx, "@__ada_task_create",
-                    To_String (M_Reg) & ", " & Fn_Ptr & ", " & To_String (Env_R) & ", " & To_String (NE_Arg),
-                    "ptr", TH_Reg);
-                  if TI.Has_Priority then
-                     Emit_Call_Or_Invoke (Ctx, "@__ada_task_set_priority",
-                       To_String (TH_Reg) & ", " & Img (TI.Priority), "", Dummy, Nounwind => True);
-                  end if;
-                  Emit_Set_Task_SS (To_String (TH_Reg));
-                  Emit_Call_Or_Invoke (Ctx, "@__ada_master_activate_since",
-                    To_String (M_Reg) & ", " & To_String (Mk), "", Dummy);
-               end;
-            else
-               Emit_Call_Or_Invoke (Ctx, "@__ada_task_create_and_activate",
+               Emit_Call_Or_Invoke (Ctx, "@__ada_master_mark", To_String (M_Reg), "ptr", Mk);
+               Emit_Call_Or_Invoke (Ctx, "@__ada_task_create",
                  To_String (M_Reg) & ", " & Fn_Ptr & ", " & To_String (Env_R) & ", " & To_String (NE_Arg),
                  "ptr", TH_Reg);
-            end if;
-         end;
+               if TI.Has_Priority then
+                  Emit_Call_Or_Invoke (Ctx, "@__ada_task_set_priority",
+                    To_String (TH_Reg) & ", " & Img (TI.Priority), "", Dummy, Nounwind => True);
+               end if;
+               Emit_Set_Task_SS (To_String (TH_Reg));
+               Emit_Call_Or_Invoke (Ctx, "@__ada_master_activate_since",
+                 To_String (M_Reg) & ", " & To_String (Mk), "", Dummy);
+            end;
+         else
+            Emit_Call_Or_Invoke (Ctx, "@__ada_task_create_and_activate",
+              To_String (M_Reg) & ", " & Fn_Ptr & ", " & To_String (Env_R) & ", " & To_String (NE_Arg),
+              "ptr", TH_Reg);
+         end if;
       else
          Emit_Call_Or_Invoke (Ctx, "@__ada_task_create",
            To_String (M_Reg) & ", " & Fn_Ptr & ", " & To_String (Env_R) & ", " & To_String (NE_Arg),
@@ -2807,39 +3600,7 @@ package body Cg_Expr is
                  To_String (TH_Reg) & ", " & Img (TI.Priority), "", Dummy_P, Nounwind => True);
             end;
          end if;
-         if TI.Storage_Size > 0 then
-            declare
-               Dummy_S : Unbounded_String;
-            begin
-               Emit_Call_Or_Invoke (Ctx, "@__ada_task_set_stack_size",
-                 To_String (TH_Reg) & ", " & Img (Long_Long_Integer (TI.Storage_Size)), "", Dummy_S, Nounwind => True);
-            end;
-         elsif not Is_Void_Tree (TI.Storage_Size_Exp)
-           and then Ctx.Saved_Expr_Vals.Contains (Tree_Key (TI.Storage_Size_Exp))
-           and then (Ctx.Saved_Expr_Vals.Element (Tree_Key (TI.Storage_Size_Exp)).Is_Global
-                     or else Ctx.Saved_Expr_Vals.Element (Tree_Key (TI.Storage_Size_Exp)).Owner_Subp = Ctx.Cur_Subp_Key)
-         then
-            declare
-               SE   : constant Saved_Expr_Info := Ctx.Saved_Expr_Vals.Element (Tree_Key (TI.Storage_Size_Exp));
-               SP   : Unbounded_String := SE.Ptr_Reg;
-               SV_R : constant String := Next_Reg (Ctx.E, "tss");
-               S64  : Unbounded_String;
-               Dummy_S : Unbounded_String;
-            begin
-               if SE.Is_Global then
-                  declare
-                     GA : constant String := Next_Reg (Ctx.E, "tssa");
-                  begin
-                     Emit_Inst (Ctx.E, GA & " = addr " & To_String (SE.Ptr_Reg));
-                     SP := To_Unbounded_String (GA);
-                  end;
-               end if;
-               Emit_Inst (Ctx.E, SV_R & " = load." & To_String (SE.Pir_Type) & " " & To_String (SP) & ", align " & Img (SE.Align));
-               S64 := To_Unbounded_String (Emit_Int_Convert (Ctx, SV_R, To_String (SE.Pir_Type), "i64"));
-               Emit_Call_Or_Invoke (Ctx, "@__ada_task_set_stack_size",
-                 To_String (TH_Reg) & ", " & To_String (S64), "", Dummy_S, Nounwind => True);
-            end;
-         end if;
+         Emit_Set_Task_SS (To_String (TH_Reg));
          if Ctx.Cur_Task_Group_Id /= 0 then
             declare
                Dummy_G : Unbounded_String;
@@ -2860,6 +3621,7 @@ package body Cg_Expr is
             end;
          end if;
       end if;
+      end;
       end;
       return To_String (TH_Reg);
    end Emit_Create_Task_Handle;
@@ -2949,9 +3711,9 @@ package body Cg_Expr is
       if EI.Is_Family and then not Is_Void_Tree (Fam_Exp) then
          declare
             IV  : constant Expr_Val := Emit_Expr (Ctx, Fam_Exp);
-            I32 : constant String := Emit_Int_Convert (Ctx, To_String (IV.Reg), To_String (IV.Pir_Type), "i32",
-                                       Is_Unsigned => Is_Unsigned_Scalar (IV.Ada_Type, To_String (IV.Pir_Type)));
-            D1  : constant String := Next_Reg (Ctx.E, "efd");
+            I64 : constant String := Emit_Widen_To_I64 (Ctx, To_String (IV.Reg), To_String (IV.Pir_Type), IV.Ada_Type);
+            D64 : constant String := Next_Reg (Ctx.E, "efd64");
+            D1  : Unbounded_String;
             A1  : constant String := Next_Reg (Ctx.E, "efa");
          begin
             if EI.Fam_Is_Static then
@@ -2961,16 +3723,16 @@ package body Cg_Expr is
                      HiC : constant String := Next_Reg (Ctx.E, "efhi");
                      Bad : constant String := Next_Reg (Ctx.E, "efb");
                   begin
-                     Emit_Inst (Ctx.E, LoC & " = cmp_lt_s.i32 " & I32 & ", " & Img (Long_Long_Integer (EI.Fam_Lo)));
-                     Emit_Inst (Ctx.E, HiC & " = cmp_gt_s.i32 " & I32 & ", " & Img (Long_Long_Integer (EI.Fam_Hi)));
+                     Emit_Inst (Ctx.E, LoC & " = cmp_lt_s.i64 " & I64 & ", " & Img (Long_Long_Integer (EI.Fam_Lo)));
+                     Emit_Inst (Ctx.E, HiC & " = cmp_gt_s.i64 " & I64 & ", " & Img (Long_Long_Integer (EI.Fam_Hi)));
                      Emit_Inst (Ctx.E, Bad & " = or.i8 " & LoC & ", " & HiC);
                      Emit_Check_Fail_If (Ctx, Bad);
                   end;
                end if;
-               Emit_Inst (Ctx.E, D1 & " = sub.i32 " & I32 & ", " & Img (Long_Long_Integer (EI.Fam_Lo)));
+               Emit_Inst (Ctx.E, D64 & " = sub.i64 " & I64 & ", " & Img (Long_Long_Integer (EI.Fam_Lo)));
             else
                declare
-                  Lo32, Hi32 : Unbounded_String;
+                  Lo64, Hi64 : Unbounded_String;
                begin
                   if Length (EI.Fam_Lo_Sym) > 0 and then Length (EI.Fam_Hi_Sym) > 0 then
                      declare
@@ -2992,16 +3754,22 @@ package body Cg_Expr is
                         Emit_Inst (Ctx.E, LV & " = load.i32 " & LA & ", align 4");
                         Emit_Inst (Ctx.E, HA & " = addr " & HSym);
                         Emit_Inst (Ctx.E, HV & " = load.i32 " & HA & ", align 4");
-                        Lo32 := To_Unbounded_String (LV);
-                        Hi32 := To_Unbounded_String (HV);
+                        Lo64 := To_Unbounded_String (Emit_Int_Convert (Ctx, LV, "i32", "i64"));
+                        Hi64 := To_Unbounded_String (Emit_Int_Convert (Ctx, HV, "i32", "i64"));
                      end;
                   else
                      declare
                         RT2, LoR, HiR : Unbounded_String;
+                        Fam_T : constant TREE :=
+                          (if not Is_Void_Tree (EI.Fam_DR) and then KIND (EI.Fam_DR) = DN_RANGE
+                             and then not Is_Void_Tree (D (AS_EXP1, EI.Fam_DR))
+                             and then KIND (D (AS_EXP1, EI.Fam_DR)) in CLASS_EXP
+                           then Subst_Tree (Ctx, D (SM_EXP_TYPE, D (AS_EXP1, EI.Fam_DR)))
+                           else IV.Ada_Type);
                      begin
                         Emit_Discrete_Range (Ctx, EI.Fam_DR, RT2, LoR, HiR);
-                        Lo32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (LoR), To_String (RT2), "i32"));
-                        Hi32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (HiR), To_String (RT2), "i32"));
+                        Lo64 := To_Unbounded_String (Emit_Widen_To_I64 (Ctx, To_String (LoR), To_String (RT2), Fam_T));
+                        Hi64 := To_Unbounded_String (Emit_Widen_To_I64 (Ctx, To_String (HiR), To_String (RT2), Fam_T));
                      end;
                   end if;
                   if Ctx.Enable_Checks then
@@ -3010,16 +3778,17 @@ package body Cg_Expr is
                         HiC : constant String := Next_Reg (Ctx.E, "efhi");
                         Bad : constant String := Next_Reg (Ctx.E, "efb");
                      begin
-                        Emit_Inst (Ctx.E, LoC & " = cmp_lt_s.i32 " & I32 & ", " & To_String (Lo32));
-                        Emit_Inst (Ctx.E, HiC & " = cmp_gt_s.i32 " & I32 & ", " & To_String (Hi32));
+                        Emit_Inst (Ctx.E, LoC & " = cmp_lt_s.i64 " & I64 & ", " & To_String (Lo64));
+                        Emit_Inst (Ctx.E, HiC & " = cmp_gt_s.i64 " & I64 & ", " & To_String (Hi64));
                         Emit_Inst (Ctx.E, Bad & " = or.i8 " & LoC & ", " & HiC);
                         Emit_Check_Fail_If (Ctx, Bad);
                      end;
                   end if;
-                  Emit_Inst (Ctx.E, D1 & " = sub.i32 " & I32 & ", " & To_String (Lo32));
+                  Emit_Inst (Ctx.E, D64 & " = sub.i64 " & I64 & ", " & To_String (Lo64));
                end;
             end if;
-            Emit_Inst (Ctx.E, A1 & " = add.i32 " & D1 & ", " & To_String (Base_R));
+            D1 := To_Unbounded_String (Emit_Int_Convert (Ctx, D64, "i64", "i32"));
+            Emit_Inst (Ctx.E, A1 & " = add.i32 " & To_String (D1) & ", " & To_String (Base_R));
             return A1;
          end;
       else
@@ -3056,6 +3825,244 @@ package body Cg_Expr is
          return Emit_Int_Convert (Ctx, To_String (V.Reg), PT, "i64");
       end if;
    end Emit_Duration_Ns;
+
+   function Emit_Discrete_Attr_Op
+     (Ctx      : in out Context;
+      AName    : String;
+      Pfx_T    : TREE;
+      Res_Type : TREE;
+      Arg_N    : TREE) return Expr_Val
+   is
+      Res : Expr_Val;
+      TI  : constant Type_Info := Get_Type_Info (Ctx, Res_Type);
+   begin
+      if AName = "POS" then
+         declare
+            V      : constant Expr_Val := Emit_Expr (Ctx, Arg_N);
+            V64    : constant String := Emit_Widen_To_I64 (Ctx, To_String (V.Reg), To_String (V.Pir_Type), V.Ada_Type);
+            Out_PT : constant String := To_String (TI.Pir_Type);
+            Out_R  : Unbounded_String;
+         begin
+            if Ctx.Enable_Checks and then Int_Bits_Of_Pir (Out_PT) < 64 then
+               if not Is_Void_Tree (Res_Type) and then Is_Discrete_Type (Subst_Resolve_Type (Ctx, Res_Type)) then
+                  Emit_Range_Check (Ctx, V64, "i64", Res_Type);
+               else
+                  declare
+                     LoC : constant String := Next_Reg (Ctx.E, "plo");
+                     HiC : constant String := Next_Reg (Ctx.E, "phi");
+                     Bad : constant String := Next_Reg (Ctx.E, "pbd");
+                     MinB : constant Long_Long_Integer := Min_Signed_For_Pir (Out_PT);
+                     MaxB : constant Long_Long_Integer :=
+                       (if Out_PT = "i8" then 127 elsif Out_PT = "i16" then 32767 else 2147483647);
+                  begin
+                     Emit_Inst (Ctx.E, LoC & " = cmp_lt_s.i64 " & V64 & ", " & Img (MinB));
+                     Emit_Inst (Ctx.E, HiC & " = cmp_gt_s.i64 " & V64 & ", " & Img (MaxB));
+                     Emit_Inst (Ctx.E, Bad & " = or.i8 " & LoC & ", " & HiC);
+                     Emit_Check_Fail_If (Ctx, Bad);
+                  end;
+               end if;
+            end if;
+            Out_R := To_Unbounded_String (Emit_Int_Convert (Ctx, V64, "i64", Out_PT));
+            Res.Kind := EK_Scalar; Res.Ada_Type := Res_Type; Res.Pir_Type := TI.Pir_Type; Res.Align := TI.Align;
+            Res.Reg  := Out_R;
+            return Res;
+         end;
+
+      elsif AName = "VAL" then
+         declare
+            Base_T : constant TREE :=
+              (if not Is_Void_Tree (Pfx_T) then Subst_Base_Type (Ctx, Pfx_T) else Subst_Base_Type (Ctx, Res_Type));
+            BTI    : constant Type_Info := Get_Type_Info (Ctx, Base_T);
+            Out_PT : constant String := To_String (BTI.Pir_Type);
+            V      : constant Expr_Val := Emit_Expr (Ctx, Arg_N);
+            I64    : constant String := Emit_Widen_To_I64 (Ctx, To_String (V.Reg), To_String (V.Pir_Type), V.Ada_Type);
+            Cv     : Unbounded_String;
+         begin
+            -- LRM 3.5.5(6) & 8.5(7): check in i64 against T'Base BEFORE narrowing; result subtype is T'Base!
+            Emit_Range_Check (Ctx, I64, "i64", Base_T);
+            Cv := To_Unbounded_String (Emit_Int_Convert (Ctx, I64, "i64", Out_PT));
+            Res.Kind := EK_Scalar; Res.Ada_Type := Base_T; Res.Pir_Type := BTI.Pir_Type; Res.Align := BTI.Align;
+            Res.Reg  := Cv;
+            return Res;
+         end;
+
+      elsif AName = "SUCC" or else AName = "PRED" then
+         declare
+            Base_T : constant TREE :=
+              (if not Is_Void_Tree (Pfx_T) then Subst_Base_Type (Ctx, Pfx_T) else Subst_Base_Type (Ctx, Res_Type));
+            BTI    : constant Type_Info := Get_Type_Info (Ctx, Base_T);
+            Out_PT : constant String := To_String (BTI.Pir_Type);
+            V      : constant Expr_Val := Emit_Expr (Ctx, Arg_N, Base_T);
+            V64    : constant String := Emit_Widen_To_I64 (Ctx, To_String (V.Reg), To_String (V.Pir_Type), V.Ada_Type);
+            R64    : constant String := Next_Reg (Ctx.E, "sp64");
+            Op     : constant String := (if AName = "SUCC" then "add" else "sub");
+            OutR   : Unbounded_String;
+         begin
+            -- Perform +/- 1 in canonical signed i64 so unsigned i8/i16/i32, mismatched widths, and i64 overflow are all exact
+            if Ctx.Enable_Checks then
+               declare
+                  Ovf : constant String := Next_Reg (Ctx.E, "ov");
+               begin
+                  Emit_Inst (Ctx.E, R64 & ", " & Ovf & " = " & Op & "_ovf_s.i64 " & V64 & ", 1");
+                  Emit_Check_Fail_If (Ctx, Ovf);
+               end;
+               Emit_Range_Check (Ctx, R64, "i64", Base_T);
+            else
+               Emit_Inst (Ctx.E, R64 & " = " & Op & ".i64 " & V64 & ", 1");
+            end if;
+            OutR := To_Unbounded_String (Emit_Int_Convert (Ctx, R64, "i64", Out_PT));
+            Res.Kind := EK_Scalar; Res.Reg := OutR;
+            Res.Pir_Type := BTI.Pir_Type; Res.Ada_Type := Base_T; Res.Align := BTI.Align;
+            return Res;
+         end;
+
+      elsif AName = "IMAGE" then
+         declare
+            BT  : constant TREE := Subst_Base_Type (Ctx, Pfx_T);
+            V   : constant Expr_Val := Emit_Expr (Ctx, Arg_N, Pfx_T);
+            One : constant String := Next_Reg (Ctx.E, "imf");
+         begin
+            Emit_Inst (Ctx.E, One & " = const.i64 1");
+            if Is_Integer_Type (BT) then
+               declare
+                  V64 : constant String := Emit_Widen_To_I64 (Ctx, To_String (V.Reg), To_String (V.Pir_Type), V.Ada_Type);
+                  Buf, Len : Unbounded_String;
+               begin
+                  Emit_Call_Or_Invoke (Ctx, "@__ada_ss_alloc", "32, 8", "ptr", Buf);
+                  Emit_Call_Or_Invoke (Ctx, "@__ada_img_i64", V64 & ", " & To_String (Buf), "i32", Len, Nounwind => True);
+                  Res.Kind := EK_Slice; Res.Reg := Buf; Res.Pir_Type := To_Unbounded_String ("ptr");
+                  Res.Ada_Type := Res_Type; Res.Align := 1; Res.NDims := 1;
+                  Res.First_Regs (1) := To_Unbounded_String (One);
+                  Res.Last_Regs (1)  := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (Len), "i32", "i64"));
+                  return Res;
+               end;
+            elsif Is_Character_Type (BT) then
+               declare
+                  C8  : constant String := Emit_Int_Convert (Ctx, To_String (V.Reg), To_String (V.Pir_Type), "i8");
+                  Buf, Len : Unbounded_String;
+               begin
+                  Emit_Call_Or_Invoke (Ctx, "@__ada_ss_alloc", "8, 8", "ptr", Buf);
+                  Emit_Call_Or_Invoke (Ctx, "@__ada_img_char", C8 & ", " & To_String (Buf), "i32", Len, Nounwind => True);
+                  Res.Kind := EK_Slice; Res.Reg := Buf; Res.Pir_Type := To_Unbounded_String ("ptr");
+                  Res.Ada_Type := Res_Type; Res.Align := 1; Res.NDims := 1;
+                  Res.First_Regs (1) := To_Unbounded_String (One);
+                  Res.Last_Regs (1)  := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (Len), "i32", "i64"));
+                  return Res;
+               end;
+            elsif not Is_Void_Tree (BT) and then KIND (BT) = DN_ENUMERATION then
+               declare
+                  PS    : Unbounded_String;
+                  Cnt   : Natural;
+                  Idx64 : constant String := Emit_Int_Convert (Ctx, To_String (V.Reg), To_String (V.Pir_Type), "i64", Is_Unsigned => True);
+                  PA    : constant String := Next_Reg (Ctx.E, "epa");
+                  PE    : constant String := Next_Reg (Ctx.E, "epe");
+                  SP    : constant String := Next_Reg (Ctx.E, "esp");
+                  SL    : Unbounded_String;
+               begin
+                  Ensure_Enum_Tables_Pkg (Ctx, BT, PS, Cnt);
+                  pragma Unreferenced (Cnt);
+                  Emit_Inst (Ctx.E, PA & " = addr " & To_String (PS));
+                  Emit_Inst (Ctx.E, PE & " = elem_ptr ptr, " & PA & ", " & Idx64);
+                  Emit_Inst (Ctx.E, SP & " = load.ptr " & PE & ", align 8");
+                  Emit_Call_Or_Invoke (Ctx, "@__ada_cstr_len", SP, "i32", SL, Nounwind => True);
+                  Res.Kind := EK_Slice; Res.Reg := To_Unbounded_String (SP);
+                  Res.Pir_Type := To_Unbounded_String ("ptr");
+                  Res.Ada_Type := Res_Type; Res.Align := 1; Res.NDims := 1;
+                  Res.First_Regs (1) := To_Unbounded_String (One);
+                  Res.Last_Regs (1)  := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (SL), "i32", "i64"));
+                  return Res;
+               end;
+            else
+               declare
+                  Empty : constant String := Next_Reg (Ctx.E, "ime");
+                  Zero  : constant String := Next_Reg (Ctx.E, "imz");
+               begin
+                  Emit_Inst (Ctx.E, Empty & " = const.ptr 0");
+                  Emit_Inst (Ctx.E, Zero & " = const.i64 0");
+                  Res.Kind := EK_Slice; Res.Reg := To_Unbounded_String (Empty);
+                  Res.Pir_Type := To_Unbounded_String ("ptr");
+                  Res.Ada_Type := Res_Type; Res.Align := 1; Res.NDims := 1;
+                  Res.First_Regs (1) := To_Unbounded_String (One);
+                  Res.Last_Regs (1)  := To_Unbounded_String (Zero);
+                  return Res;
+               end;
+            end if;
+         end;
+
+      elsif AName = "VALUE" then
+         declare
+            BT  : constant TREE := Subst_Base_Type (Ctx, Pfx_T);
+            S   : constant Expr_Val := Emit_Expr (Ctx, Arg_N);
+            SF, SL : Unbounded_String;
+            L64 : Unbounded_String;
+            Cl  : Unbounded_String;
+         begin
+            Get_Array_Dim_Bounds (Ctx, S, 1, SF, SL);
+            L64 := To_Unbounded_String (Emit_Dim_Len_I64 (Ctx, To_String (SF), To_String (SL)));
+            Cl  := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (L64), "i64", "i32"));
+            if Is_Integer_Type (BT) then
+               declare
+                  BTI : constant Type_Info := Get_Type_Info (Ctx, BT);
+                  RV  : Unbounded_String;
+                  Cv  : Unbounded_String;
+               begin
+                  Emit_Call_Or_Invoke (Ctx, "@__ada_val_i64", To_String (S.Reg) & ", " & To_String (Cl), "i64", RV);
+                  Emit_Range_Check (Ctx, To_String (RV), "i64", BT);
+                  Cv := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RV), "i64", To_String (BTI.Pir_Type)));
+                  Res.Kind := EK_Scalar; Res.Reg := Cv;
+                  Res.Pir_Type := BTI.Pir_Type; Res.Ada_Type := BT; Res.Align := BTI.Align;
+                  return Res;
+               end;
+            elsif Is_Character_Type (BT) then
+               declare
+                  RV : Unbounded_String;
+               begin
+                  Emit_Call_Or_Invoke (Ctx, "@__ada_val_char", To_String (S.Reg) & ", " & To_String (Cl), "i8", RV);
+                  Res.Kind := EK_Scalar; Res.Reg := RV;
+                  Res.Pir_Type := To_Unbounded_String ("i8"); Res.Ada_Type := BT; Res.Align := 1;
+                  return Res;
+               end;
+            elsif not Is_Void_Tree (BT) and then KIND (BT) = DN_ENUMERATION then
+               declare
+                  BTI : constant Type_Info := Get_Type_Info (Ctx, BT);
+                  PS  : Unbounded_String;
+                  Cnt : Natural;
+                  TA  : constant String := Next_Reg (Ctx.E, "eta");
+                  RV  : Unbounded_String;
+                  Cv  : Unbounded_String;
+               begin
+                  Ensure_Enum_Tables_Pkg (Ctx, BT, PS, Cnt);
+                  Emit_Inst (Ctx.E, TA & " = addr " & To_String (PS));
+                  Emit_Call_Or_Invoke (Ctx, "@__ada_val_enum",
+                    To_String (S.Reg) & ", " & To_String (Cl) & ", " & TA & ", " & Img (Cnt), "i32", RV);
+                  Cv := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RV), "i32", To_String (BTI.Pir_Type)));
+                  Res.Kind := EK_Scalar; Res.Reg := Cv;
+                  Res.Pir_Type := BTI.Pir_Type; Res.Ada_Type := BT; Res.Align := BTI.Align;
+                  return Res;
+               end;
+            else
+               declare
+                  R : constant String := Next_Reg (Ctx.E, "vz");
+               begin
+                  Emit_Inst (Ctx.E, R & " = const." & To_String (TI.Pir_Type) & " 0");
+                  Res.Kind := EK_Scalar; Res.Reg := To_Unbounded_String (R);
+                  Res.Pir_Type := TI.Pir_Type; Res.Ada_Type := Res_Type; Res.Align := TI.Align;
+                  return Res;
+               end;
+            end if;
+         end;
+      end if;
+
+      declare
+         R  : constant String := Next_Reg (Ctx.E, "af");
+         PT : constant String := (if To_String (TI.Pir_Type) = "void" then "i32" else To_String (TI.Pir_Type));
+      begin
+         Emit_Inst (Ctx.E, R & " = const." & PT & " 0");
+         Res.Kind := EK_Scalar; Res.Reg := To_Unbounded_String (R);
+         Res.Pir_Type := To_Unbounded_String (PT); Res.Ada_Type := Res_Type; Res.Align := TI.Align;
+         return Res;
+      end;
+   end Emit_Discrete_Attr_Op;
 
    procedure Ensure_Enum_Tables_Pkg
      (Ctx       : in out Context;
@@ -3121,14 +4128,34 @@ package body Cg_Expr is
 
 
    -- Forwarding wrappers to domain child packages (Cg_Expr.Composite, Cg_Expr.Call)
+   function Needs_Record_Rep_Conv
+     (Ctx   : in out Context;
+      Src_T : TREE;
+      Dst_T : TREE) return Boolean
+   is
+      Src_BR : constant TREE := Subst_Base_Type (Ctx, Src_T);
+      Dst_BR : constant TREE := Subst_Base_Type (Ctx, Dst_T);
+   begin
+      if Is_Void_Tree (Src_BR) or else Is_Void_Tree (Dst_BR)
+        or else KIND (Src_BR) /= DN_RECORD or else KIND (Dst_BR) /= DN_RECORD
+        or else Src_BR = Dst_BR
+      then
+         return False;
+      end if;
+      return not Is_Void_Tree (D (SM_REPRESENTATION, Src_BR))
+        or else not Is_Void_Tree (D (SM_REPRESENTATION, Dst_BR))
+        or else Get_Type_Info (Ctx, Src_BR).Byte_Size /= Get_Type_Info (Ctx, Dst_BR).Byte_Size;
+   end Needs_Record_Rep_Conv;
+
    procedure Emit_Copy_Composite
-     (Ctx      : in out Context;
-      Dst_Ptr  : String;
-      Src      : Expr_Val;
-      Dst_Type : TREE)
+     (Ctx       : in out Context;
+      Dst_Ptr   : String;
+      Src       : Expr_Val;
+      Dst_Type  : TREE;
+      Max_Align : Natural := 8)
    is
    begin
-      Cg_Expr.Composite.Emit_Copy_Composite (Ctx, Dst_Ptr, Src, Dst_Type);
+      Cg_Expr.Composite.Emit_Copy_Composite (Ctx, Dst_Ptr, Src, Dst_Type, Max_Align);
    end Emit_Copy_Composite;
 
    procedure Emit_Init_Composite
@@ -3138,20 +4165,22 @@ package body Cg_Expr is
       Init_Node    : TREE;
       Dst_Firsts   : Str_Array_4 := (others => Null_Unbounded_String);
       Dst_Lasts    : Str_Array_4 := (others => Null_Unbounded_String);
-      Exact_Bounds : Boolean := False)
+      Exact_Bounds : Boolean := False;
+      Max_Align    : Natural := 8)
    is
    begin
-      Cg_Expr.Composite.Emit_Init_Composite (Ctx, Dst_Ptr, Dst_Type, Init_Node, Dst_Firsts, Dst_Lasts, Exact_Bounds);
+      Cg_Expr.Composite.Emit_Init_Composite (Ctx, Dst_Ptr, Dst_Type, Init_Node, Dst_Firsts, Dst_Lasts, Exact_Bounds, Max_Align);
    end Emit_Init_Composite;
 
    procedure Emit_Default_Init
      (Ctx            : in out Context;
       Dst_Ptr        : String;
       Dst_Type       : TREE;
-      Activate_Tasks : Boolean := False)
+      Activate_Tasks : Boolean := False;
+      Max_Align      : Natural := 8)
    is
    begin
-      Cg_Expr.Composite.Emit_Default_Init (Ctx, Dst_Ptr, Dst_Type, Activate_Tasks);
+      Cg_Expr.Composite.Emit_Default_Init (Ctx, Dst_Ptr, Dst_Type, Activate_Tasks, Max_Align);
    end Emit_Default_Init;
 
    function Find_Enum_Rep_Type (Ctx : Context; T : TREE) return TREE is
@@ -3287,10 +4316,11 @@ package body Cg_Expr is
       Dst_T      : TREE;
       Src_Ptr    : String;
       Src_T      : TREE;
-      Discs_Only : Boolean := False)
+      Discs_Only : Boolean := False;
+      Max_Align  : Natural := 8)
    is
    begin
-      Cg_Expr.Composite.Emit_Record_Rep_Copy_Into (Ctx, Dst_Ptr, Dst_T, Src_Ptr, Src_T, Discs_Only);
+      Cg_Expr.Composite.Emit_Record_Rep_Copy_Into (Ctx, Dst_Ptr, Dst_T, Src_Ptr, Src_T, Discs_Only, Max_Align);
    end Emit_Record_Rep_Copy_Into;
 
    function Emit_Subp_Call
@@ -3338,106 +4368,8 @@ package body Cg_Expr is
       end if;
       case K is
          when DN_NUMERIC_LITERAL =>
-            declare
-               ET  : TREE := Subst_Tree (Ctx, D (SM_EXP_TYPE, Node));
-               SV  : constant TREE := D (SM_VALUE, Node);
-            begin
-               if Is_Void_Tree (ET) or else KIND (ET) = DN_UNIVERSAL_INTEGER or else KIND (ET) = DN_UNIVERSAL_REAL then
-                  if not Is_Void_Tree (Target_Type) and then Is_Scalar_Type (Target_Type) then
-                     ET := Subst_Tree (Ctx, Target_Type);
-                  end if;
-               end if;
-               declare
-                  TI : constant Type_Info := Get_Type_Info (Ctx, ET);
-                  R  : constant String := Next_Reg (Ctx.E, "c");
-               begin
-                  Res.Kind     := EK_Scalar;
-                  Res.Ada_Type := ET;
-                  Res.Pir_Type := TI.Pir_Type;
-                  Res.Align    := TI.Align;
-                  if Is_Float_Type (ET) then
-                     Emit_Inst (Ctx.E, R & " = const." & To_String (TI.Pir_Type) & " " & Format_Float64 (Eval_Float64 (SV)));
-                  elsif Is_Fixed_Type (ET) then
-                     declare
-                        Sc  : Integer_64;
-                        Ovf : Boolean;
-                     begin
-                        Eval_Fixed_Ticks_Exact_Checked (SV, ET, Sc, Ovf);
-                        if Ctx.Enable_Checks and then Ovf then
-                           Emit_Raise_Tag (Ctx, Constraint_Error_Tag (Ctx));
-                           declare
-                              Unr : constant String := Next_Label (Ctx.E, "fxo_u");
-                           begin
-                              Emit_Label (Ctx.E, Unr);
-                           end;
-                        end if;
-                        Emit_Inst (Ctx.E, R & " = const." & To_String (TI.Pir_Type) & " " & Img (Long_Long_Integer (Sc)));
-                     end;
-                  else
-                     declare
-                        Val : Integer_64;
-                        Ovf : Boolean;
-                        RET : constant TREE := Subst_Resolve_Type (Ctx, ET);
-                     begin
-                        Eval_Int64_Checked (SV, Val, Ovf);
-                        if Ctx.Enable_Checks and then not Is_Void_Tree (RET)
-                          and then KIND (RET) /= DN_UNIVERSAL_INTEGER
-                        then
-                           declare
-                              BT : constant TREE := Subst_Base_Type (Ctx, RET);
-                              StB : Boolean := False;
-                              BLo, BHi : Integer_64 := 0;
-                           begin
-                              if not Is_Void_Tree (BT) and then Is_Discrete_Type (BT) then
-                                 Get_Discrete_Bounds (BT, StB, BLo, BHi);
-                              end if;
-                              if Ovf or else (StB and then (Val < BLo or else Val > BHi)) then
-                                 Emit_Raise_Tag (Ctx, Constraint_Error_Tag (Ctx));
-                                 declare
-                                    Unr : constant String := Next_Label (Ctx.E, "nlo_u");
-                                 begin
-                                    Emit_Label (Ctx.E, Unr);
-                                 end;
-                                 Val := 0;
-                              end if;
-                           end;
-                        end if;
-                        declare
-                           Lit_PT : Unbounded_String := TI.Pir_Type;
-                        begin
-                           -- P3-1.3: Never truncate a base-type integer literal into a signed 'Size-packed i8/i16/i32!
-                           if To_String (Lit_PT) = "i8" and then not Is_Unsigned_Scalar (ET, "i8")
-                             and then (Val < -128 or else Val > 127)
-                           then
-                              if Val >= -32768 and then Val <= 32767 then
-                                 Lit_PT := To_Unbounded_String ("i16");
-                              elsif Val >= -2147483648 and then Val <= 2147483647 then
-                                 Lit_PT := To_Unbounded_String ("i32");
-                              else
-                                 Lit_PT := To_Unbounded_String ("i64");
-                              end if;
-                           elsif To_String (Lit_PT) = "i16" and then not Is_Unsigned_Scalar (ET, "i16")
-                             and then (Val < -32768 or else Val > 32767)
-                           then
-                              if Val >= -2147483648 and then Val <= 2147483647 then
-                                 Lit_PT := To_Unbounded_String ("i32");
-                              else
-                                 Lit_PT := To_Unbounded_String ("i64");
-                              end if;
-                           elsif To_String (Lit_PT) = "i32" and then not Is_Unsigned_Scalar (ET, "i32")
-                             and then (Val < -2147483648 or else Val > 2147483647)
-                           then
-                              Lit_PT := To_Unbounded_String ("i64");
-                           end if;
-                           Res.Pir_Type := Lit_PT;
-                           Emit_Inst (Ctx.E, R & " = const." & To_String (Lit_PT) & " " & Img (Long_Long_Integer (Val)));
-                        end;
-                     end;
-                  end if;
-                  Res.Reg := To_Unbounded_String (R);
-                  return Res;
-               end;
-            end;
+            return Emit_Static_Scalar_Value
+              (Ctx, D (SM_VALUE, Node), Subst_Tree (Ctx, D (SM_EXP_TYPE, Node)), Target_Type, "c");
 
          when DN_NULL_ACCESS =>
             declare
@@ -3558,7 +4490,7 @@ package body Cg_Expr is
 
                   declare
                      Raw_Idx_T : constant TREE :=
-                       (if ATI.Kind in TK_Constrained_Array | TK_Unconstrained_Array and then ATI.NDims >= 1
+                       (if ATI.Kind in TK_Constrained_Array | TK_Unconstrained_Array and then ATI.NDims = 1
                         then ATI.Dims (1).Idx_Type else CONST_VOID);
                      Idx_T : TREE := Raw_Idx_T;
                      Idx_Lo, Idx_Hi : Unbounded_String;
@@ -3579,41 +4511,8 @@ package body Cg_Expr is
                      if not Is_Void_Tree (Idx_T) then
                         Emit_Index_Bounds (Ctx, Idx_T, Idx_Lo, Idx_Hi);
                         F_R := Idx_Lo;
-                        declare
-                           En64 : constant String := Next_Reg (Ctx.E, "sle6");
-                        begin
-                           if Len = 0 then
-                              -- LRM 4.2(4): null string literal raises CONSTRAINT_ERROR if Idx'First = Base'First
-                              if Ctx.Enable_Checks then
-                                 declare
-                                    BT_St : Boolean := False;
-                                    BT_Lo, BT_Hi : Integer_64 := 0;
-                                 begin
-                                    Get_Discrete_Bounds (Base_Type_Spec (Idx_T), BT_St, BT_Lo, BT_Hi);
-                                    if BT_St then
-                                       declare
-                                          Und : constant String := Next_Reg (Ctx.E, "slund");
-                                       begin
-                                          Emit_Inst (Ctx.E, Und & " = cmp_le_s.i64 " & To_String (Idx_Lo) & ", " & Img (Long_Long_Integer (BT_Lo)));
-                                          Emit_Check_Fail_If (Ctx, Und);
-                                       end;
-                                    end if;
-                                 end;
-                              end if;
-                              Emit_Inst (Ctx.E, En64 & " = sub.i64 " & To_String (Idx_Lo) & ", 1");
-                           else
-                              Emit_Inst (Ctx.E, En64 & " = add.i64 " & To_String (Idx_Lo) & ", " & Img (Long_Long_Integer (Len - 1)));
-                              if Ctx.Enable_Checks then
-                                 declare
-                                    Oob : constant String := Next_Reg (Ctx.E, "sloob");
-                                 begin
-                                    Emit_Inst (Ctx.E, Oob & " = cmp_gt_s.i64 " & En64 & ", " & To_String (Idx_Hi));
-                                    Emit_Check_Fail_If (Ctx, Oob);
-                                 end;
-                              end if;
-                           end if;
-                           L_R := To_Unbounded_String (En64);
-                        end;
+                        L_R := To_Unbounded_String
+                          (Emit_Range_End_Checked_I64 (Ctx, To_String (Idx_Lo), Integer_64 (Len), To_String (Idx_Hi), Idx_T));
                      else
                         declare
                            FR0 : constant String := Next_Reg (Ctx.E, "sf");
@@ -3629,7 +4528,7 @@ package body Cg_Expr is
                      Res.Reg            := To_Unbounded_String (AR);
                      Res.Pir_Type       := To_Unbounded_String ("ptr");
                      Res.Ada_Type       := ET;
-                     Res.Align          := 1;
+                     Res.Align          := (if Is_16Bit then 2 else 1);
                      Res.NDims          := 1;
                      Res.First_Regs (1) := F_R;
                      Res.Last_Regs (1)  := L_R;
@@ -3663,94 +4562,7 @@ package body Cg_Expr is
                      SV : constant TREE := D (SM_VALUE, Node);
                   begin
                      if Has_Static_Val (SV) then
-                        if Is_Void_Tree (ET) or else KIND (ET) = DN_UNIVERSAL_INTEGER or else KIND (ET) = DN_UNIVERSAL_REAL then
-                           if not Is_Void_Tree (Target_Type) and then Is_Scalar_Type (Target_Type) then
-                              ET := Subst_Tree (Ctx, Target_Type);
-                           end if;
-                        end if;
-                        declare
-                           TI     : constant Type_Info := Get_Type_Info (Ctx, ET);
-                           R      : constant String := Next_Reg (Ctx.E, "nc");
-                           Out_PT : Unbounded_String := TI.Pir_Type;
-                        begin
-                           if Is_Float_Type (ET) then
-                              Emit_Inst (Ctx.E, R & " = const." & To_String (TI.Pir_Type) & " " & Format_Float64 (Eval_Float64 (SV)));
-                           elsif Is_Fixed_Type (ET) then
-                              declare
-                                 Sc  : Integer_64;
-                                 Ovf : Boolean;
-                              begin
-                                 Eval_Fixed_Ticks_Exact_Checked (SV, ET, Sc, Ovf);
-                                 if Ctx.Enable_Checks and then Ovf then
-                                    Emit_Raise_Tag (Ctx, Constraint_Error_Tag (Ctx));
-                                    declare
-                                       Unr : constant String := Next_Label (Ctx.E, "fxu_u");
-                                    begin
-                                       Emit_Label (Ctx.E, Unr);
-                                    end;
-                                 end if;
-                                 Emit_Inst (Ctx.E, R & " = const." & To_String (TI.Pir_Type) & " " & Img (Long_Long_Integer (Sc)));
-                              end;
-                           else
-                              declare
-                                 Val : Integer_64;
-                                 Ovf : Boolean;
-                                 RET : constant TREE := Subst_Resolve_Type (Ctx, ET);
-                              begin
-                                 Eval_Int64_Checked (SV, Val, Ovf);
-                                 if Ctx.Enable_Checks and then not Is_Void_Tree (RET)
-                                   and then KIND (RET) /= DN_UNIVERSAL_INTEGER
-                                 then
-                                    declare
-                                       BT : constant TREE := Subst_Base_Type (Ctx, RET);
-                                       StB : Boolean := False;
-                                       BLo, BHi : Integer_64 := 0;
-                                    begin
-                                       if not Is_Void_Tree (BT) and then Is_Discrete_Type (BT) then
-                                          Get_Discrete_Bounds (BT, StB, BLo, BHi);
-                                       end if;
-                                       if Ovf or else (StB and then (Val < BLo or else Val > BHi)) then
-                                          Emit_Raise_Tag (Ctx, Constraint_Error_Tag (Ctx));
-                                          declare
-                                             Unr : constant String := Next_Label (Ctx.E, "nuo_u");
-                                          begin
-                                             Emit_Label (Ctx.E, Unr);
-                                          end;
-                                          Val := 0;
-                                       end if;
-                                    end;
-                                 end if;
-                                 -- P3-1.3: Never truncate a base-type integer literal into a signed 'Size-packed i8/i16/i32!
-                                 if To_String (Out_PT) = "i8" and then not Is_Unsigned_Scalar (ET, "i8")
-                                   and then (Val < -128 or else Val > 127)
-                                 then
-                                    if Val >= -32768 and then Val <= 32767 then
-                                       Out_PT := To_Unbounded_String ("i16");
-                                    elsif Val >= -2147483648 and then Val <= 2147483647 then
-                                       Out_PT := To_Unbounded_String ("i32");
-                                    else
-                                       Out_PT := To_Unbounded_String ("i64");
-                                    end if;
-                                 elsif To_String (Out_PT) = "i16" and then not Is_Unsigned_Scalar (ET, "i16")
-                                   and then (Val < -32768 or else Val > 32767)
-                                 then
-                                    if Val >= -2147483648 and then Val <= 2147483647 then
-                                       Out_PT := To_Unbounded_String ("i32");
-                                    else
-                                       Out_PT := To_Unbounded_String ("i64");
-                                    end if;
-                                 elsif To_String (Out_PT) = "i32" and then not Is_Unsigned_Scalar (ET, "i32")
-                                   and then (Val < -2147483648 or else Val > 2147483647)
-                                 then
-                                    Out_PT := To_Unbounded_String ("i64");
-                                 end if;
-                                 Emit_Inst (Ctx.E, R & " = const." & To_String (Out_PT) & " " & Format_Int_Imm_For_Pir (Val, To_String (Out_PT)));
-                              end;
-                           end if;
-                           Res.Kind := EK_Scalar; Res.Reg := To_Unbounded_String (R);
-                           Res.Pir_Type := Out_PT; Res.Ada_Type := ET; Res.Align := TI.Align;
-                           return Res;
-                        end;
+                        return Emit_Static_Scalar_Value (Ctx, SV, ET, Target_Type, "nc");
                      elsif KIND (Def) = DN_NUMBER_ID and then not Is_Void_Tree (D (SM_INIT_EXP, Def)) then
                         return Emit_Expr (Ctx, D (SM_INIT_EXP, Def), Target_Type);
                      end if;
@@ -3762,94 +4574,7 @@ package body Cg_Expr is
                   Key : constant Unsigned_32 := Tree_Key (Def);
                begin
                   if Ctx.Vars.Contains (Key) then
-                     declare
-                        V  : constant Var_Info := Ctx.Vars.Element (Key);
-                        TI : constant Type_Info := Get_Type_Info (Ctx, V.Ada_Type);
-                     begin
-                        if V.Kind = VK_Const_Int then
-                           Res.Kind := EK_Scalar;
-                           Res.Reg := To_Unbounded_String (Emit_Int_Const (Ctx, V.Const_I64, To_String (TI.Pir_Type), "ci"));
-                           Res.Pir_Type := TI.Pir_Type; Res.Ada_Type := V.Ada_Type; Res.Align := TI.Align;
-                           return Res;
-                        elsif V.Kind = VK_Const_Float then
-                           declare
-                              R : constant String := Next_Reg (Ctx.E, "cf");
-                           begin
-                              Emit_Inst (Ctx.E, R & " = const." & To_String (TI.Pir_Type) & " " & Format_Float64 (V.Const_F64));
-                              Res.Kind := EK_Scalar; Res.Reg := To_Unbounded_String (R);
-                              Res.Pir_Type := TI.Pir_Type; Res.Ada_Type := V.Ada_Type; Res.Align := TI.Align;
-                              return Res;
-                           end;
-                        elsif V.Kind = VK_Param_Val then
-                           Res.Kind := EK_Scalar; Res.Reg := V.Pir_Name;
-                           Res.Pir_Type := TI.Pir_Type; Res.Ada_Type := V.Ada_Type; Res.Align := TI.Align;
-                           return Res;
-                        elsif V.Kind = VK_Uncon_Array_Param or else V.Kind = VK_Dyn_Array then
-                           Res.Kind     := EK_Slice;
-                           Res.Pir_Type := To_Unbounded_String ("ptr");
-                           Res.Ada_Type := V.Ada_Type;
-                           Res.Align    := V.Align;
-                           Res.NDims    := V.NDims;
-                           if V.Has_Desc and then
-                             (Length (V.Desc_Global) > 0
-                              or else (V.Owner_Subp /= 0 and then V.Owner_Subp /= Ctx.Cur_Subp_Key))
-                           then
-                              declare
-                                 DP : Unbounded_String;
-                              begin
-                                 if Length (V.Desc_Global) > 0 then
-                                    declare
-                                       GA : constant String := Next_Reg (Ctx.E, "dg");
-                                    begin
-                                       Emit_Inst (Ctx.E, GA & " = addr " & To_String (V.Desc_Global));
-                                       DP := To_Unbounded_String (GA);
-                                    end;
-                                 else
-                                    DP := To_Unbounded_String (Emit_Var_Addr (Ctx, V));
-                                 end if;
-                                 Emit_Unpack_Arr_Desc (Ctx, To_String (DP), V.Ada_Type, Res);
-                                 Res.Align := V.Align;
-                                 Res.NDims := V.NDims;
-                              end;
-                           else
-                              Res.Reg        := To_Unbounded_String (Emit_Var_Addr (Ctx, V));
-                              Res.First_Regs := V.First_Regs;
-                              Res.Last_Regs  := V.Last_Regs;
-                           end if;
-                           return Res;
-                        elsif TI.Kind = TK_Scalar then
-                           declare
-                              Addr      : constant String := Emit_Var_Addr (Ctx, V);
-                              R         : constant String := Next_Reg (Ctx.E, "ld");
-                              Is_Shared : constant Boolean :=
-                                V.Is_Shared or else (KIND (Def) = DN_VARIABLE_ID and then DB (SM_IS_SHARED, Def));
-                           begin
-                              if V.Is_Bitfield then
-                                 declare
-                                    BV : constant String := Emit_Bitfield_Load (Ctx, Addr, V.BF_FE, V.Ada_Type);
-                                 begin
-                                    Res.Kind := EK_Scalar; Res.Reg := To_Unbounded_String (BV);
-                                    Res.Pir_Type := TI.Pir_Type; Res.Ada_Type := V.Ada_Type; Res.Align := TI.Align;
-                                    return Res;
-                                 end;
-                              end if;
-                              if Is_Shared then
-                                 Emit_Inst (Ctx.E, R & " = load." & To_String (TI.Pir_Type) & " " & Addr & ", align " & Img (TI.Align) & " [volatile]");
-                                 Emit_Inst (Ctx.E, "fence [seq_cst]");
-                              else
-                                 Emit_Inst (Ctx.E, R & " = load." & To_String (TI.Pir_Type) & " " & Addr & ", align " & Img (TI.Align));
-                              end if;
-                              Res.Kind := EK_Scalar; Res.Reg := To_Unbounded_String (R);
-                              Res.Pir_Type := TI.Pir_Type; Res.Ada_Type := V.Ada_Type; Res.Align := TI.Align;
-                              return Res;
-                           end;
-                        else
-                           Res.Kind := EK_Addr;
-                           Res.Reg  := To_Unbounded_String (Emit_Var_Addr (Ctx, V));
-                           Res.Pir_Type := TI.Pir_Type; Res.Ada_Type := V.Ada_Type; Res.Align := TI.Align;
-                           return Res;
-                        end if;
-                     end;
+                     return Emit_Var_Ref (Ctx, Ctx.Vars.Element (Key), Def, Load_Scalar => True);
                   end if;
                end;
 
@@ -3897,14 +4622,15 @@ package body Cg_Expr is
                      else Pfx_T_Static);
                   Dummy_RT : constant Type_Info := Get_Type_Info (Ctx, Rec_T_Static);
                   pragma Unreferenced (Dummy_RT);
-                  CK_BF : constant Unsigned_32 := Tree_Key (Def);
+                  CK_BF : constant Unsigned_32 := Lookup_Record_Field_Key (Ctx, Rec_T_Static, Def);
+                  CT_BF : constant TREE := Subst_Tree (Ctx, D (SM_OBJ_TYPE, Def));
                begin
-                  if Ctx.Fields.Contains (CK_BF) and then Is_Bitfield (Ctx.Fields.Element (CK_BF)) then
+                  if Ctx.Fields.Contains (CK_BF) and then Uses_Bitfield_Access (Ctx, Ctx.Fields.Element (CK_BF), CT_BF) then
                      declare
                         FE      : constant Field_Entry := Ctx.Fields.Element (CK_BF);
                         Base_LV : constant Expr_Val := Emit_LValue (Ctx, Pfx_E);
                         Rec_Ptr : Unbounded_String := Base_LV.Reg;
-                        CT      : constant TREE := Subst_Tree (Ctx, D (SM_OBJ_TYPE, Def));
+                        CT      : constant TREE := CT_BF;
                         CTI     : constant Type_Info := Get_Type_Info (Ctx, CT);
                      begin
                         if Is_Access_Type (Resolve_Type_Spec (Subst_Tree (Ctx, Base_LV.Ada_Type))) then
@@ -4000,16 +4726,16 @@ package body Cg_Expr is
                ETI   : constant Type_Info := Get_Type_Info (Ctx, ET);
             begin
                if E.Kind = EK_Scalar then
-                  -- P3-2.2: universal_real compound expressions (e.g. Duration'(1.0 / 2.0)) emit f64;
-                  -- convert to fixed ticks before Emit_Range_Check!
-                  if Is_Fixed_Type (ET) and then (To_String (E.Pir_Type) = "f32" or else To_String (E.Pir_Type) = "f64") then
-                     E.Reg      := To_Unbounded_String (Emit_F64_To_Fixed_Ticks (Ctx, To_String (E.Reg), To_String (E.Pir_Type), ET, To_String (ETI.Pir_Type)));
+                  if not Is_Access_Type (ET) then
+                     E.Reg := To_Unbounded_String
+                       (Emit_Typed_Scalar_Convert (Ctx, To_String (E.Reg), E.Ada_Type, To_String (E.Pir_Type),
+                          ET, To_String (ETI.Pir_Type), Check_Range => True));
                      E.Pir_Type := ETI.Pir_Type;
                      E.Ada_Type := ET;
                      E.Align    := ETI.Align;
+                  else
+                     Emit_Discriminant_Check (Ctx, To_String (E.Reg), ET, Is_Access => True);
                   end if;
-                  Emit_Range_Check (Ctx, To_String (E.Reg), To_String (E.Pir_Type), ET);
-                  Emit_Discriminant_Check (Ctx, To_String (E.Reg), ET, Is_Access => True);
                elsif ETI.Kind = TK_Record then
                   Emit_Discriminant_Check (Ctx, To_String (E.Reg), ET, Is_Access => False);
                elsif ETI.Kind = TK_Constrained_Array and then Ctx.Enable_Checks then
@@ -4201,36 +4927,26 @@ package body Cg_Expr is
                         return Res;
                      end;
                   elsif ETI.Kind = TK_Record then
-                     -- LRM 13.6: derived record change of representation via canonical Emit_Record_Rep_Copy_Into
-                     declare
-                        Src_BR : constant TREE := Subst_Base_Type (Ctx, Src.Ada_Type);
-                        Dst_BR : constant TREE := Subst_Base_Type (Ctx, ET);
-                        Src_RR : constant TREE := (if not Is_Void_Tree (Src_BR) and then KIND (Src_BR) = DN_RECORD then D (SM_REPRESENTATION, Src_BR) else CONST_VOID);
-                        Dst_RR : constant TREE := (if not Is_Void_Tree (Dst_BR) and then KIND (Dst_BR) = DN_RECORD then D (SM_REPRESENTATION, Dst_BR) else CONST_VOID);
-                     begin
-                        if Src_BR /= Dst_BR and then not Is_Void_Tree (Src_BR) and then not Is_Void_Tree (Dst_BR)
-                          and then KIND (Src_BR) = DN_RECORD and then KIND (Dst_BR) = DN_RECORD
-                          and then (not Is_Void_Tree (Src_RR) or else not Is_Void_Tree (Dst_RR))
-                        then
-                           declare
-                              DTI_R : constant Type_Info := Get_Type_Info (Ctx, Dst_BR);
-                              Buf   : constant String := Next_Reg (Ctx.E, "crb");
-                              Sz    : constant Natural := Natural'Max (1, DTI_R.Byte_Size);
-                              Al    : constant Natural := Natural'Max (1, DTI_R.Align);
-                           begin
-                              Emit_Entry_Alloca (Ctx.E, Buf & " = alloca [" & Img (Sz) & " x i8], align " & Img (Al));
-                              Emit_Inst (Ctx.E, "memset " & Buf & ", 0, " & Img (Sz) & ", align 1");
-                              Emit_Record_Rep_Copy_Into (Ctx, Buf, ET, To_String (Src.Reg), Src.Ada_Type);
-                              Emit_Discriminant_Check (Ctx, Buf, ET, Is_Access => False);
-                              Res.Kind     := EK_Addr;
-                              Res.Reg      := To_Unbounded_String (Buf);
-                              Res.Pir_Type := DTI_R.Pir_Type;
-                              Res.Ada_Type := ET;
-                              Res.Align    := Al;
-                              return Res;
-                           end;
-                        end if;
-                     end;
+                     -- LRM 13.6 / P5-R4: derived record change of representation via canonical Needs_Record_Rep_Conv
+                     if Needs_Record_Rep_Conv (Ctx, Src.Ada_Type, ET) then
+                        declare
+                           DTI_R : constant Type_Info := Get_Type_Info (Ctx, Subst_Base_Type (Ctx, ET));
+                           Buf   : constant String := Next_Reg (Ctx.E, "crb");
+                           Sz    : constant Natural := Natural'Max (1, DTI_R.Byte_Size);
+                           Al    : constant Natural := Natural'Max (1, DTI_R.Align);
+                        begin
+                           Emit_Entry_Alloca (Ctx.E, Buf & " = alloca [" & Img (Sz) & " x i8], align " & Img (Al));
+                           Emit_Inst (Ctx.E, "memset " & Buf & ", 0, " & Img (Sz) & ", align " & Img (Al));
+                           Emit_Record_Rep_Copy_Into (Ctx, Buf, ET, To_String (Src.Reg), Src.Ada_Type);
+                           Emit_Discriminant_Check (Ctx, Buf, ET, Is_Access => False);
+                           Res.Kind     := EK_Addr;
+                           Res.Reg      := To_Unbounded_String (Buf);
+                           Res.Pir_Type := DTI_R.Pir_Type;
+                           Res.Ada_Type := ET;
+                           Res.Align    := Al;
+                           return Res;
+                        end;
+                     end if;
                      Emit_Discriminant_Check (Ctx, To_String (Src.Reg), ET, Is_Access => False);
                      Res := Src;
                      Res.Ada_Type := ET;
@@ -4317,20 +5033,29 @@ package body Cg_Expr is
             begin
                Emit_Discrete_Range (Ctx, D (AS_RANGE, Node), RT, RL, RH);
                declare
-                  PTS  : constant String := To_String (RT);
-                  Is_U : constant Boolean := Is_Unsigned_Scalar (V.Ada_Type, PTS);
+                  PTS : constant String := To_String (RT);
                begin
-                  VC := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, To_String (V.Reg), To_String (V.Pir_Type), PTS,
-                    Is_Unsigned => Is_Unsigned_Scalar (V.Ada_Type, To_String (V.Pir_Type))));
                   if PTS = "f32" or else PTS = "f64" then
+                     VC := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, To_String (V.Reg), To_String (V.Pir_Type), PTS,
+                       Is_Unsigned => Is_Unsigned_Scalar (V.Ada_Type, To_String (V.Pir_Type))));
                      Emit_Inst (Ctx.E, C1 & " = fcmp_oge." & PTS & " " & To_String (VC) & ", " & To_String (RL));
                      Emit_Inst (Ctx.E, C2 & " = fcmp_ole." & PTS & " " & To_String (VC) & ", " & To_String (RH));
-                  elsif Is_U then
-                     Emit_Inst (Ctx.E, C1 & " = cmp_ge_u." & PTS & " " & To_String (VC) & ", " & To_String (RL));
-                     Emit_Inst (Ctx.E, C2 & " = cmp_le_u." & PTS & " " & To_String (VC) & ", " & To_String (RH));
                   else
-                     Emit_Inst (Ctx.E, C1 & " = cmp_ge_s." & PTS & " " & To_String (VC) & ", " & To_String (RL));
-                     Emit_Inst (Ctx.E, C2 & " = cmp_le_s." & PTS & " " & To_String (VC) & ", " & To_String (RH));
+                     declare
+                        Rng_N : constant TREE := D (AS_RANGE, Node);
+                        Rng_T : constant TREE :=
+                          (if not Is_Void_Tree (Rng_N) and then KIND (Rng_N) = DN_RANGE
+                             and then not Is_Void_Tree (D (AS_EXP1, Rng_N))
+                             and then KIND (D (AS_EXP1, Rng_N)) in CLASS_EXP
+                           then Subst_Tree (Ctx, D (SM_EXP_TYPE, D (AS_EXP1, Rng_N)))
+                           else V.Ada_Type);
+                        V64 : constant String := Emit_Widen_To_I64 (Ctx, To_String (V.Reg), To_String (V.Pir_Type), V.Ada_Type);
+                        L64 : constant String := Emit_Widen_To_I64 (Ctx, To_String (RL), PTS, Rng_T);
+                        H64 : constant String := Emit_Widen_To_I64 (Ctx, To_String (RH), PTS, Rng_T);
+                     begin
+                        Emit_Inst (Ctx.E, C1 & " = cmp_ge_s.i64 " & V64 & ", " & L64);
+                        Emit_Inst (Ctx.E, C2 & " = cmp_le_s.i64 " & V64 & ", " & H64);
+                     end;
                   end if;
                end;
                Emit_Inst (Ctx.E, InR & " = and.i8 " & C1 & ", " & C2);
@@ -4371,42 +5096,38 @@ package body Cg_Expr is
                      PT  : constant String := To_String (V.Pir_Type);
                      LR0 : constant String := Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
                      HR0 : constant String := Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
-                     SRU : constant Boolean := Is_Unsigned_Scalar (TS, To_String (SR.Pir_Type));
-                     L_R : constant String := Emit_Scalar_Coerce (Ctx, LR0, To_String (SR.Pir_Type), PT, Is_Unsigned => SRU);
-                     H_R : constant String := Emit_Scalar_Coerce (Ctx, HR0, To_String (SR.Pir_Type), PT, Is_Unsigned => SRU);
                      C1  : constant String := Next_Reg (Ctx.E, "tm1");
                      C2  : constant String := Next_Reg (Ctx.E, "tm2");
                   begin
                      if PT = "f32" or else PT = "f64" then
-                        Emit_Inst (Ctx.E, C1 & " = fcmp_oge." & PT & " " & To_String (V.Reg) & ", " & L_R);
-                        Emit_Inst (Ctx.E, C2 & " = fcmp_ole." & PT & " " & To_String (V.Reg) & ", " & H_R);
-                     elsif Is_Unsigned_Scalar (TS, PT) then
-                        Emit_Inst (Ctx.E, C1 & " = cmp_ge_u." & PT & " " & To_String (V.Reg) & ", " & L_R);
-                        Emit_Inst (Ctx.E, C2 & " = cmp_le_u." & PT & " " & To_String (V.Reg) & ", " & H_R);
+                        declare
+                           L_R : constant String := Emit_Scalar_Coerce (Ctx, LR0, To_String (SR.Pir_Type), PT);
+                           H_R : constant String := Emit_Scalar_Coerce (Ctx, HR0, To_String (SR.Pir_Type), PT);
+                        begin
+                           Emit_Inst (Ctx.E, C1 & " = fcmp_oge." & PT & " " & To_String (V.Reg) & ", " & L_R);
+                           Emit_Inst (Ctx.E, C2 & " = fcmp_ole." & PT & " " & To_String (V.Reg) & ", " & H_R);
+                        end;
                      else
-                        Emit_Inst (Ctx.E, C1 & " = cmp_ge_s." & PT & " " & To_String (V.Reg) & ", " & L_R);
-                        Emit_Inst (Ctx.E, C2 & " = cmp_le_s." & PT & " " & To_String (V.Reg) & ", " & H_R);
+                        declare
+                           V64 : constant String := Emit_Widen_To_I64 (Ctx, To_String (V.Reg), PT, V.Ada_Type);
+                           L64 : constant String := Emit_Widen_To_I64 (Ctx, LR0, To_String (SR.Pir_Type), TS);
+                           H64 : constant String := Emit_Widen_To_I64 (Ctx, HR0, To_String (SR.Pir_Type), TS);
+                        begin
+                           Emit_Inst (Ctx.E, C1 & " = cmp_ge_s.i64 " & V64 & ", " & L64);
+                           Emit_Inst (Ctx.E, C2 & " = cmp_le_s.i64 " & V64 & ", " & H64);
+                        end;
                      end if;
                      Emit_Inst (Ctx.E, InR & " = and.i8 " & C1 & ", " & C2);
                   end;
                elsif St then
                   declare
-                     PT   : constant String := To_String (V.Pir_Type);
-                     Is_U : constant Boolean := Is_Unsigned_Scalar (TS, PT);
-                     C1   : constant String := Next_Reg (Ctx.E, "tm1");
-                     C2   : constant String := Next_Reg (Ctx.E, "tm2");
+                     V64 : constant String := Emit_Widen_To_I64 (Ctx, To_String (V.Reg), To_String (V.Pir_Type), V.Ada_Type);
+                     C1  : constant String := Next_Reg (Ctx.E, "tm1");
+                     C2  : constant String := Next_Reg (Ctx.E, "tm2");
                   begin
-                     if Is_U and then Hi < 0 then
-                        Emit_Inst (Ctx.E, InR & " = const.i8 0");
-                     elsif Is_U then
-                        Emit_Inst (Ctx.E, C1 & " = cmp_ge_u." & PT & " " & To_String (V.Reg) & ", " & Img (Long_Long_Integer (Lo)));
-                        Emit_Inst (Ctx.E, C2 & " = cmp_le_u." & PT & " " & To_String (V.Reg) & ", " & Img (Long_Long_Integer (Hi)));
-                        Emit_Inst (Ctx.E, InR & " = and.i8 " & C1 & ", " & C2);
-                     else
-                        Emit_Inst (Ctx.E, C1 & " = cmp_ge_s." & PT & " " & To_String (V.Reg) & ", " & Img (Long_Long_Integer (Lo)));
-                        Emit_Inst (Ctx.E, C2 & " = cmp_le_s." & PT & " " & To_String (V.Reg) & ", " & Img (Long_Long_Integer (Hi)));
-                        Emit_Inst (Ctx.E, InR & " = and.i8 " & C1 & ", " & C2);
-                     end if;
+                     Emit_Inst (Ctx.E, C1 & " = cmp_ge_s.i64 " & V64 & ", " & Img (Long_Long_Integer (Lo)));
+                     Emit_Inst (Ctx.E, C2 & " = cmp_le_s.i64 " & V64 & ", " & Img (Long_Long_Integer (Hi)));
+                     Emit_Inst (Ctx.E, InR & " = and.i8 " & C1 & ", " & C2);
                   end;
                elsif not Is_Void_Tree (TS) and then KIND (TS) in DN_INTEGER | DN_ENUMERATION | DN_FLOAT | DN_FIXED
                  and then not Is_Void_Tree (D (SM_RANGE, TS))
@@ -4415,58 +5136,63 @@ package body Cg_Expr is
                   declare
                      Rng : constant TREE := D (SM_RANGE, TS);
                      PT  : constant String := To_String (V.Pir_Type);
+                     Is_FP : constant Boolean := PT = "f32" or else PT = "f64";
                      L_R, H_R : Unbounded_String;
                      C1  : constant String := Next_Reg (Ctx.E, "tm1");
                      C2  : constant String := Next_Reg (Ctx.E, "tm2");
 
-                     function Fixed_Bound_Reg (EV : Expr_Val) return String is
+                     function Bound_Reg (EV : Expr_Val) return String is
                         SPT : constant String := To_String (EV.Pir_Type);
                      begin
-                        if Is_Fixed_Type (TS) and then (SPT = "f64" or else SPT = "f32") then
+                        if Is_FP then
+                           return Emit_Scalar_Coerce (Ctx, To_String (EV.Reg), SPT, PT, Is_Unsigned => Is_Unsigned_Scalar (EV.Ada_Type, SPT));
+                        elsif Is_Fixed_Type (TS) and then (SPT = "f64" or else SPT = "f32") then
                            declare
                               F64 : constant String := Emit_Scalar_Coerce (Ctx, To_String (EV.Reg), SPT, "f64");
                               Dv  : constant String := Next_Reg (Ctx.E, "fmbd");
                               V64 : Unbounded_String;
-                              MinB : constant Long_Long_Integer := (if PT = "i32" then -2147483648 else Long_Long_Integer'First);
-                              MaxB : constant Long_Long_Integer := (if PT = "i32" then 2147483647 else Long_Long_Integer'Last);
                            begin
                               Emit_Inst (Ctx.E, Dv & " = fdiv.f64 " & F64 & ", " & Format_Float64 (Fixed_Small (TS)));
                               Emit_Call_Or_Invoke (Ctx, "@__ada_f64_to_i64_round",
-                                Dv & ", " & Img (MinB) & ", " & Img (MaxB) & ", 0", "i64", V64);
-                              return Emit_Int_Convert (Ctx, To_String (V64), "i64", PT);
+                                Dv & ", " & Img (Long_Long_Integer'First) & ", " & Img (Long_Long_Integer'Last) & ", 0", "i64", V64);
+                              return To_String (V64);
                            end;
                         end if;
-                        return Emit_Scalar_Coerce (Ctx, To_String (EV.Reg), SPT, PT, Is_Unsigned => Is_Unsigned_Scalar (EV.Ada_Type, SPT));
-                     end Fixed_Bound_Reg;
+                        return Emit_Widen_To_I64 (Ctx, To_String (EV.Reg), SPT, EV.Ada_Type);
+                     end Bound_Reg;
                   begin
                      if KIND (Rng) = DN_RANGE then
                         declare
                            E1 : constant Expr_Val := Emit_Expr (Ctx, D (AS_EXP1, Rng), TS);
                            E2 : constant Expr_Val := Emit_Expr (Ctx, D (AS_EXP2, Rng), TS);
                         begin
-                           L_R := To_Unbounded_String (Fixed_Bound_Reg (E1));
-                           H_R := To_Unbounded_String (Fixed_Bound_Reg (E2));
+                           L_R := To_Unbounded_String (Bound_Reg (E1));
+                           H_R := To_Unbounded_String (Bound_Reg (E2));
                         end;
                      else
                         declare
                            RT2, LoR, HiR : Unbounded_String;
-                           Is_U2 : Boolean;
                         begin
                            Emit_Discrete_Range (Ctx, Rng, RT2, LoR, HiR);
-                           Is_U2 := Is_Unsigned_Scalar (TS, To_String (RT2));
-                           L_R := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, To_String (LoR), To_String (RT2), PT, Is_Unsigned => Is_U2));
-                           H_R := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, To_String (HiR), To_String (RT2), PT, Is_Unsigned => Is_U2));
+                           if Is_FP then
+                              L_R := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, To_String (LoR), To_String (RT2), PT));
+                              H_R := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, To_String (HiR), To_String (RT2), PT));
+                           else
+                              L_R := To_Unbounded_String (Emit_Widen_To_I64 (Ctx, To_String (LoR), To_String (RT2), TS));
+                              H_R := To_Unbounded_String (Emit_Widen_To_I64 (Ctx, To_String (HiR), To_String (RT2), TS));
+                           end if;
                         end;
                      end if;
-                     if PT = "f32" or else PT = "f64" then
+                     if Is_FP then
                         Emit_Inst (Ctx.E, C1 & " = fcmp_oge." & PT & " " & To_String (V.Reg) & ", " & To_String (L_R));
                         Emit_Inst (Ctx.E, C2 & " = fcmp_ole." & PT & " " & To_String (V.Reg) & ", " & To_String (H_R));
-                     elsif Is_Unsigned_Scalar (TS, PT) then
-                        Emit_Inst (Ctx.E, C1 & " = cmp_ge_u." & PT & " " & To_String (V.Reg) & ", " & To_String (L_R));
-                        Emit_Inst (Ctx.E, C2 & " = cmp_le_u." & PT & " " & To_String (V.Reg) & ", " & To_String (H_R));
                      else
-                        Emit_Inst (Ctx.E, C1 & " = cmp_ge_s." & PT & " " & To_String (V.Reg) & ", " & To_String (L_R));
-                        Emit_Inst (Ctx.E, C2 & " = cmp_le_s." & PT & " " & To_String (V.Reg) & ", " & To_String (H_R));
+                        declare
+                           V64 : constant String := Emit_Widen_To_I64 (Ctx, To_String (V.Reg), PT, V.Ada_Type);
+                        begin
+                           Emit_Inst (Ctx.E, C1 & " = cmp_ge_s.i64 " & V64 & ", " & To_String (L_R));
+                           Emit_Inst (Ctx.E, C2 & " = cmp_le_s.i64 " & V64 & ", " & To_String (H_R));
+                        end;
                      end if;
                      Emit_Inst (Ctx.E, InR & " = and.i8 " & C1 & ", " & C2);
                   end;
@@ -4549,44 +5275,26 @@ package body Cg_Expr is
                                                 SD : constant Saved_Disc_Info := Ctx.Saved_Type_Discs.Element (Tree_Key (TS));
                                                 LV : constant String := Load_Saved_Slot (Ctx, To_String (SD.Ptrs (FIdx + 1)), To_String (SD.Pir_Types (FIdx + 1)), SD.Aligns (FIdx + 1), SD.Is_Global);
                                              begin
-                                                ER := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, LV, To_String (SD.Pir_Types (FIdx + 1)), To_String (DTI.Pir_Type)));
+                                                ER := To_Unbounded_String (Emit_Widen_To_I64 (Ctx, LV, To_String (SD.Pir_Types (FIdx + 1)), DT));
                                              end;
                                           else
                                              declare
                                                 EV : constant Expr_Val := Emit_Expr (Ctx, CE, DT);
                                              begin
-                                                ER := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, To_String (EV.Reg), To_String (EV.Pir_Type), To_String (DTI.Pir_Type)));
+                                                ER := To_Unbounded_String (Emit_Widen_To_I64 (Ctx, To_String (EV.Reg), To_String (EV.Pir_Type), EV.Ada_Type));
                                              end;
                                           end if;
                                           if Ctx.Fields.Contains (DK) then
                                              declare
-                                                FE : constant Field_Entry := Ctx.Fields.Element (DK);
+                                                FE  : constant Field_Entry := Ctx.Fields.Element (DK);
+                                                FV6 : constant String := Emit_Load_Field_I64 (Ctx, To_String (V.Reg), To_String (RTI.Pir_Type), FE, DT, DTI);
                                              begin
-                                                if Is_Bitfield (FE) then
-                                                   declare
-                                                      BV : constant String := Emit_Bitfield_Load (Ctx, To_String (V.Reg), FE, DT);
-                                                   begin
-                                                      Emit_Inst (Ctx.E, Eq & " = cmp_eq." & To_String (DTI.Pir_Type) & " " & BV & ", " & To_String (ER));
-                                                   end;
-                                                elsif FE.In_Union or else FE.Has_Explicit_Offset then
-                                                   declare
-                                                      Off_R : constant String := Next_Reg (Ctx.E, "rmo");
-                                                   begin
-                                                      Emit_Inst (Ctx.E, Off_R & " = const.i64 " & Img (FE.Byte_Offset));
-                                                      Emit_Inst (Ctx.E, FP & " = ptr_add.i64 " & To_String (V.Reg) & ", " & Off_R & " [inbounds]");
-                                                      Emit_Inst (Ctx.E, AV & " = load." & To_String (DTI.Pir_Type) & " " & FP & ", align " & Img (Explicit_Field_Align (FE, DTI.Align)));
-                                                      Emit_Inst (Ctx.E, Eq & " = cmp_eq." & To_String (DTI.Pir_Type) & " " & AV & ", " & To_String (ER));
-                                                   end;
-                                                else
-                                                   Emit_Inst (Ctx.E, FP & " = field_ptr " & To_String (RTI.Pir_Type) & ", " & To_String (V.Reg) & ", " & Img (FE.Field_Idx));
-                                                   Emit_Inst (Ctx.E, AV & " = load." & To_String (DTI.Pir_Type) & " " & FP & ", align " & Img (Natural'Max (1, DTI.Align)));
-                                                   Emit_Inst (Ctx.E, Eq & " = cmp_eq." & To_String (DTI.Pir_Type) & " " & AV & ", " & To_String (ER));
-                                                end if;
+                                                Emit_Inst (Ctx.E, Eq & " = cmp_eq.i64 " & FV6 & ", " & To_String (ER));
                                              end;
                                           else
                                              Emit_Inst (Ctx.E, FP & " = field_ptr " & To_String (RTI.Pir_Type) & ", " & To_String (V.Reg) & ", " & Img (FIdx));
                                              Emit_Inst (Ctx.E, AV & " = load." & To_String (DTI.Pir_Type) & " " & FP & ", align " & Img (DTI.Align));
-                                             Emit_Inst (Ctx.E, Eq & " = cmp_eq." & To_String (DTI.Pir_Type) & " " & AV & ", " & To_String (ER));
+                                             Emit_Inst (Ctx.E, Eq & " = cmp_eq.i64 " & Emit_Widen_To_I64 (Ctx, AV, To_String (DTI.Pir_Type), DT) & ", " & To_String (ER));
                                           end if;
                                           if FIdx = 0 then
                                              Acc := To_Unbounded_String (Eq);
@@ -4700,44 +5408,26 @@ package body Cg_Expr is
                                                       SD : constant Saved_Disc_Info := Ctx.Saved_Type_Discs.Element (Tree_Key (DesT));
                                                       LV : constant String := Load_Saved_Slot (Ctx, To_String (SD.Ptrs (FIdx + 1)), To_String (SD.Pir_Types (FIdx + 1)), SD.Aligns (FIdx + 1), SD.Is_Global);
                                                    begin
-                                                      ER := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, LV, To_String (SD.Pir_Types (FIdx + 1)), To_String (DTI.Pir_Type)));
+                                                      ER := To_Unbounded_String (Emit_Widen_To_I64 (Ctx, LV, To_String (SD.Pir_Types (FIdx + 1)), DT));
                                                    end;
                                                 else
                                                    declare
                                                       EV : constant Expr_Val := Emit_Expr (Ctx, CE, DT);
                                                    begin
-                                                      ER := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, To_String (EV.Reg), To_String (EV.Pir_Type), To_String (DTI.Pir_Type)));
+                                                      ER := To_Unbounded_String (Emit_Widen_To_I64 (Ctx, To_String (EV.Reg), To_String (EV.Pir_Type), EV.Ada_Type));
                                                    end;
                                                 end if;
                                                 if Ctx.Fields.Contains (DK) then
                                                    declare
-                                                      FE : constant Field_Entry := Ctx.Fields.Element (DK);
+                                                      FE  : constant Field_Entry := Ctx.Fields.Element (DK);
+                                                      FV6 : constant String := Emit_Load_Field_I64 (Ctx, To_String (V.Reg), To_String (RTI.Pir_Type), FE, DT, DTI);
                                                    begin
-                                                      if Is_Bitfield (FE) then
-                                                         declare
-                                                            BV : constant String := Emit_Bitfield_Load (Ctx, To_String (V.Reg), FE, DT);
-                                                         begin
-                                                            Emit_Inst (Ctx.E, Eq & " = cmp_eq." & To_String (DTI.Pir_Type) & " " & BV & ", " & To_String (ER));
-                                                         end;
-                                                      elsif FE.In_Union or else FE.Has_Explicit_Offset then
-                                                         declare
-                                                            Off_R : constant String := Next_Reg (Ctx.E, "aro");
-                                                         begin
-                                                            Emit_Inst (Ctx.E, Off_R & " = const.i64 " & Img (FE.Byte_Offset));
-                                                            Emit_Inst (Ctx.E, FP & " = ptr_add.i64 " & To_String (V.Reg) & ", " & Off_R & " [inbounds]");
-                                                            Emit_Inst (Ctx.E, AV & " = load." & To_String (DTI.Pir_Type) & " " & FP & ", align " & Img (Explicit_Field_Align (FE, DTI.Align)));
-                                                            Emit_Inst (Ctx.E, Eq & " = cmp_eq." & To_String (DTI.Pir_Type) & " " & AV & ", " & To_String (ER));
-                                                         end;
-                                                      else
-                                                         Emit_Inst (Ctx.E, FP & " = field_ptr " & To_String (RTI.Pir_Type) & ", " & To_String (V.Reg) & ", " & Img (FE.Field_Idx));
-                                                         Emit_Inst (Ctx.E, AV & " = load." & To_String (DTI.Pir_Type) & " " & FP & ", align " & Img (Natural'Max (1, DTI.Align)));
-                                                         Emit_Inst (Ctx.E, Eq & " = cmp_eq." & To_String (DTI.Pir_Type) & " " & AV & ", " & To_String (ER));
-                                                      end if;
+                                                      Emit_Inst (Ctx.E, Eq & " = cmp_eq.i64 " & FV6 & ", " & To_String (ER));
                                                    end;
                                                 else
                                                    Emit_Inst (Ctx.E, FP & " = field_ptr " & To_String (RTI.Pir_Type) & ", " & To_String (V.Reg) & ", " & Img (FIdx));
                                                    Emit_Inst (Ctx.E, AV & " = load." & To_String (DTI.Pir_Type) & " " & FP & ", align " & Img (DTI.Align));
-                                                   Emit_Inst (Ctx.E, Eq & " = cmp_eq." & To_String (DTI.Pir_Type) & " " & AV & ", " & To_String (ER));
+                                                   Emit_Inst (Ctx.E, Eq & " = cmp_eq.i64 " & Emit_Widen_To_I64 (Ctx, AV, To_String (DTI.Pir_Type), DT) & ", " & To_String (ER));
                                                 end if;
                                                 if FIdx = 0 then Acc := To_Unbounded_String (Eq);
                                                 else
@@ -4866,161 +5556,7 @@ package body Cg_Expr is
                               Emit_Index_Bounds (Ctx, TI.Dims (D_I).Idx_Type, Firsts (D_I), Lasts (D_I));
                            end loop;
                         else
-                           declare
-                              Cur_Agg : TREE := Node;
-                           begin
-                              for Dim_I in 1 .. ND loop
-                                 declare
-                                    Assocs : SEQ_TYPE :=
-                                      (if not Is_Void_Tree (Cur_Agg) and then KIND (Cur_Agg) = DN_AGGREGATE
-                                       then LIST (D (AS_GENERAL_ASSOC_S, Cur_Agg)) else MAKE);
-                                    Item   : TREE;
-                                    Count  : Integer_64 := 0;
-                                    Got_R  : Boolean := False;
-                                    Next_A : TREE := CONST_VOID;
-                                 begin
-                                    while not IS_EMPTY (Assocs) loop
-                                       POP (Assocs, Item);
-                                       if KIND (Item) = DN_ASSOC or else KIND (Item) = DN_NAMED then
-                                          if Is_Void_Tree (Next_A) then
-                                             Next_A := D (AS_EXP, Item);
-                                          end if;
-                                          declare
-                                             CS : SEQ_TYPE := LIST (D (AS_CHOICE_S, Item));
-                                             Ch : TREE;
-                                          begin
-                                             while not IS_EMPTY (CS) loop
-                                                POP (CS, Ch);
-                                                if KIND (Ch) = DN_CHOICE_RANGE then
-                                                   declare
-                                                      RT, RL, RH : Unbounded_String;
-                                                      L64, H64   : Unbounded_String;
-                                                      SR : Saved_Range_Info;
-                                                      RU : Boolean;
-                                                   begin
-                                                      Emit_Discrete_Range (Ctx, D (AS_DISCRETE_RANGE, Ch), RT, RL, RH);
-                                                      RU := Dim_I <= Base_TI.NDims
-                                                        and then not Is_Void_Tree (Base_TI.Dims (Dim_I).Idx_Type)
-                                                        and then Is_Unsigned_Scalar (Base_TI.Dims (Dim_I).Idx_Type, To_String (RT));
-                                                      L64 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RL), To_String (RT), "i64", Is_Unsigned => RU));
-                                                      H64 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RH), To_String (RT), "i64", Is_Unsigned => RU));
-                                                      -- Cache Pass-1 choice range so Pass 2 does NOT re-evaluate side effects (c43207b/c, c43208b)
-                                                      Save_Scalar_Slot (Ctx, To_String (L64), "i64", 8, SR.Lo_Ptr, SR.Is_Global);
-                                                      Save_Scalar_Slot (Ctx, To_String (H64), "i64", 8, SR.Hi_Ptr, SR.Is_Global);
-                                                      SR.Pir_Type   := To_Unbounded_String ("i64");
-                                                      SR.Align      := 8;
-                                                      SR.Owner_Subp := Ctx.Cur_Subp_Key;
-                                                      Ctx.Saved_Type_Ranges.Include (Tree_Key (Ch), SR);
-                                                      Temp_Rng_Keys.Append (Tree_Key (Ch));
-                                                      -- Check non-null choice range against BASE index subtype even if outer dim is null (c43206a C1)
-                                                      if Ctx.Enable_Checks and then Dim_I <= Base_TI.NDims and then not Is_Void_Tree (Base_TI.Dims (Dim_I).Idx_Type) then
-                                                         Emit_Non_Null_Index_Check (Ctx, To_String (L64), To_String (H64), Base_TI.Dims (Dim_I).Idx_Type);
-                                                      end if;
-                                                      if not Got_R then
-                                                         Firsts (Dim_I) := L64;
-                                                         Lasts (Dim_I)  := H64;
-                                                         Got_R := True;
-                                                      else
-                                                         declare
-                                                            CL : constant String := Next_Reg (Ctx.E, "amn");
-                                                            ML : constant String := Next_Reg (Ctx.E, "alo");
-                                                            CH : constant String := Next_Reg (Ctx.E, "amx");
-                                                            MH : constant String := Next_Reg (Ctx.E, "ahi");
-                                                         begin
-                                                            Emit_Inst (Ctx.E, CL & " = cmp_lt_s.i64 " & To_String (L64) & ", " & To_String (Firsts (Dim_I)));
-                                                            Emit_Inst (Ctx.E, ML & " = select.i64 " & CL & ", " & To_String (L64) & ", " & To_String (Firsts (Dim_I)));
-                                                            Emit_Inst (Ctx.E, CH & " = cmp_gt_s.i64 " & To_String (H64) & ", " & To_String (Lasts (Dim_I)));
-                                                            Emit_Inst (Ctx.E, MH & " = select.i64 " & CH & ", " & To_String (H64) & ", " & To_String (Lasts (Dim_I)));
-                                                            Firsts (Dim_I) := To_Unbounded_String (ML);
-                                                            Lasts (Dim_I)  := To_Unbounded_String (MH);
-                                                         end;
-                                                      end if;
-                                                   end;
-                                                elsif KIND (Ch) = DN_CHOICE_EXP then
-                                                   declare
-                                                      ChE  : constant TREE := D (AS_EXP, Ch);
-                                                      CE   : constant Expr_Val := Emit_Expr (Ctx, ChE);
-                                                      CE_U : constant Boolean := Is_Unsigned_Scalar (CE.Ada_Type, To_String (CE.Pir_Type));
-                                                      C64  : constant String := Emit_Int_Convert (Ctx, To_String (CE.Reg), To_String (CE.Pir_Type), "i64", Is_Unsigned => CE_U);
-                                                      SE   : Saved_Expr_Info;
-                                                   begin
-                                                      if CE.Kind = EK_Scalar then
-                                                         Save_Scalar_Slot (Ctx, To_String (CE.Reg), To_String (CE.Pir_Type), CE.Align, SE.Ptr_Reg, SE.Is_Global);
-                                                         SE.Pir_Type   := CE.Pir_Type;
-                                                         SE.Ada_Type   := CE.Ada_Type;
-                                                         SE.Align      := CE.Align;
-                                                         SE.Owner_Subp := Ctx.Cur_Subp_Key;
-                                                         Ctx.Saved_Expr_Vals.Include (Tree_Key (ChE), SE);
-                                                         Temp_Exp_Keys.Append (Tree_Key (ChE));
-                                                      end if;
-                                                      if Ctx.Enable_Checks and then Dim_I <= Base_TI.NDims and then not Is_Void_Tree (Base_TI.Dims (Dim_I).Idx_Type) then
-                                                         Emit_Range_Check (Ctx, C64, "i64", Base_TI.Dims (Dim_I).Idx_Type);
-                                                      end if;
-                                                      if not Got_R then
-                                                         Firsts (Dim_I) := To_Unbounded_String (C64);
-                                                         Lasts (Dim_I)  := To_Unbounded_String (C64);
-                                                         Got_R := True;
-                                                      else
-                                                         declare
-                                                            CL : constant String := Next_Reg (Ctx.E, "amn");
-                                                            ML : constant String := Next_Reg (Ctx.E, "alo");
-                                                            CH : constant String := Next_Reg (Ctx.E, "amx");
-                                                            MH : constant String := Next_Reg (Ctx.E, "ahi");
-                                                         begin
-                                                            Emit_Inst (Ctx.E, CL & " = cmp_lt_s.i64 " & C64 & ", " & To_String (Firsts (Dim_I)));
-                                                            Emit_Inst (Ctx.E, ML & " = select.i64 " & CL & ", " & C64 & ", " & To_String (Firsts (Dim_I)));
-                                                            Emit_Inst (Ctx.E, CH & " = cmp_gt_s.i64 " & C64 & ", " & To_String (Lasts (Dim_I)));
-                                                            Emit_Inst (Ctx.E, MH & " = select.i64 " & CH & ", " & C64 & ", " & To_String (Lasts (Dim_I)));
-                                                            Firsts (Dim_I) := To_Unbounded_String (ML);
-                                                            Lasts (Dim_I)  := To_Unbounded_String (MH);
-                                                         end;
-                                                      end if;
-                                                   end;
-                                                end if;
-                                             end loop;
-                                          end;
-                                       else
-                                          if Is_Void_Tree (Next_A) then
-                                             Next_A := Item;
-                                          end if;
-                                          Count := Count + 1;
-                                       end if;
-                                    end loop;
-                                    if not Got_R then
-                                       if not Is_Void_Tree (Cur_Agg) and then KIND (Cur_Agg) = DN_STRING_LITERAL then
-                                          declare
-                                             STxt : constant String := Decode_Ada_String_Lit (Sym_Name (Cur_Agg));
-                                          begin
-                                             Count := Integer_64 (STxt'Length);
-                                          end;
-                                       end if;
-                                       declare
-                                          Idx_Lo_R, Idx_Hi_R : Unbounded_String;
-                                          En64 : constant String := Next_Reg (Ctx.E, "ae64");
-                                       begin
-                                          Emit_Index_Bounds (Ctx, TI.Dims (Dim_I).Idx_Type, Idx_Lo_R, Idx_Hi_R);
-                                          Emit_Inst (Ctx.E, En64 & " = add.i64 " & To_String (Idx_Lo_R) & ", " & Img (Long_Long_Integer (Count - 1)));
-                                          if Ctx.Enable_Checks and then Count > 0 then
-                                             declare
-                                                Oob : constant String := Next_Reg (Ctx.E, "agoob");
-                                             begin
-                                                Emit_Inst (Ctx.E, Oob & " = cmp_gt_s.i64 " & En64 & ", " & To_String (Idx_Hi_R));
-                                                Emit_Check_Fail_If (Ctx, Oob);
-                                             end;
-                                          end if;
-                                          Firsts (Dim_I) := Idx_Lo_R;
-                                          Lasts (Dim_I)  := To_Unbounded_String (En64);
-                                       end;
-                                    end if;
-                                    Cur_Agg := Next_A;
-                                    while not Is_Void_Tree (Cur_Agg)
-                                      and then (KIND (Cur_Agg) = DN_PARENTHESIZED or else KIND (Cur_Agg) = DN_QUALIFIED)
-                                    loop
-                                       Cur_Agg := D (AS_EXP, Cur_Agg);
-                                    end loop;
-                                 end;
-                              end loop;
-                           end;
+                           Emit_Agg_Pass1_Bounds (Ctx, Node, TI, Base_TI, ND, Firsts, Lasts, Temp_Rng_Keys, Temp_Exp_Keys);
                         end if;
 
                         declare
@@ -5031,12 +5567,7 @@ package body Cg_Expr is
                            Emit_Inst (Ctx.E, Byt & " = add.i64 " & To_String (Byt_U) & ", 0");
                            Emit_Call_Or_Invoke (Ctx, "@__ada_ss_alloc", Byt & ", " & Img (EAl), "ptr", Buf_U);
                            Emit_Init_Composite (Ctx, To_String (Buf_U), ET, Node, Firsts, Lasts);
-                           for K_Tmp of Temp_Rng_Keys loop
-                              Ctx.Saved_Type_Ranges.Exclude (K_Tmp);
-                           end loop;
-                           for K_Tmp of Temp_Exp_Keys loop
-                              Ctx.Saved_Expr_Vals.Exclude (K_Tmp);
-                           end loop;
+                           Release_Agg_Pass1_Cache (Ctx, Temp_Rng_Keys, Temp_Exp_Keys);
                            Res.Kind       := EK_Slice;
                            Res.Reg        := Buf_U;
                            Res.Pir_Type   := To_Unbounded_String ("ptr");
@@ -5224,11 +5755,17 @@ package body Cg_Expr is
             begin
                if K = DN_SUBTYPE_ALLOCATOR then
                   declare
-                     ST : constant TREE := Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_DESIG_TYPE, Node)));
+                     SI_A           : constant TREE := D (AS_SUBTYPE_INDICATION, Node);
+                     Has_Inline_Con : constant Boolean :=
+                       not Is_Void_Tree (SI_A) and then KIND (SI_A) = DN_SUBTYPE_INDICATION
+                       and then not Is_Void_Tree (D (AS_CONSTRAINT, SI_A));
+                     ST             : constant TREE := Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_DESIG_TYPE, Node)));
                   begin
                      if not Is_Void_Tree (ST) then
                         Alloc_T := ST;
-                        if Ctx.Enable_Checks and then KIND (ST) in DN_CONSTRAINED_ACCESS | DN_CONSTRAINED_RECORD then
+                        if Ctx.Enable_Checks and then Has_Inline_Con
+                          and then KIND (ST) in DN_CONSTRAINED_ACCESS | DN_CONSTRAINED_RECORD
+                        then
                            Emit_Type_Elab_Checks (Ctx, ST);
                         end if;
                      end if;
@@ -5318,14 +5855,9 @@ package body Cg_Expr is
                                     POP (IL, Idx_T);
                                     ND := ND + 1;
                                     declare
-                                       RT, RL, RH : Unbounded_String;
-                                       F64, L64   : Unbounded_String;
-                                       Uns_I      : Boolean;
+                                       F64, L64 : Unbounded_String;
                                     begin
-                                       Emit_Discrete_Range (Ctx, D (SM_RANGE, Resolve_Type_Spec (Idx_T)), RT, RL, RH);
-                                       Uns_I := Is_Unsigned_Scalar (Idx_T, To_String (RT));
-                                       F64 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RL), To_String (RT), "i64", Is_Unsigned => Uns_I));
-                                       L64 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RH), To_String (RT), "i64", Is_Unsigned => Uns_I));
+                                       Emit_Index_Bounds (Ctx, Subst_Tree (Ctx, Idx_T), F64, L64);
                                        -- LRM 4.8(7) & 3.6.1: check non-null index bounds against array index subtype BEFORE allocating/activating!
                                        if Ctx.Enable_Checks and then ND <= BTI.NDims and then not Is_Void_Tree (BTI.Dims (ND).Idx_Type) then
                                           Emit_Non_Null_Index_Check (Ctx, To_String (F64), To_String (L64), BTI.Dims (ND).Idx_Type);
@@ -5379,7 +5911,7 @@ package body Cg_Expr is
                                  Dummy   : Unbounded_String;
                               begin
                                  Ctx.Cur_Master_Reg := Mst_R;
-                                 Emit_Call_Or_Invoke (Ctx, "@__ada_master_mark", To_String (Mst_R), "ptr", Mk_R, Nounwind => True);
+                                 Emit_Call_Or_Invoke (Ctx, "@__ada_master_mark", To_String (Mst_R), "ptr", Mk_R);
                                  Ctx.Handlers.Append ((Handler_Label => To_Unbounded_String (L_Fail),
                                                        Current_Exn   => Null_Unbounded_String,
                                                        In_Handler    => False,
@@ -5413,26 +5945,8 @@ package body Cg_Expr is
                         end;
                      end if;
                      Emit_Call_Or_Invoke (Ctx, "@__ada_alloc", Img (Arr_Desc_Size), "ptr", Desc_Ptr);
-                     for D_Idx in 1 .. Natural'Min (ND, Max_Array_Dims) loop
-                        -- Check non-null bounds belong to Base_Arr's index subtype (c48008c/d, c48009d/e)
-                        if Ctx.Enable_Checks and then D_Idx <= BTI.NDims and then not Is_Void_Tree (BTI.Dims (D_Idx).Idx_Type) then
-                           Emit_Non_Null_Index_Check (Ctx, To_String (Firsts (D_Idx)), To_String (Lasts (D_Idx)), BTI.Dims (D_Idx).Idx_Type);
-                        end if;
-                     end loop;
                      Emit_Store_Arr_Desc (Ctx, To_String (Desc_Ptr), To_String (Data_Ptr), Firsts, Lasts, ND);
-                     -- Check designated subtype bounds if ET is constrained access-to-array (c48007c, c48008c, c48009d/e/h)
-                     if Ctx.Enable_Checks and then not Is_Void_Tree (Des_T) and then KIND (Des_T) = DN_CONSTRAINED_ARRAY then
-                        declare
-                           DesTI  : constant Type_Info := Get_Type_Info (Ctx, Des_T);
-                           DF, DL : Str_Array_4;
-                           ND_D   : constant Natural := Natural'Min (ND, DesTI.NDims);
-                        begin
-                           for D_Idx in 1 .. ND_D loop
-                              Emit_Index_Bounds (Ctx, DesTI.Dims (D_Idx).Idx_Type, DF (D_Idx), DL (D_Idx));
-                           end loop;
-                           Emit_Exact_Bounds_Check (Ctx, Firsts, Lasts, DF, DL, ND_D);
-                        end;
-                     else
+                     if Is_Void_Tree (Des_T) or else KIND (Des_T) /= DN_CONSTRAINED_ARRAY then
                         Emit_Discriminant_Check (Ctx, To_String (Desc_Ptr), ET, Is_Access => True);
                      end if;
                      Res.Kind     := EK_Scalar;
@@ -5512,7 +6026,7 @@ package body Cg_Expr is
                         then
                            Emit_Acc_Alloc (AlB, Ptr_R);
                            Ctx.Cur_Master_Reg := Mst_R;
-                           Emit_Call_Or_Invoke (Ctx, "@__ada_master_mark", To_String (Mst_R), "ptr", Mk_R, Nounwind => True);
+                           Emit_Call_Or_Invoke (Ctx, "@__ada_master_mark", To_String (Mst_R), "ptr", Mk_R);
                            Ctx.Handlers.Append ((Handler_Label => To_Unbounded_String (L_Fail),
                                                  Current_Exn   => Null_Unbounded_String,
                                                  In_Handler    => False,
@@ -5639,38 +6153,75 @@ package body Cg_Expr is
                         end if;
                      end;
                   else
-                     Emit_Acc_Alloc (Img (Natural'Max (1, DTI.Byte_Size)), Ptr_R);
-                     -- Subtype allocator (`new T`): initialize ALL non-task components first, THEN
-                     -- activate newly created tasks; if init raises, abort unactivated tasks (LRM 9.3(4-5))!
+                     -- Subtype allocator (`new T`): initialize & check constraints BEFORE charging storage pool (P5-2 #5d),
+                     -- then activate newly created tasks; if init/alloc raises, abort unactivated tasks (LRM 9.3(4-5))!
                      if Is_Task_Type (Alloc_T) then
                         declare
                            Saved_M : constant Unbounded_String := Ctx.Cur_Master_Reg;
-                           TH : Unbounded_String;
-                        begin
-                           Ctx.Cur_Master_Reg := Resolve_Alloc_Master;
-                           TH := To_Unbounded_String (Emit_Create_Task_Handle (Ctx, Alloc_T, Activate_Now => True));
-                           Ctx.Cur_Master_Reg := Saved_M;
-                           Emit_Inst (Ctx.E, "store.ptr " & To_String (TH) & ", " & To_String (Ptr_R) & ", align 8");
-                        end;
-                     else
-                        declare
-                           Saved_M : constant Unbounded_String := Ctx.Cur_Master_Reg;
-                           Mst_R  : constant Unbounded_String := Resolve_Alloc_Master;
-                           Mk_R   : Unbounded_String;
-                           L_Fail : constant String := Next_Label (Ctx.E, "alcf");
-                           L_Done : constant String := Next_Label (Ctx.E, "alcd");
-                           Ex_R   : constant String := Next_Reg (Ctx.E, "alce");
-                           Dummy  : Unbounded_String;
+                           Mst_R   : constant Unbounded_String := Resolve_Alloc_Master;
+                           Mk_R    : Unbounded_String;
+                           TH      : Unbounded_String;
+                           L_Fail  : constant String := Next_Label (Ctx.E, "talcf");
+                           L_Done  : constant String := Next_Label (Ctx.E, "talcd");
+                           Ex_R    : constant String := Next_Reg (Ctx.E, "talce");
+                           Dummy   : Unbounded_String;
                         begin
                            Ctx.Cur_Master_Reg := Mst_R;
-                           Emit_Call_Or_Invoke (Ctx, "@__ada_master_mark", To_String (Mst_R), "ptr", Mk_R, Nounwind => True);
+                           Emit_Call_Or_Invoke (Ctx, "@__ada_master_mark", To_String (Mst_R), "ptr", Mk_R);
                            Ctx.Handlers.Append ((Handler_Label => To_Unbounded_String (L_Fail),
                                                  Current_Exn   => Null_Unbounded_String,
                                                  In_Handler    => False,
                                                  SS_Mark       => Null_Unbounded_String,
                                                  SP_Mark       => Null_Unbounded_String));
-                           Emit_Default_Init (Ctx, To_String (Ptr_R), Alloc_T, Activate_Tasks => False);
-                           Emit_Discriminant_Check (Ctx, To_String (Ptr_R), ET, Is_Access => True);
+                           TH := To_Unbounded_String (Emit_Create_Task_Handle (Ctx, Alloc_T, Activate_Now => False));
+                           Emit_Acc_Alloc (Img (Natural'Max (1, DTI.Byte_Size)), Ptr_R);
+                           Emit_Inst (Ctx.E, "store.ptr " & To_String (TH) & ", " & To_String (Ptr_R) & ", align 8");
+                           Ctx.Handlers.Delete_Last;
+                           Ctx.Cur_Master_Reg := Saved_M;
+                           Emit_Call_Or_Invoke (Ctx, "@__ada_master_activate_since",
+                             To_String (Mst_R) & ", " & To_String (Mk_R), "", Dummy);
+                           Emit_Term (Ctx.E, "jmp " & L_Done);
+                           Emit_Label (Ctx.E, L_Fail, Ex_R & ": ptr");
+                           Emit_Call_Or_Invoke (Ctx, "@__ada_master_abort_since",
+                             To_String (Mst_R) & ", " & To_String (Mk_R), "", Dummy, Nounwind => True);
+                           Emit_Raise_Reg (Ctx, Ex_R);
+                           Emit_Label (Ctx.E, L_Done);
+                        end;
+                     else
+                        declare
+                           Saved_M : constant Unbounded_String := Ctx.Cur_Master_Reg;
+                           Mst_R   : constant Unbounded_String := Resolve_Alloc_Master;
+                           Mk_R    : Unbounded_String;
+                           Sz_S    : constant Natural := Natural'Max (1, DTI.Byte_Size);
+                           Al_S    : constant Natural := Natural'Max (1, DTI.Align);
+                           Use_Tmp : constant Boolean := DTI.Kind = TK_Record and then Sz_S <= 65_536;
+                           Tmp_S   : constant String := Next_Reg (Ctx.E, "salct");
+                           Init_P  : Unbounded_String;
+                           L_Fail  : constant String := Next_Label (Ctx.E, "alcf");
+                           L_Done  : constant String := Next_Label (Ctx.E, "alcd");
+                           Ex_R    : constant String := Next_Reg (Ctx.E, "alce");
+                           Dummy   : Unbounded_String;
+                        begin
+                           if Use_Tmp then
+                              Emit_Entry_Alloca (Ctx.E, Tmp_S & " = alloca [" & Img (Sz_S) & " x i8], align " & Img (Al_S));
+                              Init_P := To_Unbounded_String (Tmp_S);
+                           else
+                              Emit_Acc_Alloc (Img (Sz_S), Ptr_R);
+                              Init_P := Ptr_R;
+                           end if;
+                           Ctx.Cur_Master_Reg := Mst_R;
+                           Emit_Call_Or_Invoke (Ctx, "@__ada_master_mark", To_String (Mst_R), "ptr", Mk_R);
+                           Ctx.Handlers.Append ((Handler_Label => To_Unbounded_String (L_Fail),
+                                                 Current_Exn   => Null_Unbounded_String,
+                                                 In_Handler    => False,
+                                                 SS_Mark       => Null_Unbounded_String,
+                                                 SP_Mark       => Null_Unbounded_String));
+                           Emit_Default_Init (Ctx, To_String (Init_P), Alloc_T, Activate_Tasks => False);
+                           Emit_Discriminant_Check (Ctx, To_String (Init_P), ET, Is_Access => True);
+                           if Use_Tmp then
+                              Emit_Acc_Alloc (Img (Sz_S), Ptr_R);
+                              Emit_Inst (Ctx.E, "memcpy " & To_String (Ptr_R) & ", " & Tmp_S & ", " & Img (Sz_S) & ", align " & Img (Al_S));
+                           end if;
                            Ctx.Handlers.Delete_Last;
                            Ctx.Cur_Master_Reg := Saved_M;
                            Emit_Call_Or_Invoke (Ctx, "@__ada_master_activate_since",
@@ -5764,6 +6315,7 @@ package body Cg_Expr is
             MaxB : constant Long_Long_Integer :=
               (if UnsD and then Dst_Pir = "i8" then 255
                elsif UnsD and then Dst_Pir = "i16" then 65535
+               elsif UnsD and then Dst_Pir = "i32" then 4294967295
                elsif Dst_Pir = "i8" then 127 elsif Dst_Pir = "i16" then 32767
                elsif Dst_Pir = "i32" then 2147483647 else Long_Long_Integer'Last);
          begin
@@ -5929,7 +6481,7 @@ package body Cg_Expr is
                   Emit_Range_Check (Ctx, W64, "i64", DT);
                   return Emit_Int_Convert (Ctx, W64, "i64", Dst_Pir);
                end;
-            elsif SBits > DBits and then DBits > 0
+            elsif Src_Pir /= "ptr" and then SBits > DBits and then DBits > 0
               and then (Is_Discrete_Type (DT) or else Is_Fixed_Type (DT))
             then
                Emit_Range_Check (Ctx, Val_Reg, Src_Pir, DT);
@@ -5997,13 +6549,14 @@ package body Cg_Expr is
                                     DT  : constant TREE := Subst_Tree (Ctx, D (SM_OBJ_TYPE, DID));
                                     DTI : constant Type_Info := Get_Type_Info (Ctx, DT);
                                     EV  : constant Expr_Val := Emit_Expr (Ctx, CItem, DT);
-                                    VR  : constant String := Emit_Scalar_Coerce (Ctx, To_String (EV.Reg), To_String (EV.Pir_Type), To_String (DTI.Pir_Type));
+                                    VR  : constant String :=
+                                      Emit_Typed_Scalar_Convert (Ctx, To_String (EV.Reg), EV.Ada_Type, To_String (EV.Pir_Type),
+                                        DT, To_String (DTI.Pir_Type), Check_Range => True);
                                     DK  : constant Unsigned_32 := Tree_Key (Canonical_Def (DID));
                                     DV  : Var_Info;
                                     SP  : Unbounded_String;
                                     SG  : Boolean;
                                  begin
-                                    Emit_Range_Check (Ctx, VR, To_String (DTI.Pir_Type), DT);
                                     if D_Idx <= 8 and then Save_Allowed then
                                        Save_Scalar_Slot (Ctx, VR, To_String (DTI.Pir_Type), DTI.Align, SP, SG);
                                        SD.Count := D_Idx;
@@ -6288,36 +6841,32 @@ package body Cg_Expr is
                  and then not Is_Void_Tree (Rng) and then KIND (Rng) = DN_RANGE_ATTRIBUTE
                then
                   declare
-                     PTI  : constant Type_Info := Get_Type_Info (Ctx, Parent_T);
-                     PT   : constant String := To_String (PTI.Pir_Type);
                      RT_U, Lo_U, Hi_U : Unbounded_String;
-                     NE   : constant String := Next_Reg (Ctx.E, "trne");
-                     L_C  : constant String := Next_Label (Ctx.E, "trc");
-                     L_O  : constant String := Next_Label (Ctx.E, "tro");
+                     NE  : constant String := Next_Reg (Ctx.E, "trne");
+                     L_C : constant String := Next_Label (Ctx.E, "trc");
+                     L_O : constant String := Next_Label (Ctx.E, "tro");
                   begin
                      Emit_Discrete_Range (Ctx, Rng, RT_U, Lo_U, Hi_U);
+                     -- Check bounds in canonical signed i64 BEFORE narrowing so out-of-range bounds never wrap
                      declare
-                        R1 : constant String := Emit_Int_Convert (Ctx, To_String (Lo_U), To_String (RT_U), PT,
-                          Is_Unsigned => Is_Unsigned_Scalar (Parent_T, To_String (RT_U)));
-                        R2 : constant String := Emit_Int_Convert (Ctx, To_String (Hi_U), To_String (RT_U), PT,
-                          Is_Unsigned => Is_Unsigned_Scalar (Parent_T, To_String (RT_U)));
-                        Le_Op : constant String := (if Is_Unsigned_Scalar (Parent_T, PT) then "cmp_le_u." else "cmp_le_s.");
+                        L64 : constant String := Emit_Widen_To_I64 (Ctx, To_String (Lo_U), To_String (RT_U), Parent_T);
+                        H64 : constant String := Emit_Widen_To_I64 (Ctx, To_String (Hi_U), To_String (RT_U), Parent_T);
                      begin
-                        Emit_Inst (Ctx.E, NE & " = " & Le_Op & PT & " " & R1 & ", " & R2);
+                        Emit_Inst (Ctx.E, NE & " = cmp_le_s.i64 " & L64 & ", " & H64);
                         Emit_Term (Ctx.E, "br " & NE & ", " & L_C & ", " & L_O);
                         Emit_Label (Ctx.E, L_C);
-                        Emit_Range_Check (Ctx, R1, PT, Parent_T);
-                        Emit_Range_Check (Ctx, R2, PT, Parent_T);
+                        Emit_Range_Check (Ctx, L64, "i64", Parent_T);
+                        Emit_Range_Check (Ctx, H64, "i64", Parent_T);
                         Emit_Term (Ctx.E, "jmp " & L_O);
                         Emit_Label (Ctx.E, L_O);
                         if Save_Allowed then
                            declare
                               SR : Saved_Range_Info;
                            begin
-                              Save_Scalar_Slot (Ctx, R1, PT, Natural'Max (1, PTI.Align), SR.Lo_Ptr, SR.Is_Global);
-                              Save_Scalar_Slot (Ctx, R2, PT, Natural'Max (1, PTI.Align), SR.Hi_Ptr, SR.Is_Global);
-                              SR.Pir_Type   := PTI.Pir_Type;
-                              SR.Align      := Natural'Max (1, PTI.Align);
+                              Save_Scalar_Slot (Ctx, L64, "i64", 8, SR.Lo_Ptr, SR.Is_Global);
+                              Save_Scalar_Slot (Ctx, H64, "i64", 8, SR.Hi_Ptr, SR.Is_Global);
+                              SR.Pir_Type   := To_Unbounded_String ("i64");
+                              SR.Align      := 8;
                               SR.Owner_Subp := Ctx.Cur_Subp_Key;
                               Ctx.Saved_Type_Ranges.Include (Tree_Key (R), SR);
                            end;
@@ -6334,6 +6883,8 @@ package body Cg_Expr is
                      E1  : constant Expr_Val := Emit_Expr (Ctx, D (AS_EXP1, Rng), Parent_T);
                      E2  : constant Expr_Val := Emit_Expr (Ctx, D (AS_EXP2, Rng), Parent_T);
                      PT  : constant String := To_String (PTI.Pir_Type);
+                     Save_PT : Unbounded_String := PTI.Pir_Type;
+                     Save_Al : Natural := PTI.Align;
                      R1  : Unbounded_String;
                      R2  : Unbounded_String;
                      NE  : constant String := Next_Reg (Ctx.E, "tsne");
@@ -6392,38 +6943,46 @@ package body Cg_Expr is
                               R2 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (E2.Reg), To_String (E2.Pir_Type), PT));
                            end if;
                         end;
+                     elsif KIND (R) in DN_INTEGER | DN_ENUMERATION then
+                        -- Check discrete bounds in canonical signed i64 so out-of-range bounds never wrap!
+                        R1      := To_Unbounded_String (Emit_Widen_To_I64 (Ctx, To_String (E1.Reg), To_String (E1.Pir_Type), E1.Ada_Type));
+                        R2      := To_Unbounded_String (Emit_Widen_To_I64 (Ctx, To_String (E2.Reg), To_String (E2.Pir_Type), E2.Ada_Type));
+                        Save_PT := To_Unbounded_String ("i64");
+                        Save_Al := 8;
                      else
                         R1 := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, To_String (E1.Reg), To_String (E1.Pir_Type), PT,
                                 Is_Unsigned => Is_Unsigned_Scalar (E1.Ada_Type, To_String (E1.Pir_Type))));
                         R2 := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, To_String (E2.Reg), To_String (E2.Pir_Type), PT,
                                 Is_Unsigned => Is_Unsigned_Scalar (E2.Ada_Type, To_String (E2.Pir_Type))));
                      end if;
-                     if PT = "f32" or else PT = "f64" then
-                        Emit_Inst (Ctx.E, NE & " = fcmp_ole." & PT & " " & To_String (R1) & ", " & To_String (R2));
-                     elsif Is_Unsigned_Scalar (Parent_T, PT) then
-                        Emit_Inst (Ctx.E, NE & " = cmp_le_u." & PT & " " & To_String (R1) & ", " & To_String (R2));
-                     else
-                        Emit_Inst (Ctx.E, NE & " = cmp_le_s." & PT & " " & To_String (R1) & ", " & To_String (R2));
-                     end if;
-                     Emit_Term (Ctx.E, "br " & NE & ", " & L_C & ", " & L_O);
-                     Emit_Label (Ctx.E, L_C);
-                     Emit_Range_Check (Ctx, To_String (R1), PT, Parent_T);
-                     Emit_Range_Check (Ctx, To_String (R2), PT, Parent_T);
-                     Emit_Term (Ctx.E, "jmp " & L_O);
-                     Emit_Label (Ctx.E, L_O);
-                     -- Save pre-evaluated bounds so subsequent range checks do NOT re-evaluate side effects (c32001a, c32107a)
-                     if Save_Allowed then
-                        declare
-                           SR : Saved_Range_Info;
-                        begin
-                           Save_Scalar_Slot (Ctx, To_String (R1), PT, PTI.Align, SR.Lo_Ptr, SR.Is_Global);
-                           Save_Scalar_Slot (Ctx, To_String (R2), PT, PTI.Align, SR.Hi_Ptr, SR.Is_Global);
-                           SR.Pir_Type   := PTI.Pir_Type;
-                           SR.Align      := PTI.Align;
-                           SR.Owner_Subp := Ctx.Cur_Subp_Key;
-                           Ctx.Saved_Type_Ranges.Include (Tree_Key (R), SR);
-                        end;
-                     end if;
+                     declare
+                        Cmp_PT : constant String := To_String (Save_PT);
+                     begin
+                        if Cmp_PT = "f32" or else Cmp_PT = "f64" then
+                           Emit_Inst (Ctx.E, NE & " = fcmp_ole." & Cmp_PT & " " & To_String (R1) & ", " & To_String (R2));
+                        else
+                           Emit_Inst (Ctx.E, NE & " = cmp_le_s." & Cmp_PT & " " & To_String (R1) & ", " & To_String (R2));
+                        end if;
+                        Emit_Term (Ctx.E, "br " & NE & ", " & L_C & ", " & L_O);
+                        Emit_Label (Ctx.E, L_C);
+                        Emit_Range_Check (Ctx, To_String (R1), Cmp_PT, Parent_T);
+                        Emit_Range_Check (Ctx, To_String (R2), Cmp_PT, Parent_T);
+                        Emit_Term (Ctx.E, "jmp " & L_O);
+                        Emit_Label (Ctx.E, L_O);
+                        -- Save pre-evaluated bounds so subsequent range checks do NOT re-evaluate side effects (c32001a, c32107a)
+                        if Save_Allowed then
+                           declare
+                              SR : Saved_Range_Info;
+                           begin
+                              Save_Scalar_Slot (Ctx, To_String (R1), Cmp_PT, Save_Al, SR.Lo_Ptr, SR.Is_Global);
+                              Save_Scalar_Slot (Ctx, To_String (R2), Cmp_PT, Save_Al, SR.Hi_Ptr, SR.Is_Global);
+                              SR.Pir_Type   := Save_PT;
+                              SR.Align      := Save_Al;
+                              SR.Owner_Subp := Ctx.Cur_Subp_Key;
+                              Ctx.Saved_Type_Ranges.Include (Tree_Key (R), SR);
+                           end;
+                        end if;
+                     end;
                   end;
                end if;
                end;
@@ -6699,8 +7258,13 @@ package body Cg_Expr is
                   begin
                      if not Is_Void_Tree (Def) and then KIND (Def) in DN_CONSTANT_ID | DN_IN_ID then
                         return True;
+                     elsif not Is_Void_Tree (Def) and then KIND (Def) = DN_VARIABLE_ID
+                       and then not Is_Void_Tree (D (SM_RENAMES_OBJ, Def))
+                     then
+                        Cur := D (SM_RENAMES_OBJ, Def);
+                     else
+                        return False;
                      end if;
-                     return False;
                   end;
                when others =>
                   return False;
@@ -6755,11 +7319,36 @@ package body Cg_Expr is
                      elsif VI.Con_Captured_Slot > 0 and then VI.Owner_Subp /= 0 and then VI.Owner_Subp /= Ctx.Cur_Subp_Key then
                         declare
                            FP : constant String := Emit_Captured_Slot_Ptr (Ctx, VI.Owner_Subp, VI.Con_Captured_Slot);
-                           CP : constant String := Next_Reg (Ctx.E, "ccp");
-                           CV : constant String := Next_Reg (Ctx.E, "ccv");
                         begin
-                           Emit_Inst (Ctx.E, CP & " = load.ptr " & FP & ", align 8");
-                           Emit_Inst (Ctx.E, CV & " = load.i8 " & CP & ", align 1");
+                           if FP /= "0" then
+                              declare
+                                 CP : constant String := Next_Reg (Ctx.E, "ccp");
+                                 CV : constant String := Next_Reg (Ctx.E, "ccv");
+                              begin
+                                 Emit_Inst (Ctx.E, CP & " = load.ptr " & FP & ", align 8");
+                                 Emit_Inst (Ctx.E, CV & " = load.i8 " & CP & ", align 1");
+                                 return CV;
+                              end;
+                           end if;
+                        end;
+                     end if;
+                  end;
+               elsif not Is_Void_Tree (Def) and then KIND (Def) = DN_VARIABLE_ID
+                 and then not Is_Void_Tree (D (SM_RENAMES_OBJ, Def))
+                 and then Is_Library_Level (Def)
+               then
+                  declare
+                     TS_R : constant TREE := Resolve_Type_Spec (Subst_Tree (Ctx, D (SM_OBJ_TYPE, Def)));
+                  begin
+                     if Get_Type_Info (Ctx, TS_R).Kind = TK_Record then
+                        declare
+                           CSym : constant String := "@ada_rnc__" & Qualified_Ada_Name (Def);
+                           CA   : constant String := Next_Reg (Ctx.E, "erca");
+                           CV   : constant String := Next_Reg (Ctx.E, "ercv");
+                        begin
+                           Add_Global_Decl (Ctx.E, CSym, "extern " & CSym & " = global i8, align 1");
+                           Emit_Inst (Ctx.E, CA & " = addr " & CSym);
+                           Emit_Inst (Ctx.E, CV & " = load.i8 " & CA & ", align 1");
                            return CV;
                         end;
                      end if;

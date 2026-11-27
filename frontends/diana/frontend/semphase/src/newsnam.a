@@ -2,6 +2,7 @@ with TEXT2_IO; use TEXT2_IO; -- for debug
 with VISUTIL; use VISUTIL; -- for debug (node_rep)
 with DIANA, DIANATTR, DIANAMAN; use DIANA, DIANATTR, DIANAMAN;
 with DEFUTIL; use DEFUTIL;
+with MAKENOD; use MAKENOD;
 with NODWALK; use NODWALK;
 
 package body NEWSNAM is
@@ -165,6 +166,26 @@ package body NEWSNAM is
 		    -- make a def for the new source name
 		    DEF := MAKE_DEF_FOR_ID(SOURCE_NAME, H);
 		    MAKE_DEF_VISIBLE(DEF, HEADER);
+		else
+		    -- Character literal or enum literal without prior DEF header:
+		    -- synthesize DN_FUNCTION_SPEC so literal is visible in instantiated type!
+		    declare
+			OT: constant TREE := D(SM_OBJ_TYPE, SOURCE_NAME);
+			TN: TREE := CONST_VOID;
+		    begin
+			if OT /= CONST_VOID and then KIND(OT) = DN_ENUMERATION then
+			    TN := D(XD_SOURCE_NAME, OT);
+			end if;
+			if TN /= CONST_VOID then
+			    HEADER := MAKE_FUNCTION_SPEC
+				    ( AS_NAME => MAKE_USED_NAME_ID
+					    ( LX_SYMREP => CONST_VOID
+					    , SM_DEFN => TN )
+				    , AS_PARAM_S => MAKE_PARAM_S (LIST => MAKE) );
+			    DEF := MAKE_DEF_FOR_ID(SOURCE_NAME, H);
+			    MAKE_DEF_VISIBLE(DEF, HEADER);
+			end if;
+		    end;
 		end if;
 	    end;
 

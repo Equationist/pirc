@@ -577,8 +577,23 @@ package body FIXWITH is
 			D(LX_SYMREP, NE_ID, STORESYM(PRINTNAME(D(LX_SYMREP, NE_ID))));
 		    end if;
 		    if KIND(D(LX_SYMREP, NE_ID)) = DN_SYMBOL_REP then
-			NE_DEF := MAKE_DEF_FOR_ID(NE_ID, REGION_DEF, IN_SPEC);
-			MAKE_DEF_VISIBLE(NE_DEF, D(SM_SPEC, NE_ID));
+			declare
+			    NE_LIST: SEQ_TYPE := LIST(D(LX_SYMREP, NE_ID));
+			    NE_IT: TREE;
+			    HAS_NE_DEF: BOOLEAN := FALSE;
+			begin
+			    while not IS_EMPTY(NE_LIST) loop
+				POP(NE_LIST, NE_IT);
+				if D(XD_SOURCE_NAME, NE_IT) = NE_ID then
+				    HAS_NE_DEF := TRUE;
+				    exit;
+				end if;
+			    end loop;
+			    if not HAS_NE_DEF then
+				NE_DEF := MAKE_DEF_FOR_ID(NE_ID, REGION_DEF, IN_SPEC);
+				MAKE_DEF_VISIBLE(NE_DEF, D(SM_SPEC, NE_ID));
+			    end if;
+			end;
 		    end if;
 		end;
 	    end if;
