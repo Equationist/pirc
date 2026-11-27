@@ -67,8 +67,17 @@ static PirTypeLayout pir_type_layout_rec(const PirModule *mod, const PirTargetSp
         }
         case PIR_TYPE_NAMED_AGG: {
             uint32_t aid = ty.u.agg_id;
-            if (cache && done && aid < mod->agg_types.len && done[aid]) {
-                return cache[aid];
+            if (aid >= mod->agg_types.len) {
+                res.overflow = true;
+                return res;
+            }
+            if (cache && done) {
+                if (done[aid] == 1u) return cache[aid];
+                if (done[aid] == 2u) {
+                    res.overflow = true;
+                    return res;
+                }
+                done[aid] = 2u; /* visiting */
             }
             const PirAggDef *agg = &mod->agg_types.data[aid];
             switch (agg->kind) {
@@ -384,21 +393,6 @@ static void encode_u64_bytes(uint8_t *buf, uint64_t val, uint32_t sz, bool be) {
     }
 }
 
-static uint64_t gitem_vec_bytes_since(const GItemVec *v, uint32_t start, uint8_t ptr_bytes) {
-    uint64_t total = 0u;
-    for (uint32_t i = start; i < v->len; ++i) {
-        const PirGlobalItem *gi = &v->data[i];
-        switch (gi->kind) {
-            case PIR_GITEM_BYTES: total += gi->len; break;
-            case PIR_GITEM_ZERO:  total += gi->len ? gi->len : 1u; break;
-            case PIR_GITEM_INT:   total += 1u; break;
-            case PIR_GITEM_FLOAT: total += 8u; break;
-            case PIR_GITEM_RELOC: total += ptr_bytes; break;
-        }
-    }
-    return total;
-}
-
 static bool pir_agg_is_pad_only_rec(const PirModule *mod, PirType ty, int8_t *cache, uint32_t depth) {
     if (depth > 256u || !mod || ty.kind != PIR_TYPE_NAMED_AGG || ty.u.agg_id >= mod->agg_types.len) {
         return false;
@@ -446,197 +440,295 @@ bool pir_agg_is_pad_only(const PirModule *mod, PirType ty) {
     return r;
 }
 
-static bool is_pad_only_type(const PirModule *mod, PirType ty, int8_t *cache) {
-    return pir_agg_is_pad_only_cached(mod, ty, cache);
-}
-
-static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirType ty,
-                               const PirGlobalItem *src, uint32_t src_cnt, uint32_t *idx,
-                               GItemVec *out, int8_t *pad_cache, uint32_t depth) {
-    PirTypeLayout ly = pir_type_layout(mod, target, ty);
-    if (ly.size == 0u) return;
+static void pir_agg_init_walk_rec(const PirModule *mod, const PirTargetSpec *target,
+                                  PirType ty, const PirGlobalItem *items, uint32_t item_count,
+                                  uint32_t *idx, int8_t *pad_cache,
+                                  const PirAggInitVisitor *vis, void *ctx, uint32_t depth) {
+    PirTypeLayout ly = { 0u, 1u, 0u, false };
+    if (vis->emit_implicit_zeros && target) {
+        ly = pir_type_layout(mod, target, ty);
+        if (ly.size == 0u) return;
+    }
+    if (depth > 256u) {
+        if (vis->on_depth_exceeded) vis->on_depth_exceeded(ctx);
+        if (vis->emit_implicit_zeros && vis->on_gap) vis->on_gap(ly.size, ctx);
+        return;
+    }
     /* Padding / pad-only fields never consume any initializer items (not even zeroinit). */
-    if (is_pad_only_type(mod, ty, pad_cache)) {
-        emit_zero_gitem(out, ly.size);
+    if (pir_agg_is_pad_only_cached(mod, ty, pad_cache)) {
+        if (vis->emit_implicit_zeros && vis->on_gap) vis->on_gap(ly.size, ctx);
         return;
     }
-    if (*idx >= src_cnt) {
-        emit_zero_gitem(out, ly.size);
+    if (*idx >= item_count) {
+        if (vis->emit_implicit_zeros && vis->on_gap) vis->on_gap(ly.size, ctx);
         return;
     }
-    if (src[*idx].kind == PIR_GITEM_ZERO) {
-        const PirGlobalItem *zi = &src[*idx];
-        bool consume_whole = (ty.kind == PIR_TYPE_SCALAR) ||
-                             (zi->len != 0u && zi->len >= ly.size) ||
-                             (zi->len == 0u && !(depth == 0u && src_cnt > 1u));
+    if (items[*idx].kind == PIR_GITEM_ZERO) {
+        const PirGlobalItem *zi = &items[*idx];
+        bool consume_whole = (ty.kind == PIR_TYPE_SCALAR);
+        if (zi->len != 0u && target && !vis->emit_implicit_zeros) {
+            ly = pir_type_layout(mod, target, ty);
+        }
+        if (!consume_whole) {
+            if (zi->len != 0u) {
+                if (target) {
+                    consume_whole = (ly.overflow || zi->len >= ly.size);
+                } else {
+                    consume_whole = (depth > 0u || item_count == 1u);
+                }
+            } else {
+                consume_whole = !(depth == 0u && item_count > 1u);
+            }
+        }
         if (consume_whole) {
             (*idx)++;
-            emit_zero_gitem(out, ly.size);
+            if (vis->on_zero) vis->on_zero(ty, zi, ly.size, ctx);
             return;
         }
     }
     if (ty.kind == PIR_TYPE_SCALAR) {
-        const PirGlobalItem *it = &src[(*idx)++];
-        if (it->kind == PIR_GITEM_ZERO) {
-            emit_zero_gitem(out, ly.size);
-        } else if (it->kind == PIR_GITEM_RELOC) {
-            PIR_VEC_PUSH(out, *it);
-        } else if (it->kind == PIR_GITEM_BYTES) {
-            uint64_t copy_n = (it->len < ly.size) ? it->len : ly.size;
-            emit_bytes_gitem(mod, out, it->bytes, copy_n);
-            if (copy_n < ly.size) emit_zero_gitem(out, ly.size - copy_n);
-        } else if (it->kind == PIR_GITEM_FLOAT) {
-            if (ty.u.scalar == PIR_SCALAR_F32) {
-                uint32_t fb = 0u;
-                if (it->has_f32_bits) {
-                    fb = it->float32_bits;
-                } else {
-                    double dv = 0.0;
-                    memcpy(&dv, &it->float_bits, 8u);
-                    float fv = (float)dv;
-                    memcpy(&fb, &fv, 4u);
-                }
-                uint8_t buf[4];
-                encode_u64_bytes(buf, (uint64_t)fb, 4u, target->is_big_endian);
-                emit_bytes_gitem(mod, out, buf, 4u);
-            } else {
-                uint8_t buf[8];
-                encode_u64_bytes(buf, it->float_bits, 8u, target->is_big_endian);
-                emit_bytes_gitem(mod, out, buf, 8u);
-            }
-        } else if (it->kind == PIR_GITEM_INT) {
-            uint64_t lo = it->int_lo;
-            uint64_t hi = it->int_hi;
-            if (it->int_neg) {
-                uint64_t nlo = ~lo + 1u;
-                uint64_t cy  = (nlo == 0u) ? 1u : 0u;
-                lo = nlo;
-                hi = ~hi + cy;
-            }
-            if (ty.u.scalar == PIR_SCALAR_I128) {
-                uint8_t buf[16];
-                if (target->is_big_endian) {
-                    encode_u64_bytes(buf, hi, 8u, true);
-                    encode_u64_bytes(buf + 8, lo, 8u, true);
-                } else {
-                    encode_u64_bytes(buf, lo, 8u, false);
-                    encode_u64_bytes(buf + 8, hi, 8u, false);
-                }
-                emit_bytes_gitem(mod, out, buf, 16u);
-            } else if (ty.u.scalar == PIR_SCALAR_F32) {
-                float fv = it->int_neg ? -(float)it->int_lo : (float)it->int_lo;
-                uint32_t fb = 0u;
-                memcpy(&fb, &fv, 4u);
-                uint8_t buf[4];
-                encode_u64_bytes(buf, (uint64_t)fb, 4u, target->is_big_endian);
-                emit_bytes_gitem(mod, out, buf, 4u);
-            } else if (ty.u.scalar == PIR_SCALAR_F64) {
-                double dv = it->int_neg ? -(double)it->int_lo : (double)it->int_lo;
-                uint64_t db = 0u;
-                memcpy(&db, &dv, 8u);
-                uint8_t buf[8];
-                encode_u64_bytes(buf, db, 8u, target->is_big_endian);
-                emit_bytes_gitem(mod, out, buf, 8u);
-            } else if (ly.size <= 8u) {
-                uint8_t buf[8];
-                encode_u64_bytes(buf, lo, (uint32_t)ly.size, target->is_big_endian);
-                emit_bytes_gitem(mod, out, buf, ly.size);
-            } else {
-                emit_zero_gitem(out, ly.size);
-            }
-        }
+        const PirGlobalItem *it = &items[(*idx)++];
+        if (vis->on_scalar) vis->on_scalar(ty.u.scalar, it, ly.size, ctx);
         return;
     }
     if (ty.kind == PIR_TYPE_VECTOR) {
         PirType ety = pir_type_scalar(pir_vec_elem_scalar(ty.u.vec));
         uint32_t lanes = pir_vec_lanes(ty.u.vec);
         for (uint32_t l = 0u; l < lanes; ++l) {
-            flatten_agg_global(mod, target, ety, src, src_cnt, idx, out, pad_cache, depth + 1u);
+            if (!vis->emit_implicit_zeros && *idx >= item_count) break;
+            pir_agg_init_walk_rec(mod, target, ety, items, item_count, idx, pad_cache, vis, ctx, depth + 1u);
         }
         return;
     }
-    const PirAggDef *agg = &mod->agg_types.data[ty.u.agg_id];
-    switch (agg->kind) {
+    if (ty.u.agg_id >= mod->agg_types.len) return;
+    const PirAggDef *ad = &mod->agg_types.data[ty.u.agg_id];
+    switch (ad->kind) {
         case PIR_AGG_PAD:
-            emit_zero_gitem(out, ly.size);
+            if (vis->emit_implicit_zeros && vis->on_gap) vis->on_gap(ly.size, ctx);
             break;
         case PIR_AGG_ARRAY:
-            if (is_pad_only_type(mod, agg->elem_type, pad_cache)) {
-                emit_zero_gitem(out, ly.size);
-            } else if (*idx < src_cnt && src[*idx].kind == PIR_GITEM_BYTES &&
-                agg->elem_type.kind == PIR_TYPE_SCALAR &&
-                agg->elem_type.u.scalar == PIR_SCALAR_I8) {
-                const PirGlobalItem *bi = &src[(*idx)++];
-                uint64_t cap_n = (agg->array_len < ly.size) ? agg->array_len : ly.size;
-                uint64_t cn = (bi->len < cap_n) ? bi->len : cap_n;
-                emit_bytes_gitem(mod, out, bi->bytes, cn);
-                if (cn < ly.size) emit_zero_gitem(out, ly.size - cn);
+            if (pir_agg_is_pad_only_cached(mod, ad->elem_type, pad_cache)) {
+                if (vis->emit_implicit_zeros && vis->on_gap) vis->on_gap(ly.size, ctx);
+            } else if (*idx < item_count && items[*idx].kind == PIR_GITEM_BYTES &&
+                       ad->elem_type.kind == PIR_TYPE_SCALAR &&
+                       ad->elem_type.u.scalar == PIR_SCALAR_I8) {
+                const PirGlobalItem *bi = &items[(*idx)++];
+                if (vis->on_i8_string) vis->on_i8_string(ad->array_len, ly.size, bi, ctx);
             } else {
-                PirTypeLayout el = pir_type_layout(mod, target, agg->elem_type);
-                for (uint64_t i = 0u; i < agg->array_len; ++i) {
-                    if (*idx >= src_cnt) {
-                        emit_zero_gitem(out, (agg->array_len - i) * ly.stride);
+                PirTypeLayout el = { 0u, 1u, 0u, false };
+                if (vis->emit_implicit_zeros && target) {
+                    el = pir_type_layout(mod, target, ad->elem_type);
+                }
+                for (uint64_t k = 0u; k < ad->array_len; ++k) {
+                    if (*idx >= item_count) {
+                        if (vis->emit_implicit_zeros && vis->on_gap) {
+                            vis->on_gap((ad->array_len - k) * ly.stride, ctx);
+                        }
                         break;
                     }
                     uint32_t before = *idx;
-                    flatten_agg_global(mod, target, agg->elem_type, src, src_cnt, idx, out, pad_cache, depth + 1u);
-                    if (ly.stride > el.size) emit_zero_gitem(out, ly.stride - el.size);
+                    pir_agg_init_walk_rec(mod, target, ad->elem_type, items, item_count, idx, pad_cache, vis, ctx, depth + 1u);
+                    if (vis->emit_implicit_zeros && vis->on_gap && ly.stride > el.size) {
+                        vis->on_gap(ly.stride - el.size, ctx);
+                    }
                     if (*idx == before) {
-                        if (i + 1u < agg->array_len) {
-                            emit_zero_gitem(out, (agg->array_len - i - 1u) * ly.stride);
+                        if (vis->emit_implicit_zeros && vis->on_gap && k + 1u < ad->array_len) {
+                            vis->on_gap((ad->array_len - k - 1u) * ly.stride, ctx);
                         }
                         break;
                     }
                 }
-                uint64_t emitted = agg->array_len * ly.stride;
-                if (ly.size > emitted) emit_zero_gitem(out, ly.size - emitted);
+                if (vis->emit_implicit_zeros && vis->on_gap) {
+                    uint64_t emitted = ad->array_len * ly.stride;
+                    if (ly.size > emitted) vis->on_gap(ly.size - emitted, ctx);
+                }
             }
             break;
         case PIR_AGG_STRUCT:
         case PIR_AGG_PACKED_STRUCT: {
             uint64_t off = 0u;
-            for (uint32_t f = 0u; f < agg->field_count; ++f) {
-                PirTypeLayout fl = pir_type_layout(mod, target, agg->fields[f]);
-                if (agg->kind == PIR_AGG_STRUCT) {
-                    uint64_t next_off = align_up_u64(off, fl.align);
-                    if (next_off > off) emit_zero_gitem(out, next_off - off);
-                    off = next_off;
+            for (uint32_t f = 0u; f < ad->field_count; ++f) {
+                if (!vis->emit_implicit_zeros && *idx >= item_count) break;
+                PirTypeLayout fl = { 0u, 1u, 0u, false };
+                if (vis->emit_implicit_zeros && target) {
+                    fl = pir_type_layout(mod, target, ad->fields[f]);
+                    if (ad->kind == PIR_AGG_STRUCT) {
+                        uint64_t next_off = align_up_u64(off, fl.align);
+                        if (next_off > off && vis->on_gap) vis->on_gap(next_off - off, ctx);
+                        off = next_off;
+                    }
                 }
-                flatten_agg_global(mod, target, agg->fields[f], src, src_cnt, idx, out, pad_cache, depth + 1u);
-                off += fl.size;
+                uint32_t before = *idx;
+                pir_agg_init_walk_rec(mod, target, ad->fields[f], items, item_count, idx, pad_cache, vis, ctx, depth + 1u);
+                if (vis->emit_implicit_zeros) {
+                    off += fl.size;
+                } else if (*idx == before && !pir_agg_is_pad_only_cached(mod, ad->fields[f], pad_cache)) {
+                    break;
+                }
             }
-            if (ly.size > off) emit_zero_gitem(out, ly.size - off);
+            if (vis->emit_implicit_zeros && vis->on_gap && ly.size > off) {
+                vis->on_gap(ly.size - off, ctx);
+            }
             break;
         }
         case PIR_AGG_UNION:
-            if (agg->field_count > 0u) {
-                if (src[*idx].kind == PIR_GITEM_RELOC) {
+            if (ad->field_count > 0u) {
+                if (*idx < item_count && items[*idx].kind == PIR_GITEM_RELOC) {
                     bool has_ptr = false;
-                    for (uint32_t f = 0u; f < agg->field_count; ++f) {
-                        if (agg->fields[f].kind == PIR_TYPE_SCALAR &&
-                            agg->fields[f].u.scalar == PIR_SCALAR_PTR) {
+                    for (uint32_t f = 0u; f < ad->field_count; ++f) {
+                        if (ad->fields[f].kind == PIR_TYPE_SCALAR &&
+                            ad->fields[f].u.scalar == PIR_SCALAR_PTR) {
                             has_ptr = true;
                             break;
                         }
                     }
                     if (has_ptr) {
-                        PIR_VEC_PUSH(out, src[(*idx)++]);
-                        if (ly.size > target->ptr_bytes) {
-                            emit_zero_gitem(out, ly.size - target->ptr_bytes);
+                        const PirGlobalItem *ri = &items[(*idx)++];
+                        if (vis->on_union_reloc) vis->on_union_reloc(ri, ctx);
+                        if (vis->emit_implicit_zeros && target && vis->on_gap && ly.size > target->ptr_bytes) {
+                            vis->on_gap(ly.size - target->ptr_bytes, ctx);
                         }
                         break;
                     }
                 }
-                uint64_t start_bytes = gitem_vec_bytes_since(out, 0u, target->ptr_bytes);
-                flatten_agg_global(mod, target, agg->fields[0], src, src_cnt, idx, out, pad_cache, depth + 1u);
-                uint64_t end_bytes = gitem_vec_bytes_since(out, 0u, target->ptr_bytes);
-                uint64_t emitted   = (end_bytes >= start_bytes) ? (end_bytes - start_bytes) : 0u;
-                if (ly.size > emitted) emit_zero_gitem(out, ly.size - emitted);
-            } else {
-                emit_zero_gitem(out, ly.size);
+                pir_agg_init_walk_rec(mod, target, ad->fields[0], items, item_count, idx, pad_cache, vis, ctx, depth + 1u);
+                if (vis->emit_implicit_zeros && target && vis->on_gap) {
+                    PirTypeLayout f0_ly = pir_type_layout(mod, target, ad->fields[0]);
+                    if (ly.size > f0_ly.size) vis->on_gap(ly.size - f0_ly.size, ctx);
+                }
+            } else if (vis->emit_implicit_zeros && vis->on_gap) {
+                vis->on_gap(ly.size, ctx);
             }
             break;
     }
+}
+
+uint32_t pir_agg_init_walk(const PirModule *mod, const PirTargetSpec *target,
+                           PirType ty, const PirGlobalItem *items, uint32_t item_count,
+                           int8_t *pad_cache, const PirAggInitVisitor *vis, void *ctx) {
+    uint32_t idx = 0u;
+    pir_agg_init_walk_rec(mod, target, ty, items, item_count, &idx, pad_cache, vis, ctx, 0u);
+    return idx;
+}
+
+typedef struct {
+    PirModule           *mod;
+    const PirTargetSpec *target;
+    GItemVec            *out;
+} FlattenCtx;
+
+static void flatten_on_gap(uint64_t bytes, void *ctx) {
+    FlattenCtx *fc = (FlattenCtx *)ctx;
+    emit_zero_gitem(fc->out, bytes);
+}
+
+static void flatten_on_zero(PirType ty, const PirGlobalItem *item, uint64_t byte_size, void *ctx) {
+    (void)ty;
+    (void)item;
+    FlattenCtx *fc = (FlattenCtx *)ctx;
+    emit_zero_gitem(fc->out, byte_size);
+}
+
+static void flatten_on_scalar(PirScalarType sc, const PirGlobalItem *it, uint64_t byte_size, void *ctx) {
+    FlattenCtx *fc = (FlattenCtx *)ctx;
+    if (it->kind == PIR_GITEM_ZERO) {
+        emit_zero_gitem(fc->out, byte_size);
+    } else if (it->kind == PIR_GITEM_RELOC) {
+        PIR_VEC_PUSH(fc->out, *it);
+    } else if (it->kind == PIR_GITEM_BYTES) {
+        uint64_t copy_n = (it->len < byte_size) ? it->len : byte_size;
+        emit_bytes_gitem(fc->mod, fc->out, it->bytes, copy_n);
+        if (copy_n < byte_size) emit_zero_gitem(fc->out, byte_size - copy_n);
+    } else if (it->kind == PIR_GITEM_FLOAT) {
+        if (sc == PIR_SCALAR_F32) {
+            uint32_t fb = 0u;
+            if (it->has_f32_bits) {
+                fb = it->float32_bits;
+            } else {
+                double dv = 0.0;
+                memcpy(&dv, &it->float_bits, 8u);
+                float fv = (float)dv;
+                memcpy(&fb, &fv, 4u);
+            }
+            uint8_t buf[4];
+            encode_u64_bytes(buf, (uint64_t)fb, 4u, fc->target->is_big_endian);
+            emit_bytes_gitem(fc->mod, fc->out, buf, 4u);
+        } else {
+            uint8_t buf[8];
+            encode_u64_bytes(buf, it->float_bits, 8u, fc->target->is_big_endian);
+            emit_bytes_gitem(fc->mod, fc->out, buf, 8u);
+        }
+    } else if (it->kind == PIR_GITEM_INT) {
+        uint64_t lo = it->int_lo;
+        uint64_t hi = it->int_hi;
+        if (it->int_neg) {
+            uint64_t nlo = ~lo + 1u;
+            uint64_t cy  = (nlo == 0u) ? 1u : 0u;
+            lo = nlo;
+            hi = ~hi + cy;
+        }
+        if (sc == PIR_SCALAR_I128) {
+            uint8_t buf[16];
+            if (fc->target->is_big_endian) {
+                encode_u64_bytes(buf, hi, 8u, true);
+                encode_u64_bytes(buf + 8, lo, 8u, true);
+            } else {
+                encode_u64_bytes(buf, lo, 8u, false);
+                encode_u64_bytes(buf + 8, hi, 8u, false);
+            }
+            emit_bytes_gitem(fc->mod, fc->out, buf, 16u);
+        } else if (sc == PIR_SCALAR_F32) {
+            float fv = it->int_neg ? -(float)it->int_lo : (float)it->int_lo;
+            uint32_t fb = 0u;
+            memcpy(&fb, &fv, 4u);
+            uint8_t buf[4];
+            encode_u64_bytes(buf, (uint64_t)fb, 4u, fc->target->is_big_endian);
+            emit_bytes_gitem(fc->mod, fc->out, buf, 4u);
+        } else if (sc == PIR_SCALAR_F64) {
+            double dv = it->int_neg ? -(double)it->int_lo : (double)it->int_lo;
+            uint64_t db = 0u;
+            memcpy(&db, &dv, 8u);
+            uint8_t buf[8];
+            encode_u64_bytes(buf, db, 8u, fc->target->is_big_endian);
+            emit_bytes_gitem(fc->mod, fc->out, buf, 8u);
+        } else if (byte_size <= 8u) {
+            uint8_t buf[8];
+            encode_u64_bytes(buf, lo, (uint32_t)byte_size, fc->target->is_big_endian);
+            emit_bytes_gitem(fc->mod, fc->out, buf, byte_size);
+        } else {
+            emit_zero_gitem(fc->out, byte_size);
+        }
+    }
+}
+
+static void flatten_on_i8_string(uint64_t array_len, uint64_t byte_size,
+                                 const PirGlobalItem *bi, void *ctx) {
+    FlattenCtx *fc = (FlattenCtx *)ctx;
+    uint64_t cap_n = (array_len < byte_size) ? array_len : byte_size;
+    uint64_t cn = (bi->len < cap_n) ? bi->len : cap_n;
+    emit_bytes_gitem(fc->mod, fc->out, bi->bytes, cn);
+    if (cn < byte_size) emit_zero_gitem(fc->out, byte_size - cn);
+}
+
+static void flatten_on_union_reloc(const PirGlobalItem *ri, void *ctx) {
+    FlattenCtx *fc = (FlattenCtx *)ctx;
+    PIR_VEC_PUSH(fc->out, *ri);
+}
+
+static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirType ty,
+                               const PirGlobalItem *src, uint32_t src_cnt,
+                               GItemVec *out, int8_t *pad_cache) {
+    FlattenCtx fc = { mod, target, out };
+    PirAggInitVisitor vis = {
+        true,
+        NULL,
+        flatten_on_gap,
+        flatten_on_zero,
+        flatten_on_scalar,
+        flatten_on_i8_string,
+        flatten_on_union_reloc
+    };
+    (void)pir_agg_init_walk(mod, target, ty, src, src_cnt, pad_cache, &vis, &fc);
 }
 
 bool pir_lower_aggregates(PirModule *mod, const PirTargetSpec *target, PirDiag *diag) {
@@ -861,8 +953,7 @@ bool pir_lower_aggregates(PirModule *mod, const PirTargetSpec *target, PirDiag *
                 g->items[0].len  = ly.size > 0u ? ly.size : 1u;
             } else {
                 GItemVec flat = {0};
-                uint32_t idx = 0u;
-                flatten_agg_global(mod, target, orig_ty, g->items, g->item_count, &idx, &flat, pad_cache, 0u);
+                flatten_agg_global(mod, target, orig_ty, g->items, g->item_count, &flat, pad_cache);
                 g->is_braced  = true;
                 g->item_count = flat.len;
                 if (flat.len > 0u) {

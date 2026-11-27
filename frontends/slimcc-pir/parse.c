@@ -1351,7 +1351,7 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr, StorageClass ctx)
 
 static Type *qual_constexpr(Type *ty, VarAttr *attr, Token *tok) {
   if (attr->strg & SC_CONSTEXPR) {
-    if (get_elem(ty)->qual & (Q_VOLATILE | Q_ATOMIC | Q_RESTRICT))
+    if (eff_qual(ty) & (Q_VOLATILE | Q_ATOMIC | Q_RESTRICT))
       error_tok(tok, "invalid qualifier for 'constexpr'");
     return add_qual(Q_CONST, ty, tok);
   }
@@ -2064,7 +2064,7 @@ static Node *declaration2(Token **rest, Token *tok, Type *basety, VarAttr *attr,
     if (ty->kind == TY_VLA)
       error_tok(tok, "variable length arrays cannot be 'static'");
     if (is_iso_std && fnctx && fnctx->fn->is_ext_inline && !fnctx->fn->is_static &&
-        !(get_elem(ty)->qual & Q_CONST) && !tok->file->is_syshdr)
+        !(eff_qual(ty) & Q_CONST) && !tok->file->is_syshdr)
       error_tok(name, "non-const static local variable in external inline function");
 
     Obj *var = new_static_lvar(ty);
@@ -5237,7 +5237,7 @@ static void chk_assignable(Node *node) {
   add_type(node);
   if (node->is_nonlval ||
       !is_lvalue_expr(node) ||
-      (node->ty->qual & Q_CONST) ||
+      (eff_qual(node->ty) & Q_CONST) ||
       node->ty->has_const_member ||
       is_decay_ty(node->ty))
     error_tok(node->tok, "operand unassignable");
@@ -5894,7 +5894,7 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
 
       tok = tok->next;
       cur = cur->next = mem;
-      has_const |= (mem->ty->qual & Q_CONST) | mem->ty->has_const_member;
+      has_const |= (eff_qual(mem->ty) & Q_CONST) | mem->ty->has_const_member;
       continue;
     }
 
@@ -6320,7 +6320,7 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
       else
         ptr_convert(&arg);
     }
-    cur = cur->param_next = alloc_ast_var((!is_fixed && (arg->ty->qual & Q_ATOMIC)) ? unqual(arg->ty) : arg->ty);
+    cur = cur->param_next = alloc_ast_var(is_fixed ? arg->ty : lval_conv_type(arg->ty));
     cur->arg_expr = arg;
   }
   if (param)

@@ -999,6 +999,12 @@ Type *new_type(TypeKind kind, int64_t size, int align);
 Type *new_bitint(int64_t width, Token *tok);
 Type *get_elem(Type *ty);
 Type *unqual(Type *ty);
+static inline QualMask eff_qual(Type *ty) {
+  return get_elem(ty)->qual;
+}
+static inline Type *lval_conv_type(Type *ty) {
+  return (ty->qual & Q_ATOMIC) ? unqual(ty) : ty;
+}
 Type *tyof_unqual(Type *ty);
 Type *new_derived_type(Type *newty, QualMask qual, Type *ty);
 bool chk_qual_type(QualMask qual, Type *ty);

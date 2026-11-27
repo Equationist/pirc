@@ -150,7 +150,7 @@ Type *get_elem(Type *ty) {
 }
 
 bool is_const_var(Obj *var) {
-  return get_elem(var->ty)->qual & Q_CONST;
+  return eff_qual(var->ty) & Q_CONST;
 }
 
 Type *unqual(Type *ty) {
@@ -856,8 +856,8 @@ Node *assign_cast(Type *to_ty, Node *expr) {
           error_tok(expr->tok, "incompatible pointer types");
         if ((!expr->tok || !expr->tok->file || !expr->tok->file->is_syshdr)) {
           Type *tb = to_ty->base, *eb = expr->ty->base;
-          QualMask tq = (tb->kind == TY_VOID || !is_array(tb)) ? tb->qual : get_elem(tb)->qual;
-          QualMask eq = (eb->kind == TY_VOID || !is_array(eb)) ? eb->qual : get_elem(eb)->qual;
+          QualMask tq = eff_qual(tb);
+          QualMask eq = eff_qual(eb);
           bool either_void = (tb->kind == TY_VOID || eb->kind == TY_VOID);
           if (!either_void && (tq & Q_ATOMIC) != (eq & Q_ATOMIC))
             error_tok(expr->tok, "incompatible pointer types");
@@ -1003,8 +1003,8 @@ static Type *cond_ptr_conv(Node **lhs, Node **rhs, Node **cond) {
     if (ty1->base->kind == TY_VOID || ty2->base->kind == TY_VOID) {
       if (is_iso_std && (ty1->base->kind == TY_FUNC || ty2->base->kind == TY_FUNC))
         error_tok((*lhs)->tok, "incompatible pointer types in conditional expression");
-      QualMask q1 = is_array(ty1->base) ? get_elem(ty1->base)->qual : ty1->base->qual;
-      QualMask q2 = is_array(ty2->base) ? get_elem(ty2->base)->qual : ty2->base->qual;
+      QualMask q1 = eff_qual(ty1->base);
+      QualMask q2 = eff_qual(ty2->base);
       return pointer_to(add_qual(q1 | q2, ty_void, NULL));
     }
 

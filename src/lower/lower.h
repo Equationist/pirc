@@ -38,12 +38,32 @@ uint64_t      pir_field_offset(const PirModule *mod, const PirTargetSpec *target
 bool          pir_agg_is_pad_only_cached(const PirModule *mod, PirType ty, int8_t *cache);
 bool          pir_agg_is_pad_only(const PirModule *mod, PirType ty);
 
+/* Canonical aggregate global initializer walker shared by verifier, printer, and lowering */
+typedef struct {
+    bool emit_implicit_zeros;
+    void (*on_depth_exceeded)(void *ctx);
+    void (*on_gap)(uint64_t bytes, void *ctx);
+    void (*on_zero)(PirType ty, const PirGlobalItem *item, uint64_t byte_size, void *ctx);
+    void (*on_scalar)(PirScalarType sc, const PirGlobalItem *item, uint64_t byte_size, void *ctx);
+    void (*on_i8_string)(uint64_t array_len, uint64_t byte_size, const PirGlobalItem *item, void *ctx);
+    void (*on_union_reloc)(const PirGlobalItem *item, void *ctx);
+} PirAggInitVisitor;
+
+uint32_t pir_agg_init_walk(const PirModule *mod, const PirTargetSpec *target,
+                           PirType ty, const PirGlobalItem *items, uint32_t item_count,
+                           int8_t *pad_cache, const PirAggInitVisitor *vis, void *ctx);
+
 /* Shared IR builder helpers for lowering & optimization passes */
 PirValueId pir_fn_new_val(PirModule *mod, PirFunction *fn, const char *prefix,
                           PirType ty, PirBlockId def_block, PirInstId def_inst, uint32_t slot);
 PirBlockId pir_fn_new_block(PirModule *mod, PirFunction *fn, const char *prefix,
                             uint32_t src_line);
 PirInstId  pir_fn_append_inst(PirFunction *fn, PirInstIdVec *out_list, PirInst inst);
+PirValueId pir_fn_emit_entry_alloca(PirModule *mod, PirFunction *fn, const char *prefix,
+                                    uint64_t bytes, uint32_t align,
+                                    uint32_t src_line, uint32_t loc_idx,
+                                    PirInstIdVec *entry_out);
+void       pir_fn_prepend_entry_insts(PirFunction *fn, PirInstIdVec *entry_insts);
 PirInst    pir_make_inst(PirOpcode op, PirType ty, uint32_t src_line, uint32_t loc_idx);
 PirOperand pir_op_val(PirValueId id, PirType ty);
 PirOperand pir_op_imm_i(uint64_t val, bool is_neg, PirType ty);

@@ -84,6 +84,36 @@ PirInstId pir_fn_append_inst(PirFunction *fn, PirInstIdVec *out_list, PirInst in
     return id;
 }
 
+PirValueId pir_fn_emit_entry_alloca(PirModule *mod, PirFunction *fn, const char *prefix,
+                                    uint64_t bytes, uint32_t align,
+                                    uint32_t src_line, uint32_t loc_idx,
+                                    PirInstIdVec *entry_out) {
+    PirType tptr = pir_type_scalar(PIR_SCALAR_PTR);
+    PirInst al   = pir_make_inst(PIR_OP_ALLOCA_PTR, tptr, src_line, loc_idx);
+    al.imm_u64    = bytes > 0u ? bytes : 1u;
+    al.align      = align > 0u ? align : 1u;
+    al.results[0] = pir_fn_new_val(mod, fn, prefix, tptr, 0u, PIR_INVALID_ID, 0u);
+    pir_fn_append_inst(fn, entry_out, al);
+    return al.results[0];
+}
+
+void pir_fn_prepend_entry_insts(PirFunction *fn, PirInstIdVec *entry_insts) {
+    if (!entry_insts || entry_insts->len == 0u) return;
+    if (fn->blocks.len > 0u) {
+        PirInstIdVec *b0 = &fn->blocks.data[0].insts;
+        for (uint32_t j = 0u; j < b0->len; ++j) {
+            PIR_VEC_PUSH(entry_insts, b0->data[j]);
+        }
+        PIR_VEC_FREE(b0);
+        *b0 = *entry_insts;
+        entry_insts->data = NULL;
+        entry_insts->len  = 0u;
+        entry_insts->cap  = 0u;
+    } else {
+        PIR_VEC_FREE(entry_insts);
+    }
+}
+
 PirInst pir_make_inst(PirOpcode op, PirType ty, uint32_t src_line, uint32_t loc_idx) {
     PirInst inst;
     memset(&inst, 0, sizeof(inst));

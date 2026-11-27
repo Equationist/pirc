@@ -451,16 +451,15 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
                         pir_fn_append_inst(fn, &new_insts, bc);
                     }
                 } else {
-                    /* General cross-lane-count bitcast via stack slot. */
+                    /* General cross-lane-count bitcast via entry-block stack slot. */
                     uint32_t total_bytes = (uint32_t)(pir_type_bits(copy.ty, target->ptr_bytes) / 8u);
-                    PirInst al = pir_make_inst(PIR_OP_ALLOCA_PTR, tptr, ln, lc);
-                    al.imm_u64 = total_bytes; al.align = total_bytes;
-                    al.results[0] = pir_fn_new_val(mod, fn, "vbc", tptr, b, PIR_INVALID_ID, 0u);
-                    pir_fn_append_inst(fn, &new_insts, al);
+                    PirValueId vbc_v = pir_fn_emit_entry_alloca(mod, fn, "vbc",
+                                                                total_bytes, total_bytes,
+                                                                ln, lc, &entry_allocas);
                     if (ssp) {
                         uint32_t pb = (uint32_t)(pir_type_bits(ssp->piece_ty, target->ptr_bytes) / 8u);
                         for (uint32_t p = 0u; p < ssp->count; ++p) {
-                            PirValueId sp = emit_padd(mod, fn, b, &new_insts, pir_op_val(al.results[0], tptr), (uint64_t)p * pb, idx_ty, ln, lc);
+                            PirValueId sp = emit_padd(mod, fn, b, &new_insts, pir_op_val(vbc_v, tptr), (uint64_t)p * pb, idx_ty, ln, lc);
                             PirInst st = pir_make_inst(PIR_OP_STORE, ssp->piece_ty, ln, lc);
                             st.align = pb; st.operand_count = 2u; st.operands = pir_alloc_ops(mod, 2u);
                             st.operands[0] = pir_op_val(ssp->ids[p], ssp->piece_ty);
@@ -478,13 +477,13 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
                         PirInst st = pir_make_inst(PIR_OP_STORE, st_ty, ln, lc);
                         st.align = total_bytes; st.operand_count = 2u; st.operands = pir_alloc_ops(mod, 2u);
                         st.operands[0] = st_op;
-                        st.operands[1] = pir_op_val(al.results[0], tptr);
+                        st.operands[1] = pir_op_val(vbc_v, tptr);
                         pir_fn_append_inst(fn, &new_insts, st);
                     }
                     if (rsp) {
                         uint32_t pb = (uint32_t)(pir_type_bits(rsp->piece_ty, target->ptr_bytes) / 8u);
                         for (uint32_t p = 0u; p < rsp->count; ++p) {
-                            PirValueId lp = emit_padd(mod, fn, b, &new_insts, pir_op_val(al.results[0], tptr), (uint64_t)p * pb, idx_ty, ln, lc);
+                            PirValueId lp = emit_padd(mod, fn, b, &new_insts, pir_op_val(vbc_v, tptr), (uint64_t)p * pb, idx_ty, ln, lc);
                             PirInst ld = pir_make_inst(PIR_OP_LOAD, rsp->piece_ty, ln, lc);
                             ld.align = pb; ld.operand_count = 1u; ld.operands = pir_alloc_ops(mod, 1u);
                             ld.operands[0] = pir_op_val(lp, tptr);
@@ -494,7 +493,7 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
                     } else {
                         PirInst ld = pir_make_inst(PIR_OP_LOAD, copy.ty, ln, lc);
                         ld.align = total_bytes; ld.operand_count = 1u; ld.operands = pir_alloc_ops(mod, 1u);
-                        ld.operands[0] = pir_op_val(al.results[0], tptr);
+                        ld.operands[0] = pir_op_val(vbc_v, tptr);
                         ld.results[0]  = r0;
                         pir_fn_append_inst(fn, &new_insts, ld);
                     }
@@ -666,6 +665,7 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
                     pir_diag_error(diag, ln, 0u,
                                    "mismatched oversized vector operand in ret");
                     PIR_VEC_FREE(&new_insts);
+                    PIR_VEC_FREE(&entry_allocas);
                     PIR_VEC_FREE(&aliases);
                     free(splits);
                     return false;
@@ -695,12 +695,9 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
                 PirValueId ret_tmp = PIR_INVALID_ID;
                 if (call_ret_ov) {
                     uint64_t tbytes = pir_vec_bits(copy.ty.u.vec) / 8u;
-                    PirInst al = pir_make_inst(PIR_OP_ALLOCA_PTR, tptr, ln, lc);
-                    al.imm_u64    = tbytes;
-                    al.align      = (uint32_t)tbytes;
-                    al.results[0] = pir_fn_new_val(mod, fn, "sv_ret", tptr, 0u, PIR_INVALID_ID, 0u);
-                    pir_fn_append_inst(fn, &entry_allocas, al);
-                    ret_tmp = al.results[0];
+                    ret_tmp = pir_fn_emit_entry_alloca(mod, fn, "sv_ret",
+                                                       tbytes, (uint32_t)tbytes,
+                                                       ln, lc, &entry_allocas);
                 }
                 PIR_VEC(PirOperand) nargs = {0};
                 PIR_VEC_PUSH(&nargs, copy.operands[0]);
@@ -754,6 +751,7 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
                                    "oversized vector exceeds target SIMD width (%u bits) in unsupported op",
                                    (unsigned)max_bits);
                     PIR_VEC_FREE(&new_insts);
+                    PIR_VEC_FREE(&entry_allocas);
                     PIR_VEC_FREE(&aliases);
                     free(splits);
                     return false;
@@ -765,6 +763,7 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
                         pir_diag_error(diag, ln, 0u,
                                        "mismatched oversized vector operand in SIMD legalization");
                         PIR_VEC_FREE(&new_insts);
+                        PIR_VEC_FREE(&entry_allocas);
                         PIR_VEC_FREE(&aliases);
                         free(splits);
                         return false;
@@ -788,18 +787,7 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
         fn->blocks.data[b].insts = new_insts;
     }
 
-    if (entry_allocas.len > 0u && fn->blocks.len > 0u) {
-        PirInstIdVec merged = {0};
-        for (uint32_t k = 0u; k < entry_allocas.len; ++k) {
-            PIR_VEC_PUSH(&merged, entry_allocas.data[k]);
-        }
-        for (uint32_t k = 0u; k < fn->blocks.data[0].insts.len; ++k) {
-            PIR_VEC_PUSH(&merged, fn->blocks.data[0].insts.data[k]);
-        }
-        PIR_VEC_FREE(&fn->blocks.data[0].insts);
-        fn->blocks.data[0].insts = merged;
-    }
-    PIR_VEC_FREE(&entry_allocas);
+    pir_fn_prepend_entry_insts(fn, &entry_allocas);
 
     for (uint32_t i = 0u; i < aliases.len; ++i) {
         PirValueId root = aliases.data[i].to;

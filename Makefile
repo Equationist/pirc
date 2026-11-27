@@ -28,7 +28,7 @@ BACKEND_SRCS  := src/backend/mir.c src/backend/regalloc.c src/backend/asm_common
                  src/backend/x64/x64_isel.c src/backend/x64/x64_frame.c \
                  src/backend/x64/x64_asm.c
 CORE_SRCS     := $(COMMON_SRCS) $(TARGET_SRCS) $(ANALYSIS_SRCS) $(IR_SRCS) $(LOWER_SRCS) $(OPT_SRCS) $(INTERP_SRCS) $(BACKEND_SRCS)
-HEADERS       := src/common/arena.h src/common/vec.h src/common/diag.h \
+HEADERS       := src/common/arena.h src/common/vec.h src/common/diag.h src/common/symset.h \
                  src/target/target.h src/target/abi.h \
                  src/analysis/cfg.h src/analysis/dom.h src/analysis/loops.h src/analysis/alias.h \
                  src/ir/ir.h src/ir/lexer.h src/ir/parser.h src/ir/printer.h src/ir/verify.h \

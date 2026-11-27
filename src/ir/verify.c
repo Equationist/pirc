@@ -12,6 +12,7 @@
 
 #include "analysis/cfg.h"
 #include "analysis/dom.h"
+#include "common/symset.h"
 #include "lower/lower.h"
 #include "target/target.h"
 
@@ -31,84 +32,12 @@ static int cmp_switch_norm_case(const void *a, const void *b) {
 }
 
 typedef struct {
-    const char **slots;
-    uint32_t     cap;
-    uint32_t     len;
-} VerifySymSet;
-
-static uint32_t verify_fnv1a(const char *s) {
-    uint32_t h = 2166136261u;
-    for (const unsigned char *q = (const unsigned char *)s; *q; ++q) {
-        h ^= (uint32_t)*q;
-        h *= 16777619u;
-    }
-    return h;
-}
-
-static void symset_init(VerifySymSet *st, uint32_t hint) {
-    uint32_t cap = 32u;
-    while (cap < hint * 2u && cap < (1u << 24)) cap <<= 1u;
-    st->slots = (const char **)calloc((size_t)cap, sizeof(const char *));
-    if (!st->slots) abort();
-    st->cap = cap;
-    st->len = 0u;
-}
-
-static void symset_destroy(VerifySymSet *st) {
-    free(st->slots);
-    st->slots = NULL;
-    st->cap   = 0u;
-    st->len   = 0u;
-}
-
-static void symset_grow(VerifySymSet *st) {
-    uint32_t ncap = st->cap * 2u;
-    const char **ns = (const char **)calloc((size_t)ncap, sizeof(const char *));
-    if (!ns) abort();
-    uint32_t mask = ncap - 1u;
-    for (uint32_t i = 0u; i < st->cap; ++i) {
-        if (!st->slots[i]) continue;
-        uint32_t idx = verify_fnv1a(st->slots[i]) & mask;
-        while (ns[idx]) idx = (idx + 1u) & mask;
-        ns[idx] = st->slots[i];
-    }
-    free(st->slots);
-    st->slots = ns;
-    st->cap   = ncap;
-}
-
-static bool symset_contains(const VerifySymSet *st, const char *name) {
-    if (!name || st->cap == 0u) return false;
-    uint32_t mask = st->cap - 1u;
-    uint32_t idx  = verify_fnv1a(name) & mask;
-    while (st->slots[idx]) {
-        if (strcmp(st->slots[idx], name) == 0) return true;
-        idx = (idx + 1u) & mask;
-    }
-    return false;
-}
-
-/* Returns true if inserted (new), false if already present. */
-static bool symset_insert(VerifySymSet *st, const char *name) {
-    if (!name) return true;
-    if ((st->len + 1u) * 2u >= st->cap) symset_grow(st);
-    uint32_t mask = st->cap - 1u;
-    uint32_t idx  = verify_fnv1a(name) & mask;
-    while (st->slots[idx]) {
-        if (strcmp(st->slots[idx], name) == 0) return false;
-        idx = (idx + 1u) & mask;
-    }
-    st->slots[idx] = name;
-    st->len++;
-    return true;
-}
-
-typedef struct {
     const PirModule     *mod;
     PirVerifyMode        mode;
     const PirTargetSpec *target;
     PirDiag             *diag;
-    VerifySymSet         ref_syms;
+    PirSymSet            ref_syms;
+    PirSymSet            tls_syms;
 } Verifier;
 
 static const char *type_str(const PirModule *mod, PirType ty, char *buf, size_t n) {
@@ -160,7 +89,7 @@ static const char *type_str(const PirModule *mod, PirType ty, char *buf, size_t 
 }
 
 static bool has_symbol(const Verifier *v, const char *name) {
-    return symset_contains(&v->ref_syms, name);
+    return pir_symset_contains(&v->ref_syms, name);
 }
 
 static bool check_lir_type(Verifier *v, PirType ty, uint32_t line, const char *ctx) {
@@ -2087,16 +2016,16 @@ static void verify_function(Verifier *v, const PirFunction *fn) {
         inst_pos[i] = PIR_INVALID_ID;
         inst_blk[i] = PIR_INVALID_ID;
     }
-    VerifySymSet blk_syms;
+    PirSymSet blk_syms;
     memset(&blk_syms, 0, sizeof(blk_syms));
     if (fn->blocks.len > 16u) {
-        symset_init(&blk_syms, fn->blocks.len);
+        pir_symset_init(&blk_syms, fn->blocks.len);
     }
     for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
         const PirBlock *blk = &fn->blocks.data[b];
         if (blk->label) {
             if (blk_syms.cap > 0u) {
-                if (!symset_insert(&blk_syms, blk->label)) {
+                if (!pir_symset_insert(&blk_syms, blk->label)) {
                     pir_diag_error(v->diag, blk->src_line, 0u,
                                    "duplicate block label '.%s' in function '@%s'",
                                    blk->label, fn->name);
@@ -2290,7 +2219,7 @@ static void verify_function(Verifier *v, const PirFunction *fn) {
 
     pir_dom_destroy(&dom);
     pir_cfg_destroy(&cfg);
-    symset_destroy(&blk_syms);
+    pir_symset_destroy(&blk_syms);
     free(inst_blk);
     free(inst_pos);
 }
@@ -2353,10 +2282,6 @@ static void verify_scalar_global_item(Verifier *v, const PirGlobal *g, PirScalar
     }
 }
 
-static bool agg_type_is_pad_only(const PirModule *mod, PirType ty, int8_t *cache) {
-    return pir_agg_is_pad_only_cached(mod, ty, cache);
-}
-
 static bool agg_contains_valist_rec(const PirModule *mod, PirType ty, int8_t *cache, uint32_t depth) {
     if (depth > 256u) return false;
     if (ty.kind == PIR_TYPE_SCALAR) return ty.u.scalar == PIR_SCALAR_VALIST;
@@ -2391,114 +2316,64 @@ static bool agg_contains_valist_rec(const PirModule *mod, PirType ty, int8_t *ca
     return res;
 }
 
-static void verify_agg_global_items(Verifier *v, const PirGlobal *g, PirType ty,
-                                    uint32_t *idx, int8_t *pad_cache, uint32_t depth) {
-    if (depth > 256u) {
-        pir_diag_error(v->diag, g->src_line, 0u, "aggregate global '@%s' nesting exceeds maximum depth", g->name);
-        return;
-    }
-    if (agg_type_is_pad_only(v->mod, ty, pad_cache)) {
-        return;
-    }
-    if (*idx >= g->item_count) return;
-    if (g->items[*idx].kind == PIR_GITEM_ZERO) {
-        const PirGlobalItem *zi = &g->items[*idx];
-        bool consume_whole = (ty.kind == PIR_TYPE_SCALAR);
-        if (!consume_whole) {
-            if (zi->len != 0u) {
-                if (!v->target) {
-                    consume_whole = true;
-                } else {
-                    PirTypeLayout ly = pir_type_layout(v->mod, v->target, ty);
-                    consume_whole = (ly.overflow || zi->len >= ly.size);
-                }
-            } else {
-                consume_whole = !(depth == 0u && g->item_count > 1u);
-            }
+typedef struct {
+    Verifier        *v;
+    const PirGlobal *g;
+} VerifyAggCtx;
+
+static void verify_agg_on_depth(void *ctx) {
+    VerifyAggCtx *vc = (VerifyAggCtx *)ctx;
+    pir_diag_error(vc->v->diag, vc->g->src_line, 0u,
+                   "aggregate global '@%s' nesting exceeds maximum depth", vc->g->name);
+}
+
+static void verify_agg_on_zero(PirType ty, const PirGlobalItem *zi, uint64_t byte_size, void *ctx) {
+    (void)byte_size;
+    VerifyAggCtx *vc = (VerifyAggCtx *)ctx;
+    if (zi->len != 0u && vc->v->target) {
+        PirTypeLayout ly = pir_type_layout(vc->v->mod, vc->v->target, ty);
+        if (!ly.overflow && zi->len != ly.size) {
+            pir_diag_error(vc->v->diag, vc->g->src_line, 0u,
+                           "zeroinit size %" PRIu64 " mismatches element size %" PRIu64 " in global '@%s'",
+                           zi->len, ly.size, vc->g->name);
         }
-        if (consume_whole) {
-            (*idx)++;
-            if (zi->len != 0u && v->target) {
-                PirTypeLayout ly = pir_type_layout(v->mod, v->target, ty);
-                if (!ly.overflow && zi->len != ly.size) {
-                    pir_diag_error(v->diag, g->src_line, 0u,
-                                   "zeroinit size %" PRIu64 " mismatches element size %" PRIu64 " in global '@%s'",
-                                   zi->len, ly.size, g->name);
-                }
-            }
-            return;
-        }
-    }
-    if (ty.kind == PIR_TYPE_SCALAR) {
-        verify_scalar_global_item(v, g, ty.u.scalar, &g->items[(*idx)++]);
-        return;
-    }
-    if (ty.kind == PIR_TYPE_VECTOR) {
-        PirType ety = pir_type_scalar(pir_vec_elem_scalar(ty.u.vec));
-        uint32_t lanes = pir_vec_lanes(ty.u.vec);
-        for (uint32_t l = 0u; l < lanes && *idx < g->item_count; ++l) {
-            verify_agg_global_items(v, g, ety, idx, pad_cache, depth + 1u);
-        }
-        return;
-    }
-    if (ty.u.agg_id >= v->mod->agg_types.len) return;
-    const PirAggDef *ad = &v->mod->agg_types.data[ty.u.agg_id];
-    switch (ad->kind) {
-        case PIR_AGG_PAD:
-            break;
-        case PIR_AGG_ARRAY:
-            if (agg_type_is_pad_only(v->mod, ad->elem_type, pad_cache)) {
-                break;
-            }
-            if (g->items[*idx].kind == PIR_GITEM_BYTES &&
-                ad->elem_type.kind == PIR_TYPE_SCALAR &&
-                ad->elem_type.u.scalar == PIR_SCALAR_I8) {
-                const PirGlobalItem *bi = &g->items[(*idx)++];
-                if (bi->len > ad->array_len) {
-                    pir_diag_error(v->diag, g->src_line, 0u,
-                                   "string initializer for '@%s' exceeds array length (%" PRIu64 " > %" PRIu64 ")",
-                                   g->name, bi->len, ad->array_len);
-                }
-            } else {
-                for (uint64_t k = 0u; k < ad->array_len && *idx < g->item_count; ++k) {
-                    uint32_t before = *idx;
-                    verify_agg_global_items(v, g, ad->elem_type, idx, pad_cache, depth + 1u);
-                    if (*idx == before) break;
-                }
-            }
-            break;
-        case PIR_AGG_STRUCT:
-        case PIR_AGG_PACKED_STRUCT:
-            for (uint32_t f = 0u; f < ad->field_count && *idx < g->item_count; ++f) {
-                uint32_t before = *idx;
-                verify_agg_global_items(v, g, ad->fields[f], idx, pad_cache, depth + 1u);
-                if (*idx == before && !agg_type_is_pad_only(v->mod, ad->fields[f], pad_cache)) break;
-            }
-            break;
-        case PIR_AGG_UNION:
-            if (ad->field_count > 0u) {
-                if (g->items[*idx].kind == PIR_GITEM_RELOC) {
-                    bool has_ptr_field = false;
-                    for (uint32_t f = 0u; f < ad->field_count; ++f) {
-                        if (is_ptr_type(ad->fields[f])) {
-                            has_ptr_field = true;
-                            break;
-                        }
-                    }
-                    if (has_ptr_field) {
-                        (*idx)++;
-                        break;
-                    }
-                }
-                verify_agg_global_items(v, g, ad->fields[0], idx, pad_cache, depth + 1u);
-            }
-            break;
     }
 }
 
+static void verify_agg_on_scalar(PirScalarType sc, const PirGlobalItem *it, uint64_t byte_size, void *ctx) {
+    (void)byte_size;
+    VerifyAggCtx *vc = (VerifyAggCtx *)ctx;
+    verify_scalar_global_item(vc->v, vc->g, sc, it);
+}
+
+static void verify_agg_on_i8_string(uint64_t array_len, uint64_t byte_size,
+                                    const PirGlobalItem *bi, void *ctx) {
+    (void)byte_size;
+    VerifyAggCtx *vc = (VerifyAggCtx *)ctx;
+    if (bi->len > array_len) {
+        pir_diag_error(vc->v->diag, vc->g->src_line, 0u,
+                       "string initializer for '@%s' exceeds array length (%" PRIu64 " > %" PRIu64 ")",
+                       vc->g->name, bi->len, array_len);
+    }
+}
+
+static uint32_t verify_agg_global_items(Verifier *v, const PirGlobal *g, PirType ty, int8_t *pad_cache) {
+    VerifyAggCtx vc = { v, g };
+    PirAggInitVisitor vis = {
+        false,
+        verify_agg_on_depth,
+        NULL,
+        verify_agg_on_zero,
+        verify_agg_on_scalar,
+        verify_agg_on_i8_string,
+        NULL
+    };
+    return pir_agg_init_walk(v->mod, v->target, ty, g->items, g->item_count, pad_cache, &vis, &vc);
+}
+
 static void check_unique_symbol(Verifier *v, const char *name, uint32_t line,
-                                VerifySymSet *seen) {
-    if (!symset_insert(seen, name)) {
+                                PirSymSet *seen) {
+    if (!pir_symset_insert(seen, name)) {
         pir_diag_error(v->diag, line, 0u, "duplicate module symbol '@%s'", name);
     }
 }
@@ -2532,12 +2407,15 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
     v.mode   = mode;
     v.target = target;
     v.diag   = diag;
-    symset_init(&v.ref_syms, mod->globals.len + mod->funcs.len + 1u);
+    pir_symset_init(&v.ref_syms, mod->globals.len + mod->funcs.len + 1u);
     for (uint32_t i = 0u; i < mod->globals.len; ++i) {
-        symset_insert(&v.ref_syms, mod->globals.data[i].name);
+        pir_symset_insert(&v.ref_syms, mod->globals.data[i].name);
+        if (mod->globals.data[i].seg == PIR_GSEG_TLS) {
+            pir_symset_insert(&v.tls_syms, mod->globals.data[i].name);
+        }
     }
     for (uint32_t i = 0u; i < mod->funcs.len; ++i) {
-        symset_insert(&v.ref_syms, mod->funcs.data[i].name);
+        pir_symset_insert(&v.ref_syms, mod->funcs.data[i].name);
     }
 
     if (!mod->target_triple || !target) {
@@ -2557,8 +2435,8 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
 
     /* Unique module-level @symbols across types, sigs, globals, funcs. */
     uint32_t max_syms = mod->agg_types.len + mod->sigs.len + mod->globals.len + mod->funcs.len + 1u;
-    VerifySymSet seen;
-    symset_init(&seen, max_syms);
+    PirSymSet seen;
+    pir_symset_init(&seen, max_syms);
 
     /* Aggregates. */
     uint8_t *agg_color   = (uint8_t *)calloc(mod->agg_types.len + 1u, 1u);
@@ -2727,8 +2605,7 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
                     if (!(g->item_count == 1u && g->items[0].kind == PIR_GITEM_ZERO &&
                           (g->items[0].len == 0u ||
                            (target && g->items[0].len == pir_type_layout(mod, target, g->type).size)))) {
-                        uint32_t idx = 0u;
-                        verify_agg_global_items(&v, g, g->type, &idx, pad_cache, 0u);
+                        uint32_t idx = verify_agg_global_items(&v, g, g->type, pad_cache);
                         if (idx < g->item_count) {
                             pir_diag_error(diag, g->src_line, 0u,
                                            "aggregate global '@%s' has too many initializer items (%u > %u)",
@@ -2791,16 +2668,10 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
                     pir_diag_error(diag, g->src_line, 0u,
                                    "global '@%s' references undefined symbol '@%s'",
                                    g->name, rname);
-                } else {
-                    for (uint32_t gi = 0u; gi < mod->globals.len; ++gi) {
-                        if (strcmp(mod->globals.data[gi].name, rname) == 0 &&
-                            mod->globals.data[gi].seg == PIR_GSEG_TLS) {
-                            pir_diag_error(diag, g->src_line, 0u,
-                                           "global '@%s' cannot take static address of tls global '@%s'",
-                                           g->name, rname);
-                            break;
-                        }
-                    }
+                } else if (pir_symset_contains(&v.tls_syms, rname)) {
+                    pir_diag_error(diag, g->src_line, 0u,
+                                   "global '@%s' cannot take static address of tls global '@%s'",
+                                   g->name, rname);
                 }
             }
         }
@@ -2824,7 +2695,8 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
         verify_function(&v, fn);
     }
 
-    symset_destroy(&seen);
-    symset_destroy(&v.ref_syms);
+    pir_symset_destroy(&seen);
+    pir_symset_destroy(&v.tls_syms);
+    pir_symset_destroy(&v.ref_syms);
     return !pir_diag_has_errors(diag);
 }

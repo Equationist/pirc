@@ -350,6 +350,7 @@ static bool legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
     }
 
     PIR_VEC(ValAlias) aliases = {0};
+    PirInstIdVec entry_allocas = {0};
 
     uint32_t num_blocks = fn->blocks.len;
     for (uint32_t b = 0u; b < num_blocks; ++b) {
@@ -406,11 +407,8 @@ static bool legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                 if (call_ret_i128 || has_i128_arg) {
                     PirValueId rbuf = PIR_INVALID_ID;
                     if (call_ret_i128) {
-                        PirInst al = pir_make_inst(PIR_OP_ALLOCA_PTR, tptr, ln, lc);
-                        al.imm_u64 = 16u; al.align = 8u;
-                        al.results[0] = pir_fn_new_val(mod, fn, "c128_out", tptr, b, PIR_INVALID_ID, 0u);
-                        pir_fn_append_inst(fn, &new_insts, al);
-                        rbuf = al.results[0];
+                        rbuf = pir_fn_emit_entry_alloca(mod, fn, "c128_out",
+                                                        16u, 8u, ln, lc, &entry_allocas);
                     }
                     PIR_VEC(PirOperand) nargs = {0};
                     PIR_VEC_PUSH(&nargs, copy.operands[0]);
@@ -633,20 +631,18 @@ static bool legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                 is_i128(copy.operands[0].type) && !is_i128(copy.ty)) {
                 PirOperand vlo, vhi;
                 operand_to_pair(&copy.operands[0], map, &vlo, &vhi);
-                PirInst al = pir_make_inst(PIR_OP_ALLOCA_PTR, tptr, ln, lc);
-                al.imm_u64 = 16u; al.align = 16u;
-                al.results[0] = pir_fn_new_val(mod, fn, "bc128", tptr, b, PIR_INVALID_ID, 0u);
-                pir_fn_append_inst(fn, &new_insts, al);
+                PirValueId bc_v = pir_fn_emit_entry_alloca(mod, fn, "bc128",
+                                                           16u, 16u, ln, lc, &entry_allocas);
 
                 PirInst s0 = pir_make_inst(PIR_OP_STORE, t64, ln, lc);
                 s0.align = 8u; s0.operand_count = 2u; s0.operands = pir_alloc_ops(mod, 2u);
                 s0.operands[0] = target->is_big_endian ? vhi : vlo;
-                s0.operands[1] = pir_op_val(al.results[0], tptr);
+                s0.operands[1] = pir_op_val(bc_v, tptr);
                 pir_fn_append_inst(fn, &new_insts, s0);
 
                 PirInst pa = pir_make_inst(PIR_OP_PTR_ADD, idx_ty, ln, lc);
                 pa.flags = PIR_FLAG_INBOUNDS; pa.operand_count = 2u; pa.operands = pir_alloc_ops(mod, 2u);
-                pa.operands[0] = pir_op_val(al.results[0], tptr);
+                pa.operands[0] = pir_op_val(bc_v, tptr);
                 pa.operands[1] = pir_op_imm_i(8u, false, idx_ty);
                 pa.results[0]  = pir_fn_new_val(mod, fn, "bc128p", tptr, b, PIR_INVALID_ID, 0u);
                 pir_fn_append_inst(fn, &new_insts, pa);
@@ -659,7 +655,7 @@ static bool legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
 
                 PirInst ld = pir_make_inst(PIR_OP_LOAD, copy.ty, ln, lc);
                 ld.align = 16u; ld.operand_count = 1u; ld.operands = pir_alloc_ops(mod, 1u);
-                ld.operands[0] = pir_op_val(al.results[0], tptr);
+                ld.operands[0] = pir_op_val(bc_v, tptr);
                 ld.results[0]  = copy.results[0];
                 pir_fn_append_inst(fn, &new_insts, ld);
                 continue;
@@ -979,35 +975,34 @@ static bool legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                                                                 ln, "i128 division lowering", diag);
                 if (cid == PIR_INVALID_ID) {
                     PIR_VEC_FREE(&new_insts);
+                    PIR_VEC_FREE(&entry_allocas);
                     PIR_VEC_FREE(&aliases);
                     free(map);
                     return false;
                 }
                 fn = &mod->funcs.data[fi]; /* Re-fetch after potential realloc */
 
-                PirInst al = pir_make_inst(PIR_OP_ALLOCA_PTR, tptr, ln, lc);
-                al.imm_u64 = 16u; al.align = 8u;
-                al.results[0] = pir_fn_new_val(mod, fn, "ti_out", tptr, b, PIR_INVALID_ID, 0u);
-                pir_fn_append_inst(fn, &new_insts, al);
+                PirValueId ti_v = pir_fn_emit_entry_alloca(mod, fn, "ti_out",
+                                                           16u, 8u, ln, lc, &entry_allocas);
 
                 PirInst call = pir_make_inst(PIR_OP_CALL, pir_type_scalar(PIR_SCALAR_VOID), ln, lc);
                 call.flags = PIR_FLAG_NOUNWIND;
                 call.operand_count = 6u; call.operands = pir_alloc_ops(mod, 6u);
                 call.operands[0] = pir_op_sym_func(mod->funcs.data[cid].name, cid);
-                call.operands[1] = pir_op_val(al.results[0], tptr);
+                call.operands[1] = pir_op_val(ti_v, tptr);
                 call.operands[2] = alo; call.operands[3] = ahi;
                 call.operands[4] = blo; call.operands[5] = bhi;
                 pir_fn_append_inst(fn, &new_insts, call);
 
                 PirInst l0 = pir_make_inst(PIR_OP_LOAD, t64, ln, lc);
                 l0.align = 8u; l0.operand_count = 1u; l0.operands = pir_alloc_ops(mod, 1u);
-                l0.operands[0] = pir_op_val(al.results[0], tptr);
+                l0.operands[0] = pir_op_val(ti_v, tptr);
                 l0.results[0]  = target->is_big_endian ? rhi : rlo;
                 pir_fn_append_inst(fn, &new_insts, l0);
 
                 PirInst pa = pir_make_inst(PIR_OP_PTR_ADD, idx_ty, ln, lc);
                 pa.flags = PIR_FLAG_INBOUNDS; pa.operand_count = 2u; pa.operands = pir_alloc_ops(mod, 2u);
-                pa.operands[0] = pir_op_val(al.results[0], tptr);
+                pa.operands[0] = pir_op_val(ti_v, tptr);
                 pa.operands[1] = pir_op_imm_i(8u, false, idx_ty);
                 pa.results[0]  = pir_fn_new_val(mod, fn, "ti_p1", tptr, b, PIR_INVALID_ID, 0u);
                 pir_fn_append_inst(fn, &new_insts, pa);
@@ -1091,26 +1086,24 @@ static bool legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                     }
                     continue;
                 }
-                PirInst al = pir_make_inst(PIR_OP_ALLOCA_PTR, tptr, ln, lc);
-                al.imm_u64 = 16u; al.align = 16u;
-                al.results[0] = pir_fn_new_val(mod, fn, "bc128", tptr, b, PIR_INVALID_ID, 0u);
-                pir_fn_append_inst(fn, &new_insts, al);
+                PirValueId bc_v = pir_fn_emit_entry_alloca(mod, fn, "bc128",
+                                                           16u, 16u, ln, lc, &entry_allocas);
 
                 PirInst st = pir_make_inst(PIR_OP_STORE, copy.operands[0].type, ln, lc);
                 st.align = 16u; st.operand_count = 2u; st.operands = pir_alloc_ops(mod, 2u);
                 st.operands[0] = copy.operands[0];
-                st.operands[1] = pir_op_val(al.results[0], tptr);
+                st.operands[1] = pir_op_val(bc_v, tptr);
                 pir_fn_append_inst(fn, &new_insts, st);
 
                 PirInst l0 = pir_make_inst(PIR_OP_LOAD, t64, ln, lc);
                 l0.align = 8u; l0.operand_count = 1u; l0.operands = pir_alloc_ops(mod, 1u);
-                l0.operands[0] = pir_op_val(al.results[0], tptr);
+                l0.operands[0] = pir_op_val(bc_v, tptr);
                 l0.results[0]  = target->is_big_endian ? rhi : rlo;
                 pir_fn_append_inst(fn, &new_insts, l0);
 
                 PirInst pa = pir_make_inst(PIR_OP_PTR_ADD, idx_ty, ln, lc);
                 pa.flags = PIR_FLAG_INBOUNDS; pa.operand_count = 2u; pa.operands = pir_alloc_ops(mod, 2u);
-                pa.operands[0] = pir_op_val(al.results[0], tptr);
+                pa.operands[0] = pir_op_val(bc_v, tptr);
                 pa.operands[1] = pir_op_imm_i(8u, false, idx_ty);
                 pa.results[0]  = pir_fn_new_val(mod, fn, "bc128p", tptr, b, PIR_INVALID_ID, 0u);
                 pir_fn_append_inst(fn, &new_insts, pa);
@@ -1199,6 +1192,7 @@ static bool legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
     }
 
     fn = &mod->funcs.data[fi];
+    pir_fn_prepend_entry_insts(fn, &entry_allocas);
     for (uint32_t i = 0u; i < aliases.len; ++i) {
         PirValueId root = aliases.data[i].to;
         uint32_t steps = 0u;

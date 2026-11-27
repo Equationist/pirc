@@ -7,6 +7,7 @@
 #include "ir/lexer.h"
 #include "analysis/cfg.h"
 #include "analysis/dom.h"
+#include "common/symset.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -53,23 +54,11 @@ typedef struct {
     uint32_t  *val_ht_next;
     uint32_t   val_ht_cap;
     uint32_t   val_ht_next_cap;
-    uint32_t  *blk_ht_head;     /* Per-function O(1) hash table for duplicate block labels */
-    uint32_t  *blk_ht_next;
-    uint32_t   blk_ht_cap;
-    uint32_t   blk_ht_next_cap;
+    PirSymSet  blk_syms;        /* Per-function O(1) set for duplicate block labels */
     PIR_VEC(PendingTarget) pending_targets;
     PIR_VEC(PendingValRef) pending_vals;
     PIR_VEC(PendingSigRef) pending_sigs;
 } Parser;
-
-static uint32_t parser_fnv1a(const char *s) {
-    uint32_t h = 2166136261u;
-    for (const unsigned char *q = (const unsigned char *)s; *q; ++q) {
-        h ^= (uint32_t)*q;
-        h *= 16777619u;
-    }
-    return h;
-}
 
 static void parser_reset_fn_tables(Parser *p) {
     if (p->val_ht_cap == 0u) {
@@ -78,12 +67,7 @@ static void parser_reset_fn_tables(Parser *p) {
         if (!p->val_ht_head) abort();
     }
     for (uint32_t i = 0u; i < p->val_ht_cap; ++i) p->val_ht_head[i] = PIR_INVALID_ID;
-    if (p->blk_ht_cap == 0u) {
-        p->blk_ht_cap  = 32u;
-        p->blk_ht_head = (uint32_t *)malloc((size_t)p->blk_ht_cap * sizeof(uint32_t));
-        if (!p->blk_ht_head) abort();
-    }
-    for (uint32_t i = 0u; i < p->blk_ht_cap; ++i) p->blk_ht_head[i] = PIR_INVALID_ID;
+    pir_symset_clear(&p->blk_syms);
 }
 
 static bool is_agg_defined(const Parser *p, PirTypeId id) {
@@ -863,7 +847,7 @@ static PirValueId define_value(Parser *p, PirFunction *fn, const char *name, Pir
         for (uint32_t i = 0u; i < ncap; ++i) nh[i] = PIR_INVALID_ID;
         uint32_t mask = ncap - 1u;
         for (uint32_t i = 0u; i < fn->values.len; ++i) {
-            uint32_t bkt = parser_fnv1a(fn->values.data[i].name) & mask;
+            uint32_t bkt = pir_fnv1a_str(fn->values.data[i].name) & mask;
             p->val_ht_next[i] = nh[bkt];
             nh[bkt] = i;
         }
@@ -871,7 +855,7 @@ static PirValueId define_value(Parser *p, PirFunction *fn, const char *name, Pir
         p->val_ht_head = nh;
         p->val_ht_cap  = ncap;
     }
-    uint32_t bkt = parser_fnv1a(name) & (p->val_ht_cap - 1u);
+    uint32_t bkt = pir_fnv1a_str(name) & (p->val_ht_cap - 1u);
     for (uint32_t i = p->val_ht_head[bkt]; i != PIR_INVALID_ID; i = p->val_ht_next[i]) {
         const PirValueDef *v = &fn->values.data[i];
         if (strcmp(v->name, name) != 0) continue;
@@ -2492,36 +2476,8 @@ static bool parse_func_decl(Parser *p, PirLinkage linkage, bool is_weak_extern) 
             }
             const char *lbl = p->cur.text;
             uint32_t bline  = p->cur.line;
-            if (f->blocks.len >= p->blk_ht_next_cap) {
-                uint32_t ncap = p->blk_ht_next_cap ? p->blk_ht_next_cap * 2u : 32u;
-                while (ncap <= f->blocks.len) ncap *= 2u;
-                uint32_t *nn = (uint32_t *)realloc(p->blk_ht_next, (size_t)ncap * sizeof(uint32_t));
-                if (!nn) abort();
-                p->blk_ht_next     = nn;
-                p->blk_ht_next_cap = ncap;
-            }
-            if (f->blocks.len * 2u >= p->blk_ht_cap && p->blk_ht_cap < (1u << 24)) {
-                uint32_t ncap = p->blk_ht_cap ? p->blk_ht_cap * 2u : 32u;
-                while (ncap <= f->blocks.len * 2u && ncap < (1u << 24)) ncap *= 2u;
-                uint32_t *nh = (uint32_t *)malloc((size_t)ncap * sizeof(uint32_t));
-                if (!nh) abort();
-                for (uint32_t bi = 0u; bi < ncap; ++bi) nh[bi] = PIR_INVALID_ID;
-                uint32_t mask = ncap - 1u;
-                for (uint32_t bi = 0u; bi < f->blocks.len; ++bi) {
-                    uint32_t bb = parser_fnv1a(f->blocks.data[bi].label) & mask;
-                    p->blk_ht_next[bi] = nh[bb];
-                    nh[bb] = bi;
-                }
-                free(p->blk_ht_head);
-                p->blk_ht_head = nh;
-                p->blk_ht_cap  = ncap;
-            }
-            uint32_t bbkt = parser_fnv1a(lbl) & (p->blk_ht_cap - 1u);
-            for (uint32_t b = p->blk_ht_head[bbkt]; b != PIR_INVALID_ID; b = p->blk_ht_next[b]) {
-                if (strcmp(f->blocks.data[b].label, lbl) == 0) {
-                    pir_diag_error(p->diag, bline, 0u, "duplicate block label '.%s'", lbl);
-                    break;
-                }
+            if (!pir_symset_insert(&p->blk_syms, lbl)) {
+                pir_diag_error(p->diag, bline, 0u, "duplicate block label '.%s'", lbl);
             }
             PirBlock blk;
             memset(&blk, 0, sizeof(blk));
@@ -2529,8 +2485,6 @@ static bool parse_func_decl(Parser *p, PirLinkage linkage, bool is_weak_extern) 
             blk.src_line = bline;
             PirBlockId blk_idx = f->blocks.len;
             PIR_VEC_PUSH(&f->blocks, blk);
-            p->blk_ht_next[blk_idx] = p->blk_ht_head[bbkt];
-            p->blk_ht_head[bbkt]    = blk_idx;
             advance_tok(p);
 
             if (match_tok(p, TOK_LPAREN)) {
@@ -2781,25 +2735,14 @@ static bool resolve_module(Parser *p) {
             /* Insert in reverse so traversing each bucket visits lower ValueIds first. */
             for (uint32_t v = nv; v > 0u; --v) {
                 uint32_t vid = v - 1u;
-                const char *s = fn->values.data[vid].name;
-                uint32_t h = 2166136261u;
-                for (const unsigned char *q = (const unsigned char *)s; *q; ++q) {
-                    h ^= (uint32_t)*q;
-                    h *= 16777619u;
-                }
-                uint32_t bkt = h & ht_mask;
+                uint32_t bkt = pir_fnv1a_str(fn->values.data[vid].name) & ht_mask;
                 ht_next[vid] = ht_head[bkt];
                 ht_head[bkt] = vid;
             }
             idx_fn_id = vr->func_idx;
         }
 
-        uint32_t vh = 2166136261u;
-        for (const unsigned char *q = (const unsigned char *)vr->name; *q; ++q) {
-            vh ^= (uint32_t)*q;
-            vh *= 16777619u;
-        }
-        uint32_t bkt = vh & ht_mask;
+        uint32_t bkt = pir_fnv1a_str(vr->name) & ht_mask;
         PirValueId found = PIR_INVALID_ID;
 
         /* Prefer definition in the same block (supports same-named block params in nested blocks). */
@@ -3003,8 +2946,7 @@ done:
     free(p.agg_defined);
     free(p.val_ht_head);
     free(p.val_ht_next);
-    free(p.blk_ht_head);
-    free(p.blk_ht_next);
+    pir_symset_destroy(&p.blk_syms);
     PIR_VEC_FREE(&p.pending_targets);
     PIR_VEC_FREE(&p.pending_vals);
     PIR_VEC_FREE(&p.pending_sigs);
