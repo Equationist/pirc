@@ -15,6 +15,8 @@ typedef struct {
     uint32_t       num_blocks;
     PirBlockId    *idom;     /* Immediate dominator; PIR_INVALID_ID if unreachable */
     PirBlockIdVec *children; /* Dominator tree children per block */
+    uint32_t      *tin;      /* Euler-tour DFS entry timestamp (0 if unreachable) */
+    uint32_t      *tout;     /* Euler-tour DFS exit timestamp */
 } PirDom;
 
 void pir_dom_build(PirDom *dom, const PirCfg *cfg);

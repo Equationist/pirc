@@ -147,14 +147,26 @@ static bool elf_sec_needs_quote(const char *s) {
 
 static void emit_elf_section_name(FILE *out, const char *sec) {
     if (elf_sec_needs_quote(sec)) {
-        pir_asm_emit_escaped_cstr(out, sec);
+        /* GNU as / LLVM-MC read characters inside ELF .section "..." names verbatim
+         * (no C backslash unescaping except \"), so emit bytes directly without doubling '\'. */
+        fputc('"', out);
+        if (sec) {
+            for (const unsigned char *p = (const unsigned char *)sec; *p; ++p) {
+                unsigned char c = *p;
+                if (c == '"') {
+                    fputs("\\\"", out);
+                } else {
+                    fputc((int)c, out);
+                }
+            }
+        }
+        fputc('"', out);
     } else {
         fputs(sec, out);
     }
 }
 
 static bool global_has_reloc(const PirGlobal *g);
-static bool global_is_all_zero(const PirGlobal *g);
 
 void pir_asm_emit_linkage(FILE *out, const PirTargetSpec *target,
                           PirLinkage linkage, const char *name,
@@ -214,43 +226,37 @@ static void emit_elf_section_directive(FILE *out, const PirModule *mod,
         return;
     }
 
-    if (strchr(custom_sec, ',') != NULL) {
-        /* Comma in ELF section name: quote as section name to avoid directive injection. */
-        fputs("\t.section ", out);
-        pir_asm_emit_escaped_cstr(out, custom_sec);
-        if (is_func) fputs(",\"ax\",@progbits\n", out);
-        else if (seg == PIR_GSEG_TLS) fprintf(out, ",\"awT\",%s\n", is_zero ? "@nobits" : "@progbits");
-        else if (seg == PIR_GSEG_RODATA && !has_reloc) fputs(",\"a\",@progbits\n", out);
-        else fprintf(out, ",\"aw\",%s\n", is_zero ? "@nobits" : "@progbits");
-        return;
-    }
-
-    static const struct { const char *name; const char *dir; } BUILTIN_SECS[] = {
-        { ".text",   "\t.text\n" },
-        { ".data",   "\t.data\n" },
-        { ".rodata", "\t.section .rodata,\"a\",@progbits\n" },
-        { ".tdata",  "\t.section .tdata,\"awT\",@progbits\n" },
-        { ".bss",    "\t.bss\n" },
-        { ".tbss",   "\t.section .tbss,\"awT\",@nobits\n" },
-    };
-    for (size_t i = 0u; i < sizeof(BUILTIN_SECS) / sizeof(BUILTIN_SECS[0]); ++i) {
-        if (strcmp(custom_sec, BUILTIN_SECS[i].name) == 0) {
-            fputs(BUILTIN_SECS[i].dir, out);
-            return;
+    if (strchr(custom_sec, ',') == NULL) {
+        static const struct { const char *name; const char *dir; } BUILTIN_SECS[] = {
+            { ".text",           "\t.text\n" },
+            { ".data",           "\t.data\n" },
+            { ".rodata",         "\t.section .rodata,\"a\",@progbits\n" },
+            { ".data.rel.ro",    "\t.section .data.rel.ro,\"aw\",@progbits\n" },
+            { ".tdata",          "\t.section .tdata,\"awT\",@progbits\n" },
+            { ".bss",            "\t.bss\n" },
+            { ".tbss",           "\t.section .tbss,\"awT\",@nobits\n" },
+            { ".eh_frame",       "\t.section .eh_frame,\"a\",@progbits\n" },
+            { ".note.GNU-stack", "\t.section .note.GNU-stack,\"\",@progbits\n" },
+        };
+        for (size_t i = 0u; i < sizeof(BUILTIN_SECS) / sizeof(BUILTIN_SECS[0]); ++i) {
+            if (strcmp(custom_sec, BUILTIN_SECS[i].name) == 0) {
+                fputs(BUILTIN_SECS[i].dir, out);
+                return;
+            }
         }
-    }
 
-    static const struct { const char *pfx; const char *type; } ARRAY_SECS[] = {
-        { ".init_array",    "@init_array" },
-        { ".fini_array",    "@fini_array" },
-        { ".preinit_array", "@preinit_array" },
-    };
-    for (size_t i = 0u; i < sizeof(ARRAY_SECS) / sizeof(ARRAY_SECS[0]); ++i) {
-        if (elf_sec_is_prefix(custom_sec, ARRAY_SECS[i].pfx)) {
-            fputs("\t.section ", out);
-            emit_elf_section_name(out, custom_sec);
-            fprintf(out, ",\"aw\",%s\n", ARRAY_SECS[i].type);
-            return;
+        static const struct { const char *pfx; const char *type; } ARRAY_SECS[] = {
+            { ".init_array",    "@init_array" },
+            { ".fini_array",    "@fini_array" },
+            { ".preinit_array", "@preinit_array" },
+        };
+        for (size_t i = 0u; i < sizeof(ARRAY_SECS) / sizeof(ARRAY_SECS[0]); ++i) {
+            if (elf_sec_is_prefix(custom_sec, ARRAY_SECS[i].pfx)) {
+                fputs("\t.section ", out);
+                emit_elf_section_name(out, custom_sec);
+                fprintf(out, ",\"aw\",%s\n", ARRAY_SECS[i].type);
+                return;
+            }
         }
     }
 
@@ -273,7 +279,7 @@ static void emit_elf_section_directive(FILE *out, const PirModule *mod,
                 strcmp(og->section, custom_sec) != 0) {
                 continue;
             }
-            if (!global_is_all_zero(og)) eff_zero = false;
+            if (!pir_global_is_all_zero(og)) eff_zero = false;
             if (og->seg == PIR_GSEG_TLS) { eff_tls = true; eff_write = true; }
             else if (og->seg != PIR_GSEG_RODATA || global_has_reloc(og)) eff_write = true;
         }
@@ -293,8 +299,13 @@ static void emit_elf_section_directive(FILE *out, const PirModule *mod,
 static void emit_macho_section_directive(FILE *out, const char *custom_sec, PirGlobalSeg seg,
                                          bool has_reloc, bool is_zero, bool is_func) {
     if (custom_sec && custom_sec[0] != '\0') {
-        if (strchr(custom_sec, ',') != NULL && strchr(custom_sec, ';') == NULL) {
-            fprintf(out, "\t.section %s\n", custom_sec);
+        const char *c1 = strchr(custom_sec, ',');
+        if (c1 != NULL && strchr(custom_sec, ';') == NULL) {
+            if (is_func && strchr(c1 + 1, ',') == NULL) {
+                fprintf(out, "\t.section %s,regular,pure_instructions\n", custom_sec);
+            } else {
+                fprintf(out, "\t.section %s\n", custom_sec);
+            }
             return;
         }
         if (is_func) {
@@ -499,36 +510,6 @@ static uint64_t compute_global_bytes(const PirModule *mod, const PirTargetSpec *
     return tot > 0u ? tot : 1u;
 }
 
-static bool global_is_all_zero(const PirGlobal *g) {
-    if (g->is_zeroinit) return true;
-    if (g->item_count == 0u) return true;
-    if (g->has_type && g->type.kind == PIR_TYPE_VECTOR) {
-        bool is_fp = pir_scalar_is_float(pir_vec_elem_scalar(g->type.u.vec));
-        for (uint32_t k = 0u; k < g->item_count; ++k) {
-            const PirGlobalItem *gi = &g->items[k];
-            if (gi->kind == PIR_GITEM_INT && gi->int_lo == 0u && gi->int_hi == 0u &&
-                !(is_fp && gi->int_neg)) continue;
-            if (gi->kind == PIR_GITEM_FLOAT && gi->float_bits == 0u) continue;
-            if (gi->kind == PIR_GITEM_ZERO) continue;
-            return false;
-        }
-        return true;
-    }
-    if (g->has_type && g->type.kind == PIR_TYPE_SCALAR && g->item_count == 1u) {
-        const PirGlobalItem *gi = &g->items[0];
-        bool is_fp = pir_scalar_is_float(g->type.u.scalar);
-        if (gi->kind == PIR_GITEM_INT && gi->int_lo == 0u && gi->int_hi == 0u &&
-            !(is_fp && gi->int_neg)) return true;
-        if (gi->kind == PIR_GITEM_FLOAT && gi->float_bits == 0u) return true;
-        if (gi->kind == PIR_GITEM_ZERO) return true;
-        return false;
-    }
-    for (uint32_t k = 0u; k < g->item_count; ++k) {
-        if (g->items[k].kind != PIR_GITEM_ZERO) return false;
-    }
-    return true;
-}
-
 static void emit_reloc_quad(FILE *out, const PirTargetSpec *target,
                             const PirGlobalItem *gi, PirAsmNeedsQuoteFn arch_needs_quote) {
     fputs("\t.quad ", out);
@@ -672,7 +653,7 @@ bool pir_asm_emit_globals(FILE *out, const PirModule *mod, const PirTargetSpec *
             }
         }
         uint32_t p2 = pir_asm_log2_align(al);
-        bool all_zero = global_is_all_zero(g);
+        bool all_zero = pir_global_is_all_zero(g);
         uint64_t sz = compute_global_bytes(mod, target, g);
 
         /* Darwin Mach-O TLS: __DATA,__thread_vars descriptor + __thread_data / .tbss backing.

@@ -175,6 +175,7 @@ static void dump_module_layout(const PirModule *mod, const PirTargetSpec *target
 int main(int argc, char **argv) {
     bool do_version     = false;
     bool do_verify      = false;
+    bool do_verify_only = false;
     bool want_hir       = false;
     bool want_lir       = false;
     bool do_print       = false;
@@ -221,7 +222,8 @@ int main(int argc, char **argv) {
             do_verify = true;
             want_lir  = true;
         } else if (strcmp(arg, "--verify-only") == 0) {
-            do_verify = true;
+            do_verify      = true;
+            do_verify_only = true;
         } else if (strcmp(arg, "--lir") == 0) {
             want_lir = true;
         } else if (strcmp(arg, "--print") == 0 || strcmp(arg, "--emit-hir") == 0) {
@@ -275,6 +277,17 @@ int main(int argc, char **argv) {
 
     if (do_emit_asm && do_emit_obj) {
         fprintf(stderr, "pirc: conflicting options '-S' and '-c'\n");
+        return 1;
+    }
+    if (do_verify_only && (do_print || do_emit_lir || do_dump_layout || do_interp ||
+                           do_emit_asm || do_emit_obj)) {
+        fprintf(stderr, "pirc: '--verify-only' cannot be combined with output or execution flags\n");
+        return 1;
+    }
+    if ((do_print && do_emit_lir) ||
+        ((do_print || do_emit_lir) && (do_emit_asm || do_emit_obj || do_interp)) ||
+        (do_interp && (do_emit_asm || do_emit_obj))) {
+        fprintf(stderr, "pirc: conflicting output/execution action flags\n");
         return 1;
     }
     if (want_hir && want_lir) {
@@ -372,7 +385,22 @@ int main(int argc, char **argv) {
     }
 
     if (do_print || do_emit_lir) {
-        pir_print_module(&mod, stdout);
+        FILE *out = stdout;
+        if (output_path) {
+            out = fopen(output_path, "wb");
+            if (!out) {
+                fprintf(stderr, "pirc: cannot open output '%s'\n", output_path);
+                rc = 1;
+                goto cleanup;
+            }
+        }
+        pir_print_module(&mod, out);
+        bool ok = (ferror(out) == 0);
+        if (output_path && fclose(out) != 0) ok = false;
+        if (!ok) {
+            rc = 1;
+            goto cleanup;
+        }
     }
 
     if (do_emit_asm || do_emit_obj) {

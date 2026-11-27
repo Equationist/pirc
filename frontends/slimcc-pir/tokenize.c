@@ -654,11 +654,14 @@ static Token *read_string_literal(const char *start, const char *quote, Type *ty
     }
     buf[len++] = *p++;
   }
+  Token *tok = new_token(TK_STR, start, end + 1);
   if (invalid) {
     free(buf);
-    return new_token(TK_INVALID, start, end + 1);
+    tok->str_invalid = true;
+    tok->ty = array_of(ty, 1);
+    tok->str = calloc(1, 1);
+    return tok;
   }
-  Token *tok = new_token(TK_STR, start, end + 1);
   tok->ty = array_of(ty, len + 1);
   tok->str = buf;
   return tok;
@@ -703,11 +706,14 @@ static Token *read_utf16_string_literal(const char *start, const char *quote) {
     }
     invalid = true;
   }
+  Token *tok = new_token(TK_STR, start, end + 1);
   if (invalid) {
     free(buf);
-    return new_token(TK_INVALID, start, end + 1);
+    tok->str_invalid = true;
+    tok->ty = array_of(ty_char16_t, 1);
+    tok->str = calloc(2, 1);
+    return tok;
   }
-  Token *tok = new_token(TK_STR, start, end + 1);
   tok->ty = array_of(ty_char16_t, len + 1);
   tok->str = (char *)buf;
   return tok;
@@ -729,11 +735,14 @@ static Token *read_utf32_string_literal(const char *start, const char *quote, Ty
     else
       buf[len++] = decode_utf8(&p, p);
   }
+  Token *tok = new_token(TK_STR, start, end + 1);
   if (invalid) {
     free(buf);
-    return new_token(TK_INVALID, start, end + 1);
+    tok->str_invalid = true;
+    tok->ty = array_of(ty, 1);
+    tok->str = calloc(4, 1);
+    return tok;
   }
-  Token *tok = new_token(TK_STR, start, end + 1);
   tok->ty = array_of(ty, len + 1);
   tok->str = (char *)buf;
   return tok;
@@ -741,8 +750,12 @@ static Token *read_utf32_string_literal(const char *start, const char *quote, Ty
 
 static Token *read_char_literal(const char *start) {
   const char *p = start + 1;
-  if (*p == '\'')
-    return new_token(TK_INVALID, start, p + 1);
+  if (*p == '\'') {
+    Token *tok = new_token(TK_CHAR_LIT, start, p + 1);
+    tok->str_invalid = true;
+    tok->ty = ty_int;
+    return tok;
+  }
 
   uint64_t val = 0;
   bool is_multi = false;
@@ -772,8 +785,12 @@ static Token *read_char_literal(const char *start) {
     is_multi = true;
   }
 
-  if (invalid)
-    return new_token(TK_INVALID, start, p + 1);
+  if (invalid) {
+    Token *tok = new_token(TK_CHAR_LIT, start, p + 1);
+    tok->str_invalid = true;
+    tok->ty = ty_int;
+    return tok;
+  }
 
   if (!is_multi && !ty_pchar->is_unsigned)
     val = (uint32_t)(int8_t)val;
@@ -787,8 +804,12 @@ static Token *read_char_literal(const char *start) {
 static Token *read_unicode_char_literal(const char *start, const char *quote, Type *ty) {
   bool invalid = false;
   const char *p = quote + 1;
-  if (*p == '\'')
-    return new_token(TK_INVALID, start, p + 1);
+  if (*p == '\'') {
+    Token *tok = new_token(TK_CHAR_LIT, start, p + 1);
+    tok->str_invalid = true;
+    tok->ty = ty;
+    return tok;
+  }
   if (*p == '\0' || *p == '\n')
     error_at(start, "unclosed character literal");
 
@@ -808,14 +829,21 @@ static Token *read_unicode_char_literal(const char *start, const char *quote, Ty
     }
     if (*p != '\'')
       error_at(start, "unclosed character literal");
-    return new_token(TK_INVALID, start, p + 1);
+    Token *tok = new_token(TK_CHAR_LIT, start, p + 1);
+    tok->str_invalid = true;
+    tok->ty = ty;
+    return tok;
   }
 
   if (start[0] == 'u' && start[1] == '8' && c > (is_hex_oct ? 0xFFu : 0x7Fu))
     invalid = true;
 
-  if (invalid)
-    return new_token(TK_INVALID, start, p + 1);
+  if (invalid) {
+    Token *tok = new_token(TK_CHAR_LIT, start, p + 1);
+    tok->str_invalid = true;
+    tok->ty = ty;
+    return tok;
+  }
 
   Token *tok = new_token(TK_CHAR_LIT, start, p + 1);
   tok->ival = c;
@@ -1167,8 +1195,9 @@ void tokenize_string_literal(Token *tok, Type *basety) {
   else
     tok2 = read_utf32_string_literal(tok->loc, tok->loc, basety);
   current_file = saved_file;
-  if (tok2->kind == TK_INVALID)
+  if (tok2->kind == TK_INVALID || tok2->str_invalid)
     error_tok(tok, "invalid string literal");
+  tok->str_invalid = false;
   tok->ty = tok2->ty;
   tok->str = tok2->str;
 }
@@ -1385,7 +1414,7 @@ Token *tokenize(File *file, SlashDelta *delta, Token **end) {
       continue;
     }
 
-    if (*p == '\\') {
+    if (*p == '\\' || *p == '$') {
       cur = cur->next = new_token(TK_PUNCT, p, p + 1);
       p++;
       continue;
@@ -1407,6 +1436,10 @@ Token *tokenize(File *file, SlashDelta *delta, Token **end) {
 }
 
 Token *tokenize_file(const char *path, Token *tok, Token **end) {
+  return tokenize_file_ex(path, tok, end, false);
+}
+
+Token *tokenize_file_ex(const char *path, Token *tok, Token **end, bool is_syshdr) {
   FILE *fp;
 
   if (strcmp(path, "-") == 0) {
@@ -1419,6 +1452,13 @@ Token *tokenize_file(const char *path, Token *tok, Token **end) {
         error_tok(tok, "%s: cannot open file: %s", path, strerror(errno));
       error("%s: cannot open file: %s", path, strerror(errno));
     }
+    struct stat st;
+    if (fstat(fileno(fp), &st) == 0 && S_ISDIR(st.st_mode)) {
+      fclose(fp);
+      if (tok)
+        error_tok(tok, "%s: is a directory", path);
+      error("%s: is a directory", path);
+    }
   }
 
   char *buf;
@@ -1429,8 +1469,18 @@ Token *tokenize_file(const char *path, Token *tok, Token **end) {
   for (;;) {
     char buf2[4096];
     int n = fread(buf2, 1, sizeof(buf2), fp);
-    if (n == 0)
+    if (n == 0) {
+      if (ferror(fp)) {
+        if (fp != stdin)
+          fclose(fp);
+        fclose(out);
+        free(buf);
+        if (tok)
+          error_tok(tok, "%s: read error: %s", path, strerror(errno));
+        error("%s: read error: %s", path, strerror(errno));
+      }
       break;
+    }
     fwrite(buf2, 1, n, out);
   }
 
@@ -1485,7 +1535,9 @@ Token *tokenize_file(const char *path, Token *tok, Token **end) {
   SlashDelta dlt = {0};
   remove_backslash_newline(buf, &dlt);
 
-  return tokenize(new_file(path, buf), &dlt, end);
+  File *f = new_file(path, buf);
+  f->is_syshdr = is_syshdr;
+  return tokenize(f, &dlt, end);
 }
 
 int add_display_file(const char *path) {

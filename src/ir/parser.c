@@ -49,10 +49,42 @@ typedef struct {
     bool      *agg_defined;     /* Dynamically sized bitmap of defined named aggregates */
     uint32_t   agg_defined_cap;
     uint32_t   type_depth;
+    uint32_t  *val_ht_head;     /* Per-function O(1) hash table for define_value() */
+    uint32_t  *val_ht_next;
+    uint32_t   val_ht_cap;
+    uint32_t   val_ht_next_cap;
+    uint32_t  *blk_ht_head;     /* Per-function O(1) hash table for duplicate block labels */
+    uint32_t  *blk_ht_next;
+    uint32_t   blk_ht_cap;
+    uint32_t   blk_ht_next_cap;
     PIR_VEC(PendingTarget) pending_targets;
     PIR_VEC(PendingValRef) pending_vals;
     PIR_VEC(PendingSigRef) pending_sigs;
 } Parser;
+
+static uint32_t parser_fnv1a(const char *s) {
+    uint32_t h = 2166136261u;
+    for (const unsigned char *q = (const unsigned char *)s; *q; ++q) {
+        h ^= (uint32_t)*q;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static void parser_reset_fn_tables(Parser *p) {
+    if (p->val_ht_cap == 0u) {
+        p->val_ht_cap  = 64u;
+        p->val_ht_head = (uint32_t *)malloc((size_t)p->val_ht_cap * sizeof(uint32_t));
+        if (!p->val_ht_head) abort();
+    }
+    for (uint32_t i = 0u; i < p->val_ht_cap; ++i) p->val_ht_head[i] = PIR_INVALID_ID;
+    if (p->blk_ht_cap == 0u) {
+        p->blk_ht_cap  = 32u;
+        p->blk_ht_head = (uint32_t *)malloc((size_t)p->blk_ht_cap * sizeof(uint32_t));
+        if (!p->blk_ht_head) abort();
+    }
+    for (uint32_t i = 0u; i < p->blk_ht_cap; ++i) p->blk_ht_head[i] = PIR_INVALID_ID;
+}
 
 static bool is_agg_defined(const Parser *p, PirTypeId id) {
     return id < p->agg_defined_cap && p->agg_defined[id];
@@ -526,6 +558,40 @@ static bool parse_u32_positive(Parser *p, uint32_t *out, const char *what) {
     return true;
 }
 
+static bool parse_sym_offset(Parser *p, int64_t *out_off) {
+    *out_off = 0;
+    bool sub = false;
+    if (p->cur.kind == TOK_PLUS || p->cur.kind == TOK_MINUS) {
+        bool op_minus = (p->cur.kind == TOK_MINUS);
+        advance_tok(p);
+        if (p->cur.kind != TOK_INT || p->cur.int_hi != 0u) {
+            pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected integer symbol offset");
+            return false;
+        }
+        if (op_minus && p->cur.int_neg) {
+            pir_diag_error(p->diag, p->cur.line, p->cur.col, "double-negated symbol offset is invalid");
+            return false;
+        }
+        sub = op_minus || p->cur.int_neg;
+    } else if (p->cur.kind == TOK_INT && p->cur.int_neg) {
+        sub = true;
+        if (p->cur.int_hi != 0u) {
+            pir_diag_error(p->diag, p->cur.line, p->cur.col, "symbol offset out of signed 64-bit range");
+            return false;
+        }
+    } else {
+        return true;
+    }
+    uint64_t mag = p->cur.int_lo;
+    if (sub ? (mag > (uint64_t)INT64_MAX + 1u) : (mag > (uint64_t)INT64_MAX)) {
+        pir_diag_error(p->diag, p->cur.line, p->cur.col, "symbol offset out of signed 64-bit range");
+        return false;
+    }
+    *out_off = sub ? (int64_t)(UINT64_C(0) - mag) : (int64_t)mag;
+    advance_tok(p);
+    return true;
+}
+
 static bool parse_operand(Parser *p, PirFuncId func_idx, PirBlockId blk_idx,
                           PirInstId inst_idx, int which_target, uint32_t op_idx,
                           bool allow_invoke_kw, bool allow_type_tag,
@@ -553,6 +619,7 @@ static bool parse_operand(Parser *p, PirFuncId func_idx, PirBlockId blk_idx,
         out->u.imm_float.raw_val      = p->cur.float_val;
         out->u.imm_float.f32_bits     = f32b;
         out->u.imm_float.has_f32_bits = true;
+        out->u.imm_float.f32_overflow = p->cur.float_f32_overflow;
         out->u.imm_float.bits         = encode_float_bits(p->cur.float_val, pir_type_scalar(PIR_SCALAR_F64));
         advance_tok(p);
     } else if (p->cur.kind == TOK_GLOBAL) {
@@ -561,22 +628,7 @@ static bool parse_operand(Parser *p, PirFuncId func_idx, PirBlockId blk_idx,
         out->u.sym.name = p->cur.text;
         out->u.sym.id   = PIR_INVALID_ID;
         advance_tok(p);
-        if (p->cur.kind == TOK_PLUS || p->cur.kind == TOK_MINUS) {
-            bool sub = (p->cur.kind == TOK_MINUS);
-            advance_tok(p);
-            if (p->cur.kind != TOK_INT || p->cur.int_hi != 0u) {
-                pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected integer offset");
-                return false;
-            }
-            uint64_t mag = p->cur.int_lo;
-            bool neg = (sub != p->cur.int_neg);
-            if (neg ? (mag > (uint64_t)INT64_MAX + 1u) : (mag > (uint64_t)INT64_MAX)) {
-                pir_diag_error(p->diag, p->cur.line, p->cur.col, "symbol offset out of signed 64-bit range");
-                return false;
-            }
-            out->u.sym.offset = neg ? (int64_t)(UINT64_C(0) - mag) : (int64_t)mag;
-            advance_tok(p);
-        }
+        if (!parse_sym_offset(p, &out->u.sym.offset)) return false;
     } else if (p->cur.kind == TOK_IDENT && strcmp(p->cur.text, "nan") == 0) {
         double nv = (double)NAN;
         out->kind                = PIR_OPER_IMM_FLOAT;
@@ -788,14 +840,39 @@ static PirType infer_result1_type(PirOpcode op, PirType ty) {
 static PirValueId define_value(Parser *p, PirFunction *fn, const char *name, PirType ty,
                                PirBlockId def_block, PirInstId def_inst,
                                uint32_t param_idx, uint32_t line) {
-    /* Duplicate check:
+    /* Duplicate check (O(1) amortized via per-function hash table):
      * - Duplicate function param -> error
      * - Duplicate within same block (param or inst) -> error
      * - Instruction result colliding with any func param or other inst result -> error
      * - Block param in block B sharing a name with block param in block A (A != B) is allowed
      *   (matches PIR.md Example 2 and roundtrip/03_block_args_loop.pir). */
     bool is_blk_param = (def_block != PIR_INVALID_ID && def_inst == PIR_INVALID_ID);
-    for (uint32_t i = 0u; i < fn->values.len; ++i) {
+    if (fn->values.len >= p->val_ht_next_cap) {
+        uint32_t ncap = p->val_ht_next_cap ? p->val_ht_next_cap * 2u : 64u;
+        while (ncap <= fn->values.len) ncap *= 2u;
+        uint32_t *nn = (uint32_t *)realloc(p->val_ht_next, (size_t)ncap * sizeof(uint32_t));
+        if (!nn) abort();
+        p->val_ht_next     = nn;
+        p->val_ht_next_cap = ncap;
+    }
+    if (fn->values.len * 2u >= p->val_ht_cap && p->val_ht_cap < (1u << 24)) {
+        uint32_t ncap = p->val_ht_cap ? p->val_ht_cap * 2u : 64u;
+        while (ncap <= fn->values.len * 2u && ncap < (1u << 24)) ncap *= 2u;
+        uint32_t *nh = (uint32_t *)malloc((size_t)ncap * sizeof(uint32_t));
+        if (!nh) abort();
+        for (uint32_t i = 0u; i < ncap; ++i) nh[i] = PIR_INVALID_ID;
+        uint32_t mask = ncap - 1u;
+        for (uint32_t i = 0u; i < fn->values.len; ++i) {
+            uint32_t bkt = parser_fnv1a(fn->values.data[i].name) & mask;
+            p->val_ht_next[i] = nh[bkt];
+            nh[bkt] = i;
+        }
+        free(p->val_ht_head);
+        p->val_ht_head = nh;
+        p->val_ht_cap  = ncap;
+    }
+    uint32_t bkt = parser_fnv1a(name) & (p->val_ht_cap - 1u);
+    for (uint32_t i = p->val_ht_head[bkt]; i != PIR_INVALID_ID; i = p->val_ht_next[i]) {
         const PirValueDef *v = &fn->values.data[i];
         if (strcmp(v->name, name) != 0) continue;
         bool other_blk_param = (v->def_block != PIR_INVALID_ID && v->def_inst == PIR_INVALID_ID);
@@ -813,6 +890,8 @@ static PirValueId define_value(Parser *p, PirFunction *fn, const char *name, Pir
     vd.param_index = param_idx;
     PirValueId id  = fn->values.len;
     PIR_VEC_PUSH(&fn->values, vd);
+    p->val_ht_next[id] = p->val_ht_head[bkt];
+    p->val_ht_head[bkt] = id;
     return id;
 }
 
@@ -1795,18 +1874,38 @@ static bool parse_fn_cc_and_attrs(Parser *p, PirCallingConv *cc_out,
             *sec_out = p->cur.text;
             advance_tok(p);
         } else if (is_ident(p, "nounwind")) {
+            if (*attrs_out & PIR_FATTR_NOUNWIND) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate function attribute 'nounwind'");
+                return false;
+            }
             *attrs_out |= PIR_FATTR_NOUNWIND;
             advance_tok(p);
         } else if (is_ident(p, "noreturn")) {
+            if (*attrs_out & PIR_FATTR_NORETURN) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate function attribute 'noreturn'");
+                return false;
+            }
             *attrs_out |= PIR_FATTR_NORETURN;
             advance_tok(p);
         } else if (is_ident(p, "readonly")) {
+            if (*attrs_out & PIR_FATTR_READONLY) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate function attribute 'readonly'");
+                return false;
+            }
             *attrs_out |= PIR_FATTR_READONLY;
             advance_tok(p);
         } else if (is_ident(p, "signext")) {
+            if (*attrs_out & PIR_FATTR_RET_SIGNEXT) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate function attribute 'signext'");
+                return false;
+            }
             *attrs_out |= PIR_FATTR_RET_SIGNEXT;
             advance_tok(p);
         } else if (is_ident(p, "zeroext")) {
+            if (*attrs_out & PIR_FATTR_RET_ZEROEXT) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate function attribute 'zeroext'");
+                return false;
+            }
             *attrs_out |= PIR_FATTR_RET_ZEROEXT;
             advance_tok(p);
         } else if (cabi_ret_out && is_ident(p, "sret_x8")) {
@@ -1862,16 +1961,23 @@ static bool parse_fn_cc_and_attrs(Parser *p, PirCallingConv *cc_out,
         } else if (p->cur.kind == TOK_LBRACKET) {
             advance_tok(p);
             do {
-                if (is_ident(p, "nounwind"))      *attrs_out |= PIR_FATTR_NOUNWIND;
-                else if (is_ident(p, "noreturn")) *attrs_out |= PIR_FATTR_NORETURN;
-                else if (is_ident(p, "readonly")) *attrs_out |= PIR_FATTR_READONLY;
-                else if (is_ident(p, "signext"))  *attrs_out |= PIR_FATTR_RET_SIGNEXT;
-                else if (is_ident(p, "zeroext"))  *attrs_out |= PIR_FATTR_RET_ZEROEXT;
+                uint32_t bit = 0u;
+                if (is_ident(p, "nounwind"))      bit = PIR_FATTR_NOUNWIND;
+                else if (is_ident(p, "noreturn")) bit = PIR_FATTR_NORETURN;
+                else if (is_ident(p, "readonly")) bit = PIR_FATTR_READONLY;
+                else if (is_ident(p, "signext"))  bit = PIR_FATTR_RET_SIGNEXT;
+                else if (is_ident(p, "zeroext"))  bit = PIR_FATTR_RET_ZEROEXT;
                 else {
                     pir_diag_error(p->diag, p->cur.line, p->cur.col, "unknown function attribute '%s'",
                                    p->cur.text ? p->cur.text : "");
                     return false;
                 }
+                if (*attrs_out & bit) {
+                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate function attribute '%s'",
+                                   p->cur.text);
+                    return false;
+                }
+                *attrs_out |= bit;
                 advance_tok(p);
             } while (match_tok(p, TOK_COMMA));
             if (!expect_tok(p, TOK_RBRACKET, "']'")) return false;
@@ -2031,10 +2137,12 @@ static bool parse_global_item(Parser *p, PirType hint_ty, PirGlobalItem *out) {
         double v = 0.0;
         float vf = 0.0f;
         bool has_f32 = false;
+        bool f32_ovf = false;
         if (p->cur.kind == TOK_FLOAT) {
             v = p->cur.float_val;
             vf = p->cur.float_val_f32;
             has_f32 = true;
+            f32_ovf = p->cur.float_f32_overflow;
         } else if (strcmp(p->cur.text, "nan") == 0) {
             v = (double)NAN;
             vf = (float)NAN;
@@ -2049,6 +2157,7 @@ static bool parse_global_item(Parser *p, PirType hint_ty, PirGlobalItem *out) {
         out->kind         = PIR_GITEM_FLOAT;
         out->float32_bits = f32b;
         out->has_f32_bits = has_f32;
+        out->f32_overflow = f32_ovf;
         out->float_bits   = encode_float_bits_tok(v, vf, has_f32, hint_ty);
         advance_tok(p);
         return true;
@@ -2071,28 +2180,14 @@ static bool parse_global_item(Parser *p, PirType hint_ty, PirGlobalItem *out) {
         out->kind     = PIR_GITEM_RELOC;
         out->sym_name = p->cur.text;
         advance_tok(p);
-        if (p->cur.kind == TOK_PLUS || p->cur.kind == TOK_MINUS) {
-            bool sub = (p->cur.kind == TOK_MINUS);
-            advance_tok(p);
-            if (p->cur.kind != TOK_INT || p->cur.int_hi != 0u) {
-                pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected integer relocation offset");
-                return false;
-            }
-            uint64_t mag = p->cur.int_lo;
-            bool neg = (sub != p->cur.int_neg);
-            if (neg ? (mag > (uint64_t)INT64_MAX + 1u) : (mag > (uint64_t)INT64_MAX)) {
-                pir_diag_error(p->diag, p->cur.line, p->cur.col, "relocation offset out of signed 64-bit range");
-                return false;
-            }
-            out->sym_offset = neg ? (int64_t)(UINT64_C(0) - mag) : (int64_t)mag;
-            advance_tok(p);
-        }
+        if (!parse_sym_offset(p, &out->sym_offset)) return false;
         return true;
     }
     if (p->cur.kind == TOK_GLOBAL) {
         out->kind     = PIR_GITEM_RELOC;
         out->sym_name = p->cur.text;
         advance_tok(p);
+        if (!parse_sym_offset(p, &out->sym_offset)) return false;
         return true;
     }
     pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected global initializer item");
@@ -2376,6 +2471,7 @@ static bool parse_func_decl(Parser *p, PirLinkage linkage, bool is_weak_extern) 
 
     if (match_tok(p, TOK_LBRACE)) {
         f->is_defined = true;
+        parser_reset_fn_tables(p);
         /* Index 0 in locs is sentinel "no location". */
         PirSourceLoc zero_loc = { 0u, 0u, 0u };
         PIR_VEC_PUSH(&f->locs, zero_loc);
@@ -2396,7 +2492,32 @@ static bool parse_func_decl(Parser *p, PirLinkage linkage, bool is_weak_extern) 
             }
             const char *lbl = p->cur.text;
             uint32_t bline  = p->cur.line;
-            for (uint32_t b = 0u; b < f->blocks.len; ++b) {
+            if (f->blocks.len >= p->blk_ht_next_cap) {
+                uint32_t ncap = p->blk_ht_next_cap ? p->blk_ht_next_cap * 2u : 32u;
+                while (ncap <= f->blocks.len) ncap *= 2u;
+                uint32_t *nn = (uint32_t *)realloc(p->blk_ht_next, (size_t)ncap * sizeof(uint32_t));
+                if (!nn) abort();
+                p->blk_ht_next     = nn;
+                p->blk_ht_next_cap = ncap;
+            }
+            if (f->blocks.len * 2u >= p->blk_ht_cap && p->blk_ht_cap < (1u << 24)) {
+                uint32_t ncap = p->blk_ht_cap ? p->blk_ht_cap * 2u : 32u;
+                while (ncap <= f->blocks.len * 2u && ncap < (1u << 24)) ncap *= 2u;
+                uint32_t *nh = (uint32_t *)malloc((size_t)ncap * sizeof(uint32_t));
+                if (!nh) abort();
+                for (uint32_t bi = 0u; bi < ncap; ++bi) nh[bi] = PIR_INVALID_ID;
+                uint32_t mask = ncap - 1u;
+                for (uint32_t bi = 0u; bi < f->blocks.len; ++bi) {
+                    uint32_t bb = parser_fnv1a(f->blocks.data[bi].label) & mask;
+                    p->blk_ht_next[bi] = nh[bb];
+                    nh[bb] = bi;
+                }
+                free(p->blk_ht_head);
+                p->blk_ht_head = nh;
+                p->blk_ht_cap  = ncap;
+            }
+            uint32_t bbkt = parser_fnv1a(lbl) & (p->blk_ht_cap - 1u);
+            for (uint32_t b = p->blk_ht_head[bbkt]; b != PIR_INVALID_ID; b = p->blk_ht_next[b]) {
                 if (strcmp(f->blocks.data[b].label, lbl) == 0) {
                     pir_diag_error(p->diag, bline, 0u, "duplicate block label '.%s'", lbl);
                     break;
@@ -2408,6 +2529,8 @@ static bool parse_func_decl(Parser *p, PirLinkage linkage, bool is_weak_extern) 
             blk.src_line = bline;
             PirBlockId blk_idx = f->blocks.len;
             PIR_VEC_PUSH(&f->blocks, blk);
+            p->blk_ht_next[blk_idx] = p->blk_ht_head[bbkt];
+            p->blk_ht_head[bbkt]    = blk_idx;
             advance_tok(p);
 
             if (match_tok(p, TOK_LPAREN)) {
@@ -2734,6 +2857,34 @@ static bool resolve_module(Parser *p) {
                         if (next_b == cur_b) break;
                         cur_b = next_b;
                     }
+                } else if (vr->use_block < dom_cfg.num_blocks) {
+                    /* Unreachable block: BFS backward through CFG predecessors to find ancestor block param. */
+                    uint8_t *vis = (uint8_t *)calloc(dom_cfg.num_blocks, 1u);
+                    uint32_t *q = (uint32_t *)malloc(dom_cfg.num_blocks * sizeof(uint32_t));
+                    if (!vis || !q) abort();
+                    uint32_t qh = 0u, qt = 0u;
+                    vis[vr->use_block] = 1u;
+                    q[qt++] = vr->use_block;
+                    while (qh < qt && found == PIR_INVALID_ID) {
+                        uint32_t cur_b = q[qh++];
+                        for (uint32_t pi = 0u; pi < dom_cfg.preds[cur_b].len; ++pi) {
+                            uint32_t pb = dom_cfg.preds[cur_b].data[pi];
+                            if (pb >= dom_cfg.num_blocks || vis[pb]) continue;
+                            vis[pb] = 1u;
+                            for (uint32_t v = ht_head[bkt]; v != PIR_INVALID_ID; v = ht_next[v]) {
+                                if (fn->values.data[v].def_block == pb &&
+                                    fn->values.data[v].def_inst == PIR_INVALID_ID &&
+                                    strcmp(fn->values.data[v].name, vr->name) == 0) {
+                                    found = v;
+                                    break;
+                                }
+                            }
+                            if (found != PIR_INVALID_ID) break;
+                            q[qt++] = pb;
+                        }
+                    }
+                    free(q);
+                    free(vis);
                 }
             }
         }
@@ -2802,8 +2953,8 @@ bool pir_parse_module(const char *src, size_t len, const char *filename,
             PirFileDecl fd;
             fd.id = (uint32_t)p.cur.int_lo;
             advance_tok(&p);
-            if (p.cur.kind != TOK_STRING || token_has_nul(&p.cur)) {
-                pir_diag_error(diag, p.cur.line, p.cur.col, "expected file path string");
+            if (p.cur.kind != TOK_STRING || token_has_nul(&p.cur) || token_has_newline(&p.cur)) {
+                pir_diag_error(diag, p.cur.line, p.cur.col, "expected valid file path string");
                 break;
             }
             fd.path = p.cur.text;
@@ -2850,6 +3001,10 @@ bool pir_parse_module(const char *src, size_t len, const char *filename,
 
 done:
     free(p.agg_defined);
+    free(p.val_ht_head);
+    free(p.val_ht_next);
+    free(p.blk_ht_head);
+    free(p.blk_ht_next);
     PIR_VEC_FREE(&p.pending_targets);
     PIR_VEC_FREE(&p.pending_vals);
     PIR_VEC_FREE(&p.pending_sigs);

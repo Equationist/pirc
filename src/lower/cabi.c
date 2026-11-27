@@ -504,7 +504,27 @@ static bool rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
                 vpd.abi_kind = PIR_PARAM_NORMAL;
                 vpd.type     = arg.type;
                 PirAbiArgInfo vinfo;
-                if (pir_abi_classify_param(mod, target, &vpd, &va_st, &vinfo)) {
+                bool sysv_va_v256 = (target->arch == PIR_ARCH_X86_64 &&
+                                     target->os != PIR_OS_WINDOWS &&
+                                     arg.type.kind == PIR_TYPE_VECTOR &&
+                                     pir_vec_bits(arg.type.u.vec) > 128u);
+                bool classified = false;
+                if (sysv_va_v256) {
+                    /* SysV AMD64 §3.5.7: 256-bit vectors in variadic positions are ALWAYS passed
+                     * in overflow_arg_area (never ymm0..ymm7), even when AVX is enabled. */
+                    PirTypeLayout vly = pir_type_layout(mod, target, arg.type);
+                    memset(&vinfo, 0, sizeof(vinfo));
+                    vinfo.kind              = PIR_ABI_INDIRECT;
+                    vinfo.stack_byval_size  = vly.size;
+                    vinfo.stack_byval_align = (target->os == PIR_OS_MACOS &&
+                                               target->caps.max_simd_bits < 256u &&
+                                               vly.align > 16u)
+                                              ? 16u : vly.align;
+                    classified = true;
+                } else {
+                    classified = pir_abi_classify_param(mod, target, &vpd, &va_st, &vinfo);
+                }
+                if (classified) {
                     if (vinfo.kind == PIR_ABI_INDIRECT) {
                         PirTypeLayout vly = pir_type_layout(mod, target, arg.type);
                         PirInst cp = pir_make_inst(PIR_OP_ALLOCA_PTR, tptr, ln, lc);
@@ -707,6 +727,8 @@ static void rewrite_param_decls(PirModule *mod, const PirTargetSpec *target, con
                 p.type            = tptr;
                 p.abi_byval_size  = info->stack_byval_size;
                 p.abi_byval_align = info->stack_byval_align;
+                p.abi_stack_align = 0u;
+                p.abi_force_stack = false;
                 PIR_VEC_PUSH(&np, p);
             } else {
                 for (uint32_t k = 0u; k < info->reg_count; ++k) {
@@ -733,6 +755,8 @@ static void rewrite_param_decls(PirModule *mod, const PirTargetSpec *target, con
             p.type            = tptr;
             p.abi_byval_size  = info->stack_byval_size;
             p.abi_byval_align = info->stack_byval_align;
+            p.abi_stack_align = 0u;
+            p.abi_force_stack = false;
             p.val_id          = PIR_INVALID_ID;
             if (defined_fn) {
                 p.val_id = pir_fn_new_val(mod, defined_fn, "abi_ip", tptr,

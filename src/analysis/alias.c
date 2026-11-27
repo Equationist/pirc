@@ -90,7 +90,9 @@ PirPtrInfo pir_alias_decompose(const PirFunction *fn, PirOperand op, uint8_t ptr
             info.kind         = PIR_PTR_GLOBAL;
             info.global_name  = op.u.sym.name;
             info.all_inbounds = all_inbounds;
-            int64_t so = op.u.sym.offset;
+            int64_t so = (ptr_bytes == 4u)
+                         ? (int64_t)(int32_t)(uint32_t)op.u.sym.offset
+                         : op.u.sym.offset;
             if ((so > 0 && info.offset > INT64_MAX - so) ||
                 (so < 0 && info.offset < INT64_MIN - so)) {
                 info.has_offset = false;

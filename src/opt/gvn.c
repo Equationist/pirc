@@ -25,6 +25,8 @@ typedef struct {
     uint32_t   op_count;
     PirOperand ops[3];
     PirValueId val_id;
+    uint32_t   hash;
+    uint32_t   prev;
 } GvnEntry;
 
 typedef PIR_VEC(GvnEntry) GvnEntryVec;
@@ -38,7 +40,72 @@ typedef struct {
     ConstVal            *consts;
     uint32_t             nvals;
     GvnEntryVec          table;
+    uint32_t            *buckets;
+    uint32_t             bucket_cap;
 } GvnCtx;
+
+static uint32_t gvn_mix(uint32_t h, uint64_t v) {
+    h ^= (uint32_t)v;
+    h *= 0x85ebca6bu;
+    h ^= (uint32_t)(v >> 32u);
+    h *= 0xc2b2ae35u;
+    return h ^ (h >> 16u);
+}
+
+static uint32_t gvn_hash_inst(const PirInst *ins, const PirOperand *canon) {
+    uint32_t h = 2166136261u;
+    h = gvn_mix(h, (uint64_t)ins->op);
+    h = gvn_mix(h, (uint64_t)ins->ty.kind);
+    h = gvn_mix(h, (uint64_t)ins->ty.u.agg_id);
+    h = gvn_mix(h, (uint64_t)ins->flags);
+    h = gvn_mix(h, ins->imm_u64);
+    h = gvn_mix(h, (uint64_t)ins->operand_count);
+    for (uint32_t k = 0u; k < ins->operand_count; ++k) {
+        const PirOperand *op = &canon[k];
+        h = gvn_mix(h, (uint64_t)op->kind);
+        switch (op->kind) {
+            case PIR_OPER_VAL:
+                h = gvn_mix(h, (uint64_t)op->u.val);
+                break;
+            case PIR_OPER_IMM_INT:
+                h = gvn_mix(h, op->u.imm_int.lo);
+                h = gvn_mix(h, op->u.imm_int.hi ^ (uint64_t)op->u.imm_int.is_negative);
+                h = gvn_mix(h, (uint64_t)op->type.u.scalar);
+                break;
+            case PIR_OPER_IMM_FLOAT:
+                h = gvn_mix(h, op->u.imm_float.bits);
+                h = gvn_mix(h, (uint64_t)op->type.u.scalar);
+                break;
+            case PIR_OPER_SYM:
+                h = gvn_mix(h, (uint64_t)op->u.sym.offset);
+                if (op->u.sym.name) {
+                    for (const unsigned char *s = (const unsigned char *)op->u.sym.name; *s; ++s) {
+                        h = (h ^ (uint32_t)*s) * 16777619u;
+                    }
+                }
+                break;
+            case PIR_OPER_INVOKE_RET:
+            case PIR_OPER_INVOKE_EXN:
+                break;
+        }
+    }
+    return h;
+}
+
+static void gvn_rehash(GvnCtx *ctx, uint32_t new_cap) {
+    uint32_t *nb = (uint32_t *)malloc(new_cap * sizeof(uint32_t));
+    if (!nb) abort();
+    for (uint32_t i = 0u; i < new_cap; ++i) nb[i] = PIR_INVALID_ID;
+    uint32_t mask = new_cap - 1u;
+    for (uint32_t i = 0u; i < ctx->table.len; ++i) {
+        uint32_t bi = ctx->table.data[i].hash & mask;
+        ctx->table.data[i].prev = nb[bi];
+        nb[bi] = i;
+    }
+    free(ctx->buckets);
+    ctx->buckets    = nb;
+    ctx->bucket_cap = new_cap;
+}
 
 static PirValueId resolve_alias(GvnCtx *ctx, PirValueId v) {
     PirValueId root = v;
@@ -721,15 +788,27 @@ static void gvn_walk_dom_tree(GvnCtx *ctx, PirBlockId root_b) {
                     canon[1] = tmp;
                 }
 
+                uint32_t h = gvn_hash_inst(ins, canon);
                 bool found = false;
-                for (uint32_t i = 0u; i < ctx->table.len; ++i) {
-                    if (entry_matches(&ctx->table.data[i], ins, canon)) {
-                        ctx->alias[ins->results[0]] = ctx->table.data[i].val_id;
-                        found = true;
-                        break;
+                if (ctx->bucket_cap > 0u) {
+                    uint32_t bi = h & (ctx->bucket_cap - 1u);
+                    for (uint32_t idx = ctx->buckets[bi]; idx != PIR_INVALID_ID;
+                         idx = ctx->table.data[idx].prev) {
+                        if (ctx->table.data[idx].hash == h &&
+                            entry_matches(&ctx->table.data[idx], ins, canon)) {
+                            ctx->alias[ins->results[0]] = ctx->table.data[idx].val_id;
+                            found = true;
+                            break;
+                        }
                     }
                 }
                 if (!found) {
+                    if (ctx->bucket_cap == 0u) {
+                        gvn_rehash(ctx, 256u);
+                    } else if (ctx->table.len * 2u >= ctx->bucket_cap) {
+                        gvn_rehash(ctx, ctx->bucket_cap * 2u);
+                    }
+                    uint32_t bi = h & (ctx->bucket_cap - 1u);
                     GvnEntry e;
                     memset(&e, 0, sizeof(e));
                     e.op       = ins->op;
@@ -739,7 +818,11 @@ static void gvn_walk_dom_tree(GvnCtx *ctx, PirBlockId root_b) {
                     e.op_count = ins->operand_count;
                     for (uint32_t k = 0u; k < ins->operand_count; ++k) e.ops[k] = canon[k];
                     e.val_id   = ins->results[0];
+                    e.hash     = h;
+                    e.prev     = ctx->buckets[bi];
+                    uint32_t new_idx = ctx->table.len;
                     PIR_VEC_PUSH(&ctx->table, e);
+                    ctx->buckets[bi] = new_idx;
                 }
             }
         }
@@ -748,7 +831,14 @@ static void gvn_walk_dom_tree(GvnCtx *ctx, PirBlockId root_b) {
             GvnFrame cf = { child, 0u, 0u, false };
             PIR_VEC_PUSH(&stk, cf);
         } else {
-            ctx->table.len = fr->saved_len;
+            uint32_t mask = ctx->bucket_cap > 0u ? (ctx->bucket_cap - 1u) : 0u;
+            while (ctx->table.len > fr->saved_len) {
+                ctx->table.len--;
+                const GvnEntry *e = &ctx->table.data[ctx->table.len];
+                if (ctx->bucket_cap > 0u) {
+                    ctx->buckets[e->hash & mask] = e->prev;
+                }
+            }
             stk.len--;
         }
     }
@@ -796,6 +886,7 @@ void pir_opt_gvn(PirModule *mod, PirFunction *fn, const PirTargetSpec *target) {
         }
     }
 
+    free(ctx.buckets);
     PIR_VEC_FREE(&ctx.table);
     free(consts);
     free(alias);

@@ -51,6 +51,7 @@ typedef struct {
     bool           int_neg;
     double         float_val;
     float          float_val_f32;
+    bool           float_f32_overflow;
 } PirToken;
 
 typedef struct {

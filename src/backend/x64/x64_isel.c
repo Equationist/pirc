@@ -1524,6 +1524,11 @@ static void emit_call_inst(X64ISelCtx *c, const PirInst *inst, uint32_t loc) {
     for (uint32_t i = 0u; i < pass_nargs; ++i) {
         if (alocs[i].is_reg) continue;
         if (alocs[i].is_stack_byval) {
+            if (alocs[i].byval_size > (uint64_t)UINT32_MAX) {
+                pir_diag_error(c->diag, inst->src_line, 0u,
+                               "x86-64 outgoing byval_size exceeds 32-bit copy limit");
+                break;
+            }
             MInst cp = minst_make(MI_COPY_OUTARG_MEM, 8u, loc);
             cp.aux_id   = (uint32_t)alocs[i].byval_size;
             cp.op_count = 2u;

@@ -606,7 +606,8 @@ static PirBlockId lower_va_arg_aapcs64_linux(PirModule *mod, const PirTargetSpec
             PirValueId dp = va_padd(mod, fn, reg_blk, rb, inst->operands[0],
                                     (uint64_t)k * ely.size, ti64, ln, lc);
             PirInst st = pir_make_inst(PIR_OP_STORE, ety, ln, lc);
-            st.align = ely.align; st.operand_count = 2u; st.operands = pir_alloc_ops(mod, 2u);
+            st.align = (plan.align > 0u && plan.align < ely.align) ? plan.align : ely.align;
+            st.operand_count = 2u; st.operands = pir_alloc_ops(mod, 2u);
             st.operands[0] = pir_op_val(ld.results[0], ety);
             st.operands[1] = pir_op_val(dp, tptr);
             pir_fn_append_inst(fn, rb, st);

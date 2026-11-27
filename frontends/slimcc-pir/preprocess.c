@@ -188,7 +188,7 @@ static Token *skip_cond_incl(Token *tok) {
   for (; tok->kind != TK_EOF; last = tok, tok = tok->next) {
     if (tok->kind == TK_INCL_END)
       error_tok(tok, "unterminated conditional directive");
-    if (Is_hash(tok)) {
+    if (Is_hash(tok) && !tok->next->at_bol) {
       if ((equal(tok->next, "if") ||
            equal(tok->next, "ifdef") ||
            equal(tok->next, "ifndef"))) {
@@ -442,7 +442,11 @@ static Token *read_pp_const_expr(Token *tok) {
       to_pp_eval_int(tok, equal(tok, "true") && opt_std >= STD_C23);
       break;
     case TK_PP_NUM:     tok->kind = TK_PP_NUM_PPEV; break;
-    case TK_CHAR_LIT:   tok->kind = TK_CHAR_LIT_PPEV; break;
+    case TK_CHAR_LIT:
+      if (tok->str_invalid)
+        error_tok(tok, "invalid character literal");
+      tok->kind = TK_CHAR_LIT_PPEV;
+      break;
     case TK_INTMAX_NUM: break;
     default:
       if (tok->kind >= TK_PUNCT && tok->kind < TK_PUNCT_END)
@@ -886,17 +890,19 @@ static char *join_tokens(Token *tok, Token *end, bool is_stringize) {
     if (t->has_space && t != tok)
       len++;
 
+    const Token *src = (is_stringize && t->kind == TK_IDENT && t->origin && t->origin->has_ucn)
+                           ? t->origin : t;
     if (is_stringize) {
       if (t->kind == TK_STR || t->kind == TK_CHAR_LIT) {
-        for (int i = 0; i < t->len; i++) {
-          if (t->loc[i] == '\\' || t->loc[i] == '"')
+        for (int i = 0; i < src->len; i++) {
+          if (src->loc[i] == '\\' || src->loc[i] == '"')
             len++;
           len++;
         }
         continue;
       }
     }
-    len += t->len;
+    len += src->len;
   }
 
   char *buf = malloc(len);
@@ -908,18 +914,20 @@ static char *join_tokens(Token *tok, Token *end, bool is_stringize) {
     if (t->has_space && t != tok)
       buf[pos++] = ' ';
 
+    const Token *src = (is_stringize && t->kind == TK_IDENT && t->origin && t->origin->has_ucn)
+                           ? t->origin : t;
     if (is_stringize) {
       if (t->kind == TK_STR || t->kind == TK_CHAR_LIT) {
-        for (int i = 0; i < t->len; i++) {
-          if (t->loc[i] == '\\' || t->loc[i] == '"')
+        for (int i = 0; i < src->len; i++) {
+          if (src->loc[i] == '\\' || src->loc[i] == '"')
             buf[pos++] = '\\';
-          buf[pos++] = t->loc[i];
+          buf[pos++] = src->loc[i];
         }
         continue;
       }
     }
-    memcpy(buf + pos, t->loc, t->len);
-    pos += t->len;
+    memcpy(buf + pos, src->loc, src->len);
+    pos += src->len;
   }
 
   if (is_stringize)
@@ -992,7 +1000,8 @@ static Token *subst(Token *tok, MacroContext *ctx) {
     if (tok->kind == TK_COMMA && tok->next->kind == TK_HASH2 && ctx->m->has_va_arg) {
       MacroArg *arg = find_arg(NULL, tok->next->next, ctx);
       if (arg && (arg == &ctx->args[ctx->m->arg_cnt - 1])) {
-        if (is_iso_std && !tok->file->is_syshdr)
+        if (is_iso_std && !tok->file->is_syshdr &&
+            (ctx->omit_comma || arg->tok->kind != TK_EOF))
           error_tok(tok, "GNU ', ## __VA_ARGS__' extension is not allowed in ISO C");
         if (ctx->omit_comma) {
           tok = tok->next->next->next;
@@ -1013,7 +1022,7 @@ static Token *subst(Token *tok, MacroContext *ctx) {
         bool sp = cur->has_space;
         if (tok->kind == TK_HASH) {
           cur = cur->next = stringize(&tok, tok, ctx);
-          cur->has_space |= sp;
+          cur->has_space = sp;
           continue;
         }
         MacroArg *arg = find_arg(&tok, tok, ctx);
@@ -1024,14 +1033,14 @@ static Token *subst(Token *tok, MacroContext *ctx) {
           for (Token *t = arg->tok; t->kind != TK_EOF; t = t->next) {
             cur = cur->next = copy_token(t);
             if (first_t) {
-              cur->has_space |= sp;
+              cur->has_space = sp;
               first_t = false;
             }
           }
           continue;
         }
         cur = cur->next = copy_token(tok);
-        cur->has_space |= sp;
+        cur->has_space = sp;
         tok = tok->next;
         continue;
       }
@@ -1161,6 +1170,8 @@ static Token *insert_funclike(Token *tok, Token *stop_tok, Token *orig) {
     cur->has_space |= space;
     space = false;
   }
+  if (space && stop_tok && stop_tok->kind != TK_EOF)
+    stop_tok->has_space = true;
   cur->next = stop_tok;
   return head.next;
 }
@@ -1427,10 +1438,11 @@ static Token *include_file(Token *tok, const char *path, Token *filename_tok, In
   if (guard_name && hashmap_get(&macros, guard_name))
     return tok;
 
+  bool is_syshdr = filename_tok->file->is_syshdr || in_sysincl_path(idx);
   Token *end = NULL;
-  Token *start = tokenize_file(path, filename_tok, &end);
+  Token *start = tokenize_file_ex(path, filename_tok, &end, is_syshdr);
   start->file->incl_idx = idx;
-  start->file->is_syshdr = filename_tok->file->is_syshdr || in_sysincl_path(idx);
+  start->file->is_syshdr = is_syshdr;
   add_dep_file(path, start->file->is_syshdr);
 
   if (!end) {
@@ -1651,6 +1663,9 @@ static Token *pass_line(Token **cur, Token *tok) {
 
 static Token *directives(Token **cur, Token *start, bool is_root) {
   Token *tok = start->next;
+
+  if (tok->at_bol)
+    return tok;
 
   if (equal(tok, "embed")) {
     if (is_iso_std && opt_std < STD_C23 && !start->file->is_syshdr)
@@ -2500,7 +2515,7 @@ static Token *preprocess3(Token *tok) {
       continue;
     }
 
-    if (Is_hash(tok) && consume(&tok, tok->next, "pragma")) {
+    if (Is_hash(tok) && (!tok->origin || tok->is_pragma_op) && consume(&tok, tok->next, "pragma")) {
       if (equal(tok, "pack")) {
         Token *lp = tok->next;
         Token *end = NULL;
@@ -2565,6 +2580,12 @@ static Token *preprocess3(Token *tok) {
     case TK_STR:
       if (tok->next->kind == TK_STR)
         join_adjacent_string_literals(tok);
+      if (tok->str_invalid)
+        error_tok(tok, "invalid string literal");
+      break;
+    case TK_CHAR_LIT:
+      if (tok->str_invalid)
+        error_tok(tok, "invalid character literal");
       break;
     case TK_PUNCT:
     case TK_INVALID: {

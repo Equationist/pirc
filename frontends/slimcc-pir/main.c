@@ -891,7 +891,13 @@ static void run_cc1(const char *input, const char *output) {
   int id = fork_cc1(input, output);
 
   int status;
-  if (waitpid(id, &status, 0) <= 0 || status != 0)
+  if (waitpid(id, &status, 0) <= 0)
+    cleanup_exit(1);
+  if (WIFSIGNALED(status)) {
+    fprintf(stderr, "slimcc: internal compiler error: cc1 killed by signal %d\n", WTERMSIG(status));
+    cleanup_exit(1);
+  }
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
     cleanup_exit(1);
 }
 

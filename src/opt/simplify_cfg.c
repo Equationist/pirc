@@ -290,13 +290,13 @@ static bool is_pure_speculatable_alu(const PirModule *mod, const PirFunction *fn
     if (ins->results[0] == PIR_INVALID_ID || ins->results[1] != PIR_INVALID_ID) return false;
     if (ins->ty.kind != PIR_TYPE_SCALAR) return false;
     if ((pir_inst_effects(mod, fn, ins) & PIR_EFF_PURE_HOISTABLE) == 0u) return false;
+    /* Never speculatively hoist symbol operands (e.g., weak extern TLS or GOT loads). */
+    for (uint32_t k = 0u; k < ins->operand_count; ++k) {
+        if (ins->operands[k].kind == PIR_OPER_SYM) return false;
+    }
 
     PirOpcode op = ins->op;
-    if (op == PIR_OP_CONST) {
-        /* Never speculatively hoist symbol addresses (e.g., weak extern TLS or GOT loads). */
-        return ins->operand_count >= 1u && ins->operands[0].kind != PIR_OPER_SYM;
-    }
-    if (op == PIR_OP_SELECT ||
+    if (op == PIR_OP_CONST || op == PIR_OP_SELECT ||
         op == PIR_OP_ADD || op == PIR_OP_SUB || op == PIR_OP_MUL ||
         op == PIR_OP_AND || op == PIR_OP_OR || op == PIR_OP_XOR ||
         op == PIR_OP_SHL || op == PIR_OP_SHR || op == PIR_OP_SAR ||
@@ -363,6 +363,10 @@ static bool if_convert_diamonds(PirModule *mod, PirFunction *fn, const PirCfg *c
             for (uint32_t k = 0u; k < nparams; ++k) {
                 PirType pty = fn->values.data[fn->blocks.data[mblk].params.data[k]].type;
                 if (pty.kind != PIR_TYPE_SCALAR) { ok = false; break; }
+                if (t_bt.args[k].kind == PIR_OPER_SYM || f_bt.args[k].kind == PIR_OPER_SYM) {
+                    ok = false;
+                    break;
+                }
             }
             if (!ok) continue;
 
@@ -448,7 +452,9 @@ static bool if_convert_diamonds(PirModule *mod, PirFunction *fn, const PirCfg *c
                         if (!is_pure_speculatable_alu(mod, fn, &fn->insts.data[fb->insts.data[j]], false)) ok = false;
                     }
                     for (uint32_t k = 0u; k < nparams && ok; ++k) {
-                        if (fn->values.data[fn->blocks.data[mblk].params.data[k]].type.kind != PIR_TYPE_SCALAR) {
+                        if (fn->values.data[fn->blocks.data[mblk].params.data[k]].type.kind != PIR_TYPE_SCALAR ||
+                            tjmp->targets[0].args[k].kind == PIR_OPER_SYM ||
+                            fjmp->targets[0].args[k].kind == PIR_OPER_SYM) {
                             ok = false;
                         }
                     }

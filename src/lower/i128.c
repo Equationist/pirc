@@ -307,18 +307,20 @@ static bool legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
             PIR_VEC_PUSH(&nfp, op);
 
             fn->ret_type = tvoid;
-            if (target->arch == PIR_ARCH_X86_64 && target->os == PIR_OS_WINDOWS) {
-                fn->cabi_ret.kind      = PIR_CABI_RET_SRET_RAX;
-                fn->cabi_ret.reg_count = 0u;
-                fn->cabi_ret.agg_size  = 0u;
-                fn->cabi_ret.agg_align = 0u;
-            } else {
-                fn->cabi_ret.kind      = PIR_CABI_RET_MULTI_REG;
-                fn->cabi_ret.reg_count = 2u;
-                fn->cabi_ret.regs[0]   = t64;
-                fn->cabi_ret.regs[1]   = t64;
-                fn->cabi_ret.agg_size  = 16u;
-                fn->cabi_ret.agg_align = 8u;
+            if (fn->cc == PIR_CC_C) {
+                if (target->arch == PIR_ARCH_X86_64 && target->os == PIR_OS_WINDOWS) {
+                    fn->cabi_ret.kind      = PIR_CABI_RET_SRET_RAX;
+                    fn->cabi_ret.reg_count = 0u;
+                    fn->cabi_ret.agg_size  = 0u;
+                    fn->cabi_ret.agg_align = 0u;
+                } else {
+                    fn->cabi_ret.kind      = PIR_CABI_RET_MULTI_REG;
+                    fn->cabi_ret.reg_count = 2u;
+                    fn->cabi_ret.regs[0]   = t64;
+                    fn->cabi_ret.regs[1]   = t64;
+                    fn->cabi_ret.agg_size  = 16u;
+                    fn->cabi_ret.agg_align = 8u;
+                }
             }
         }
         for (uint32_t i = 0u; i < fn->param_count; ++i) {
@@ -1223,7 +1225,7 @@ static bool legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
     return true;
 }
 
-static void split_i128_decl(PirModule *mod, const PirTargetSpec *target,
+static void split_i128_decl(PirModule *mod, const PirTargetSpec *target, PirCallingConv cc,
                             PirParamDecl **params_io, uint32_t *count_io,
                             PirType *ret_ty_io, PirCabiRetInfo *cabi_ret_io) {
     PirParamDecl *old_p = *params_io;
@@ -1246,18 +1248,20 @@ static void split_i128_decl(PirModule *mod, const PirTargetSpec *target,
         op.val_id   = PIR_INVALID_ID;
         PIR_VEC_PUSH(&np, op);
         *ret_ty_io = tvoid;
-        if (target->arch == PIR_ARCH_X86_64 && target->os == PIR_OS_WINDOWS) {
-            cabi_ret_io->kind      = PIR_CABI_RET_SRET_RAX;
-            cabi_ret_io->reg_count = 0u;
-            cabi_ret_io->agg_size  = 0u;
-            cabi_ret_io->agg_align = 0u;
-        } else {
-            cabi_ret_io->kind      = PIR_CABI_RET_MULTI_REG;
-            cabi_ret_io->reg_count = 2u;
-            cabi_ret_io->regs[0]   = t64;
-            cabi_ret_io->regs[1]   = t64;
-            cabi_ret_io->agg_size  = 16u;
-            cabi_ret_io->agg_align = 8u;
+        if (cc == PIR_CC_C) {
+            if (target->arch == PIR_ARCH_X86_64 && target->os == PIR_OS_WINDOWS) {
+                cabi_ret_io->kind      = PIR_CABI_RET_SRET_RAX;
+                cabi_ret_io->reg_count = 0u;
+                cabi_ret_io->agg_size  = 0u;
+                cabi_ret_io->agg_align = 0u;
+            } else {
+                cabi_ret_io->kind      = PIR_CABI_RET_MULTI_REG;
+                cabi_ret_io->reg_count = 2u;
+                cabi_ret_io->regs[0]   = t64;
+                cabi_ret_io->regs[1]   = t64;
+                cabi_ret_io->agg_size  = 16u;
+                cabi_ret_io->agg_align = 8u;
+            }
         }
     }
     for (uint32_t i = 0u; i < old_n; ++i) {
@@ -1300,7 +1304,8 @@ bool pir_legalize_i128(PirModule *mod, const PirTargetSpec *target, PirDiag *dia
                 ok = false;
             }
         } else {
-            split_i128_decl(mod, target, &mod->funcs.data[fi].params, &mod->funcs.data[fi].param_count,
+            split_i128_decl(mod, target, mod->funcs.data[fi].cc,
+                            &mod->funcs.data[fi].params, &mod->funcs.data[fi].param_count,
                             &mod->funcs.data[fi].ret_type, &mod->funcs.data[fi].cabi_ret);
         }
     }
@@ -1310,7 +1315,8 @@ bool pir_legalize_i128(PirModule *mod, const PirTargetSpec *target, PirDiag *dia
         return false;
     }
     for (uint32_t si = 0u; si < orig_sigs; ++si) {
-        split_i128_decl(mod, target, &mod->sigs.data[si].params, &mod->sigs.data[si].param_count,
+        split_i128_decl(mod, target, mod->sigs.data[si].cc,
+                        &mod->sigs.data[si].params, &mod->sigs.data[si].param_count,
                         &mod->sigs.data[si].ret_type, &mod->sigs.data[si].cabi_ret);
     }
 

@@ -449,7 +449,7 @@ static bool is_enum_compat(EnumVal *ev1, EnumVal *ev2) {
 
 static int64_t *get_arr_len(Type *ty) {
   if ((ty->kind == TY_ARRAY && ty->array_len >= 0) ||
-      (ty->kind == TY_VLA && !ty->vla_len_expr))
+      (ty->kind == TY_VLA && !ty->vla_len_expr && ty->array_len >= 0))
     return &ty->array_len;
   return NULL;
 }
@@ -634,7 +634,9 @@ bool is_compatible(Type *t1, Type *t2) {
     Obj *p1 = t1->param_list;
     Obj *p2 = t2->param_list;
     for (; p1 && p2; p1 = p1->param_next, p2 = p2->param_next) {
-      if (!!(p1->ty->qual & Q_ATOMIC) != !!(p2->ty->qual & Q_ATOMIC))
+      if (!!(p1->ty->qual & Q_ATOMIC) != !!(p2->ty->qual & Q_ATOMIC) &&
+          (p1->ty->size != p2->ty->size || p1->ty->align != p2->ty->align ||
+           p1->ty->kind == TY_STRUCT || p1->ty->kind == TY_UNION))
         return false;
       if (!is_compatible(p1->ty, p2->ty))
         return false;

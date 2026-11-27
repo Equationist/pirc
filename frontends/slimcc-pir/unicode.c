@@ -424,15 +424,22 @@ static bool in_range(uint32_t c, const UTF32Range *range, size_t len) {
   return false;
 }
 
+static bool is_c17_d1_extra(uint32_t c) {
+  return c == 0x00A8 || c == 0x00AD || c == 0x00AF ||
+         (c >= 0x00B2 && c <= 0x00B4) ||
+         (c >= 0x00B7 && c <= 0x00B9) ||
+         (c >= 0x00BC && c <= 0x00BE);
+}
+
 bool is_ident1(uint32_t c) {
   return in_range(c, xid_start, sizeof(xid_start) / sizeof(UTF32Range)) ||
+         (opt_std < STD_C23 && is_c17_d1_extra(c)) ||
          (!is_iso_std && in_range(c, math_start, sizeof(math_start) / sizeof(UTF32Range)));
 }
 
 bool is_ident2(uint32_t c) {
   return is_ident1(c) ||
          in_range(c, xid_cont, sizeof(xid_cont) / sizeof(UTF32Range)) ||
-         (opt_std < STD_C23 && (c == 0xB2 || c == 0xB3 || c == 0xB9)) ||
          (!is_iso_std && in_range(c, math_cont, sizeof(math_cont) / sizeof(UTF32Range)));
 }
 

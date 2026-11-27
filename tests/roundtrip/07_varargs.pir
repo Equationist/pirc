@@ -5,8 +5,7 @@ type @Pair = { i32, i32 }
 extern func @vprintf(%fmt: ptr, %ap: byval(va_list)) -> i32 cc "c"
 extern func @printf(%fmt: ptr, ...) -> i32 cc "c"
 
-@fmt_str = data align 1 { "sum=%d
-", 0 }
+@fmt_str = data align 1 { "sum=%d\n", 0 }
 
 export func @log_and_sum(%fmt: ptr, %n: i32, ...) -> i32 cc "c" {
 .entry:

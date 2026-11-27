@@ -521,14 +521,112 @@ static void print_global_item(const PirGlobalItem *it, PirType hint_ty, FILE *ou
         case PIR_GITEM_INT:
             print_u128(it->int_hi, it->int_lo, it->int_neg, out);
             break;
-        case PIR_GITEM_FLOAT:
-            print_float_bits(it->float_bits, hint_ty, out);
+        case PIR_GITEM_FLOAT: {
+            PirScalarType sc = (hint_ty.kind == PIR_TYPE_VECTOR)
+                               ? pir_vec_elem_scalar(hint_ty.u.vec)
+                               : (hint_ty.kind == PIR_TYPE_SCALAR ? hint_ty.u.scalar : PIR_SCALAR_F64);
+            uint64_t fbits = (sc == PIR_SCALAR_F32 && it->has_f32_bits)
+                             ? (uint64_t)it->float32_bits
+                             : it->float_bits;
+            print_float_bits(fbits, hint_ty, out);
             break;
+        }
         case PIR_GITEM_RELOC:
             fputs("ptr ", out);
             print_global_sym(it->sym_name, out);
             if (it->sym_offset > 0)      fprintf(out, " + %" PRId64, it->sym_offset);
             else if (it->sym_offset < 0) fprintf(out, " - %" PRIu64, UINT64_C(0) - (uint64_t)it->sym_offset);
+            break;
+    }
+}
+
+static bool printer_agg_is_pad_only(const PirModule *mod, PirType ty, uint32_t depth) {
+    if (depth > 256u || ty.kind != PIR_TYPE_NAMED_AGG || ty.u.agg_id >= mod->agg_types.len) {
+        return false;
+    }
+    const PirAggDef *ad = &mod->agg_types.data[ty.u.agg_id];
+    switch (ad->kind) {
+        case PIR_AGG_PAD:
+            return true;
+        case PIR_AGG_ARRAY:
+            return printer_agg_is_pad_only(mod, ad->elem_type, depth + 1u);
+        case PIR_AGG_STRUCT:
+        case PIR_AGG_PACKED_STRUCT:
+            for (uint32_t f = 0u; f < ad->field_count; ++f) {
+                if (!printer_agg_is_pad_only(mod, ad->fields[f], depth + 1u)) return false;
+            }
+            return ad->field_count > 0u;
+        case PIR_AGG_UNION:
+            return ad->field_count > 0u && printer_agg_is_pad_only(mod, ad->fields[0], depth + 1u);
+    }
+    return false;
+}
+
+static void print_agg_global_items(const PirModule *mod, const PirGlobal *g, PirType ty,
+                                   uint32_t *idx, uint32_t *printed, FILE *out, uint32_t depth) {
+    if (depth > 256u || *idx >= g->item_count) return;
+    if (printer_agg_is_pad_only(mod, ty, 0u)) return;
+    if (g->items[*idx].kind == PIR_GITEM_ZERO) {
+        bool consume_whole = (ty.kind == PIR_TYPE_SCALAR) ||
+                             (g->items[*idx].len > 0u && depth > 0u) ||
+                             (depth == 0u && g->item_count == 1u);
+        if (consume_whole) {
+            if (*printed > 0u) fputs(", ", out);
+            print_global_item(&g->items[(*idx)++], ty, out);
+            (*printed)++;
+            return;
+        }
+    }
+    if (ty.kind == PIR_TYPE_SCALAR) {
+        if (*printed > 0u) fputs(", ", out);
+        print_global_item(&g->items[(*idx)++], ty, out);
+        (*printed)++;
+        return;
+    }
+    if (ty.kind == PIR_TYPE_VECTOR) {
+        PirType ety = pir_type_scalar(pir_vec_elem_scalar(ty.u.vec));
+        uint32_t lanes = pir_vec_lanes(ty.u.vec);
+        for (uint32_t l = 0u; l < lanes && *idx < g->item_count; ++l) {
+            print_agg_global_items(mod, g, ety, idx, printed, out, depth + 1u);
+        }
+        return;
+    }
+    if (ty.u.agg_id >= mod->agg_types.len) return;
+    const PirAggDef *ad = &mod->agg_types.data[ty.u.agg_id];
+    switch (ad->kind) {
+        case PIR_AGG_PAD:
+            break;
+        case PIR_AGG_ARRAY:
+            if (g->items[*idx].kind == PIR_GITEM_BYTES &&
+                ad->elem_type.kind == PIR_TYPE_SCALAR &&
+                ad->elem_type.u.scalar == PIR_SCALAR_I8) {
+                if (*printed > 0u) fputs(", ", out);
+                print_global_item(&g->items[(*idx)++], ty, out);
+                (*printed)++;
+            } else {
+                for (uint64_t k = 0u; k < ad->array_len && *idx < g->item_count; ++k) {
+                    uint32_t before = *idx;
+                    print_agg_global_items(mod, g, ad->elem_type, idx, printed, out, depth + 1u);
+                    if (*idx == before) break;
+                }
+            }
+            break;
+        case PIR_AGG_STRUCT:
+        case PIR_AGG_PACKED_STRUCT:
+            for (uint32_t f = 0u; f < ad->field_count && *idx < g->item_count; ++f) {
+                print_agg_global_items(mod, g, ad->fields[f], idx, printed, out, depth + 1u);
+            }
+            break;
+        case PIR_AGG_UNION:
+            if (ad->field_count > 0u) {
+                if (g->items[*idx].kind == PIR_GITEM_RELOC) {
+                    if (*printed > 0u) fputs(", ", out);
+                    print_global_item(&g->items[(*idx)++], pir_type_scalar(PIR_SCALAR_PTR), out);
+                    (*printed)++;
+                } else {
+                    print_agg_global_items(mod, g, ad->fields[0], idx, printed, out, depth + 1u);
+                }
+            }
             break;
     }
 }
@@ -926,9 +1024,20 @@ void pir_print_module(const PirModule *mod, FILE *out) {
                 fputs(" = zeroinit", out);
             } else if (g->is_braced) {
                 fputs(" = { ", out);
-                for (uint32_t k = 0u; k < g->item_count; ++k) {
-                    if (k > 0u) fputs(", ", out);
-                    print_global_item(&g->items[k], g->type, out);
+                if (g->type.kind == PIR_TYPE_NAMED_AGG) {
+                    uint32_t idx = 0u;
+                    uint32_t printed = 0u;
+                    print_agg_global_items(mod, g, g->type, &idx, &printed, out, 0u);
+                    while (idx < g->item_count) {
+                        if (printed > 0u) fputs(", ", out);
+                        print_global_item(&g->items[idx++], g->type, out);
+                        printed++;
+                    }
+                } else {
+                    for (uint32_t k = 0u; k < g->item_count; ++k) {
+                        if (k > 0u) fputs(", ", out);
+                        print_global_item(&g->items[k], g->type, out);
+                    }
                 }
                 fputs(" }", out);
             } else if (g->item_count == 1u) {

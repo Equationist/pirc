@@ -114,12 +114,24 @@ static bool is_vec_cast_op(PirOpcode op) {
            op == PIR_OP_FPTOSI || op == PIR_OP_FPTOUI;
 }
 
+static void set_simd_sret_cabi(const PirTargetSpec *target, PirCallingConv cc,
+                               PirCabiRetInfo *cabi_ret) {
+    if (cc != PIR_CC_C) return;
+    memset(cabi_ret, 0, sizeof(*cabi_ret));
+    if (target->arch == PIR_ARCH_ARM64) {
+        cabi_ret->kind = PIR_CABI_RET_SRET_X8;
+    } else if (target->arch == PIR_ARCH_X86_64) {
+        cabi_ret->kind = PIR_CABI_RET_SRET_RAX;
+    }
+}
+
 static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirFuncId fi, PirDiag *diag) {
     PirFunction *fn = &mod->funcs.data[fi];
     if (!fn->is_defined) return true;
     uint16_t max_bits = target->caps.max_simd_bits;
 
-    bool has_oversized = needs_split(fn->ret_type, max_bits);
+    bool ret_is_ov = needs_split(fn->ret_type, max_bits);
+    bool has_oversized = ret_is_ov;
     for (uint32_t v = 0u; v < fn->values.len && !has_oversized; ++v) {
         if (needs_split(fn->values.data[v].type, max_bits)) { has_oversized = true; }
     }
@@ -128,16 +140,11 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
     }
     if (!has_oversized) return true;
 
-    if (needs_split(fn->ret_type, max_bits)) {
-        pir_diag_error(diag, fn->src_line, 0u,
-                       "oversized vector return type exceeds target SIMD width (%u bits)",
-                       (unsigned)max_bits);
-        return false;
-    }
-
     PirType t8     = pir_type_scalar(PIR_SCALAR_I8);
     PirType tptr   = pir_type_scalar(PIR_SCALAR_PTR);
+    PirType tvoid  = pir_type_scalar(PIR_SCALAR_VOID);
     PirType idx_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
+    PirValueId ret_out_val = PIR_INVALID_ID;
 
     uint32_t orig_vals = fn->values.len;
     VecSplit *splits = (VecSplit *)calloc(orig_vals + 1u, sizeof(VecSplit));
@@ -181,13 +188,26 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
         fn->blocks.data[b].params = nparams;
     }
 
-    /* Expand function params if any are oversized vectors. */
-    bool has_split_fp = false;
-    for (uint32_t i = 0u; i < fn->param_count; ++i) {
-        if (needs_split(fn->params[i].type, max_bits)) { has_split_fp = true; break; }
+    /* Expand function params if any are oversized vectors or return is an oversized vector. */
+    bool has_split_fp = ret_is_ov;
+    for (uint32_t i = 0u; i < fn->param_count && !has_split_fp; ++i) {
+        if (needs_split(fn->params[i].type, max_bits)) { has_split_fp = true; }
     }
     if (has_split_fp) {
         PIR_VEC(PirParamDecl) nfp = {0};
+        if (ret_is_ov) {
+            ret_out_val = pir_fn_new_val(mod, fn, "simd_out", tptr, PIR_INVALID_ID, PIR_INVALID_ID, 0u);
+            PirParamDecl op;
+            memset(&op, 0, sizeof(op));
+            op.name     = fn->values.data[ret_out_val].name;
+            op.type     = tptr;
+            op.abi_type = tvoid;
+            op.val_id   = ret_out_val;
+            PIR_VEC_PUSH(&nfp, op);
+
+            fn->ret_type = tvoid;
+            set_simd_sret_cabi(target, fn->cc, &fn->cabi_ret);
+        }
         for (uint32_t i = 0u; i < fn->param_count; ++i) {
             if (needs_split(fn->params[i].type, max_bits)) {
                 const VecSplit *sp = &splits[fn->params[i].val_id];
@@ -215,6 +235,7 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
     }
 
     PIR_VEC(SimdAlias) aliases = {0};
+    PirInstIdVec entry_allocas = {0};
 
     for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
         PirInstIdVec new_insts = {0};
@@ -637,19 +658,55 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
                         }
                     }
                 }
-            } else if (copy.op == PIR_OP_CALL || copy.op == PIR_OP_CALL_INDIRECT) {
-                /* Split oversized vector arguments at call sites (matching expanded callee params). */
-                if (rsp || needs_split(copy.ty, max_bits)) {
+            } else if (copy.op == PIR_OP_RET && ret_is_ov) {
+                /* Store split return vector pieces into hidden sret/out pointer, then void ret. */
+                if (copy.operand_count < 1u || copy.operands[0].kind != PIR_OPER_VAL ||
+                    copy.operands[0].u.val >= orig_vals ||
+                    splits[copy.operands[0].u.val].count == 0u) {
                     pir_diag_error(diag, ln, 0u,
-                                   "oversized vector return exceeds target SIMD width (%u bits)",
-                                   (unsigned)max_bits);
+                                   "mismatched oversized vector operand in ret");
                     PIR_VEC_FREE(&new_insts);
                     PIR_VEC_FREE(&aliases);
                     free(splits);
                     return false;
                 }
+                const VecSplit *sp = &splits[copy.operands[0].u.val];
+                uint64_t pbytes = pir_type_bits(sp->piece_ty, target->ptr_bytes) / 8u;
+                for (uint32_t p = 0u; p < sp->count; ++p) {
+                    PirValueId dp = emit_padd(mod, fn, b, &new_insts,
+                                              pir_op_val(ret_out_val, tptr),
+                                              (uint64_t)p * pbytes, idx_ty, ln, lc);
+                    PirInst st = pir_make_inst(PIR_OP_STORE, sp->piece_ty, ln, lc);
+                    st.align = (uint32_t)(pbytes > 0u ? pbytes : 1u);
+                    st.operand_count = 2u; st.operands = pir_alloc_ops(mod, 2u);
+                    st.operands[0] = pir_op_val(sp->ids[p], sp->piece_ty);
+                    st.operands[1] = pir_op_val(dp, tptr);
+                    pir_fn_append_inst(fn, &new_insts, st);
+                }
+                PirInst *slot = &fn->insts.data[iid];
+                slot->ty            = tvoid;
+                slot->operand_count = 0u;
+                slot->operands      = NULL;
+                PIR_VEC_PUSH(&new_insts, iid);
+            } else if (copy.op == PIR_OP_CALL || copy.op == PIR_OP_CALL_INDIRECT) {
+                /* Lower oversized vector return via temporary stack buffer + hidden arg 0,
+                 * and split oversized vector arguments matching expanded callee params. */
+                bool call_ret_ov = needs_split(copy.ty, max_bits);
+                PirValueId ret_tmp = PIR_INVALID_ID;
+                if (call_ret_ov) {
+                    uint64_t tbytes = pir_vec_bits(copy.ty.u.vec) / 8u;
+                    PirInst al = pir_make_inst(PIR_OP_ALLOCA_PTR, tptr, ln, lc);
+                    al.imm_u64    = tbytes;
+                    al.align      = (uint32_t)tbytes;
+                    al.results[0] = pir_fn_new_val(mod, fn, "sv_ret", tptr, 0u, PIR_INVALID_ID, 0u);
+                    pir_fn_append_inst(fn, &entry_allocas, al);
+                    ret_tmp = al.results[0];
+                }
                 PIR_VEC(PirOperand) nargs = {0};
                 PIR_VEC_PUSH(&nargs, copy.operands[0]);
+                if (call_ret_ov) {
+                    PIR_VEC_PUSH(&nargs, pir_op_val(ret_tmp, tptr));
+                }
                 for (uint32_t k = 1u; k < copy.operand_count; ++k) {
                     PirOperand a = copy.operands[k];
                     if (a.kind == PIR_OPER_VAL && a.u.val < orig_vals &&
@@ -657,11 +714,9 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
                         const VecSplit *sp = &splits[a.u.val];
                         for (uint32_t p = 0u; p < sp->count; ++p) {
                             PirOperand po = pir_op_val(sp->ids[p], sp->piece_ty);
-                            if (a.call_stack_align > 0u &&
-                                sp->piece_ty.kind == PIR_TYPE_VECTOR &&
-                                pir_vec_bits(sp->piece_ty.u.vec) >= 128u) {
-                                po.call_stack_align = (p == 0u) ? a.call_stack_align : 16u;
-                            }
+                            po.call_stack_align  = (p == 0u) ? a.call_stack_align : 0u;
+                            po.call_force_stack  = a.call_force_stack;
+                            po.has_explicit_type = a.has_explicit_type;
                             PIR_VEC_PUSH(&nargs, po);
                         }
                     } else {
@@ -673,7 +728,25 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
                 slot->operands      = pir_alloc_ops(mod, nargs.len);
                 memcpy(slot->operands, nargs.data, nargs.len * sizeof(PirOperand));
                 PIR_VEC_FREE(&nargs);
+                if (call_ret_ov) {
+                    slot->ty         = tvoid;
+                    slot->results[0] = PIR_INVALID_ID;
+                }
                 PIR_VEC_PUSH(&new_insts, iid);
+                if (call_ret_ov && rsp) {
+                    uint64_t pbytes = pir_type_bits(rsp->piece_ty, target->ptr_bytes) / 8u;
+                    for (uint32_t p = 0u; p < rsp->count; ++p) {
+                        PirValueId sp_ptr = emit_padd(mod, fn, b, &new_insts,
+                                                      pir_op_val(ret_tmp, tptr),
+                                                      (uint64_t)p * pbytes, idx_ty, ln, lc);
+                        PirInst ld = pir_make_inst(PIR_OP_LOAD, rsp->piece_ty, ln, lc);
+                        ld.align = (uint32_t)(pbytes > 0u ? pbytes : 1u);
+                        ld.operand_count = 1u; ld.operands = pir_alloc_ops(mod, 1u);
+                        ld.operands[0] = pir_op_val(sp_ptr, tptr);
+                        ld.results[0]  = rsp->ids[p];
+                        pir_fn_append_inst(fn, &new_insts, ld);
+                    }
+                }
             } else {
                 /* Generic lane-wise unary or binary op (arith, bitwise, shift, float). */
                 if (!rsp || copy.op == PIR_OP_RET || copy.op == PIR_OP_INVOKE) {
@@ -715,6 +788,19 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
         fn->blocks.data[b].insts = new_insts;
     }
 
+    if (entry_allocas.len > 0u && fn->blocks.len > 0u) {
+        PirInstIdVec merged = {0};
+        for (uint32_t k = 0u; k < entry_allocas.len; ++k) {
+            PIR_VEC_PUSH(&merged, entry_allocas.data[k]);
+        }
+        for (uint32_t k = 0u; k < fn->blocks.data[0].insts.len; ++k) {
+            PIR_VEC_PUSH(&merged, fn->blocks.data[0].insts.data[k]);
+        }
+        PIR_VEC_FREE(&fn->blocks.data[0].insts);
+        fn->blocks.data[0].insts = merged;
+    }
+    PIR_VEC_FREE(&entry_allocas);
+
     for (uint32_t i = 0u; i < aliases.len; ++i) {
         PirValueId root = aliases.data[i].to;
         uint32_t steps = 0u;
@@ -741,16 +827,29 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
     return true;
 }
 
-static void split_simd_decl(PirModule *mod, PirParamDecl **params_io, uint32_t *count_io,
+static void split_simd_decl(PirModule *mod, const PirTargetSpec *target, PirCallingConv cc,
+                            PirParamDecl **params_io, uint32_t *count_io,
+                            PirType *ret_ty_io, PirCabiRetInfo *cabi_ret_io,
                             uint16_t max_bits) {
     PirParamDecl *old_p = *params_io;
     uint32_t old_n      = *count_io;
-    bool has_any = false;
-    for (uint32_t i = 0u; i < old_n; ++i) {
-        if (needs_split(old_p[i].type, max_bits)) { has_any = true; break; }
+    bool ret_is_ov      = needs_split(*ret_ty_io, max_bits);
+    bool has_any        = ret_is_ov;
+    for (uint32_t i = 0u; i < old_n && !has_any; ++i) {
+        if (needs_split(old_p[i].type, max_bits)) { has_any = true; }
     }
     if (!has_any) return;
     PIR_VEC(PirParamDecl) np = {0};
+    if (ret_is_ov) {
+        PirParamDecl op;
+        memset(&op, 0, sizeof(op));
+        op.type     = pir_type_scalar(PIR_SCALAR_PTR);
+        op.abi_type = pir_type_scalar(PIR_SCALAR_VOID);
+        op.val_id   = PIR_INVALID_ID;
+        PIR_VEC_PUSH(&np, op);
+        *ret_ty_io = pir_type_scalar(PIR_SCALAR_VOID);
+        set_simd_sret_cabi(target, cc, cabi_ret_io);
+    }
     for (uint32_t i = 0u; i < old_n; ++i) {
         if (needs_split(old_p[i].type, max_bits)) {
             PirType pty;
@@ -783,23 +882,17 @@ bool pir_legalize_simd(PirModule *mod, const PirTargetSpec *target, PirDiag *dia
                 return false;
             }
         } else {
-            if (needs_split(mod->funcs.data[fi].ret_type, max_bits)) {
-                pir_diag_error(diag, mod->funcs.data[fi].src_line, 0u,
-                               "oversized vector return type exceeds target SIMD width (%u bits)",
-                               (unsigned)max_bits);
-                return false;
-            }
-            split_simd_decl(mod, &mod->funcs.data[fi].params, &mod->funcs.data[fi].param_count, max_bits);
+            split_simd_decl(mod, target, mod->funcs.data[fi].cc,
+                            &mod->funcs.data[fi].params, &mod->funcs.data[fi].param_count,
+                            &mod->funcs.data[fi].ret_type, &mod->funcs.data[fi].cabi_ret,
+                            max_bits);
         }
     }
     for (uint32_t si = 0u; si < mod->sigs.len; ++si) {
-        if (needs_split(mod->sigs.data[si].ret_type, max_bits)) {
-            pir_diag_error(diag, mod->sigs.data[si].src_line, 0u,
-                           "oversized vector return type in signature exceeds target SIMD width (%u bits)",
-                           (unsigned)max_bits);
-            return false;
-        }
-        split_simd_decl(mod, &mod->sigs.data[si].params, &mod->sigs.data[si].param_count, max_bits);
+        split_simd_decl(mod, target, mod->sigs.data[si].cc,
+                        &mod->sigs.data[si].params, &mod->sigs.data[si].param_count,
+                        &mod->sigs.data[si].ret_type, &mod->sigs.data[si].cabi_ret,
+                        max_bits);
     }
 
     /* Flatten oversized typed vector globals (> max_simd_bits) into raw byte/zeroinit data. */

@@ -28,7 +28,9 @@ void pir_dom_build(PirDom *dom, const PirCfg *cfg) {
     }
     dom->idom     = (PirBlockId *)malloc(cfg->num_blocks * sizeof(PirBlockId));
     dom->children = (PirBlockIdVec *)calloc(cfg->num_blocks, sizeof(PirBlockIdVec));
-    if (!dom->idom || !dom->children) {
+    dom->tin      = (uint32_t *)calloc(cfg->num_blocks, sizeof(uint32_t));
+    dom->tout     = (uint32_t *)calloc(cfg->num_blocks, sizeof(uint32_t));
+    if (!dom->idom || !dom->children || !dom->tin || !dom->tout) {
         abort();
     }
     for (uint32_t i = 0u; i < cfg->num_blocks; ++i) {
@@ -68,6 +70,28 @@ void pir_dom_build(PirDom *dom, const PirCfg *cfg) {
             PIR_VEC_PUSH(&dom->children[p], b);
         }
     }
+
+    /* Compute Euler-tour timestamps iteratively for O(1) dominance queries. */
+    typedef struct { PirBlockId b; uint32_t ci; } DomDfsFrame;
+    PIR_VEC(DomDfsFrame) stk = {0};
+    uint32_t timer = 0u;
+    dom->tin[0] = ++timer;
+    DomDfsFrame root_fr = { 0u, 0u };
+    PIR_VEC_PUSH(&stk, root_fr);
+    while (stk.len > 0u) {
+        DomDfsFrame *fr = &stk.data[stk.len - 1u];
+        PirBlockId cur = fr->b;
+        if (fr->ci < dom->children[cur].len) {
+            PirBlockId ch = dom->children[cur].data[fr->ci++];
+            dom->tin[ch] = ++timer;
+            DomDfsFrame next_fr = { ch, 0u };
+            PIR_VEC_PUSH(&stk, next_fr);
+        } else {
+            dom->tout[cur] = timer;
+            stk.len--;
+        }
+    }
+    PIR_VEC_FREE(&stk);
 }
 
 void pir_dom_destroy(PirDom *dom) {
@@ -76,6 +100,8 @@ void pir_dom_destroy(PirDom *dom) {
     }
     free(dom->children);
     free(dom->idom);
+    free(dom->tin);
+    free(dom->tout);
     memset(dom, 0, sizeof(*dom));
 }
 
@@ -83,17 +109,12 @@ bool pir_dom_dominates(const PirDom *dom, PirBlockId a, PirBlockId b) {
     if (a >= dom->num_blocks || b >= dom->num_blocks) {
         return false;
     }
-    if (dom->idom[a] == PIR_INVALID_ID || dom->idom[b] == PIR_INVALID_ID) {
+    uint32_t ta = dom->tin[a];
+    uint32_t tb = dom->tin[b];
+    if (ta == 0u || tb == 0u) {
         return false;
     }
-    PirBlockId cur = b;
-    while (cur != a) {
-        if (cur == 0u || cur == PIR_INVALID_ID) {
-            return false;
-        }
-        cur = dom->idom[cur];
-    }
-    return true;
+    return ta <= tb && tb <= dom->tout[a];
 }
 
 static void add_unique_blk(PirBlockIdVec *v, PirBlockId b) {

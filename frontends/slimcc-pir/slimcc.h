@@ -415,6 +415,7 @@ struct Token {
   bool is_live : 1;
   bool has_ucn : 1;
   bool is_pragma_op : 1;
+  bool str_invalid : 1;
   int len;         // Token length
   const char *loc; // Token location
   File *file;
@@ -447,6 +448,7 @@ Token *skip_tk(Token *tok, TokenKind);
 bool consume(Token **rest, Token *tok, const char *str);
 bool consume_tk(Token **rest, Token *tok, TokenKind kind);
 Token *tokenize_file(const char *path, Token *tok, Token **end);
+Token *tokenize_file_ex(const char *path, Token *tok, Token **end, bool is_syshdr);
 File *new_file(const char *name, const char *contents);
 int add_display_file(const char *path);
 void tokenize_string_literal(Token *tok, Type *basety);
@@ -506,6 +508,8 @@ struct Obj {
 
   // Global variable or function
   bool is_definition;
+  bool has_real_def;
+  bool has_file_decl;
   bool is_static;
   bool is_weak;
   bool is_ext_inline;

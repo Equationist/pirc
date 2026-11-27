@@ -90,12 +90,19 @@ static void dse_process_block(DseCtx *ctx, PirBlockId b, const ActiveLoadVec *pa
         for (uint32_t j = 0u; j < n; ++j) {
             PirInst *ins = &fn->insts.data[blk->insts.data[j]];
             resolve_ops(ctx->alias, ctx->nvals, ins->operands, ins->operand_count);
+            uint32_t eff = pir_inst_effects(ctx->mod, fn, ins);
 
             if (ins->op == PIR_OP_STORE) {
-                if (ins->flags & PIR_FLAG_VOLATILE) {
+                if ((eff & PIR_EFF_MEM_BARRIER) != 0u) {
                     active.len = 0u;
                     loads.len  = 0u;
                     continue;
+                }
+                bool may_trap = (eff & PIR_EFF_MAY_TRAP) != 0u;
+                if (may_trap) {
+                    for (uint32_t k = 0u; k < active.len; ++k) {
+                        active.data[k].observed = true;
+                    }
                 }
                 uint32_t ssz = pir_type_bits(ins->ty, ctx->target->ptr_bytes) / 8u;
                 uint32_t dst = 0u;
@@ -130,50 +137,58 @@ static void dse_process_block(DseCtx *ctx, PirBlockId b, const ActiveLoadVec *pa
                 as.val          = ins->operands[0];
                 as.ty           = ins->ty;
                 as.size         = ssz;
-                as.observed     = false;
+                as.observed     = may_trap;
                 PIR_VEC_PUSH(&active, as);
             } else if (ins->op == PIR_OP_LOAD) {
-                if (ins->flags & PIR_FLAG_VOLATILE) {
+                if ((eff & PIR_EFF_MEM_BARRIER) != 0u) {
                     active.len = 0u;
                     loads.len  = 0u;
                     continue;
                 }
-                uint32_t lsz = pir_type_bits(ins->ty, ctx->target->ptr_bytes) / 8u;
-                bool forwarded = false;
-                for (uint32_t k = active.len; k > 0u; --k) {
-                    ActiveStore *as = &active.data[k - 1u];
-                    PirAliasResult ar = pir_alias_query(fn, as->ptr, as->size, ins->operands[0], lsz,
-                                                        ctx->target->ptr_bytes);
-                    if (ar == PIR_ALIAS_MUST && pir_type_eq(as->ty, ins->ty)) {
-                        if (as->val.kind == PIR_OPER_VAL) {
-                            ctx->alias[ins->results[0]] = resolve_alias(ctx->alias, ctx->nvals, as->val.u.val);
-                            dead[j] = true;
-                        } else {
-                            PirOpcode cop = (as->val.kind == PIR_OPER_SYM) ? PIR_OP_ADDR : PIR_OP_CONST;
-                            ins->op            = cop;
-                            ins->flags         = PIR_FLAG_NONE;
-                            ins->align         = 0u;
-                            ins->operands      = pir_alloc_ops(ctx->mod, 1u);
-                            ins->operands[0]   = as->val;
-                            ins->operand_count = 1u;
-                        }
-                        forwarded = true;
-                        break;
-                    }
-                    if (ar != PIR_ALIAS_NO) {
-                        as->observed = true;
+                bool may_trap = (eff & PIR_EFF_MAY_TRAP) != 0u;
+                if (may_trap) {
+                    for (uint32_t k = 0u; k < active.len; ++k) {
+                        active.data[k].observed = true;
                     }
                 }
-                if (!forwarded) {
-                    for (uint32_t k = loads.len; k > 0u; --k) {
-                        ActiveLoad *al = &loads.data[k - 1u];
-                        PirAliasResult ar = pir_alias_query(fn, al->ptr, al->size, ins->operands[0], lsz,
+                uint32_t lsz = pir_type_bits(ins->ty, ctx->target->ptr_bytes) / 8u;
+                bool forwarded = false;
+                if (!may_trap) {
+                    for (uint32_t k = active.len; k > 0u; --k) {
+                        ActiveStore *as = &active.data[k - 1u];
+                        PirAliasResult ar = pir_alias_query(fn, as->ptr, as->size, ins->operands[0], lsz,
                                                             ctx->target->ptr_bytes);
-                        if (ar == PIR_ALIAS_MUST && pir_type_eq(al->ty, ins->ty)) {
-                            ctx->alias[ins->results[0]] = resolve_alias(ctx->alias, ctx->nvals, al->val);
-                            dead[j] = true;
+                        if (ar == PIR_ALIAS_MUST && pir_type_eq(as->ty, ins->ty)) {
+                            if (as->val.kind == PIR_OPER_VAL) {
+                                ctx->alias[ins->results[0]] = resolve_alias(ctx->alias, ctx->nvals, as->val.u.val);
+                                dead[j] = true;
+                            } else {
+                                PirOpcode cop = (as->val.kind == PIR_OPER_SYM) ? PIR_OP_ADDR : PIR_OP_CONST;
+                                ins->op            = cop;
+                                ins->flags         = PIR_FLAG_NONE;
+                                ins->align         = 0u;
+                                ins->operands      = pir_alloc_ops(ctx->mod, 1u);
+                                ins->operands[0]   = as->val;
+                                ins->operand_count = 1u;
+                            }
                             forwarded = true;
                             break;
+                        }
+                        if (ar != PIR_ALIAS_NO) {
+                            as->observed = true;
+                        }
+                    }
+                    if (!forwarded) {
+                        for (uint32_t k = loads.len; k > 0u; --k) {
+                            ActiveLoad *al = &loads.data[k - 1u];
+                            PirAliasResult ar = pir_alias_query(fn, al->ptr, al->size, ins->operands[0], lsz,
+                                                                ctx->target->ptr_bytes);
+                            if (ar == PIR_ALIAS_MUST && pir_type_eq(al->ty, ins->ty)) {
+                                ctx->alias[ins->results[0]] = resolve_alias(ctx->alias, ctx->nvals, al->val);
+                                dead[j] = true;
+                                forwarded = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -191,7 +206,6 @@ static void dse_process_block(DseCtx *ctx, PirBlockId b, const ActiveLoadVec *pa
                     PIR_VEC_PUSH(&loads, al);
                 }
             } else {
-                uint32_t eff = pir_inst_effects(ctx->mod, fn, ins);
                 if ((eff & PIR_EFF_MEM_BARRIER) != 0u) {
                     active.len = 0u;
                     loads.len  = 0u;

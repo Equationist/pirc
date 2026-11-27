@@ -452,7 +452,7 @@ static bool is_pad_only_type(const PirModule *mod, PirType ty, int8_t *cache) {
 
 static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirType ty,
                                const PirGlobalItem *src, uint32_t src_cnt, uint32_t *idx,
-                               GItemVec *out, int8_t *pad_cache) {
+                               GItemVec *out, int8_t *pad_cache, uint32_t depth) {
     PirTypeLayout ly = pir_type_layout(mod, target, ty);
     if (ly.size == 0u) return;
     /* Padding / pad-only fields never consume any initializer items (not even zeroinit). */
@@ -465,9 +465,15 @@ static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirT
         return;
     }
     if (src[*idx].kind == PIR_GITEM_ZERO) {
-        (*idx)++;
-        emit_zero_gitem(out, ly.size);
-        return;
+        const PirGlobalItem *zi = &src[*idx];
+        bool consume_whole = (ty.kind == PIR_TYPE_SCALAR) ||
+                             (zi->len != 0u && zi->len >= ly.size) ||
+                             (zi->len == 0u && !(depth == 0u && src_cnt > 1u));
+        if (consume_whole) {
+            (*idx)++;
+            emit_zero_gitem(out, ly.size);
+            return;
+        }
     }
     if (ty.kind == PIR_TYPE_SCALAR) {
         const PirGlobalItem *it = &src[(*idx)++];
@@ -545,7 +551,7 @@ static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirT
         PirType ety = pir_type_scalar(pir_vec_elem_scalar(ty.u.vec));
         uint32_t lanes = pir_vec_lanes(ty.u.vec);
         for (uint32_t l = 0u; l < lanes; ++l) {
-            flatten_agg_global(mod, target, ety, src, src_cnt, idx, out, pad_cache);
+            flatten_agg_global(mod, target, ety, src, src_cnt, idx, out, pad_cache, depth + 1u);
         }
         return;
     }
@@ -572,8 +578,15 @@ static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirT
                         emit_zero_gitem(out, (agg->array_len - i) * ly.stride);
                         break;
                     }
-                    flatten_agg_global(mod, target, agg->elem_type, src, src_cnt, idx, out, pad_cache);
+                    uint32_t before = *idx;
+                    flatten_agg_global(mod, target, agg->elem_type, src, src_cnt, idx, out, pad_cache, depth + 1u);
                     if (ly.stride > el.size) emit_zero_gitem(out, ly.stride - el.size);
+                    if (*idx == before) {
+                        if (i + 1u < agg->array_len) {
+                            emit_zero_gitem(out, (agg->array_len - i - 1u) * ly.stride);
+                        }
+                        break;
+                    }
                 }
                 uint64_t emitted = agg->array_len * ly.stride;
                 if (ly.size > emitted) emit_zero_gitem(out, ly.size - emitted);
@@ -589,7 +602,7 @@ static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirT
                     if (next_off > off) emit_zero_gitem(out, next_off - off);
                     off = next_off;
                 }
-                flatten_agg_global(mod, target, agg->fields[f], src, src_cnt, idx, out, pad_cache);
+                flatten_agg_global(mod, target, agg->fields[f], src, src_cnt, idx, out, pad_cache, depth + 1u);
                 off += fl.size;
             }
             if (ly.size > off) emit_zero_gitem(out, ly.size - off);
@@ -615,7 +628,7 @@ static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirT
                     }
                 }
                 uint64_t start_bytes = gitem_vec_bytes_since(out, 0u, target->ptr_bytes);
-                flatten_agg_global(mod, target, agg->fields[0], src, src_cnt, idx, out, pad_cache);
+                flatten_agg_global(mod, target, agg->fields[0], src, src_cnt, idx, out, pad_cache, depth + 1u);
                 uint64_t end_bytes = gitem_vec_bytes_since(out, 0u, target->ptr_bytes);
                 uint64_t emitted   = (end_bytes >= start_bytes) ? (end_bytes - start_bytes) : 0u;
                 if (ly.size > emitted) emit_zero_gitem(out, ly.size - emitted);
@@ -719,6 +732,9 @@ bool pir_lower_aggregates(PirModule *mod, const PirTargetSpec *target, PirDiag *
                         if (target->ptr_bytes == 4u) {
                             uint32_t u32 = neg ? (0u - (uint32_t)off) : (uint32_t)off;
                             off = (uint64_t)u32;
+                            neg = false;
+                        } else if (neg && off > (UINT64_C(1) << 63)) {
+                            off = UINT64_C(0) - off;
                             neg = false;
                         }
                         if (off == 0u && copy.operands[0].kind == PIR_OPER_VAL &&
@@ -846,7 +862,7 @@ bool pir_lower_aggregates(PirModule *mod, const PirTargetSpec *target, PirDiag *
             } else {
                 GItemVec flat = {0};
                 uint32_t idx = 0u;
-                flatten_agg_global(mod, target, orig_ty, g->items, g->item_count, &idx, &flat, pad_cache);
+                flatten_agg_global(mod, target, orig_ty, g->items, g->item_count, &idx, &flat, pad_cache, 0u);
                 g->is_braced  = true;
                 g->item_count = flat.len;
                 if (flat.len > 0u) {

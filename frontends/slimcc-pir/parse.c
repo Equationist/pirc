@@ -1351,7 +1351,7 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr, StorageClass ctx)
 
 static Type *qual_constexpr(Type *ty, VarAttr *attr, Token *tok) {
   if (attr->strg & SC_CONSTEXPR) {
-    if (ty->qual & (Q_VOLATILE | Q_ATOMIC | Q_RESTRICT))
+    if (get_elem(ty)->qual & (Q_VOLATILE | Q_ATOMIC | Q_RESTRICT))
       error_tok(tok, "invalid qualifier for 'constexpr'");
     return add_qual(Q_CONST, ty, tok);
   }
@@ -1380,7 +1380,7 @@ static Type *param_declarator(Type *basety, Type *ty, Token *tok, bool is_fndef)
         (ty->kind == TY_VLA && ty->vla_len_expr && ty->vla_len_expr->kind == ND_UNKNOWN))
       error_tok(tok, "'static' requires an array size");
 
-  ty = add_qual(is_fndef ? arr_qual : (arr_qual & ~Q_ATOMIC), ptr_decay(ty), tok);
+  ty = add_qual(arr_qual, ptr_decay(ty), tok);
 
   if (ty->kind == TY_VOID || (ty->size < 0 && is_fndef))
     error_tok(tok, "invalid parameter type");
@@ -2064,7 +2064,7 @@ static Node *declaration2(Token **rest, Token *tok, Type *basety, VarAttr *attr,
     if (ty->kind == TY_VLA)
       error_tok(tok, "variable length arrays cannot be 'static'");
     if (is_iso_std && fnctx && fnctx->fn->is_ext_inline && !fnctx->fn->is_static &&
-        !(ty->qual & Q_CONST) && !tok->file->is_syshdr)
+        !(get_elem(ty)->qual & Q_CONST) && !tok->file->is_syshdr)
       error_tok(name, "non-const static local variable in external inline function");
 
     Obj *var = new_static_lvar(ty);
@@ -2599,6 +2599,8 @@ static void initializer3(Token **rest, Token *tok, Initializer *init, Node *expr
 
   if (init->ty->kind == TY_STRUCT || init->ty->kind == TY_UNION) {
     if (has_brace) {
+      if ((init->ty->qual & Q_ATOMIC) && is_iso_std && !tok->file->is_syshdr)
+        error_tok(tok, "cannot initialize '_Atomic' struct or union with brace-enclosed member list");
       set_init(init, INIT_NONE);
       init->is_zero = true;
     } else {
@@ -4023,6 +4025,8 @@ static int64_t eval(Node *node) {
 static bool is_ice_expr_syntax(Node *n) {
   if (!n)
     return true;
+  if (n->ty && is_ptr(n->ty))
+    return false;
   switch (n->kind) {
   case ND_NUM:
     return !n->ty || !is_flonum(n->ty);
@@ -4032,10 +4036,12 @@ static bool is_ice_expr_syntax(Node *n) {
   case ND_NEG:
   case ND_NOT:
   case ND_BITNOT:
-    if (n->m.lhs && n->m.lhs->ty && is_flonum(n->m.lhs->ty))
+    if (n->m.lhs && n->m.lhs->ty && (is_flonum(n->m.lhs->ty) || is_ptr(n->m.lhs->ty)))
       return false;
     return is_ice_expr_syntax(n->m.lhs);
   case ND_CAST:
+    if (n->m.lhs && n->m.lhs->ty && is_ptr(n->m.lhs->ty))
+      return false;
     if (n->m.lhs && n->m.lhs->ty && is_flonum(n->m.lhs->ty))
       return !n->is_implicit_cast && n->m.lhs->kind == ND_NUM;
     return is_ice_expr_syntax(n->m.lhs);
@@ -4059,8 +4065,8 @@ static bool is_ice_expr_syntax(Node *n) {
   case ND_LOGAND:
   case ND_LOGOR:
   case ND_COMMA:
-    if ((n->m.lhs && n->m.lhs->ty && is_flonum(n->m.lhs->ty)) ||
-        (n->m.rhs && n->m.rhs->ty && is_flonum(n->m.rhs->ty)))
+    if ((n->m.lhs && n->m.lhs->ty && (is_flonum(n->m.lhs->ty) || is_ptr(n->m.lhs->ty))) ||
+        (n->m.rhs && n->m.rhs->ty && (is_flonum(n->m.rhs->ty) || is_ptr(n->m.rhs->ty))))
       return false;
     return is_ice_expr_syntax(n->m.lhs) && is_ice_expr_syntax(n->m.rhs);
   case ND_COND:
@@ -4781,6 +4787,21 @@ static long_double_t eval_double(Node *node) {
   return eval_error(node);
 }
 
+static bool bitint_sign_bit(const BitBuf *v, int64_t bits) {
+  int64_t idx = (bits - 1) / 64;
+  return (((&v->as64)[idx] >> ((bits - 1) % 64)) & 1u) != 0u;
+}
+
+static bool bitint_is_signed_min(const BitBuf *v, Type *ty) {
+  int64_t top_idx = (ty->bit_cnt - 1) / 64;
+  uint64_t top_bit = UINT64_C(1) << ((ty->bit_cnt - 1) % 64);
+  for (int64_t i = 0; i < top_idx; i++)
+    if ((&v->as64)[i] != 0)
+      return false;
+  uint64_t mask = (ty->bit_cnt % 64 == 0) ? UINT64_MAX : ((top_bit << 1) - 1u);
+  return ((&v->as64)[top_idx] & mask) == top_bit;
+}
+
 static BitBuf *eval_bitint(Node *node) {
   if (eval_recover && *eval_recover)
     return NULL;
@@ -4803,13 +4824,76 @@ static BitBuf *eval_bitint(Node *node) {
     if (eval_recover && *eval_recover)
       return free(lval), free(rval), NULL;
 
+    bool sa = (!ty->is_unsigned && eval_strict) ? bitint_sign_bit(lval, ty->bit_cnt) : false;
+    bool sb = (!ty->is_unsigned && eval_strict) ? bitint_sign_bit(rval, ty->bit_cnt) : false;
+
     switch (node->kind) {
     case ND_BITAND: eval_bitint_bitand(ty->bit_cnt, lval, rval); break;
     case ND_BITOR:  eval_bitint_bitor(ty->bit_cnt, lval, rval); break;
     case ND_BITXOR: eval_bitint_bitxor(ty->bit_cnt, lval, rval); break;
-    case ND_ADD:    eval_bitint_add(ty->bit_cnt, lval, rval); break;
-    case ND_SUB:    eval_bitint_sub(ty->bit_cnt, lval, rval); break;
-    case ND_MUL:    eval_bitint_mul(ty->bit_cnt, lval, rval); break;
+    case ND_ADD:
+      eval_bitint_add(ty->bit_cnt, lval, rval);
+      if (!ty->is_unsigned && eval_strict && sa == sb && bitint_sign_bit(rval, ty->bit_cnt) != sa) {
+        free(lval); free(rval);
+        eval_error2(node, "integer overflow in constant expression");
+        return NULL;
+      }
+      break;
+    case ND_SUB:
+      eval_bitint_sub(ty->bit_cnt, lval, rval);
+      if (!ty->is_unsigned && eval_strict && sa != sb && bitint_sign_bit(rval, ty->bit_cnt) != sa) {
+        free(lval); free(rval);
+        eval_error2(node, "integer overflow in constant expression");
+        return NULL;
+      }
+      break;
+    case ND_MUL: {
+      if (!ty->is_unsigned && eval_strict) {
+        size_t bsz = (size_t)bitint_buffer_size(ty);
+        bool l_nz = eval_bitint_to_bool(ty->bit_cnt, lval);
+        bool r_nz = eval_bitint_to_bool(ty->bit_cnt, rval);
+        BitBuf *orig_r = NULL;
+        if (l_nz && r_nz) {
+          orig_r = malloc(bsz);
+          memcpy(orig_r, rval, bsz);
+        }
+        eval_bitint_mul(ty->bit_cnt, lval, rval);
+        if (orig_r) {
+          BitBuf *chk_a = malloc(bsz);
+          BitBuf *chk_b = malloc(bsz);
+          memcpy(chk_a, rval, bsz);
+          memcpy(chk_b, lval, bsz);
+          clean_bitint(chk_a, ty);
+          clean_bitint(chk_b, ty);
+          bool ovf = false;
+          if (bitint_is_signed_min(chk_a, ty)) {
+            int64_t cnt = (int64_t)(bsz / 8);
+            bool b_m1 = true;
+            for (int64_t i = 0; i < cnt; i++)
+              if ((&chk_b->as64)[i] != UINT64_MAX) { b_m1 = false; break; }
+            if (b_m1) ovf = true;
+          }
+          if (!ovf) {
+            eval_bitint_div(ty->bit_cnt, chk_a, chk_b, false, true);
+            clean_bitint(chk_b, ty);
+            clean_bitint(orig_r, ty);
+            if (memcmp(chk_b, orig_r, bsz) != 0)
+              ovf = true;
+          }
+          free(chk_a);
+          free(chk_b);
+          free(orig_r);
+          if (ovf) {
+            free(lval); free(rval);
+            eval_error2(node, "integer overflow in constant expression");
+            return NULL;
+          }
+        }
+      } else {
+        eval_bitint_mul(ty->bit_cnt, lval, rval);
+      }
+      break;
+    }
     case ND_DIV:
     case ND_REM: {
       bool res = eval_bitint_to_bool(ty->bit_cnt, rval);
@@ -4885,9 +4969,24 @@ static BitBuf *eval_bitint(Node *node) {
       return NULL;
     }
 
-    if (node->kind == ND_SHL)
+    if (node->kind == ND_SHL) {
+      if (!ty->is_unsigned && eval_strict && amount > 0) {
+        if (bitint_sign_bit(val, ty->bit_cnt)) {
+          free(val);
+          eval_error2(node, "integer overflow in constant expression");
+          return NULL;
+        }
+        int64_t first_lost = ty->bit_cnt - 1 - (int64_t)amount;
+        for (int64_t bi = first_lost; bi < ty->bit_cnt; bi++) {
+          if (((&val->as64)[bi / 64] >> (bi % 64)) & 1u) {
+            free(val);
+            eval_error2(node, "integer overflow in constant expression");
+            return NULL;
+          }
+        }
+      }
       eval_bitint_shl(ty->bit_cnt, val, val, amount);
-    else
+    } else
       eval_bitint_shr(ty->bit_cnt, val, val, amount, ty->is_unsigned);
     return val;
   }
@@ -4900,17 +4999,19 @@ static BitBuf *eval_bitint(Node *node) {
 
     switch (node->kind) {
     case ND_BITNOT: eval_bitint_bitnot(ty->bit_cnt, val); break;
-    case ND_NEG:    eval_bitint_neg(ty->bit_cnt, val); break;
+    case ND_NEG:
+      if (!ty->is_unsigned && eval_strict && bitint_is_signed_min(val, ty)) {
+        free(val);
+        eval_error2(node, "integer overflow in constant expression");
+        return NULL;
+      }
+      eval_bitint_neg(ty->bit_cnt, val);
+      break;
     }
     return val;
   }
   case ND_COND: {
     bool cond = eval(node->ctrl.cond);
-    if (eval_strict) {
-      BitBuf *lval = eval_bitint(node->ctrl.then);
-      BitBuf *rval = eval_bitint(node->ctrl.els);
-      return cond ? (free(rval), lval) : (free(lval), rval);
-    }
     return cond ? eval_bitint(node->ctrl.then) : eval_bitint(node->ctrl.els);
   }
   case ND_CAST:
@@ -4936,12 +5037,12 @@ static BitBuf *eval_bitint(Node *node) {
       long_double_t d = eval_double(lhs);
       if (eval_recover && *eval_recover)
         return NULL;
-      if (!(d == d) || (ty->is_unsigned && d < 0.0)) {
+      if (!(d == d) || (ty->is_unsigned && d <= -1.0)) {
         eval_error2(node, "float-to-_BitInt conversion out of range in constant expression");
         return NULL;
       }
-      bool is_neg = (d < 0.0);
-      long_double_t mag = is_neg ? -d : d;
+      bool is_neg = (!ty->is_unsigned && d < 0.0);
+      long_double_t mag = (ty->is_unsigned && d < 0.0) ? 0.0 : (is_neg ? -d : d);
       BitBuf *val = calloc(1, bitint_buffer_size(ty));
       int64_t cnt = bitint_buffer_size(ty) / 8;
       for (int64_t i = 0; i < cnt && mag >= 1.0; i++) {
@@ -5142,7 +5243,17 @@ static void chk_assignable(Node *node) {
     error_tok(node->tok, "operand unassignable");
 }
 
+static Node *assign_inner(Token **rest, Token *tok);
+
 static Node *assign(Token **rest, Token *tok) {
+  if (++parse_depth > 256)
+    error_tok(tok, "expression nesting depth exceeded");
+  Node *r = assign_inner(rest, tok);
+  parse_depth--;
+  return r;
+}
+
+static Node *assign_inner(Token **rest, Token *tok) {
   Node *node = conditional(&tok, tok);
 
   TokenKind tk = tok->kind;
@@ -5218,7 +5329,17 @@ Type *vla_cond_result_len(Type *ty1, Type *ty2, Type *base, Node **cond, Obj **c
   return vla_of(base, node, 0);
 }
 
+static Node *conditional_inner(Token **rest, Token *tok);
+
 static Node *conditional(Token **rest, Token *tok) {
+  if (++parse_depth > 256)
+    error_tok(tok, "expression nesting depth exceeded");
+  Node *r = conditional_inner(rest, tok);
+  parse_depth--;
+  return r;
+}
+
+static Node *conditional_inner(Token **rest, Token *tok) {
   Node *cond = binary(&tok, tok, PCD_LOGOR);
 
   if (tok->kind != TK_QMARK) {
@@ -5473,7 +5594,7 @@ static Type *sizeof_arg(Token **rest, Token *tok, Node **expr) {
 }
 
 static bool is_lvalue_expr(Node *n) {
-  if (!n)
+  if (!n || n->is_nonlval)
     return false;
   switch (n->kind) {
   case ND_VAR:
@@ -6181,6 +6302,7 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
     Node *arg = assign(&tok, tok);
     add_type(arg);
 
+    bool is_fixed = (param != NULL);
     if (param) {
       arg = assign_cast(param->ty, arg);
 
@@ -6198,7 +6320,7 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
       else
         ptr_convert(&arg);
     }
-    cur = cur->param_next = alloc_ast_var(arg->ty);
+    cur = cur->param_next = alloc_ast_var((!is_fixed && (arg->ty->qual & Q_ATOMIC)) ? unqual(arg->ty) : arg->ty);
     cur->arg_expr = arg;
   }
   if (param)
@@ -6258,6 +6380,7 @@ static Node *generic_selection(Token **rest, Token *tok) {
   }
   Node *ret = NULL;
   Node *def = NULL;
+  Token *def_tok = NULL;
 
   struct {
     Type **data;
@@ -6271,7 +6394,10 @@ static Node *generic_selection(Token **rest, Token *tok) {
         error_tok(tok, "duplicate default generic association");
 
       tok = skip_tk(tok->next, TK_COLON);
+      def_tok = tok;
+      uneval_depth++;
       def = assign(&tok, tok);
+      uneval_depth--;
       add_type(def);
       continue;
     }
@@ -6295,9 +6421,14 @@ static Node *generic_selection(Token **rest, Token *tok) {
       GrowArr(types.data, &types.cap);
     types.data[types.len++] = t2;
 
+    bool matched = is_compatible2(t1, t2);
+    if (!matched)
+      uneval_depth++;
     Node *node = assign(&tok, skip_tk(tok, TK_COLON));
+    if (!matched)
+      uneval_depth--;
     add_type(node);
-    if (is_compatible2(t1, t2)) {
+    if (matched) {
       if (ret)
         error_tok(start, "controlling expression compatible with multiple generic associations");
       ret = node;
@@ -6310,6 +6441,11 @@ static Node *generic_selection(Token **rest, Token *tok) {
     return ret;
   if (!def)
     error_tok(start, "controlling type not compatible with any association type");
+  if (def_tok) {
+    Token *dummy;
+    def = assign(&dummy, def_tok);
+    add_type(def);
+  }
   return def;
 }
 
@@ -6965,10 +7101,12 @@ static Node *func_old_style_param(Token **rest, Token *tok, Type *prot_ty, Type 
 
       if (!promoted) {
         var->ty = ty;
+        var->is_register = !!(attr.strg & SC_REGISTER);
         push_var_name(name, var);
       } else {
         var->ty = promoted;
         Node *lhs = new_var_node(new_lvar2(ty, decl_scope()), name);
+        lhs->m.var->is_register = !!(attr.strg & SC_REGISTER);
         push_var_name(name, lhs->m.var);
 
         Node *rhs = new_var_node(var, name);
@@ -7000,9 +7138,10 @@ static Node *func_old_style_param(Token **rest, Token *tok, Type *prot_ty, Type 
 
 static void strip_proto_vla_exprs(Type *ty) {
   for (; ty; ty = ty->base) {
-    if (ty->kind == TY_VLA)
+    if (ty->kind == TY_VLA) {
       ty->vla_len_expr = NULL;
-    else if (ty->kind == TY_FUNC) {
+      ty->array_len = -1;
+    } else if (ty->kind == TY_FUNC) {
       strip_proto_vla_exprs(ty->return_ty);
       for (Obj *p = ty->param_list; p; p = p->param_next)
         strip_proto_vla_exprs(p->ty);
@@ -7132,9 +7271,10 @@ static Obj *func_prototype(Token *tok, Token *name, Type *ty, VarAttr *attr, boo
     if (!is_compatible(fn->ty, ty))
       error_tok(name, "incompatible redeclaration");
     if (scope->parent && !is_def) {
-      scoped_fn_ty = composite_type(fn->ty, ty);
+      scoped_fn_ty = fn->has_file_decl ? composite_type(fn->ty, ty) : ty;
     } else {
-      fn->ty = composite_type(fn->ty, ty);
+      fn->ty = fn->has_file_decl ? composite_type(fn->ty, ty) : ty;
+      fn->has_file_decl = true;
     }
 
     if (fn->is_gnu_inline && !fn->export_fn && !fn->is_static) {
@@ -7162,6 +7302,7 @@ static Obj *func_prototype(Token *tok, Token *name, Type *ty, VarAttr *attr, boo
   } else {
     fn = ent->val = new_gvar(get_ident(&cc1_arena, name), ty);
     fn->is_static = attr->strg & SC_STATIC;
+    fn->has_file_decl = !scope->parent;
     set_returns_twice(fn);
   }
   VarScope *vsc = push_gvar_name2(name, fn);
@@ -7172,8 +7313,6 @@ static Obj *func_prototype(Token *tok, Token *name, Type *ty, VarAttr *attr, boo
   }
 
   fn->is_gnu_inline |= is_gnu_inline;
-  if (is_def && (attr->strg & SC_INLINE) && !fn->is_static && !is_gnu_inline)
-    fn->is_ext_inline = true;
 
   aligned_attr(name, tok, attr, &fn->alt_align);
   symbol_attr(name, tok, attr, fn);
@@ -7219,6 +7358,9 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
         strip_proto_vla_exprs(ty);
       Obj *fn = func_prototype(tok, name, ty, attr, is_fndef);
       func_exportness(fn, attr, is_fndef);
+      if (is_fndef && (attr->strg & SC_INLINE) && !fn->is_static &&
+          !fn->export_fn && !fn->is_gnu_inline)
+        fn->is_ext_inline = true;
 
       if (is_fndef) {
         func_definition(rest, tok, fn, ty);
@@ -7259,13 +7401,15 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
         error_tok(name, "redeclaration with%s thread local",
                   var->kind == OBJ_TLS ? "out" : "");
       if (scope->parent) {
-        scoped_ty = composite_type(var->ty, ty);
+        scoped_ty = var->has_file_decl ? composite_type(var->ty, ty) : ty;
       } else {
-        var->ty = composite_type(var->ty, ty);
+        var->ty = var->has_file_decl ? composite_type(var->ty, ty) : ty;
+        var->has_file_decl = true;
       }
     } else {
       var = ent->val = new_gvar(get_ident(&cc1_arena, name), ty);
       var->is_static = (attr->strg & SC_STATIC) || (attr->strg & SC_CONSTEXPR);
+      var->has_file_decl = !scope->parent;
       if (attr->strg & SC_THREAD)
         var->kind = OBJ_TLS;
     }
@@ -7285,7 +7429,7 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
           error_tok(name, "_Alignas redeclaration mismatch");
         if (var->has_alignas && !attr->has_alignas && is_definition)
           error_tok(name, "definition missing '_Alignas' from previous declaration");
-        if (!var->has_alignas && attr->has_alignas && var->is_definition)
+        if (!var->has_alignas && attr->has_alignas && var->has_real_def)
           error_tok(name, "'_Alignas' cannot be added after definition");
       }
       if (attr->has_alignas) {
@@ -7305,11 +7449,13 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
     }
     var->is_definition = true;
 
-    if (attr->strg & SC_CONSTEXPR)
+    if (attr->strg & SC_CONSTEXPR) {
+      var->has_real_def = true;
       constexpr_initializer(&tok, skip_tk(tok, TK_EQ), var, var);
-    else if (tok->kind == TK_EQ)
+    } else if (tok->kind == TK_EQ) {
+      var->has_real_def = true;
       gvar_initializer(&tok, tok->next, var);
-    else if (is_iso_std && var->is_static && var->ty->size < 0)
+    } else if (is_iso_std && var->is_static && var->ty->size < 0)
       error_tok(name, "tentative definition with internal linkage has incomplete type");
   }
   *rest = tok;

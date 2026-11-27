@@ -24,6 +24,9 @@ typedef struct {
     bool      unaligned;
     bool      single_v128;
     PirType   v128_ty;
+    bool      single_v256;
+    PirType   v256_ty;
+    uint32_t  non_v256_leaves;
 } SysvAggWalk;
 
 static SysvClass merge_cls(SysvClass a, SysvClass b) {
@@ -51,6 +54,7 @@ static void walk_sysv(const PirModule *mod, const PirTargetSpec *target,
             w->unaligned = true;
             return;
         }
+        w->non_v256_leaves++;
         uint64_t eb = base_off / 8u;
         if (ty.u.scalar == PIR_SCALAR_I128) {
             w->cls[0] = merge_cls(w->cls[0], EB_INT);
@@ -75,12 +79,19 @@ static void walk_sysv(const PirModule *mod, const PirTargetSpec *target,
             return;
         }
         uint16_t bits = pir_vec_bits(ty.u.vec);
-        if (bits == 128u && base_off == 0u) {
+        if (bits == 256u && base_off == 0u) {
+            w->single_v256 = true;
+            w->v256_ty     = ty;
+            w->cls[0] = merge_cls(w->cls[0], EB_SSE);
+            w->cls[1] = merge_cls(w->cls[1], EB_SSEUP);
+        } else if (bits == 128u && base_off == 0u) {
+            w->non_v256_leaves++;
             w->single_v128 = true;
             w->v128_ty     = ty;
             w->cls[0] = merge_cls(w->cls[0], EB_SSE);
             w->cls[1] = merge_cls(w->cls[1], EB_SSEUP);
         } else {
+            w->non_v256_leaves++;
             uint64_t eb = base_off / 8u;
             if (eb < 2u) w->cls[eb] = merge_cls(w->cls[eb], EB_SSE);
         }
@@ -143,10 +154,46 @@ static void classify_sysv_agg(const PirModule *mod, const PirTargetSpec *target,
         return;
     }
     if (ly.size > 16u) {
+        if (ly.size == 32u && target->caps.max_simd_bits >= 256u) {
+            uint32_t n2 = mod->agg_types.len;
+            uint16_t stack_seen2[64];
+            uint16_t *seen2 = (n2 <= 64u) ? stack_seen2 : (uint16_t *)calloc(n2, sizeof(uint16_t));
+            if (!seen2) abort();
+            if (seen2 == stack_seen2) memset(stack_seen2, 0, n2 * sizeof(uint16_t));
+            SysvAggWalk w2;
+            memset(&w2, 0, sizeof(w2));
+            walk_sysv(mod, target, agg_ty, 0u, &w2, seen2);
+            if (seen2 != stack_seen2) free(seen2);
+            if (!w2.unaligned && w2.single_v256 && w2.non_v256_leaves == 0u) {
+                out->kind      = PIR_ABI_DIRECT;
+                out->reg_count = 1u;
+                out->regs[0]   = w2.v256_ty;
+                out->fp_used   = 1u;
+                return;
+            }
+        }
+        uint32_t byval_al = ly.align;
+        if (target->os == PIR_OS_MACOS && target->caps.max_simd_bits < 256u &&
+            byval_al == 32u && agg_ty.kind == PIR_TYPE_NAMED_AGG &&
+            agg_ty.u.agg_id < mod->agg_types.len &&
+            mod->agg_types.data[agg_ty.u.agg_id].min_align < 32u) {
+            /* Apple x86_64 without AVX caps v256 aggregate stack alignment at 16B
+             * unless explicitly over-aligned with _Alignas(>=32). */
+            uint32_t n2 = mod->agg_types.len;
+            uint16_t stack_seen2[64];
+            uint16_t *seen2 = (n2 <= 64u) ? stack_seen2 : (uint16_t *)calloc(n2, sizeof(uint16_t));
+            if (!seen2) abort();
+            if (seen2 == stack_seen2) memset(stack_seen2, 0, n2 * sizeof(uint16_t));
+            SysvAggWalk w2;
+            memset(&w2, 0, sizeof(w2));
+            walk_sysv(mod, target, agg_ty, 0u, &w2, seen2);
+            if (seen2 != stack_seen2) free(seen2);
+            if (w2.single_v256) byval_al = 16u;
+        }
         out->kind              = PIR_ABI_INDIRECT;
         out->gp_used           = 0u;
         out->stack_byval_size  = ly.size;
-        out->stack_byval_align = ly.align;
+        out->stack_byval_align = byval_al;
         return;
     }
     uint32_t n = mod->agg_types.len;
@@ -237,14 +284,15 @@ bool pir_abi_sysv_x64_param(const PirModule *mod, const PirTargetSpec *target,
     } else if (pd->type.kind == PIR_TYPE_VECTOR) {
         uint16_t vbits = pir_vec_bits(pd->type.u.vec);
         if (vbits > 128u && target->caps.max_simd_bits < 256u) {
-            /* SysV AMD64 without AVX: 256-bit vectors are MEMORY class (inline 32B stack slot). */
+            /* SysV AMD64 without AVX: 256-bit vectors are MEMORY class (inline 32B stack slot).
+             * Apple x86_64 without AVX aligns v256 stack slots to 16B; Linux aligns to 32B. */
             PirTypeLayout vly = pir_type_layout(mod, target, pd->type);
             out->kind              = PIR_ABI_INDIRECT;
             out->reg_count         = 0u;
             out->gp_used           = 0u;
             out->fp_used           = 0u;
             out->stack_byval_size  = vly.size;
-            out->stack_byval_align = vly.align;
+            out->stack_byval_align = (target->os == PIR_OS_MACOS && vly.align > 16u) ? 16u : vly.align;
             return true;
         }
         uint32_t vgp = 0u, vfp = 0u;

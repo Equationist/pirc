@@ -291,10 +291,15 @@ void pir_abi_plan_va_arg(const PirModule *mod, const PirTargetSpec *target,
     out->mem_align = slot_sz;
     if (is_sysv_x64) {
         if (out->align > 8u) {
-            out->mem_align = (is_buf && out->align < 16u) ? 16u : out->align;
+            uint64_t mal = (is_buf && out->align < 16u) ? 16u : out->align;
+            if (target->os == PIR_OS_MACOS && target->caps.max_simd_bits < 256u &&
+                !is_buf && out->load_ty.kind == PIR_TYPE_VECTOR && out->size > 16u && mal > 16u) {
+                mal = 16u;
+            }
+            out->mem_align = mal;
         }
     } else if (is_aapcs64_lin && !out->is_indirect) {
-        uint32_t stk_al = out->is_hfa ? out->align : out->nat_align;
+        uint32_t stk_al = out->nat_align;
         if (stk_al > 8u) out->mem_align = (stk_al > 16u) ? 16u : stk_al;
     } else if (is_darwin_a64 && !out->is_indirect) {
         if (out->align > 8u) out->mem_align = (out->align > 16u) ? 16u : out->align;

@@ -29,7 +29,7 @@ typedef enum {
 #define atomic_init(addr, val) ((void)(*(addr) = (val)))
 #define kill_dependency(x) (x)
 #define atomic_thread_fence(order) ((void)(order), __builtin_atomic_thread_fence())
-#define atomic_signal_fence(order) ((void)(order))
+#define atomic_signal_fence(order) ((void)(order), __builtin_atomic_thread_fence())
 #define atomic_is_lock_free(x) ((void)(x), (sizeof(*(x)) <= 8))
 
 #define atomic_load(addr) (0 ? *__builtin_atomic_chk(addr) : *__builtin_atomic_chk(addr))

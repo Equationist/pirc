@@ -431,6 +431,7 @@ typedef struct {
             double   raw_val;      /* Parsed double before f32/f64 narrowing */
             uint32_t f32_bits;     /* Direct strtof IEEE 754 bits (avoids f32 double rounding) */
             bool     has_f32_bits;
+            bool     f32_overflow; /* Literal exceeded finite f32 range */
         } imm_float;
         struct {
             const char *name;
@@ -547,6 +548,7 @@ typedef struct {
     uint64_t          float_bits;
     uint32_t          float32_bits;
     bool              has_f32_bits;
+    bool              f32_overflow;
 } PirGlobalItem;
 
 typedef struct {
@@ -866,6 +868,44 @@ static inline bool pir_op_is_terminator(PirOpcode op) {
 
 static inline bool pir_is_pow2_u32(uint32_t v) {
     return v != 0u && (v & (v - 1u)) == 0u;
+}
+
+static inline bool pir_global_is_all_zero(const PirGlobal *g) {
+    if (g->is_zeroinit || g->item_count == 0u) {
+        return true;
+    }
+    bool is_fp = false;
+    if (g->has_type) {
+        if (g->type.kind == PIR_TYPE_SCALAR) {
+            is_fp = pir_scalar_is_float(g->type.u.scalar);
+        } else if (g->type.kind == PIR_TYPE_VECTOR) {
+            is_fp = pir_scalar_is_float(pir_vec_elem_scalar(g->type.u.vec));
+        }
+    }
+    for (uint32_t k = 0u; k < g->item_count; ++k) {
+        const PirGlobalItem *gi = &g->items[k];
+        switch (gi->kind) {
+            case PIR_GITEM_ZERO:
+                break;
+            case PIR_GITEM_INT:
+                if (gi->int_lo != 0u || gi->int_hi != 0u) return false;
+                if (is_fp && gi->int_neg) return false;
+                break;
+            case PIR_GITEM_FLOAT:
+                if (gi->float_bits != 0u || (gi->has_f32_bits && gi->float32_bits != 0u)) {
+                    return false;
+                }
+                break;
+            case PIR_GITEM_BYTES:
+                for (uint64_t bi = 0u; bi < gi->len; ++bi) {
+                    if (gi->bytes[bi] != 0u) return false;
+                }
+                break;
+            case PIR_GITEM_RELOC:
+                return false;
+        }
+    }
+    return true;
 }
 
 #endif /* PIR_IR_IR_H */

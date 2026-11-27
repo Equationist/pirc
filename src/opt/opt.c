@@ -44,13 +44,20 @@ uint32_t pir_inst_effects(const PirModule *mod, const PirFunction *fn, const Pir
         ins->op != PIR_OP_ADD && ins->op != PIR_OP_SUB && ins->op != PIR_OP_MUL) {
         pure_flags_ok = false;
     }
+    /* Any instruction referencing a TLS symbol operand materializes a TLV thunk call,
+     * which may trap (e.g. undefined weak extern TLS) and clobbers caller-saved state. */
+    for (uint32_t i = 0u; i < ins->operand_count; ++i) {
+        if (pir_op_is_tls_sym(mod, &ins->operands[i])) {
+            eff |= PIR_EFF_MAY_TRAP | PIR_EFF_REAL_CALL;
+            pure_flags_ok = false;
+            break;
+        }
+    }
 
     switch (ins->op) {
         case PIR_OP_CONST:
         case PIR_OP_ADDR:
-            if (ins->operand_count >= 1u && pir_op_is_tls_sym(mod, &ins->operands[0])) {
-                eff |= PIR_EFF_MAY_TRAP | PIR_EFF_REAL_CALL;
-            } else if (pure_flags_ok) {
+            if (pure_flags_ok) {
                 eff |= PIR_EFF_PURE_HOISTABLE;
             }
             break;

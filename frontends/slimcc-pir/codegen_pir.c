@@ -389,8 +389,8 @@ typedef struct {
   int count;
 } HfaCheck;
 
-static bool is_unnamed_bf_only_agg(Type *ty) {
-  if (!ty || (ty->kind != TY_STRUCT && ty->kind != TY_UNION) || ty->size <= 0)
+static bool is_unnamed_bf_only_agg_rec(Type *ty, int depth) {
+  if (depth > 256 || !ty || (ty->kind != TY_STRUCT && ty->kind != TY_UNION) || ty->size <= 0)
     return false;
   for (Member *m = ty->members; m; m = m->next) {
     if (m->is_bitfield) {
@@ -402,25 +402,30 @@ static bool is_unnamed_bf_only_agg(Type *ty) {
       continue;
     if (m->ty->kind == TY_ARRAY) {
       Type *elem = m->ty;
-      while (elem && elem->kind == TY_ARRAY)
+      int ad = depth;
+      while (elem && elem->kind == TY_ARRAY && ad++ < 256)
         elem = elem->base;
-      if (!elem || elem->size <= 0 || is_unnamed_bf_only_agg(elem))
+      if (!elem || elem->size <= 0 || is_unnamed_bf_only_agg_rec(elem, ad + 1))
         continue;
       return false;
     }
     if ((m->ty->kind == TY_STRUCT || m->ty->kind == TY_UNION) &&
-        is_unnamed_bf_only_agg(m->ty))
+        is_unnamed_bf_only_agg_rec(m->ty, depth + 1))
       continue;
     return false;
   }
   return true;
 }
 
-static int32_t c_agg_member_natural_align(Type *ty) {
-  if (!ty)
+static bool is_unnamed_bf_only_agg(Type *ty) {
+  return is_unnamed_bf_only_agg_rec(ty, 0);
+}
+
+static int32_t c_agg_member_natural_align_rec(Type *ty, int depth) {
+  if (!ty || depth > 256)
     return 1;
   if (ty->kind == TY_ARRAY)
-    return c_agg_member_natural_align(ty->base);
+    return c_agg_member_natural_align_rec(ty->base, depth + 1);
   if (ty->kind != TY_STRUCT && ty->kind != TY_UNION)
     return ty->align > 0 ? ty->align : 1;
   int32_t max_al = 1;
@@ -436,9 +441,17 @@ static int32_t c_agg_member_natural_align(Type *ty) {
   return max_al;
 }
 
-static void check_hfa_walk(Type *ty, int64_t base_off, HfaCheck *hc) {
+static int32_t c_agg_member_natural_align(Type *ty) {
+  return c_agg_member_natural_align_rec(ty, 0);
+}
+
+static void check_hfa_walk_rec(Type *ty, int64_t base_off, HfaCheck *hc, int depth) {
   if (!hc->valid)
     return;
+  if (depth > 256) {
+    hc->valid = false;
+    return;
+  }
   if (ty->qual & Q_ATOMIC) {
     hc->valid = false;
     return;
@@ -469,7 +482,7 @@ static void check_hfa_walk(Type *ty, int64_t base_off, HfaCheck *hc) {
       return;
     }
     for (int64_t i = 0; i < ty->array_len && hc->valid; i++)
-      check_hfa_walk(ty->base, base_off + i * ty->base->size, hc);
+      check_hfa_walk_rec(ty->base, base_off + i * ty->base->size, hc, depth + 1);
     return;
   }
   if (ty->kind == TY_STRUCT) {
@@ -482,7 +495,7 @@ static void check_hfa_walk(Type *ty, int64_t base_off, HfaCheck *hc) {
       }
       if ((m->ty->kind == TY_STRUCT || m->ty->kind == TY_UNION) && m->ty->size == 0)
         continue;
-      check_hfa_walk(m->ty, base_off + m->offset, hc);
+      check_hfa_walk_rec(m->ty, base_off + m->offset, hc, depth + 1);
     }
     return;
   }
@@ -502,7 +515,7 @@ static void check_hfa_walk(Type *ty, int64_t base_off, HfaCheck *hc) {
       if (m->ty->size <= 0 || is_unnamed_bf_only_agg(m->ty))
         continue;
       HfaCheck mc = {.valid = true, .elem_kind = TY_VOID, .count = 0};
-      check_hfa_walk(m->ty, base_off + m->offset, &mc);
+      check_hfa_walk_rec(m->ty, base_off + m->offset, &mc, depth + 1);
       int64_t esz = (mc.elem_kind == TY_FLOAT) ? 4 : 8;
       if (!mc.valid || mc.count < 1 || mc.count > 4 || m->ty->size != mc.count * esz) {
         hc->valid = false;
@@ -529,6 +542,10 @@ static void check_hfa_walk(Type *ty, int64_t base_off, HfaCheck *hc) {
     return;
   }
   hc->valid = false;
+}
+
+static void check_hfa_walk(Type *ty, int64_t base_off, HfaCheck *hc) {
+  check_hfa_walk_rec(ty, base_off, hc, 0);
 }
 
 static const char *register_pir_type_def(const char *def_str) {
@@ -565,9 +582,17 @@ static int sysv_merge_cls(int a, int b) {
   return 1;
 }
 
+static void walk_sysv_x64_agg_rec(Type *ty, int64_t base_off, SysvX64Walk *w, int depth);
 static void walk_sysv_x64_agg(Type *ty, int64_t base_off, SysvX64Walk *w) {
+  walk_sysv_x64_agg_rec(ty, base_off, w, 0);
+}
+static void walk_sysv_x64_agg_rec(Type *ty, int64_t base_off, SysvX64Walk *w, int depth) {
   if (w->unaligned || !ty)
     return;
+  if (depth > 256) {
+    w->unaligned = true;
+    return;
+  }
   if (ty->qual & Q_ATOMIC) {
     w->unaligned = true;
     return;
@@ -608,7 +633,7 @@ static void walk_sysv_x64_agg(Type *ty, int64_t base_off, SysvX64Walk *w) {
     if (ty->array_len <= 0 || !ty->base || ty->base->size <= 0)
       return;
     for (int64_t i = 0; i < ty->array_len && !w->unaligned; i++)
-      walk_sysv_x64_agg(ty->base, base_off + i * ty->base->size, w);
+      walk_sysv_x64_agg_rec(ty->base, base_off + i * ty->base->size, w, depth + 1);
     return;
   }
   if (ty->kind == TY_STRUCT || ty->kind == TY_UNION) {
@@ -626,7 +651,7 @@ static void walk_sysv_x64_agg(Type *ty, int64_t base_off, SysvX64Walk *w) {
         w->unaligned = true;
         return;
       }
-      walk_sysv_x64_agg(m->ty, base_off + m->offset, w);
+      walk_sysv_x64_agg_rec(m->ty, base_off + m->offset, w, depth + 1);
     }
     return;
   }
@@ -891,7 +916,7 @@ static const char *get_pir_sig_for_call(Type *fnty, Obj *call_args) {
         sb_printf(&sb, ", ");
       first = false;
       if (is_mem_val_ty(a->ty))
-        sb_printf(&sb, "byval(@%s)", get_pir_agg_type_name(a->ty));
+        sb_printf(&sb, "byval(@%s)", get_pir_agg_type_name(unqual(a->ty)));
       else
         sb_printf(&sb, "%s%s", pir_abi_scalar_ty_name(a->ty), pir_int_ext_attr(a->ty));
     }
@@ -2112,7 +2137,8 @@ static PirVal gen_funcall(Node *node) {
           break;
         }
         if (d_mem) {
-          if (strcmp(get_pir_agg_type_name(dp->ty), get_pir_agg_type_name(ca->ty)) != 0) {
+          if (strcmp(get_pir_agg_type_name(dp->ty), get_pir_agg_type_name(ca->ty)) != 0 &&
+              !((dp->ty->qual & Q_ATOMIC) && is_compatible(unqual(dp->ty), unqual(ca->ty)))) {
             use_direct = false;
             break;
           }
@@ -2141,8 +2167,10 @@ static PirVal gen_funcall(Node *node) {
   for (Obj *a = node->call.args; a; a = a->param_next)
     arg_cnt++;
 
+  Type *sig_fnty = use_direct ? direct->ty : fnty;
   PirVal *arg_vals = arg_cnt ? calloc((size_t)arg_cnt, sizeof(PirVal)) : NULL;
   Type **arg_tys = arg_cnt ? calloc((size_t)arg_cnt, sizeof(Type *)) : NULL;
+  Obj *fp_cur = (!sig_fnty->is_oldstyle) ? sig_fnty->param_list : NULL;
   int idx = 0;
   for (Obj *a = node->call.args; a; a = a->param_next, idx++) {
     arg_tys[idx] = a->ty;
@@ -2150,13 +2178,22 @@ static PirVal gen_funcall(Node *node) {
       gen_expr(a->arg_expr);
       arg_vals[idx] = pir_void_val();
     } else {
+      while (fp_cur && fp_cur->ty->size <= 0 && is_agg_ty(fp_cur->ty))
+        fp_cur = fp_cur->param_next;
+      Obj *dp = fp_cur;
+      if (fp_cur)
+        fp_cur = fp_cur->param_next;
+
       PirVal av = gen_expr(a->arg_expr);
-      /* Stage under-aligned aggregate byval args into an aligned stack slot */
+      /* Stage under-aligned or smaller non-atomic aggregate byval args into an aligned stack slot */
       if (is_mem_val_ty(a->ty)) {
+        Type *dst_ty = (dp && is_mem_val_ty(dp->ty)) ? dp->ty : a->ty;
         int64_t asz = agg_copy_size(a->ty);
-        int32_t req_al = align_floor_pow2(a->ty->align > 0 ? a->ty->align : 1);
+        int32_t req_al = align_floor_pow2(dst_ty->align > 0 ? dst_ty->align : 1);
         int32_t eff_al = effective_lval_align(a->arg_expr);
-        if (asz > 0 && eff_al < req_al) {
+        if ((dst_ty->qual & Q_ATOMIC) && (asz < dst_ty->size || eff_al < req_al)) {
+          av = emit_stage_padded_atomic_src(av, asz, dst_ty->size, req_al);
+        } else if (asz > 0 && eff_al < req_al) {
           int slot = emit_entry_alloca(asz, req_al);
           int sp = new_tid();
           sb_printf(&fc->body_sb, "    %%t%d = ptr_add.i64 %%loc_%d, 0\n", sp, slot);
@@ -2174,7 +2211,6 @@ static PirVal gen_funcall(Node *node) {
 
   /* Count fixed parameters for variadic tagging */
   int fixed_cnt = 0;
-  Type *sig_fnty = use_direct ? direct->ty : fnty;
   if (!sig_fnty->is_oldstyle) {
     for (Obj *p = sig_fnty->param_list; p; p = p->param_next)
       if (!(p->ty->size <= 0 && is_agg_ty(p->ty)))
@@ -2248,7 +2284,7 @@ static PirVal gen_funcall(Node *node) {
     if (is_mem_val_ty(arg_tys[i])) {
       if (is_va_extra)
         sb_printf(&fc->body_sb, "%%t%d: byval(@%s)", arg_vals[i].id,
-                  get_pir_agg_type_name(arg_tys[i]));
+                  get_pir_agg_type_name(unqual(arg_tys[i])));
       else
         sb_printf(&fc->body_sb, "%%t%d", arg_vals[i].id);
     } else {
@@ -3920,7 +3956,22 @@ static void emit_global_def(SBuf *sb, Obj *var) {
     return;
   }
 
-  /* Emit braced byte/string + relocation initializer */
+  /* Fast-path all-zero initialized globals with no relocations into compact zeroinit. */
+  if (!var->rel) {
+    bool all_zero = true;
+    for (int64_t i = 0; i < sz; i++) {
+      if (var->init_data[i] != 0) {
+        all_zero = false;
+        break;
+      }
+    }
+    if (all_zero) {
+      sb_printf(sb, "[%" PRIi64 " x i8] = zeroinit, align %d\n", sz, p2);
+      return;
+    }
+  }
+
+  /* Emit braced byte/string + zeroinit + relocation initializer */
   sb_printf(sb, "align %d { ", p2);
   Relocation *rel = var->rel;
   int64_t pos = 0;
@@ -3945,7 +3996,20 @@ static void emit_global_def(SBuf *sb, Obj *var) {
     }
 
     int64_t limit = (rel && rel->offset > pos && rel->offset < sz) ? rel->offset : sz;
-    /* Emit printable ASCII runs as string chunks, or individual bytes */
+    if (var->init_data[pos] == 0) {
+      int64_t zend = pos;
+      while (zend < limit && var->init_data[zend] == 0)
+        zend++;
+      if (zend - pos >= 32) {
+        if (!first)
+          sb_printf(sb, ", ");
+        first = false;
+        sb_printf(sb, "zeroinit %" PRIi64, zend - pos);
+        pos = zend;
+        continue;
+      }
+    }
+    /* Emit printable ASCII runs as string chunks, stopping before long zero runs. */
     int64_t run = limit - pos;
     if (run > 64)
       run = 64;

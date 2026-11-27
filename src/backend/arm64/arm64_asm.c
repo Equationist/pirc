@@ -55,9 +55,11 @@ static bool a64_needs_sym_quote(const char *s) {
     if (c == 'x' || c == 'w' || c == 'v' || c == 'q' || c == 'd' ||
         c == 's' || c == 'h' || c == 'b' || c == 'z' || c == 'p') {
         if (s[1] >= '0' && s[1] <= '9') {
+            bool has_dot_suffix = (c == 'v' || c == 'z' || c == 'p');
             uint32_t v = (uint32_t)(s[1] - '0');
-            if (s[2] == '\0') return true;
-            if (s[2] >= '0' && s[2] <= '9' && s[3] == '\0') {
+            if (s[2] == '\0' || (has_dot_suffix && s[2] == '.')) return true;
+            if (s[2] >= '0' && s[2] <= '9' &&
+                (s[3] == '\0' || (has_dot_suffix && s[3] == '.'))) {
                 v = v * 10u + (uint32_t)(s[2] - '0');
                 uint32_t lim = (c == 'p') ? 15u : 31u;
                 return v <= lim && s[1] != '0';
@@ -1056,7 +1058,8 @@ void pir_arm64_asm_emitter_init(PirCodeEmitter *em, FILE *out, const PirTargetSp
 
 bool pir_backend_emit_asm(const PirModule *mod, const PirTargetSpec *target,
                           FILE *out, PirDiag *diag) {
-    if (target->arch != PIR_ARCH_ARM64 && target->arch != PIR_ARCH_X86_64) {
+    if ((target->arch != PIR_ARCH_ARM64 && target->arch != PIR_ARCH_X86_64) ||
+        target->os == PIR_OS_WINDOWS) {
         pir_diag_error(diag, 0u, 0u,
                        "native assembly emission for target '%s' is not supported",
                        target->triple);

@@ -16,10 +16,99 @@
 #include "target/target.h"
 
 typedef struct {
+    uint64_t hi;
+    uint64_t lo;
+} SwitchNormCase;
+
+static int cmp_switch_norm_case(const void *a, const void *b) {
+    const SwitchNormCase *x = (const SwitchNormCase *)a;
+    const SwitchNormCase *y = (const SwitchNormCase *)b;
+    if (x->hi < y->hi) return -1;
+    if (x->hi > y->hi) return 1;
+    if (x->lo < y->lo) return -1;
+    if (x->lo > y->lo) return 1;
+    return 0;
+}
+
+typedef struct {
+    const char **slots;
+    uint32_t     cap;
+    uint32_t     len;
+} VerifySymSet;
+
+static uint32_t verify_fnv1a(const char *s) {
+    uint32_t h = 2166136261u;
+    for (const unsigned char *q = (const unsigned char *)s; *q; ++q) {
+        h ^= (uint32_t)*q;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static void symset_init(VerifySymSet *st, uint32_t hint) {
+    uint32_t cap = 32u;
+    while (cap < hint * 2u && cap < (1u << 24)) cap <<= 1u;
+    st->slots = (const char **)calloc((size_t)cap, sizeof(const char *));
+    if (!st->slots) abort();
+    st->cap = cap;
+    st->len = 0u;
+}
+
+static void symset_destroy(VerifySymSet *st) {
+    free(st->slots);
+    st->slots = NULL;
+    st->cap   = 0u;
+    st->len   = 0u;
+}
+
+static void symset_grow(VerifySymSet *st) {
+    uint32_t ncap = st->cap * 2u;
+    const char **ns = (const char **)calloc((size_t)ncap, sizeof(const char *));
+    if (!ns) abort();
+    uint32_t mask = ncap - 1u;
+    for (uint32_t i = 0u; i < st->cap; ++i) {
+        if (!st->slots[i]) continue;
+        uint32_t idx = verify_fnv1a(st->slots[i]) & mask;
+        while (ns[idx]) idx = (idx + 1u) & mask;
+        ns[idx] = st->slots[i];
+    }
+    free(st->slots);
+    st->slots = ns;
+    st->cap   = ncap;
+}
+
+static bool symset_contains(const VerifySymSet *st, const char *name) {
+    if (!name || st->cap == 0u) return false;
+    uint32_t mask = st->cap - 1u;
+    uint32_t idx  = verify_fnv1a(name) & mask;
+    while (st->slots[idx]) {
+        if (strcmp(st->slots[idx], name) == 0) return true;
+        idx = (idx + 1u) & mask;
+    }
+    return false;
+}
+
+/* Returns true if inserted (new), false if already present. */
+static bool symset_insert(VerifySymSet *st, const char *name) {
+    if (!name) return true;
+    if ((st->len + 1u) * 2u >= st->cap) symset_grow(st);
+    uint32_t mask = st->cap - 1u;
+    uint32_t idx  = verify_fnv1a(name) & mask;
+    while (st->slots[idx]) {
+        if (strcmp(st->slots[idx], name) == 0) return false;
+        idx = (idx + 1u) & mask;
+    }
+    st->slots[idx] = name;
+    st->len++;
+    return true;
+}
+
+typedef struct {
     const PirModule     *mod;
     PirVerifyMode        mode;
     const PirTargetSpec *target;
     PirDiag             *diag;
+    VerifySymSet         ref_syms;
 } Verifier;
 
 static const char *type_str(const PirModule *mod, PirType ty, char *buf, size_t n) {
@@ -70,14 +159,8 @@ static const char *type_str(const PirModule *mod, PirType ty, char *buf, size_t 
     return "?";
 }
 
-static bool has_symbol(const PirModule *mod, const char *name) {
-    for (uint32_t i = 0u; i < mod->globals.len; ++i) {
-        if (strcmp(mod->globals.data[i].name, name) == 0) return true;
-    }
-    for (uint32_t i = 0u; i < mod->funcs.len; ++i) {
-        if (strcmp(mod->funcs.data[i].name, name) == 0) return true;
-    }
-    return false;
+static bool has_symbol(const Verifier *v, const char *name) {
+    return symset_contains(&v->ref_syms, name);
 }
 
 static bool check_lir_type(Verifier *v, PirType ty, uint32_t line, const char *ctx) {
@@ -258,6 +341,9 @@ static void verify_params_and_ret(Verifier *v, const char *owner, uint32_t line,
             }
         }
         if (pd->abi_byval_size > 0u) {
+            if (v->target && (v->target->arch != PIR_ARCH_X86_64 || v->target->os == PIR_OS_WINDOWS)) {
+                pir_diag_error(v->diag, line, 0u, "'%s': byval_size is only valid on SysV x86-64 targets", owner);
+            }
             if (pd->abi_kind != PIR_PARAM_NORMAL || !is_ptr_type(pd->type)) {
                 pir_diag_error(v->diag, line, 0u, "'%s': byval_size only valid on normal ptr parameter", owner);
             } else if (pd->abi_byval_size > max_sz) {
@@ -271,6 +357,9 @@ static void verify_params_and_ret(Verifier *v, const char *owner, uint32_t line,
         }
         if (pd->abi_stack_align != 0u && !align_valid_u32(pd->abi_stack_align)) {
             pir_diag_error(v->diag, line, 0u, "'%s': invalid stack_align %u", owner, pd->abi_stack_align);
+        }
+        if (pd->abi_kind != PIR_PARAM_NORMAL && (pd->abi_stack_align != 0u || pd->abi_force_stack)) {
+            pir_diag_error(v->diag, line, 0u, "'%s': stack_align/force_stack cannot be combined with HIR byval/retbuf", owner);
         }
         if ((pd->attrs & (PIR_PATTR_NOALIAS | PIR_PATTR_READONLY)) != 0u &&
             !(pd->type.kind == PIR_TYPE_SCALAR && pd->type.u.scalar == PIR_SCALAR_PTR)) {
@@ -307,10 +396,20 @@ static void verify_params_and_ret(Verifier *v, const char *owner, uint32_t line,
         }
         if (param_count == 0u || params[0].abi_kind != PIR_PARAM_NORMAL || !is_ptr_type(params[0].type)) {
             pir_diag_error(v->diag, line, 0u, "'%s': sret/multi_ret requires normal ptr parameter 0", owner);
-        } else if (params[0].abi_byval_size != 0u) {
-            pir_diag_error(v->diag, line, 0u, "'%s': sret/multi_ret parameter 0 cannot have byval_size", owner);
+        } else if (params[0].abi_byval_size != 0u || params[0].abi_stack_align != 0u ||
+                   params[0].abi_force_stack) {
+            pir_diag_error(v->diag, line, 0u, "'%s': sret/multi_ret parameter 0 cannot have byval_size/stack_align/force_stack", owner);
+        }
+        for (uint32_t i = 0u; i < param_count; ++i) {
+            if (params[i].abi_kind != PIR_PARAM_NORMAL) {
+                pir_diag_error(v->diag, line, 0u, "'%s': sret/multi_ret cannot be combined with HIR byval/retbuf parameters", owner);
+                break;
+            }
         }
         if (cabi_ret->kind == PIR_CABI_RET_MULTI_REG) {
+            uint64_t total_sz = 0u;
+            uint64_t prev_sz  = 0u;
+            uint8_t  ptr_b    = v->target ? v->target->ptr_bytes : 8u;
             if (cabi_ret->reg_count < 2u || cabi_ret->reg_count > 4u) {
                 pir_diag_error(v->diag, line, 0u, "'%s': multi_ret requires 2..4 registers", owner);
             } else {
@@ -325,12 +424,22 @@ static void verify_params_and_ret(Verifier *v, const char *owner, uint32_t line,
                         pir_diag_error(v->diag, line, 0u,
                                        "'%s': multi_ret vector register exceeds target max_simd_bits", owner);
                     }
+                    uint64_t rsz = v->target
+                                   ? pir_type_layout(v->mod, v->target, rt).size
+                                   : (uint64_t)(pir_type_bits(rt, ptr_b) / 8u);
+                    if (r + 1u == cabi_ret->reg_count) prev_sz = total_sz;
+                    total_sz += rsz;
                 }
-            }
-            uint64_t max_mr_sz = (uint64_t)cabi_ret->reg_count * 16u;
-            if (cabi_ret->agg_size == 0u || cabi_ret->agg_size > max_mr_sz) {
-                pir_diag_error(v->diag, line, 0u, "'%s': multi_ret size %" PRIu64 " is invalid",
-                               owner, cabi_ret->agg_size);
+                PirType last_rt = cabi_ret->regs[cabi_ret->reg_count - 1u];
+                if (cabi_ret->agg_size == 0u || cabi_ret->agg_size > total_sz ||
+                    cabi_ret->agg_size <= prev_sz) {
+                    pir_diag_error(v->diag, line, 0u, "'%s': multi_ret size %" PRIu64 " is invalid for register capacity %" PRIu64,
+                                   owner, cabi_ret->agg_size, total_sz);
+                } else if (cabi_ret->agg_size < total_sz &&
+                           (last_rt.kind == PIR_TYPE_VECTOR || pir_type_is_float(last_rt))) {
+                    pir_diag_error(v->diag, line, 0u, "'%s': multi_ret partial size %" PRIu64 " invalid for non-integer final register",
+                                   owner, cabi_ret->agg_size);
+                }
             }
             if (!align_valid_u32(cabi_ret->agg_align)) {
                 pir_diag_error(v->diag, line, 0u, "'%s': multi_ret align %u is invalid",
@@ -558,6 +667,10 @@ static void check_call_args(Verifier *v, const PirFunction *fn, const PirInst *i
                            "call to '%s': cannot combine byval(@T) with byval_size", callee_name);
         }
         if (arg->call_byval_size > 0u) {
+            if (v->target && (v->target->arch != PIR_ARCH_X86_64 || v->target->os == PIR_OS_WINDOWS)) {
+                pir_diag_error(v->diag, inst->src_line, 0u,
+                               "call to '%s': byval_size is only valid on SysV x86-64 targets", callee_name);
+            }
             if (!is_ptr_type(arg->type) || arg->kind == PIR_OPER_IMM_INT || arg->kind == PIR_OPER_IMM_FLOAT) {
                 pir_diag_error(v->diag, inst->src_line, 0u,
                                "call to '%s': byval_size requires ptr value or symbol", callee_name);
@@ -765,12 +878,14 @@ static void check_operand_kind_and_type(Verifier *v, const PirFunction *fn,
     } else if (op->kind == PIR_OPER_IMM_FLOAT) {
         if (!(expected.kind == PIR_TYPE_SCALAR && pir_scalar_is_float(expected.u.scalar))) {
             pir_diag_error(v->diag, line, 0u, "float immediate invalid for type in %s", ctx);
+        } else if (expected.u.scalar == PIR_SCALAR_F32 && op->u.imm_float.f32_overflow) {
+            pir_diag_error(v->diag, line, 0u, "float literal overflows f32 range in %s", ctx);
         }
     } else if (op->kind == PIR_OPER_SYM) {
         if (!is_ptr_type(expected)) {
             pir_diag_error(v->diag, line, 0u, "symbol operand requires ptr type in %s", ctx);
         }
-        if (!op->u.sym.name || !has_symbol(v->mod, op->u.sym.name)) {
+        if (!op->u.sym.name || !has_symbol(v, op->u.sym.name)) {
             pir_diag_error(v->diag, line, 0u, "undefined symbol '@%s' in %s",
                            op->u.sym.name ? op->u.sym.name : "?", ctx);
         }
@@ -840,7 +955,7 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
                     if (!is_ptr_type(inst->ty)) {
                         pir_diag_error(v->diag, inst->src_line, 0u, "symbol const requires ptr type");
                     }
-                    if (!has_symbol(v->mod, inst->operands[0].u.sym.name)) {
+                    if (!has_symbol(v, inst->operands[0].u.sym.name)) {
                         pir_diag_error(v->diag, inst->src_line, 0u,
                                        "undefined symbol '@%s'", inst->operands[0].u.sym.name);
                     }
@@ -854,7 +969,7 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
             check_result_count(v, inst, 1u);
             check_op_count(v, inst, 1u);
             if (inst->operand_count == 1u && (inst->operands[0].kind != PIR_OPER_SYM ||
-                !has_symbol(v->mod, inst->operands[0].u.sym.name))) {
+                !has_symbol(v, inst->operands[0].u.sym.name))) {
                 pir_diag_error(v->diag, inst->src_line, 0u, "addr requires defined @symbol");
             }
             break;
@@ -1765,21 +1880,51 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
                 }
                 clo &= mask;
                 if (sw_bits <= 64u) chi = 0u;
-                for (uint32_t d = 0u; d < c; ++d) {
-                    uint64_t dlo = inst->switch_cases[d].case_lo;
-                    uint64_t dhi = inst->switch_cases[d].case_hi;
-                    if (inst->switch_cases[d].is_negative) {
-                        uint64_t nlo = ~dlo + 1u;
-                        uint64_t cy = (nlo == 0u) ? 1u : 0u;
-                        dlo = nlo; dhi = ~dhi + cy;
+                if (inst->switch_case_count <= 16u) {
+                    for (uint32_t d = 0u; d < c; ++d) {
+                        uint64_t dlo = inst->switch_cases[d].case_lo;
+                        uint64_t dhi = inst->switch_cases[d].case_hi;
+                        if (inst->switch_cases[d].is_negative) {
+                            uint64_t nlo = ~dlo + 1u;
+                            uint64_t cy = (nlo == 0u) ? 1u : 0u;
+                            dlo = nlo; dhi = ~dhi + cy;
+                        }
+                        dlo &= mask;
+                        if (sw_bits <= 64u) dhi = 0u;
+                        if (clo == dlo && chi == dhi) {
+                            pir_diag_error(v->diag, inst->src_line, 0u, "duplicate switch case constant");
+                            break;
+                        }
                     }
-                    dlo &= mask;
-                    if (sw_bits <= 64u) dhi = 0u;
-                    if (clo == dlo && chi == dhi) {
+                }
+            }
+            if (inst->switch_case_count > 16u && inst->ty.kind == PIR_TYPE_SCALAR &&
+                pir_scalar_is_int(inst->ty.u.scalar)) {
+                uint32_t sw_bits = pir_scalar_bits(inst->ty.u.scalar, ptr_bytes);
+                uint64_t mask = (sw_bits >= 64u) ? UINT64_MAX : ((UINT64_C(1) << sw_bits) - 1u);
+                SwitchNormCase *sc = (SwitchNormCase *)malloc(inst->switch_case_count * sizeof(SwitchNormCase));
+                if (!sc) abort();
+                for (uint32_t c = 0u; c < inst->switch_case_count; ++c) {
+                    uint64_t clo = inst->switch_cases[c].case_lo;
+                    uint64_t chi = inst->switch_cases[c].case_hi;
+                    if (inst->switch_cases[c].is_negative) {
+                        uint64_t nlo = ~clo + 1u;
+                        uint64_t cy = (nlo == 0u) ? 1u : 0u;
+                        clo = nlo; chi = ~chi + cy;
+                    }
+                    clo &= mask;
+                    if (sw_bits <= 64u) chi = 0u;
+                    sc[c].hi = chi;
+                    sc[c].lo = clo;
+                }
+                qsort(sc, inst->switch_case_count, sizeof(SwitchNormCase), cmp_switch_norm_case);
+                for (uint32_t c = 1u; c < inst->switch_case_count; ++c) {
+                    if (sc[c].hi == sc[c - 1u].hi && sc[c].lo == sc[c - 1u].lo) {
                         pir_diag_error(v->diag, inst->src_line, 0u, "duplicate switch case constant");
                         break;
                     }
                 }
+                free(sc);
             }
             break;
 
@@ -1942,15 +2087,30 @@ static void verify_function(Verifier *v, const PirFunction *fn) {
         inst_pos[i] = PIR_INVALID_ID;
         inst_blk[i] = PIR_INVALID_ID;
     }
+    VerifySymSet blk_syms;
+    memset(&blk_syms, 0, sizeof(blk_syms));
+    if (fn->blocks.len > 16u) {
+        symset_init(&blk_syms, fn->blocks.len);
+    }
     for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
         const PirBlock *blk = &fn->blocks.data[b];
-        for (uint32_t pb = 0u; pb < b; ++pb) {
-            if (blk->label && fn->blocks.data[pb].label &&
-                strcmp(blk->label, fn->blocks.data[pb].label) == 0) {
-                pir_diag_error(v->diag, blk->src_line, 0u,
-                               "duplicate block label '.%s' in function '@%s'",
-                               blk->label, fn->name);
-                break;
+        if (blk->label) {
+            if (blk_syms.cap > 0u) {
+                if (!symset_insert(&blk_syms, blk->label)) {
+                    pir_diag_error(v->diag, blk->src_line, 0u,
+                                   "duplicate block label '.%s' in function '@%s'",
+                                   blk->label, fn->name);
+                }
+            } else {
+                for (uint32_t pb = 0u; pb < b; ++pb) {
+                    if (fn->blocks.data[pb].label &&
+                        strcmp(blk->label, fn->blocks.data[pb].label) == 0) {
+                        pir_diag_error(v->diag, blk->src_line, 0u,
+                                       "duplicate block label '.%s' in function '@%s'",
+                                       blk->label, fn->name);
+                        break;
+                    }
+                }
             }
         }
         for (uint32_t k = 0u; k < blk->params.len; ++k) {
@@ -2130,6 +2290,7 @@ static void verify_function(Verifier *v, const PirFunction *fn) {
 
     pir_dom_destroy(&dom);
     pir_cfg_destroy(&cfg);
+    symset_destroy(&blk_syms);
     free(inst_blk);
     free(inst_pos);
 }
@@ -2164,6 +2325,9 @@ static void verify_scalar_global_item(Verifier *v, const PirGlobal *g, PirScalar
         if (!pir_scalar_is_float(sk)) {
             pir_diag_error(v->diag, g->src_line, 0u,
                            "float initializer invalid for non-float global '@%s'", g->name);
+        } else if (sk == PIR_SCALAR_F32 && gi->f32_overflow) {
+            pir_diag_error(v->diag, g->src_line, 0u,
+                           "float literal overflows f32 range in global '@%s'", g->name);
         }
     } else if (ik == PIR_GITEM_INT) {
         if (sk == PIR_SCALAR_PTR) {
@@ -2175,6 +2339,12 @@ static void verify_scalar_global_item(Verifier *v, const PirGlobal *g, PirScalar
             if (gi->int_hi != 0u) {
                 pir_diag_error(v->diag, g->src_line, 0u,
                                "128-bit integer initializer invalid for float global '@%s'", g->name);
+            } else if (gi->int_neg && gi->int_lo == 0u &&
+                       v->target && v->target->os != PIR_OS_MACOS && v->target->os != PIR_OS_WINDOWS &&
+                       g->section && (strcmp(g->section, ".bss") == 0 || strcmp(g->section, ".tbss") == 0)) {
+                pir_diag_error(v->diag, g->src_line, 0u,
+                               "global '@%s' in nobits section '%s' cannot have -0.0 float initializer",
+                               g->name, g->section);
             }
         } else if (pir_scalar_is_int(sk)) {
             uint32_t bits = pir_type_bits(pir_type_scalar(sk), ptr_bytes);
@@ -2232,16 +2402,32 @@ static void verify_agg_global_items(Verifier *v, const PirGlobal *g, PirType ty,
     }
     if (*idx >= g->item_count) return;
     if (g->items[*idx].kind == PIR_GITEM_ZERO) {
-        const PirGlobalItem *zi = &g->items[(*idx)++];
-        if (zi->len != 0u && v->target) {
-            PirTypeLayout ly = pir_type_layout(v->mod, v->target, ty);
-            if (!ly.overflow && zi->len != ly.size) {
-                pir_diag_error(v->diag, g->src_line, 0u,
-                               "zeroinit size %" PRIu64 " mismatches element size %" PRIu64 " in global '@%s'",
-                               zi->len, ly.size, g->name);
+        const PirGlobalItem *zi = &g->items[*idx];
+        bool consume_whole = (ty.kind == PIR_TYPE_SCALAR);
+        if (!consume_whole) {
+            if (zi->len != 0u) {
+                if (!v->target) {
+                    consume_whole = true;
+                } else {
+                    PirTypeLayout ly = pir_type_layout(v->mod, v->target, ty);
+                    consume_whole = (ly.overflow || zi->len >= ly.size);
+                }
+            } else {
+                consume_whole = !(depth == 0u && g->item_count > 1u);
             }
         }
-        return;
+        if (consume_whole) {
+            (*idx)++;
+            if (zi->len != 0u && v->target) {
+                PirTypeLayout ly = pir_type_layout(v->mod, v->target, ty);
+                if (!ly.overflow && zi->len != ly.size) {
+                    pir_diag_error(v->diag, g->src_line, 0u,
+                                   "zeroinit size %" PRIu64 " mismatches element size %" PRIu64 " in global '@%s'",
+                                   zi->len, ly.size, g->name);
+                }
+            }
+            return;
+        }
     }
     if (ty.kind == PIR_TYPE_SCALAR) {
         verify_scalar_global_item(v, g, ty.u.scalar, &g->items[(*idx)++]);
@@ -2275,14 +2461,18 @@ static void verify_agg_global_items(Verifier *v, const PirGlobal *g, PirType ty,
                 }
             } else {
                 for (uint64_t k = 0u; k < ad->array_len && *idx < g->item_count; ++k) {
+                    uint32_t before = *idx;
                     verify_agg_global_items(v, g, ad->elem_type, idx, pad_cache, depth + 1u);
+                    if (*idx == before) break;
                 }
             }
             break;
         case PIR_AGG_STRUCT:
         case PIR_AGG_PACKED_STRUCT:
             for (uint32_t f = 0u; f < ad->field_count && *idx < g->item_count; ++f) {
+                uint32_t before = *idx;
                 verify_agg_global_items(v, g, ad->fields[f], idx, pad_cache, depth + 1u);
+                if (*idx == before && !agg_type_is_pad_only(v->mod, ad->fields[f], pad_cache)) break;
             }
             break;
         case PIR_AGG_UNION:
@@ -2307,14 +2497,24 @@ static void verify_agg_global_items(Verifier *v, const PirGlobal *g, PirType ty,
 }
 
 static void check_unique_symbol(Verifier *v, const char *name, uint32_t line,
-                                const char **seen, uint32_t *seen_len) {
-    for (uint32_t i = 0u; i < *seen_len; ++i) {
-        if (strcmp(seen[i], name) == 0) {
-            pir_diag_error(v->diag, line, 0u, "duplicate module symbol '@%s'", name);
-            return;
-        }
+                                VerifySymSet *seen) {
+    if (!symset_insert(seen, name)) {
+        pir_diag_error(v->diag, line, 0u, "duplicate module symbol '@%s'", name);
     }
-    seen[(*seen_len)++] = name;
+}
+
+static void check_elf_symbol_name(Verifier *v, const char *name, PirLinkage linkage, uint32_t line) {
+    if (!v->target || v->target->os == PIR_OS_MACOS || v->target->os == PIR_OS_WINDOWS || !name) {
+        return;
+    }
+    if (strcmp(name, ".") == 0) {
+        pir_diag_error(v->diag, line, 0u, "symbol name '.' is not representable on ELF targets");
+    }
+    if ((linkage == PIR_LINK_EXPORT || linkage == PIR_LINK_WEAK) &&
+        strncmp(name, ".L", 2u) == 0) {
+        pir_diag_error(v->diag, line, 0u,
+                       "exported/weak symbol '@%s' starting with '.L' is invalid on ELF targets", name);
+    }
 }
 
 bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
@@ -2326,7 +2526,19 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
         }
     }
 
-    Verifier v = { mod, mode, target, diag };
+    Verifier v;
+    memset(&v, 0, sizeof(v));
+    v.mod    = mod;
+    v.mode   = mode;
+    v.target = target;
+    v.diag   = diag;
+    symset_init(&v.ref_syms, mod->globals.len + mod->funcs.len + 1u);
+    for (uint32_t i = 0u; i < mod->globals.len; ++i) {
+        symset_insert(&v.ref_syms, mod->globals.data[i].name);
+    }
+    for (uint32_t i = 0u; i < mod->funcs.len; ++i) {
+        symset_insert(&v.ref_syms, mod->funcs.data[i].name);
+    }
 
     if (!mod->target_triple || !target) {
         pir_diag_error(diag, 1u, 0u, "invalid or unsupported target triple '%s'",
@@ -2345,9 +2557,8 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
 
     /* Unique module-level @symbols across types, sigs, globals, funcs. */
     uint32_t max_syms = mod->agg_types.len + mod->sigs.len + mod->globals.len + mod->funcs.len + 1u;
-    const char **seen = (const char **)malloc(max_syms * sizeof(const char *));
-    if (!seen) abort();
-    uint32_t seen_len = 0u;
+    VerifySymSet seen;
+    symset_init(&seen, max_syms);
 
     /* Aggregates. */
     uint8_t *agg_color   = (uint8_t *)calloc(mod->agg_types.len + 1u, 1u);
@@ -2360,7 +2571,7 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
     for (uint32_t i = 0u; i < mod->agg_types.len; ++i) {
         const PirAggDef *a = &mod->agg_types.data[i];
         if (a->name) {
-            check_unique_symbol(&v, a->name, a->src_line, seen, &seen_len);
+            check_unique_symbol(&v, a->name, a->src_line, &seen);
         }
         if (mode == PIR_VERIFY_LIR) {
             pir_diag_error(diag, a->src_line, 0u,
@@ -2410,7 +2621,7 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
     /* Signatures. */
     for (uint32_t i = 0u; i < mod->sigs.len; ++i) {
         const PirSigDef *s = &mod->sigs.data[i];
-        check_unique_symbol(&v, s->name, s->src_line, seen, &seen_len);
+        check_unique_symbol(&v, s->name, s->src_line, &seen);
         verify_params_and_ret(&v, s->name, s->src_line, s->cc, s->attrs, s->params,
                               s->param_count, s->is_variadic, s->ret_type, &s->cabi_ret);
     }
@@ -2418,7 +2629,8 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
     /* Globals. */
     for (uint32_t i = 0u; i < mod->globals.len; ++i) {
         const PirGlobal *g = &mod->globals.data[i];
-        check_unique_symbol(&v, g->name, g->src_line, seen, &seen_len);
+        check_unique_symbol(&v, g->name, g->src_line, &seen);
+        check_elf_symbol_name(&v, g->name, g->linkage, g->src_line);
         if (g->align != 0u && !align_valid_u32(g->align)) {
             pir_diag_error(diag, g->src_line, 0u,
                            "alignment %u is not a valid power of two", g->align);
@@ -2433,31 +2645,7 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
             }
             if (target && target->os != PIR_OS_MACOS && target->os != PIR_OS_WINDOWS &&
                 g->section && (strcmp(g->section, ".bss") == 0 || strcmp(g->section, ".tbss") == 0)) {
-                bool all_zero = g->is_zeroinit;
-                if (!all_zero && g->item_count > 0u) {
-                    all_zero = true;
-                    for (uint32_t k = 0u; k < g->item_count && all_zero; ++k) {
-                        const PirGlobalItem *gi = &g->items[k];
-                        switch (gi->kind) {
-                            case PIR_GITEM_ZERO: break;
-                            case PIR_GITEM_INT:
-                                if (gi->int_lo != 0u || gi->int_hi != 0u) all_zero = false;
-                                break;
-                            case PIR_GITEM_FLOAT:
-                                if (gi->float_bits != 0u || (gi->has_f32_bits && gi->float32_bits != 0u)) all_zero = false;
-                                break;
-                            case PIR_GITEM_BYTES:
-                                for (uint64_t bi = 0u; bi < gi->len; ++bi) {
-                                    if (gi->bytes[bi] != 0u) { all_zero = false; break; }
-                                }
-                                break;
-                            case PIR_GITEM_RELOC:
-                                all_zero = false;
-                                break;
-                        }
-                    }
-                }
-                if (!all_zero) {
+                if (!pir_global_is_all_zero(g)) {
                     pir_diag_error(diag, g->src_line, 0u,
                                    "global '@%s' in nobits section '%s' cannot have non-zero initializer",
                                    g->name, g->section);
@@ -2599,7 +2787,7 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
         for (uint32_t k = 0u; k < g->item_count; ++k) {
             if (g->items[k].kind == PIR_GITEM_RELOC) {
                 const char *rname = g->items[k].sym_name;
-                if (!has_symbol(mod, rname)) {
+                if (!has_symbol(&v, rname)) {
                     pir_diag_error(diag, g->src_line, 0u,
                                    "global '@%s' references undefined symbol '@%s'",
                                    g->name, rname);
@@ -2625,10 +2813,18 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
     /* Functions. */
     for (uint32_t i = 0u; i < mod->funcs.len; ++i) {
         const PirFunction *fn = &mod->funcs.data[i];
-        check_unique_symbol(&v, fn->name, fn->src_line, seen, &seen_len);
+        check_unique_symbol(&v, fn->name, fn->src_line, &seen);
+        check_elf_symbol_name(&v, fn->name, fn->linkage, fn->src_line);
+        if (target && target->os != PIR_OS_MACOS && target->os != PIR_OS_WINDOWS &&
+            fn->section && (strcmp(fn->section, ".bss") == 0 || strcmp(fn->section, ".tbss") == 0)) {
+            pir_diag_error(diag, fn->src_line, 0u,
+                           "function '@%s' cannot be placed in nobits section '%s'",
+                           fn->name, fn->section);
+        }
         verify_function(&v, fn);
     }
 
-    free(seen);
+    symset_destroy(&seen);
+    symset_destroy(&v.ref_syms);
     return !pir_diag_has_errors(diag);
 }

@@ -48,7 +48,7 @@ static bool x64_needs_sym_quote(const char *s) {
         "al",  "bl",  "cl",  "dl",  "ah",  "bh",  "ch",  "dh",
         "sil", "dil", "bpl", "spl",
         "cs",  "ds",  "es",  "fs",  "gs",  "ss",  "st",
-        "eiz", "riz", "rflags", "eflags", "flags", "mxcsr", "ssp",
+        "eiz", "riz", "rflags", "eflags", "flags", "mxcsr", "ssp", "fpcr", "fpsr",
         /* Intel-syntax keywords and operators */
         "byte", "word", "dword", "qword", "tbyte", "oword",
         "xmmword", "ymmword", "zmmword", "fword", "xword",
@@ -102,7 +102,9 @@ static bool x64_needs_sym_quote(const char *s) {
     if (len == 2u && lo[0] == 'k' && lo[1] >= '0' && lo[1] <= '7') {
         return true;
     }
-    if ((lo[0] == 'c' || lo[0] == 'd') && lo[1] == 'r' && lo[2] >= '0' && lo[2] <= '9') {
+    if (((lo[0] == 'c' && lo[1] == 'r') ||
+         (lo[0] == 'd' && (lo[1] == 'r' || lo[1] == 'b'))) &&
+        lo[2] >= '0' && lo[2] <= '9') {
         if (len == 3u) return true;
         if (len == 4u && lo[2] == '1' && lo[3] >= '0' && lo[3] <= '5') return true;
     }

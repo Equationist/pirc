@@ -234,7 +234,7 @@ bool pir_abi_aapcs64_param(const PirModule *mod, const PirTargetSpec *target,
                     PirTypeLayout bl = pir_type_layout(mod, target, out->regs[0]);
                     out->pad_fp_before = (st->fp_used < 8u) ? (8u - st->fp_used) : 0u;
                     st->fp_used = 8u;
-                    out->stack_align = (target->os == PIR_OS_MACOS) ? bl.align : dar_al;
+                    out->stack_align = (target->os == PIR_OS_MACOS) ? bl.align : nsaa_al;
                     if (target->os != PIR_OS_MACOS &&
                         out->regs[0].kind == PIR_TYPE_SCALAR &&
                         out->regs[0].u.scalar == PIR_SCALAR_F32 &&

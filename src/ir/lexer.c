@@ -82,6 +82,11 @@ static bool lex_string_body(PirLexer *lex, uint32_t start_line, uint32_t start_c
             *out_len = len;
             return true;
         }
+        if (c == '\n' || c == '\r') {
+            free(tmp);
+            pir_diag_error(lex->diag, start_line, start_col, "unescaped newline in string literal");
+            return false;
+        }
         unsigned char byte = (unsigned char)c;
         if (c == '\\') {
             if (lex->pos >= lex->len) {
@@ -218,9 +223,12 @@ static PirToken lex_number(PirLexer *lex, bool neg, uint32_t line, uint32_t col,
         tok.float_val = strtod(buf, &endp);
         int err_d = errno;
         bool ok = (endp == buf + off + flen);
+        int err_f = 0;
         if (ok) {
             char *endp_f = NULL;
+            errno = 0;
             tok.float_val_f32 = strtof(buf, &endp_f);
+            err_f = errno;
             if (endp_f != buf + off + flen) ok = false;
         }
         free(buf);
@@ -234,6 +242,7 @@ static PirToken lex_number(PirLexer *lex, bool neg, uint32_t line, uint32_t col,
             tok.kind = TOK_ERR;
             return tok;
         }
+        tok.float_f32_overflow = (err_f == ERANGE && isinf(tok.float_val_f32));
         tok.kind = TOK_FLOAT;
         return tok;
     }
