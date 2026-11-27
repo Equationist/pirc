@@ -598,12 +598,25 @@ bool pir_interp_try_shim(PirInterp *it, const char *name,
         return true;
     }
     if (strcmp(name, "strlen") == 0) {
-        if (arg_count != 1u) { pir_interp_fail(it, PIR_INTERP_UB, "strlen arity"); return true; }
+        bool sp64 = (arg_count == 2u && it->target && it->target->caps.max_int_bits == 32u &&
+                     ret_ty.kind == PIR_TYPE_SCALAR && ret_ty.u.scalar == PIR_SCALAR_VOID);
+        if (arg_count != 1u && !sp64) { pir_interp_fail(it, PIR_INTERP_UB, "strlen arity"); return true; }
         char *s = NULL;
         size_t len = 0u;
-        if (read_cstr(it, args[0].ptr, &s, &len)) {
+        PirPtr sp = sp64 ? args[1].ptr : args[0].ptr;
+        if (read_cstr(it, sp, &s, &len)) {
             free(s);
-            pir_val_set_u64(out_ret, ret_ty, (uint64_t)len);
+            if (sp64) {
+                uint64_t l64 = (uint64_t)len;
+                if (pir_interp_check_access(it, args[0].ptr, 8u, 1u, true, false)) {
+                    PirAlloc *a = &it->allocs.data[args[0].ptr.alloc_id];
+                    size_t off = (size_t)args[0].ptr.offset;
+                    memcpy(a->bytes + off, &l64, 8u);
+                    memset(a->init_bits + off, 1, 8u);
+                }
+            } else {
+                pir_val_set_u64(out_ret, ret_ty, (uint64_t)len);
+            }
         }
         return true;
     }

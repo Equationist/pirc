@@ -86,21 +86,12 @@ _pir_rv32_exit:
 2:
     j       2b
 
-    /* void _pir_rv32_putc(int ch) -- writes 1 byte via RISC-V semihosting SYS_WRITEC */
+    /* void _pir_rv32_putc(int ch) -- writes 1 byte to QEMU virt NS16550A UART0 (stdout) */
     .globl _pir_rv32_putc
     .p2align 2
 _pir_rv32_putc:
-    addi    sp, sp, -16
-    sb      a0, 0(sp)
-    li      a0, 0x03                /* SYS_WRITEC */
-    mv      a1, sp
-    .option push
-    .option norvc
-    slli    zero, zero, 0x1f
-    ebreak
-    srai    zero, zero, 0x7
-    .option pop
-    addi    sp, sp, 16
+    li      t0, 0x10000000
+    sb      a0, 0(t0)
     ret
 
     /* int __pir_setjmp(void *jb) -- saves ra, sp, s0..s11, fs0..fs11 (152 bytes) */

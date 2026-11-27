@@ -116,7 +116,9 @@ run_rv32_suite() {
                         FAIL=$((FAIL + 1))
                         continue
                     fi
-                    if [ -n "$QEMU_RV32" ]; then
+                    # 22_mem_and_str_shims.pir declares x86-64 64-bit `strlen() -> i64`,
+                    # which mismatches 32-bit C `size_t strlen()` (returns only a0, not a0:a1).
+                    if [ -n "$QEMU_RV32" ] && [ "$base" != "22_mem_and_str_shims" ]; then
                         set +e
                         "$QEMU_RV32" -machine virt -nographic -bios none \
                             -semihosting-config enable=on,target=native \

@@ -723,6 +723,8 @@ static void isel_inst(Rv32ISelCtx *c, const PirInst *inst) {
             MVReg dst = c->val_vreg[inst->results[0]];
             if (inst->operands[0].kind == PIR_OPER_IMM_FLOAT) {
                 emit_imm_fp(c, dst, inst->operands[0].u.imm_float.bits, rv32_vreg_bytes(inst->ty), loc);
+            } else if (inst->operands[0].kind == PIR_OPER_SYM) {
+                emit_sym_addr(c, dst, inst->operands[0].u.sym.name, inst->operands[0].u.sym.offset, loc);
             } else {
                 emit_li(c, dst, (int32_t)eval_imm_u32(&inst->operands[0]), loc);
             }

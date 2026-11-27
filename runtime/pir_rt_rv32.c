@@ -322,6 +322,53 @@ static int print_uint(uint64_t v, unsigned base, int upper) {
     return n;
 }
 
+static int print_double(double v, int prec) {
+    int n = 0;
+    if (v != v) {
+        const char *s = "nan";
+        while (*s) { _pir_rv32_putc((unsigned char)*s++); n++; }
+        return n;
+    }
+    union { double d; uint64_t u; } bits;
+    bits.d = v;
+    if (bits.u >> 63u) {
+        _pir_rv32_putc('-');
+        n++;
+        v = -v;
+    }
+    if (v > 4e9) {
+        const char *s = "inf";
+        while (*s) { _pir_rv32_putc((unsigned char)*s++); n++; }
+        return n;
+    }
+    if (prec < 0) prec = 6;
+    if (prec > 9) prec = 9;
+    uint32_t iscale = 1u;
+    for (int i = 0; i < prec; ++i) iscale *= 10u;
+    uint32_t ipart = (uint32_t)v;
+    double frac = v - (double)ipart;
+    uint32_t fpart = (uint32_t)(frac * (double)iscale + 0.5);
+    if (fpart >= iscale) {
+        fpart -= iscale;
+        ipart++;
+    }
+    n += print_uint((uint64_t)ipart, 10u, 0);
+    if (prec > 0) {
+        _pir_rv32_putc('.');
+        n++;
+        char fbuf[16];
+        for (int i = prec - 1; i >= 0; --i) {
+            fbuf[i] = (char)('0' + (fpart % 10u));
+            fpart /= 10u;
+        }
+        for (int i = 0; i < prec; ++i) {
+            _pir_rv32_putc((unsigned char)fbuf[i]);
+            n++;
+        }
+    }
+    return n;
+}
+
 int printf(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -331,9 +378,14 @@ int printf(const char *fmt, ...) {
         s++;
         if (*s == '%') { _pir_rv32_putc('%'); total++; continue; }
         int is_ll = 0;
+        int prec  = -1;
         while (*s == '-' || *s == '+' || *s == ' ' || *s == '0' || *s == '#') s++;
         while (*s >= '0' && *s <= '9') s++;
-        if (*s == '.') { s++; while (*s >= '0' && *s <= '9') s++; }
+        if (*s == '.') {
+            s++;
+            prec = 0;
+            while (*s >= '0' && *s <= '9') { prec = prec * 10 + (*s - '0'); s++; }
+        }
         if (*s == 'l') { s++; if (*s == 'l') { is_ll = 1; s++; } }
         if (*s == 'd' || *s == 'i') {
             int64_t v = is_ll ? va_arg(ap, int64_t) : (int64_t)va_arg(ap, int32_t);
@@ -345,6 +397,9 @@ int printf(const char *fmt, ...) {
         } else if (*s == 'x' || *s == 'X') {
             uint64_t v = is_ll ? va_arg(ap, uint64_t) : (uint64_t)va_arg(ap, uint32_t);
             total += print_uint(v, 16u, *s == 'X');
+        } else if (*s == 'f' || *s == 'F') {
+            double v = va_arg(ap, double);
+            total += print_double(v, prec);
         } else if (*s == 'c') {
             _pir_rv32_putc(va_arg(ap, int) & 0xFF);
             total++;
