@@ -1013,6 +1013,95 @@ static void chk_vardecl(Type *ty, Token *name, Token *tok) {
     error_tok(tok, "variable declared void");
 }
 
+typedef enum {
+  DECL_CTX_PARAM,
+  DECL_CTX_MEMBER,
+  DECL_CTX_TYPENAME,
+  DECL_CTX_COMPLIT,
+  DECL_CTX_TYPEDEF,
+  DECL_CTX_FUNC,
+} DeclCtxKind;
+
+static void validate_decl_attrs(const VarAttr *attr, DeclCtxKind ctx, Token *tok) {
+  switch (ctx) {
+  case DECL_CTX_PARAM:
+    if (attr->has_alignas)
+      error_tok(tok, "_Alignas cannot be applied to a parameter");
+    if (attr->has_noreturn_kw)
+      error_tok(tok, "'_Noreturn' cannot be applied to a parameter");
+    break;
+  case DECL_CTX_MEMBER:
+    if (attr->has_noreturn_kw)
+      error_tok(tok, "'_Noreturn' is not allowed in struct or union member");
+    break;
+  case DECL_CTX_TYPENAME:
+    if (attr->has_alignas)
+      error_tok(tok, "'_Alignas' is not allowed in a type name");
+    if (attr->has_noreturn_kw)
+      error_tok(tok, "'_Noreturn' is not allowed in a type name");
+    break;
+  case DECL_CTX_COMPLIT:
+    if (attr->has_alignas)
+      error_tok(tok, "'_Alignas' is not allowed in a compound literal");
+    if (attr->has_noreturn_kw)
+      error_tok(tok, "'_Noreturn' is not allowed in a compound literal");
+    break;
+  case DECL_CTX_TYPEDEF:
+    if (attr->has_alignas)
+      error_tok(tok, "_Alignas cannot appear in a typedef");
+    if (attr->has_noreturn_kw)
+      error_tok(tok, "'_Noreturn' cannot appear in a typedef");
+    break;
+  case DECL_CTX_FUNC:
+    if (attr->has_alignas)
+      error_tok(tok, "_Alignas cannot be applied to a function");
+    break;
+  }
+}
+
+static void chk_alignas_natural(const VarAttr *attr, const Type *ty, Token *tok) {
+  if (attr->alignas_val > 0 && ty->align > 0 && attr->alignas_val < ty->align)
+    error_tok(tok, "_Alignas cannot reduce natural alignment");
+}
+
+typedef enum {
+  ICE_I64_STRICT64,
+  ICE_I64_CASE,
+  ICE_BOOL,
+} IceMode;
+
+static void chk_bitint_within_64bit(BitBuf *data, Type *ty, Token *tok);
+
+static int64_t eval_ice_node(Node *node, IceMode mode, Token *err_tok, const char *non_int_msg) {
+  bool prv_strict = eval_strict;
+  if (is_iso_std && (!node->tok || !node->tok->file || !node->tok->file->is_syshdr))
+    eval_strict = true;
+
+  if (is_integer(node->ty)) {
+    int64_t v = eval(node);
+    eval_strict = prv_strict;
+    return (mode == ICE_BOOL) ? (v != 0) : v;
+  }
+  if (node->ty->kind == TY_BITINT) {
+    BitBuf *data = eval_bitint(node);
+    eval_strict = prv_strict;
+    int64_t res;
+    if (mode == ICE_BOOL) {
+      res = eval_bitint_to_bool(node->ty->bit_cnt, data) ? 1 : 0;
+    } else if (mode == ICE_I64_CASE) {
+      clean_bitint(data, node->ty);
+      res = (int64_t)data->as64;
+    } else {
+      chk_bitint_within_64bit(data, node->ty, node->tok);
+      res = (int64_t)data->as64;
+    }
+    free(data);
+    return res;
+  }
+  eval_strict = prv_strict;
+  error_tok(err_tok, "%s", non_int_msg);
+}
+
 static void chk_inline(VarAttr *attr, Token *tok) {
   if (attr->strg & SC_INLINE)
     error_tok(tok, "only function declarations can be 'inline'");
@@ -1332,10 +1421,7 @@ static void func_params(Token *tok, Type *fn_ty, bool is_def) {
       }
       VarAttr attr = {0};
       Type *basety = declspec(&tok, tok, &attr, SC_REGISTER);
-      if (attr.has_alignas)
-        error_tok(tok, "_Alignas cannot be applied to a parameter");
-      if (attr.has_noreturn_kw)
-        error_tok(tok, "'_Noreturn' cannot be applied to a parameter");
+      validate_decl_attrs(&attr, DECL_CTX_PARAM, tok);
 
       if (is_def)
         chain_expr(&expr, calc_vla2(basety, tok, &attr));
@@ -1597,10 +1683,7 @@ static Type *declarator(Token **rest, Token *tok, Type *basety, Token **name_tok
 static Type *typename2(Token **rest, Token *tok, VarAttr *attr) {
   Token *start = tok;
   Type *ty = declspec(&tok, tok, attr, SC_NONE);
-  if (attr->has_alignas)
-    error_tok(start, "'_Alignas' is not allowed in a type name");
-  if (attr->has_noreturn_kw)
-    error_tok(start, "'_Noreturn' is not allowed in a type name");
+  validate_decl_attrs(attr, DECL_CTX_TYPENAME, start);
   return declarator(rest, tok, ty, NULL);
 }
 
@@ -1958,8 +2041,7 @@ static Node *declaration2(Token **rest, Token *tok, Type *basety, VarAttr *attr,
   if (ty->kind == TY_FUNC) {
     if (attr->strg & SC_STATIC)
       error_tok(tok, "static function not in file scope");
-    if (attr->has_alignas)
-      error_tok(name ? name : tok, "_Alignas cannot be applied to a function");
+    validate_decl_attrs(attr, DECL_CTX_FUNC, name ? name : tok);
     strip_proto_vla_exprs(ty);
     Obj *fn = func_prototype(tok, name, ty, attr, false);
     strip_proto_vla_exprs(fn->ty);
@@ -1991,8 +2073,7 @@ static Node *declaration2(Token **rest, Token *tok, Type *basety, VarAttr *attr,
     if (attr->strg & SC_THREAD)
       var->kind = OBJ_TLS;
     assembler_name(&tok, tok, var);
-    if (attr->alignas_val > 0 && ty->align > 0 && attr->alignas_val < ty->align)
-      error_tok(name, "_Alignas cannot reduce natural alignment");
+    chk_alignas_natural(attr, ty, name);
     aligned_attr(name, tok, attr, &var->alt_align);
     symbol_attr(name, tok, attr, var);
 
@@ -2029,8 +2110,7 @@ static Node *declaration2(Token **rest, Token *tok, Type *basety, VarAttr *attr,
 
     new_defr(DF_VLA_DEALLOC)->vla = var->vptr;
 
-    if (attr->alignas_val > 0 && ty->align > 0 && attr->alignas_val < ty->align)
-      error_tok(name, "_Alignas cannot reduce natural alignment");
+    chk_alignas_natural(attr, ty, name);
     aligned_attr(name, tok, attr, &var->alt_align);
     cleanup_attr(name, tok, attr, var);
 
@@ -2053,8 +2133,7 @@ static Node *declaration2(Token **rest, Token *tok, Type *basety, VarAttr *attr,
   var->is_register = !!(attr->strg & SC_REGISTER);
   push_var_name(name, var);
   assembler_name(&tok, tok, var);
-  if (attr->alignas_val > 0 && ty->align > 0 && attr->alignas_val < ty->align)
-    error_tok(name, "_Alignas cannot reduce natural alignment");
+  chk_alignas_natural(attr, ty, name);
   aligned_attr(name, tok, attr, &var->alt_align);
   cleanup_attr(name, tok, attr, var);
 
@@ -3186,22 +3265,7 @@ static void eval_static_assert(Token **rest, Token *tok) {
   Node *node = conditional(&tok, skip_tk(tok, TK_LPAREN));
   add_type(node);
 
-  bool res;
-  bool prv_strict = eval_strict;
-  if (is_iso_std && (!node->tok || !node->tok->file || !node->tok->file->is_syshdr))
-    eval_strict = true;
-  if (is_integer(node->ty)) {
-    res = eval(node);
-  } else if (node->ty->kind == TY_BITINT) {
-    BitBuf *val = eval_bitint(node);
-    res = eval_bitint_to_bool(node->ty->bit_cnt, val);
-    free(val);
-  } else {
-    eval_strict = prv_strict;
-    error_tok(tok, "static_assert argument not integer");
-  }
-  eval_strict = prv_strict;
-  if (!res)
+  if (!eval_ice_node(node, ICE_BOOL, tok, "static_assert argument not integer"))
     error_tok(tok, "static assertion failed");
 
   if (tok->kind == TK_COMMA) {
@@ -3239,26 +3303,7 @@ static void push_goto(Node *node) {
 static int64_t eval_case_const_expr(Token **rest, Token *tok) {
   Node *node = conditional(rest, tok);
   add_type(node);
-  if (is_integer(node->ty)) {
-    bool prv = eval_strict;
-    if (is_iso_std && (!node->tok || !node->tok->file || !node->tok->file->is_syshdr))
-      eval_strict = true;
-    int64_t res = eval(node);
-    eval_strict = prv;
-    return res;
-  }
-  if (node->ty->kind == TY_BITINT) {
-    bool prv = eval_strict;
-    if (is_iso_std && (!node->tok || !node->tok->file || !node->tok->file->is_syshdr))
-      eval_strict = true;
-    BitBuf *data = eval_bitint(node);
-    eval_strict = prv;
-    clean_bitint(data, node->ty);
-    int64_t val = (int64_t)data->as64;
-    free(data);
-    return val;
-  }
-  error_tok(node->tok, "expression not integer");
+  return eval_ice_node(node, ICE_I64_CASE, node->tok, "expression not integer");
 }
 
 static void case_range(Token **rest, Token *tok, Node *sw, Node *case_node) {
@@ -4595,26 +4640,7 @@ static int64_t const_expr2(Token **rest, Token *tok, Type **ty) {
   add_type(node);
   if (ty)
     *ty = node->ty;
-
-  if (is_integer(node->ty)) {
-    bool prv = eval_strict;
-    if (is_iso_std && (!node->tok || !node->tok->file || !node->tok->file->is_syshdr))
-      eval_strict = true;
-    int64_t res = eval(node);
-    eval_strict = prv;
-    return res;
-  }
-
-  if (node->ty->kind == TY_BITINT) {
-    BitBuf *data = eval_bitint(node);
-
-    chk_bitint_within_64bit(data, node->ty, node->tok);
-
-    int64_t val = data->as64;
-    free(data);
-    return val;
-  }
-  error_tok(node->tok, "expression not integer");
+  return eval_ice_node(node, ICE_I64_STRICT64, node->tok, "expression not integer");
 }
 
 int64_t const_expr(Token **rest, Token *tok) {
@@ -5718,8 +5744,7 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
     VarAttr attr = {0};
     Token *decl_start = tok;
     Type *basety = declspec(&tok, tok, &attr, SC_NONE);
-    if (attr.has_noreturn_kw)
-      error_tok(decl_start, "'_Noreturn' is not allowed in struct or union member");
+    validate_decl_attrs(&attr, DECL_CTX_MEMBER, decl_start);
 
     // Anonymous struct member
     if (tok->kind == TK_SEMI && (basety->kind == TY_STRUCT || basety->kind == TY_UNION)) {
@@ -5742,8 +5767,7 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
 
       Member *mem = calloc(1, sizeof(Member));
       mem->ty = basety;
-      if (attr.alignas_val > 0 && mem->ty->align > 0 && attr.alignas_val < mem->ty->align)
-        error_tok(tok, "_Alignas cannot reduce natural alignment");
+      chk_alignas_natural(&attr, mem->ty, tok);
       aligned_attr(NULL, tok, &attr, &mem->alt_align);
       mem_attr(NULL, tok, &attr, mem);
 
@@ -5785,8 +5809,7 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
 
       if (mem->is_bitfield && attr.has_alignas)
         error_tok(tok, "_Alignas cannot be applied to a bit-field");
-      if (attr.alignas_val > 0 && mem->ty->align > 0 && attr.alignas_val < mem->ty->align)
-        error_tok(tok, "_Alignas cannot reduce natural alignment");
+      chk_alignas_natural(&attr, mem->ty, tok);
       aligned_attr(mem->name, tok, &attr, &mem->alt_align);
       mem_attr(mem->name, tok, &attr, mem);
       cur = cur->next = mem;
@@ -6256,10 +6279,7 @@ static Node *generic_selection(Token **rest, Token *tok) {
     Token *ty_tok = tok;
     VarAttr attr = {0};
     Type *basety = declspec(&tok, tok, &attr, SC_NONE);
-    if (attr.has_alignas)
-      error_tok(ty_tok, "'_Alignas' is not allowed in a type name");
-    if (attr.has_noreturn_kw)
-      error_tok(ty_tok, "'_Noreturn' is not allowed in a type name");
+    validate_decl_attrs(&attr, DECL_CTX_TYPENAME, ty_tok);
     Type *t2 = declarator2(&tok, tok, basety, NULL, true);
     declarator3(basety, t2, true, false);
 
@@ -6327,10 +6347,7 @@ static Node *compound_literal(Token **rest, Token *tok) {
       ? (SC_CONSTEXPR | SC_REGISTER | SC_STATIC | SC_THREAD)
       : SC_NONE;
   Type *ty = declspec(&tok, tok, &attr, cl_sc);
-  if (attr.has_alignas)
-    error_tok(start, "'_Alignas' is not allowed in a compound literal");
-  if (attr.has_noreturn_kw)
-    error_tok(start, "'_Noreturn' is not allowed in a compound literal");
+  validate_decl_attrs(&attr, DECL_CTX_COMPLIT, start);
 
   ty = declarator(&tok, tok, ty, NULL);
 
@@ -6787,8 +6804,7 @@ static Node *parse_typedef(Token **rest, Token *tok, Type *basety, VarAttr *attr
       error_tok(tok, "variably-modified type at file scope");
 
     int align = 0;
-    if (attr->has_alignas)
-      error_tok(name, "_Alignas cannot appear in a typedef");
+    validate_decl_attrs(attr, DECL_CTX_TYPEDEF, name);
     aligned_attr(name, tok, attr, &align);
 
     HashEntry *ent = hashmap_get_or_insert(&decl_scope()->vars, name->loc, name->len);
@@ -6915,8 +6931,7 @@ static Node *func_old_style_param(Token **rest, Token *tok, Type *prot_ty, Type 
   while (is_typename(tok)) {
     VarAttr attr = {0};
     Type *basety = declspec(&tok, tok, &attr, SC_REGISTER);
-    if (attr.has_alignas)
-      error_tok(tok, "_Alignas cannot be applied to a parameter");
+    validate_decl_attrs(&attr, DECL_CTX_PARAM, tok);
 
     chain_expr(&expr, calc_vla2(basety, tok, &attr));
 
@@ -7199,8 +7214,7 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
     declarator3(basety, ty, false, is_fndef);
 
     if (ty->kind == TY_FUNC) {
-      if (attr->has_alignas)
-        error_tok(name ? name : tok, "_Alignas cannot be applied to a function");
+      validate_decl_attrs(attr, DECL_CTX_FUNC, name ? name : tok);
       if (!is_fndef)
         strip_proto_vla_exprs(ty);
       Obj *fn = func_prototype(tok, name, ty, attr, is_fndef);
@@ -7263,8 +7277,7 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
     }
 
     assembler_name(&tok, tok, var);
-    if (attr->alignas_val > 0 && ty->align > 0 && attr->alignas_val < ty->align)
-      error_tok(name, "_Alignas cannot reduce natural alignment");
+    chk_alignas_natural(attr, ty, name);
     if (is_iso_std && !tok->file->is_syshdr) {
       int cur_al = attr->has_alignas ? MAX(attr->alignas_val, ty->align) : 0;
       if (existed) {

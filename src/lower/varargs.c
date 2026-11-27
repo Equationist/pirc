@@ -10,24 +10,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-static uint64_t va_align_up(uint64_t v, uint64_t al) {
-    return (v + al - 1u) & ~(al - 1u);
-}
-
-static bool va_agg_is_indirect(const PirModule *mod, const PirTargetSpec *target, PirType arg_ty) {
-    PirParamDecl pd;
-    memset(&pd, 0, sizeof(pd));
-    pd.abi_kind = PIR_PARAM_BYVAL;
-    pd.abi_type = arg_ty;
-    pd.type     = pir_type_scalar(PIR_SCALAR_PTR);
-    PirAbiRegState st = { 0u, 0u };
-    PirAbiArgInfo info;
-    if (!pir_abi_classify_param(mod, target, &pd, &st, &info)) {
-        return false;
-    }
-    return info.kind == PIR_ABI_INDIRECT && info.stack_byval_size == 0u;
-}
-
 static bool is_valist_type(PirType t) {
     return t.kind == PIR_TYPE_SCALAR && t.u.scalar == PIR_SCALAR_VALIST;
 }
@@ -41,6 +23,63 @@ static PirValueId va_padd(PirModule *mod, PirFunction *fn, PirBlockId blk, PirIn
     pa.results[0]  = pir_fn_new_val(mod, fn, "vap", pir_type_scalar(PIR_SCALAR_PTR), blk, PIR_INVALID_ID, 0u);
     pir_fn_append_inst(fn, out, pa);
     return pa.results[0];
+}
+
+/* Materialize a va_arg / va_arg_buf value from a resolved argument-slot pointer `slot_ptr`. */
+static void emit_va_arg_materialize(PirModule *mod, const PirTargetSpec *target,
+                                    PirFunction *fn, PirBlockId dst_blk, PirInstIdVec *out,
+                                    const PirInst *orig, const PirVaArgPlan *plan,
+                                    PirValueId slot_ptr) {
+    PirType tptr   = pir_type_scalar(PIR_SCALAR_PTR);
+    PirType tvoid  = pir_type_scalar(PIR_SCALAR_VOID);
+    PirType idx_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
+    uint32_t ptr_al = target->ptr_bytes > 0u ? (uint32_t)target->ptr_bytes : 8u;
+    uint32_t ln = orig->src_line, lc = orig->loc_idx;
+
+    PirValueId src_ptr = slot_ptr;
+    if (plan->is_indirect) {
+        PirInst lp = pir_make_inst(PIR_OP_LOAD, tptr, ln, lc);
+        lp.align = ptr_al; lp.operand_count = 1u; lp.operands = pir_alloc_ops(mod, 1u);
+        lp.operands[0] = pir_op_val(slot_ptr, tptr);
+        lp.results[0]  = pir_fn_new_val(mod, fn, "vaindp", tptr, dst_blk, PIR_INVALID_ID, 0u);
+        pir_fn_append_inst(fn, out, lp);
+        src_ptr = lp.results[0];
+    }
+
+    if (plan->is_buf) {
+        PirInst mc = pir_make_inst(PIR_OP_MEMCPY, tvoid, ln, lc);
+        mc.align = plan->align < ptr_al ? plan->align : ptr_al;
+        mc.operand_count = 3u; mc.operands = pir_alloc_ops(mod, 3u);
+        mc.operands[0] = orig->operands[0];
+        mc.operands[1] = pir_op_val(src_ptr, tptr);
+        mc.operands[2] = pir_op_imm_i(plan->size, false, idx_ty);
+        pir_fn_append_inst(fn, out, mc);
+    } else if (plan->promote_f32) {
+        PirInst ld = pir_make_inst(PIR_OP_LOAD, plan->load_ty, ln, lc);
+        ld.align = ptr_al < 8u ? ptr_al : 8u;
+        ld.operand_count = 1u; ld.operands = pir_alloc_ops(mod, 1u);
+        ld.operands[0] = pir_op_val(src_ptr, tptr);
+        ld.results[0]  = pir_fn_new_val(mod, fn, "vaf64", plan->load_ty, dst_blk, PIR_INVALID_ID, 0u);
+        pir_fn_append_inst(fn, out, ld);
+
+        PirInst ft = pir_make_inst(PIR_OP_FPTRUNC, plan->arg_ty, ln, lc);
+        ft.operand_count = 1u; ft.operands = pir_alloc_ops(mod, 1u);
+        ft.operands[0] = pir_op_val(ld.results[0], plan->load_ty);
+        ft.results[0]  = orig->results[0];
+        fn->values.data[orig->results[0]].def_block = dst_blk;
+        pir_fn_append_inst(fn, out, ft);
+    } else {
+        uint32_t ld_align = plan->is_indirect
+                            ? (plan->align > 0u ? plan->align : 1u)
+                            : (plan->align < ptr_al ? plan->align : ptr_al);
+        PirInst ld = pir_make_inst(PIR_OP_LOAD, plan->arg_ty, ln, lc);
+        ld.align = ld_align;
+        ld.operand_count = 1u; ld.operands = pir_alloc_ops(mod, 1u);
+        ld.operands[0] = pir_op_val(src_ptr, tptr);
+        ld.results[0]  = orig->results[0];
+        fn->values.data[orig->results[0]].def_block = dst_blk;
+        pir_fn_append_inst(fn, out, ld);
+    }
 }
 
 /* Split block `b` at instruction `j` for branched va_arg (SysV x64 / Linux AAPCS64),
@@ -80,31 +119,20 @@ static PirBlockId lower_va_arg_sysv_agg(PirModule *mod, const PirTargetSpec *tar
     PirType tvoid = pir_type_scalar(PIR_SCALAR_VOID);
     uint32_t ln = inst->src_line, lc = inst->loc_idx;
 
-    PirType arg_ty     = inst->aux_type;
     PirOperand dst_buf = inst->operands[0];
     PirOperand ap      = inst->operands[1];
-    PirTypeLayout ly   = pir_type_layout(mod, target, arg_ty);
-    uint64_t mem_step  = va_align_up(ly.size > 0u ? ly.size : 8u, 8u);
+    PirVaArgPlan plan;
+    pir_abi_plan_va_arg(mod, target, inst->aux_type, true, &plan);
+    const PirAbiArgInfo info = plan.abi;
 
-    PirParamDecl pd;
-    memset(&pd, 0, sizeof(pd));
-    pd.abi_kind = PIR_PARAM_BYVAL;
-    pd.abi_type = arg_ty;
-    pd.type     = tptr;
-    PirAbiRegState st0 = { 0u, 0u };
-    PirAbiArgInfo info;
-    bool classified = pir_abi_classify_param(mod, target, &pd, &st0, &info);
-    bool is_empty   = (ly.size == 0u) ||
-                      (classified && info.kind == PIR_ABI_DIRECT && info.reg_count == 0u);
-    if (is_empty) {
+    if (plan.is_empty) {
         PirBlockId cont_blk = split_block_tail(mod, fn, b, j, head, ln, NULL);
         PirInst jc = pir_make_inst(PIR_OP_JMP, tvoid, ln, lc);
         jc.targets[0].target = cont_blk;
         pir_fn_append_inst(fn, &fn->blocks.data[b].insts, jc);
         return cont_blk;
     }
-    bool use_regs   = classified && info.kind == PIR_ABI_DIRECT &&
-                      info.reg_count > 0u && (info.gp_used > 0u || info.fp_used > 0u);
+    bool use_regs = !plan.force_mem;
 
     PirBlockId reg_blk  = pir_fn_new_block(mod, fn, "va_reg", ln);
     PirBlockId mem_blk  = pir_fn_new_block(mod, fn, "va_mem", ln);
@@ -189,7 +217,7 @@ static PirBlockId lower_va_arg_sysv_agg(PirModule *mod, const PirTargetSpec *tar
             PirType rty = info.regs[k];
             bool is_sse = pir_type_is_float(rty) || rty.kind == PIR_TYPE_VECTOR;
             uint64_t dst_off = info.has_reg_offsets ? info.reg_offsets[k] : ((uint64_t)k * 8u);
-            uint64_t rem     = (ly.size > dst_off) ? (ly.size - dst_off) : 0u;
+            uint64_t rem     = (plan.size > dst_off) ? (plan.size - dst_off) : 0u;
             uint64_t chunk   = (rty.kind == PIR_TYPE_VECTOR && pir_vec_bits(rty.u.vec) == 128u)
                                ? (rem < 16u ? rem : 16u)
                                : (rem < 8u ? rem : 8u);
@@ -276,25 +304,24 @@ static PirBlockId lower_va_arg_sysv_agg(PirModule *mod, const PirTargetSpec *tar
     pir_fn_append_inst(fn, mb, loaa);
 
     PirValueId cur_oaa = loaa.results[0];
-    if (ly.align > 8u) {
-        uint64_t al = (ly.align > 16u) ? ly.align : 16u;
-        cur_oaa = pir_emit_align_ptr(mod, fn, mem_blk, mb, cur_oaa, al, target, ln, lc);
+    if (plan.mem_align > 8u) {
+        cur_oaa = pir_emit_align_ptr(mod, fn, mem_blk, mb, cur_oaa, plan.mem_align, target, ln, lc);
     }
 
-    if (ly.size > 0u) {
+    if (plan.size > 0u) {
         PirInst mc = pir_make_inst(PIR_OP_MEMCPY, tvoid, ln, lc);
-        mc.align = ly.align < 8u ? ly.align : 8u;
+        mc.align = plan.align < 8u ? plan.align : 8u;
         mc.operand_count = 3u; mc.operands = pir_alloc_ops(mod, 3u);
         mc.operands[0] = dst_buf;
         mc.operands[1] = pir_op_val(cur_oaa, tptr);
-        mc.operands[2] = pir_op_imm_i(ly.size, false, ti64);
+        mc.operands[2] = pir_op_imm_i(plan.size, false, ti64);
         pir_fn_append_inst(fn, mb, mc);
     }
 
     PirInst noaa = pir_make_inst(PIR_OP_PTR_ADD, ti64, ln, lc);
     noaa.operand_count = 2u; noaa.operands = pir_alloc_ops(mod, 2u);
     noaa.operands[0] = pir_op_val(cur_oaa, tptr);
-    noaa.operands[1] = pir_op_imm_i(mem_step, false, ti64);
+    noaa.operands[1] = pir_op_imm_i(plan.mem_step, false, ti64);
     noaa.results[0]  = pir_fn_new_val(mod, fn, "vanoaa", tptr, mem_blk, PIR_INVALID_ID, 0u);
     pir_fn_append_inst(fn, mb, noaa);
 
@@ -323,32 +350,27 @@ static PirBlockId lower_va_arg_sysv(PirModule *mod, const PirTargetSpec *target,
     PirType tvoid = pir_type_scalar(PIR_SCALAR_VOID);
     uint32_t ln = inst->src_line, lc = inst->loc_idx;
 
-    PirType arg_ty = inst->ty;
-    bool promote_f32 = (arg_ty.kind == PIR_TYPE_SCALAR && arg_ty.u.scalar == PIR_SCALAR_F32);
-    PirType load_ty = promote_f32 ? pir_type_scalar(PIR_SCALAR_F64) : arg_ty;
-    PirOperand ap  = inst->operands[0];
-    PirTypeLayout ly = pir_type_layout(mod, target, load_ty);
-    uint64_t step = va_align_up(ly.size > 0u ? ly.size : 8u, 8u);
-    bool is_fp     = (pir_type_is_float(load_ty) || load_ty.kind == PIR_TYPE_VECTOR);
-    bool force_mem = (load_ty.kind == PIR_TYPE_VECTOR && ly.size > 16u);
+    PirVaArgPlan plan;
+    pir_abi_plan_va_arg(mod, target, inst->ty, false, &plan);
+    PirOperand ap = inst->operands[0];
 
-    PirBlockId reg_blk = force_mem ? PIR_INVALID_ID : pir_fn_new_block(mod, fn, "va_reg", ln);
+    PirBlockId reg_blk = plan.force_mem ? PIR_INVALID_ID : pir_fn_new_block(mod, fn, "va_reg", ln);
     PirBlockId mem_blk = pir_fn_new_block(mod, fn, "va_mem", ln);
     PirValueId res_ptr = PIR_INVALID_ID;
     PirBlockId cont_blk = split_block_tail(mod, fn, b, j, head, ln, &res_ptr);
 
     /* SysV va_list: { gp_offset: i32 @0, fp_offset: i32 @4, overflow_arg_area: ptr @8, reg_save_area: ptr @16 } */
     PirInstIdVec *cur = &fn->blocks.data[b].insts;
-    if (force_mem) {
+    if (plan.force_mem) {
         /* SysV AMD64 §3.5.7: 256-bit vectors are always passed in MEMORY (overflow_arg_area),
          * never in the 176-byte reg_save_area (which only holds 128-bit xmm0..xmm7). */
         PirInst jm0 = pir_make_inst(PIR_OP_JMP, tvoid, ln, lc);
         jm0.targets[0].target = mem_blk;
         pir_fn_append_inst(fn, cur, jm0);
     } else {
-        uint64_t off_field = is_fp ? 4u : 0u;
-        uint64_t limit     = is_fp ? 176u : 48u;
-        uint64_t reg_step  = is_fp ? 16u : (step > 8u ? step : 8u);
+        uint64_t off_field = plan.is_fp ? 4u : 0u;
+        uint64_t limit     = plan.is_fp ? 176u : 48u;
+        uint64_t reg_step  = plan.is_fp ? 16u : (plan.mem_step > 8u ? plan.mem_step : 8u);
 
         PirValueId off_p = va_padd(mod, fn, b, cur, ap, off_field, ti64, ln, lc);
         PirInst loff = pir_make_inst(PIR_OP_LOAD, ti32, ln, lc);
@@ -423,14 +445,14 @@ static PirBlockId lower_va_arg_sysv(PirModule *mod, const PirTargetSpec *target,
     pir_fn_append_inst(fn, mb, loaa);
 
     PirValueId arg_mem = loaa.results[0];
-    if (ly.align > 8u) {
-        arg_mem = pir_emit_align_ptr(mod, fn, mem_blk, mb, arg_mem, ly.align, target, ln, lc);
+    if (plan.mem_align > 8u) {
+        arg_mem = pir_emit_align_ptr(mod, fn, mem_blk, mb, arg_mem, plan.mem_align, target, ln, lc);
     }
 
     PirInst noaa = pir_make_inst(PIR_OP_PTR_ADD, ti64, ln, lc);
     noaa.operand_count = 2u; noaa.operands = pir_alloc_ops(mod, 2u);
     noaa.operands[0] = pir_op_val(arg_mem, tptr);
-    noaa.operands[1] = pir_op_imm_i(step, false, ti64);
+    noaa.operands[1] = pir_op_imm_i(plan.mem_step, false, ti64);
     noaa.results[0]  = pir_fn_new_val(mod, fn, "vanoaa", tptr, mem_blk, PIR_INVALID_ID, 0u);
     pir_fn_append_inst(fn, mb, noaa);
 
@@ -448,29 +470,7 @@ static PirBlockId lower_va_arg_sysv(PirModule *mod, const PirTargetSpec *target,
 
     /* Prepend load to cont_blk. */
     PirInstIdVec prep = {0};
-    if (promote_f32) {
-        PirInst ld = pir_make_inst(PIR_OP_LOAD, load_ty, ln, lc);
-        ld.align = 8u;
-        ld.operand_count = 1u; ld.operands = pir_alloc_ops(mod, 1u);
-        ld.operands[0] = pir_op_val(res_ptr, tptr);
-        ld.results[0]  = pir_fn_new_val(mod, fn, "vaf64", load_ty, cont_blk, PIR_INVALID_ID, 0u);
-        pir_fn_append_inst(fn, &prep, ld);
-
-        PirInst ft = pir_make_inst(PIR_OP_FPTRUNC, arg_ty, ln, lc);
-        ft.operand_count = 1u; ft.operands = pir_alloc_ops(mod, 1u);
-        ft.operands[0] = pir_op_val(ld.results[0], load_ty);
-        ft.results[0]  = inst->results[0];
-        fn->values.data[inst->results[0]].def_block = cont_blk;
-        pir_fn_append_inst(fn, &prep, ft);
-    } else {
-        PirInst ld = pir_make_inst(PIR_OP_LOAD, arg_ty, ln, lc);
-        ld.align = ly.align < 8u ? ly.align : 8u;
-        ld.operand_count = 1u; ld.operands = pir_alloc_ops(mod, 1u);
-        ld.operands[0] = pir_op_val(res_ptr, tptr);
-        ld.results[0]  = inst->results[0];
-        fn->values.data[inst->results[0]].def_block = cont_blk;
-        pir_fn_append_inst(fn, &prep, ld);
-    }
+    emit_va_arg_materialize(mod, target, fn, cont_blk, &prep, inst, &plan, res_ptr);
     for (uint32_t k = 0u; k < fn->blocks.data[cont_blk].insts.len; ++k) {
         PIR_VEC_PUSH(&prep, fn->blocks.data[cont_blk].insts.data[k]);
     }
@@ -490,53 +490,29 @@ static PirBlockId lower_va_arg_aapcs64_linux(PirModule *mod, const PirTargetSpec
     uint32_t ln = inst->src_line, lc = inst->loc_idx;
 
     bool is_buf = (inst->op == PIR_OP_VA_ARG_BUF);
-    PirType arg_ty = is_buf ? inst->aux_type : inst->ty;
-    bool promote_f32 = (!is_buf && arg_ty.kind == PIR_TYPE_SCALAR && arg_ty.u.scalar == PIR_SCALAR_F32);
-    PirType load_ty = promote_f32 ? pir_type_scalar(PIR_SCALAR_F64) : arg_ty;
-    PirOperand ap  = is_buf ? inst->operands[1] : inst->operands[0];
-    PirTypeLayout ly = pir_type_layout(mod, target, load_ty);
-    uint32_t nat_al  = pir_abi_natural_align(mod, target, load_ty);
-    if (is_buf && (ly.size == 0u || pir_abi_is_pad_only_agg(mod, arg_ty))) {
+    PirVaArgPlan plan;
+    pir_abi_plan_va_arg(mod, target, is_buf ? inst->aux_type : inst->ty, is_buf, &plan);
+    PirOperand ap = is_buf ? inst->operands[1] : inst->operands[0];
+
+    if (plan.is_empty) {
         PirBlockId cont_blk = split_block_tail(mod, fn, b, j, head, ln, NULL);
         PirInst jc = pir_make_inst(PIR_OP_JMP, tvoid, ln, lc);
         jc.targets[0].target = cont_blk;
         pir_fn_append_inst(fn, &fn->blocks.data[b].insts, jc);
         return cont_blk;
     }
-    bool indirect_val = (!is_buf && load_ty.kind == PIR_TYPE_VECTOR && ly.size > 16u);
-    bool indirect = (is_buf && va_agg_is_indirect(mod, target, arg_ty)) || indirect_val;
-    uint64_t step = indirect ? 8u : va_align_up(ly.size > 0u ? ly.size : 8u, 8u);
-
-    /* Classify aggregate for HFA (uses FP save area __vr_top / __vr_offs). */
-    bool is_hfa = false;
-    PirAbiArgInfo hfa_info;
-    memset(&hfa_info, 0, sizeof(hfa_info));
-    if (is_buf && !indirect) {
-        PirParamDecl pd;
-        memset(&pd, 0, sizeof(pd));
-        pd.abi_kind = PIR_PARAM_BYVAL;
-        pd.abi_type = arg_ty;
-        pd.type     = tptr;
-        PirAbiRegState st0 = { 0u, 0u };
-        if (pir_abi_classify_param(mod, target, &pd, &st0, &hfa_info) &&
-            hfa_info.kind == PIR_ABI_DIRECT && hfa_info.fp_used > 0u) {
-            is_hfa = true;
-        }
-    }
-    bool is_fp = is_hfa || (!is_buf && !indirect_val && (pir_type_is_float(load_ty) || load_ty.kind == PIR_TYPE_VECTOR));
 
     PirBlockId reg_blk = pir_fn_new_block(mod, fn, "va_reg", ln);
     PirBlockId mem_blk = pir_fn_new_block(mod, fn, "va_mem", ln);
     PirValueId res_ptr = PIR_INVALID_ID;
-    PirBlockId cont_blk = split_block_tail(mod, fn, b, j, head, ln, is_hfa ? NULL : &res_ptr);
+    PirBlockId cont_blk = split_block_tail(mod, fn, b, j, head, ln, plan.is_hfa ? NULL : &res_ptr);
 
     /* Linux AAPCS64 va_list: { __stack: ptr @0, __gr_top: ptr @8, __vr_top: ptr @16, __gr_offs: i32 @24, __vr_offs: i32 @28 } */
-    uint64_t top_off  = is_fp ? 16u : 8u;
-    uint64_t offs_off = is_fp ? 28u : 24u;
-    uint64_t reg_step = is_hfa ? ((uint64_t)hfa_info.fp_used * 16u)
-                      : is_fp  ? 16u
-                               : (step > 8u ? step : 8u);
-    bool align_gp16 = !is_fp && !indirect && nat_al >= 16u;
+    uint64_t top_off  = plan.is_fp ? 16u : 8u;
+    uint64_t offs_off = plan.is_fp ? 28u : 24u;
+    uint64_t reg_step = plan.is_hfa ? ((uint64_t)plan.abi.fp_used * 16u)
+                      : plan.is_fp  ? 16u
+                                    : (plan.mem_step > 8u ? plan.mem_step : 8u);
 
     PirInstIdVec *cur = &fn->blocks.data[b].insts;
     PirValueId op = va_padd(mod, fn, b, cur, ap, offs_off, ti64, ln, lc);
@@ -547,7 +523,7 @@ static PirBlockId lower_va_arg_aapcs64_linux(PirModule *mod, const PirTargetSpec
     pir_fn_append_inst(fn, cur, lo);
 
     PirValueId cur_offs = lo.results[0];
-    if (align_gp16) {
+    if (plan.align_gp16) {
         /* AAPCS64 Appendix B: 16B-aligned GP arg rounds __gr_offs up to a multiple of 16. */
         PirInst ad = pir_make_inst(PIR_OP_ADD, ti32, ln, lc);
         ad.operand_count = 2u; ad.operands = pir_alloc_ops(mod, 2u);
@@ -614,11 +590,11 @@ static PirBlockId lower_va_arg_aapcs64_linux(PirModule *mod, const PirTargetSpec
     rp.results[0]  = pir_fn_new_val(mod, fn, "varp", tptr, reg_blk, PIR_INVALID_ID, 0u);
     pir_fn_append_inst(fn, rb, rp);
 
-    if (is_hfa) {
+    if (plan.is_hfa) {
         /* Copy each HFA element from its 16-byte __vr_top slot into packed dst_buf. */
-        PirType ety = hfa_info.regs[0];
+        PirType ety = plan.abi.regs[0];
         PirTypeLayout ely = pir_type_layout(mod, target, ety);
-        for (uint32_t k = 0u; k < hfa_info.reg_count; ++k) {
+        for (uint32_t k = 0u; k < plan.abi.reg_count; ++k) {
             PirValueId sp = va_padd(mod, fn, reg_blk, rb, pir_op_val(rp.results[0], tptr),
                                     (uint64_t)k * 16u, ti64, ln, lc);
             PirInst ld = pir_make_inst(PIR_OP_LOAD, ety, ln, lc);
@@ -661,16 +637,14 @@ static PirBlockId lower_va_arg_aapcs64_linux(PirModule *mod, const PirTargetSpec
     pir_fn_append_inst(fn, mb, ls);
 
     PirValueId stk_ptr = ls.results[0];
-    uint32_t stk_al = is_hfa ? ly.align : nat_al;
-    if (!indirect && stk_al > 8u) {
-        uint64_t al = (stk_al > 16u) ? 16u : stk_al;
-        stk_ptr = pir_emit_align_ptr(mod, fn, mem_blk, mb, stk_ptr, al, target, ln, lc);
+    if (plan.mem_align > 8u) {
+        stk_ptr = pir_emit_align_ptr(mod, fn, mem_blk, mb, stk_ptr, plan.mem_align, target, ln, lc);
     }
 
     PirInst ns = pir_make_inst(PIR_OP_PTR_ADD, ti64, ln, lc);
     ns.operand_count = 2u; ns.operands = pir_alloc_ops(mod, 2u);
     ns.operands[0] = pir_op_val(stk_ptr, tptr);
-    ns.operands[1] = pir_op_imm_i(step, false, ti64);
+    ns.operands[1] = pir_op_imm_i(plan.mem_step, false, ti64);
     ns.results[0]  = pir_fn_new_val(mod, fn, "vanstk", tptr, mem_blk, PIR_INVALID_ID, 0u);
     pir_fn_append_inst(fn, mb, ns);
 
@@ -680,13 +654,13 @@ static PirBlockId lower_va_arg_aapcs64_linux(PirModule *mod, const PirTargetSpec
     ss.operands[1] = ap;
     pir_fn_append_inst(fn, mb, ss);
 
-    if (is_hfa) {
+    if (plan.is_hfa) {
         PirInst mc = pir_make_inst(PIR_OP_MEMCPY, tvoid, ln, lc);
-        mc.align = ly.align < 8u ? ly.align : 8u;
+        mc.align = plan.align < 8u ? plan.align : 8u;
         mc.operand_count = 3u; mc.operands = pir_alloc_ops(mod, 3u);
         mc.operands[0] = inst->operands[0];
         mc.operands[1] = pir_op_val(stk_ptr, tptr);
-        mc.operands[2] = pir_op_imm_i(ly.size, false, ti64);
+        mc.operands[2] = pir_op_imm_i(plan.size, false, ti64);
         pir_fn_append_inst(fn, mb, mc);
 
         PirInst jm = pir_make_inst(PIR_OP_JMP, tvoid, ln, lc);
@@ -702,57 +676,7 @@ static PirBlockId lower_va_arg_aapcs64_linux(PirModule *mod, const PirTargetSpec
     pir_fn_append_inst(fn, mb, jm);
 
     PirInstIdVec prep = {0};
-    if (is_buf) {
-        PirValueId src_ptr = res_ptr;
-        if (indirect) {
-            PirInst lp = pir_make_inst(PIR_OP_LOAD, tptr, ln, lc);
-            lp.align = 8u; lp.operand_count = 1u; lp.operands = pir_alloc_ops(mod, 1u);
-            lp.operands[0] = pir_op_val(res_ptr, tptr);
-            lp.results[0]  = pir_fn_new_val(mod, fn, "vaindp", tptr, cont_blk, PIR_INVALID_ID, 0u);
-            pir_fn_append_inst(fn, &prep, lp);
-            src_ptr = lp.results[0];
-        }
-        PirInst mc = pir_make_inst(PIR_OP_MEMCPY, tvoid, ln, lc);
-        mc.align = ly.align < 8u ? ly.align : 8u;
-        mc.operand_count = 3u; mc.operands = pir_alloc_ops(mod, 3u);
-        mc.operands[0] = inst->operands[0];
-        mc.operands[1] = pir_op_val(src_ptr, tptr);
-        mc.operands[2] = pir_op_imm_i(ly.size, false, ti64);
-        pir_fn_append_inst(fn, &prep, mc);
-    } else if (promote_f32) {
-        PirInst ld = pir_make_inst(PIR_OP_LOAD, load_ty, ln, lc);
-        ld.align = 8u;
-        ld.operand_count = 1u; ld.operands = pir_alloc_ops(mod, 1u);
-        ld.operands[0] = pir_op_val(res_ptr, tptr);
-        ld.results[0]  = pir_fn_new_val(mod, fn, "vaf64", load_ty, cont_blk, PIR_INVALID_ID, 0u);
-        pir_fn_append_inst(fn, &prep, ld);
-
-        PirInst ft = pir_make_inst(PIR_OP_FPTRUNC, arg_ty, ln, lc);
-        ft.operand_count = 1u; ft.operands = pir_alloc_ops(mod, 1u);
-        ft.operands[0] = pir_op_val(ld.results[0], load_ty);
-        ft.results[0]  = inst->results[0];
-        fn->values.data[inst->results[0]].def_block = cont_blk;
-        pir_fn_append_inst(fn, &prep, ft);
-    } else {
-        PirValueId src_ptr = res_ptr;
-        uint32_t ld_align = ly.align < 8u ? ly.align : 8u;
-        if (indirect_val) {
-            PirInst lp = pir_make_inst(PIR_OP_LOAD, tptr, ln, lc);
-            lp.align = 8u; lp.operand_count = 1u; lp.operands = pir_alloc_ops(mod, 1u);
-            lp.operands[0] = pir_op_val(res_ptr, tptr);
-            lp.results[0]  = pir_fn_new_val(mod, fn, "vaindp", tptr, cont_blk, PIR_INVALID_ID, 0u);
-            pir_fn_append_inst(fn, &prep, lp);
-            src_ptr = lp.results[0];
-            ld_align = ly.align > 0u ? ly.align : 1u;
-        }
-        PirInst ld = pir_make_inst(PIR_OP_LOAD, arg_ty, ln, lc);
-        ld.align = ld_align;
-        ld.operand_count = 1u; ld.operands = pir_alloc_ops(mod, 1u);
-        ld.operands[0] = pir_op_val(src_ptr, tptr);
-        ld.results[0]  = inst->results[0];
-        fn->values.data[inst->results[0]].def_block = cont_blk;
-        pir_fn_append_inst(fn, &prep, ld);
-    }
+    emit_va_arg_materialize(mod, target, fn, cont_blk, &prep, inst, &plan, res_ptr);
     for (uint32_t k = 0u; k < fn->blocks.data[cont_blk].insts.len; ++k) {
         PIR_VEC_PUSH(&prep, fn->blocks.data[cont_blk].insts.data[k]);
     }
@@ -767,36 +691,14 @@ static void lower_va_arg_ptr_cursor(PirModule *mod, const PirTargetSpec *target,
     /* Darwin ARM64, Win64, & 32-bit pointer-cursor targets: va_list is a flat char * cursor. */
     PirType tptr   = pir_type_scalar(PIR_SCALAR_PTR);
     PirType idx_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
-    PirType tvoid  = pir_type_scalar(PIR_SCALAR_VOID);
     uint32_t ptr_al = target->ptr_bytes > 0u ? (uint32_t)target->ptr_bytes : 8u;
-    uint64_t slot_sz = (target->ptr_bytes == 4u) ? 4u : 8u;
     uint32_t ln = inst->src_line, lc = inst->loc_idx;
 
     bool is_buf = (inst->op == PIR_OP_VA_ARG_BUF);
-    PirType arg_ty = is_buf ? inst->aux_type : inst->ty;
-    bool promote_f32 = (!is_buf && arg_ty.kind == PIR_TYPE_SCALAR && arg_ty.u.scalar == PIR_SCALAR_F32);
-    PirType load_ty = promote_f32 ? pir_type_scalar(PIR_SCALAR_F64) : arg_ty;
-    PirOperand ap  = is_buf ? inst->operands[1] : inst->operands[0];
-    PirTypeLayout ly = pir_type_layout(mod, target, load_ty);
-    if (is_buf) {
-        if (ly.size == 0u) return;
-        PirParamDecl pd;
-        memset(&pd, 0, sizeof(pd));
-        pd.abi_kind = PIR_PARAM_BYVAL;
-        pd.abi_type = arg_ty;
-        pd.type     = tptr;
-        PirAbiRegState st0 = { 0u, 0u };
-        PirAbiArgInfo info;
-        if (pir_abi_classify_param(mod, target, &pd, &st0, &info) &&
-            info.kind == PIR_ABI_DIRECT && info.reg_count == 0u) {
-            return;
-        }
-    }
-    bool indirect_val = (!is_buf &&
-                         ((target->arch == PIR_ARCH_X86_64 && target->os == PIR_OS_WINDOWS && ly.size > 8u) ||
-                          (target->arch == PIR_ARCH_ARM64 && load_ty.kind == PIR_TYPE_VECTOR && ly.size > 16u)));
-    bool indirect = (is_buf && va_agg_is_indirect(mod, target, arg_ty)) || indirect_val;
-    uint64_t step = indirect ? slot_sz : va_align_up(ly.size > 0u ? ly.size : slot_sz, slot_sz);
+    PirVaArgPlan plan;
+    pir_abi_plan_va_arg(mod, target, is_buf ? inst->aux_type : inst->ty, is_buf, &plan);
+    if (plan.is_empty) return;
+    PirOperand ap = is_buf ? inst->operands[1] : inst->operands[0];
 
     PirInst lcur = pir_make_inst(PIR_OP_LOAD, tptr, ln, lc);
     lcur.align = ptr_al; lcur.operand_count = 1u; lcur.operands = pir_alloc_ops(mod, 1u);
@@ -805,17 +707,14 @@ static void lower_va_arg_ptr_cursor(PirModule *mod, const PirTargetSpec *target,
     pir_fn_append_inst(fn, out, lcur);
 
     PirValueId cur_ptr = lcur.results[0];
-    if (target->arch == PIR_ARCH_ARM64 && target->os == PIR_OS_MACOS &&
-        !indirect && ly.align > 8u) {
-        /* Darwin ARM64 aligns direct variadic stack arguments with align > 8 up to 16B. */
-        uint64_t al = (ly.align > 16u) ? 16u : ly.align;
-        cur_ptr = pir_emit_align_ptr(mod, fn, b, out, cur_ptr, al, target, ln, lc);
+    if (plan.mem_align > ptr_al) {
+        cur_ptr = pir_emit_align_ptr(mod, fn, b, out, cur_ptr, plan.mem_align, target, ln, lc);
     }
 
     PirInst next = pir_make_inst(PIR_OP_PTR_ADD, idx_ty, ln, lc);
     next.operand_count = 2u; next.operands = pir_alloc_ops(mod, 2u);
     next.operands[0] = pir_op_val(cur_ptr, tptr);
-    next.operands[1] = pir_op_imm_i(step, false, idx_ty);
+    next.operands[1] = pir_op_imm_i(plan.mem_step, false, idx_ty);
     next.results[0]  = pir_fn_new_val(mod, fn, "vanxt", tptr, b, PIR_INVALID_ID, 0u);
     pir_fn_append_inst(fn, out, next);
 
@@ -825,55 +724,7 @@ static void lower_va_arg_ptr_cursor(PirModule *mod, const PirTargetSpec *target,
     scur.operands[1] = ap;
     pir_fn_append_inst(fn, out, scur);
 
-    if (is_buf) {
-        PirValueId src_ptr = cur_ptr;
-        if (indirect) {
-            PirInst lp = pir_make_inst(PIR_OP_LOAD, tptr, ln, lc);
-            lp.align = ptr_al; lp.operand_count = 1u; lp.operands = pir_alloc_ops(mod, 1u);
-            lp.operands[0] = pir_op_val(cur_ptr, tptr);
-            lp.results[0]  = pir_fn_new_val(mod, fn, "vaindp", tptr, b, PIR_INVALID_ID, 0u);
-            pir_fn_append_inst(fn, out, lp);
-            src_ptr = lp.results[0];
-        }
-        PirInst mc = pir_make_inst(PIR_OP_MEMCPY, tvoid, ln, lc);
-        mc.align = ly.align < ptr_al ? ly.align : ptr_al;
-        mc.operand_count = 3u; mc.operands = pir_alloc_ops(mod, 3u);
-        mc.operands[0] = inst->operands[0];
-        mc.operands[1] = pir_op_val(src_ptr, tptr);
-        mc.operands[2] = pir_op_imm_i(ly.size, false, idx_ty);
-        pir_fn_append_inst(fn, out, mc);
-    } else if (promote_f32) {
-        PirInst ld = pir_make_inst(PIR_OP_LOAD, load_ty, ln, lc);
-        ld.align = ptr_al < 8u ? ptr_al : 8u;
-        ld.operand_count = 1u; ld.operands = pir_alloc_ops(mod, 1u);
-        ld.operands[0] = pir_op_val(cur_ptr, tptr);
-        ld.results[0]  = pir_fn_new_val(mod, fn, "vaf64", load_ty, b, PIR_INVALID_ID, 0u);
-        pir_fn_append_inst(fn, out, ld);
-
-        PirInst ft = pir_make_inst(PIR_OP_FPTRUNC, arg_ty, ln, lc);
-        ft.operand_count = 1u; ft.operands = pir_alloc_ops(mod, 1u);
-        ft.operands[0] = pir_op_val(ld.results[0], load_ty);
-        ft.results[0]  = inst->results[0];
-        pir_fn_append_inst(fn, out, ft);
-    } else {
-        PirValueId src_ptr = cur_ptr;
-        uint32_t ld_align = ly.align < ptr_al ? ly.align : ptr_al;
-        if (indirect_val) {
-            PirInst lp = pir_make_inst(PIR_OP_LOAD, tptr, ln, lc);
-            lp.align = ptr_al; lp.operand_count = 1u; lp.operands = pir_alloc_ops(mod, 1u);
-            lp.operands[0] = pir_op_val(cur_ptr, tptr);
-            lp.results[0]  = pir_fn_new_val(mod, fn, "vaindp", tptr, b, PIR_INVALID_ID, 0u);
-            pir_fn_append_inst(fn, out, lp);
-            src_ptr = lp.results[0];
-            ld_align = ly.align > 0u ? ly.align : 1u;
-        }
-        PirInst ld = pir_make_inst(PIR_OP_LOAD, arg_ty, ln, lc);
-        ld.align = ld_align;
-        ld.operand_count = 1u; ld.operands = pir_alloc_ops(mod, 1u);
-        ld.operands[0] = pir_op_val(src_ptr, tptr);
-        ld.results[0]  = inst->results[0];
-        pir_fn_append_inst(fn, out, ld);
-    }
+    emit_va_arg_materialize(mod, target, fn, b, out, inst, &plan, cur_ptr);
 }
 
 static PirTypeId ensure_aapcs64_valist_struct(PirModule *mod) {
@@ -1129,16 +980,13 @@ bool pir_lower_varargs(PirModule *mod, const PirTargetSpec *target, PirDiag *dia
             bool has_ov = false;
             for (uint32_t j = 0u; j < fn->blocks.data[b].insts.len; ++j) {
                 const PirInst *ins = &fn->insts.data[fn->blocks.data[b].insts.data[j]];
-                if (ins->op == PIR_OP_VA_ARG && ins->ty.kind == PIR_TYPE_VECTOR &&
-                    pir_vec_bits(ins->ty.u.vec) > target->caps.max_simd_bits) {
-                    uint16_t vbits = pir_vec_bits(ins->ty.u.vec);
-                    if ((target->arch == PIR_ARCH_X86_64 && target->os == PIR_OS_WINDOWS && vbits > 64u) ||
-                        (target->arch == PIR_ARCH_ARM64 && vbits > 128u) ||
-                        (target->arch == PIR_ARCH_X86_64 && target->os != PIR_OS_WINDOWS && vbits > 128u)) {
-                        continue;
+                if (ins->op == PIR_OP_VA_ARG && ins->ty.kind == PIR_TYPE_VECTOR) {
+                    PirVaArgPlan vp;
+                    pir_abi_plan_va_arg(mod, target, ins->ty, false, &vp);
+                    if (vp.split_vec) {
+                        has_ov = true;
+                        break;
                     }
-                    has_ov = true;
-                    break;
                 }
             }
             if (!has_ov) continue;
@@ -1146,15 +994,11 @@ bool pir_lower_varargs(PirModule *mod, const PirTargetSpec *target, PirDiag *dia
             for (uint32_t j = 0u; j < fn->blocks.data[b].insts.len; ++j) {
                 PirInstId iid = fn->blocks.data[b].insts.data[j];
                 PirInst copy  = fn->insts.data[iid];
-                bool do_split = (copy.op == PIR_OP_VA_ARG && copy.ty.kind == PIR_TYPE_VECTOR &&
-                                 pir_vec_bits(copy.ty.u.vec) > target->caps.max_simd_bits);
-                if (do_split) {
-                    uint16_t vbits = pir_vec_bits(copy.ty.u.vec);
-                    if ((target->arch == PIR_ARCH_X86_64 && target->os == PIR_OS_WINDOWS && vbits > 64u) ||
-                        (target->arch == PIR_ARCH_ARM64 && vbits > 128u) ||
-                        (target->arch == PIR_ARCH_X86_64 && target->os != PIR_OS_WINDOWS && vbits > 128u)) {
-                        do_split = false;
-                    }
+                bool do_split = false;
+                if (copy.op == PIR_OP_VA_ARG && copy.ty.kind == PIR_TYPE_VECTOR) {
+                    PirVaArgPlan vp;
+                    pir_abi_plan_va_arg(mod, target, copy.ty, false, &vp);
+                    do_split = vp.split_vec;
                 }
                 if (do_split) {
                     PirType pty;

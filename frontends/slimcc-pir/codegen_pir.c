@@ -1377,6 +1377,51 @@ static PirVal emit_cast_val(PirVal v, Type *from_ty, Type *to_ty) {
   return emit_bitint_norm(cur, to_ty);
 }
 
+typedef struct {
+  int b_fast;
+  int b_slow;
+  int b_done;
+} AtomicAlignBlocks;
+
+static AtomicAlignBlocks emit_atomic_align_begin(PirVal addr, int64_t sz, const char *pfx) {
+  need_atomic_lock_helpers = true;
+  AtomicAlignBlocks ab = {new_bid(), new_bid(), new_bid()};
+  int pi = new_tid(), mis = new_tid(), is_mis = new_tid();
+  sb_printf(&fc->body_sb, "    %%t%d = ptrtoint.i64 %%t%d\n", pi, addr.id);
+  sb_printf(&fc->body_sb, "    %%t%d = and.i64 %%t%d, %" PRIi64 "\n", mis, pi, sz - 1);
+  sb_printf(&fc->body_sb, "    %%t%d = cmp_ne.i64 %%t%d, 0\n", is_mis, mis);
+  sb_printf(&fc->body_sb, "    br %%t%d, .%s_slow_%d, .%s_fast_%d\n",
+            is_mis, pfx, ab.b_slow, pfx, ab.b_fast);
+  fc->terminated = true;
+  sb_printf(&fc->body_sb, "\n.%s_fast_%d:\n", pfx, ab.b_fast);
+  fc->terminated = false;
+  return ab;
+}
+
+static void emit_atomic_align_slow(const AtomicAlignBlocks *ab, const char *pfx, int fast_val) {
+  if (fast_val >= 0)
+    sb_printf(&fc->body_sb, "    jmp .%s_done_%d(%%t%d)\n", pfx, ab->b_done, fast_val);
+  else
+    sb_printf(&fc->body_sb, "    jmp .%s_done_%d\n", pfx, ab->b_done);
+  fc->terminated = true;
+  sb_printf(&fc->body_sb, "\n.%s_slow_%d:\n", pfx, ab->b_slow);
+  fc->terminated = false;
+}
+
+static void emit_atomic_align_end(const AtomicAlignBlocks *ab, const char *pfx,
+                                  int slow_val, int done_val, const char *done_ty) {
+  if (slow_val >= 0)
+    sb_printf(&fc->body_sb, "    jmp .%s_done_%d(%%t%d)\n", pfx, ab->b_done, slow_val);
+  else
+    sb_printf(&fc->body_sb, "    jmp .%s_done_%d\n", pfx, ab->b_done);
+  fc->terminated = true;
+  if (done_val >= 0)
+    sb_printf(&fc->body_sb, "\n.%s_done_%d(%%t%d: %s):\n", pfx, ab->b_done, done_val, done_ty);
+  else
+    sb_printf(&fc->body_sb, "\n.%s_done_%d:\n", pfx, ab->b_done);
+  fc->terminated = false;
+}
+
 static PirVal emit_load_scalar(PirVal addr, Type *ty, int32_t align_hint) {
   ensure_open_block();
   const char *pt = pir_scalar_ty_name(ty);
@@ -1386,17 +1431,7 @@ static PirVal emit_load_scalar(PirVal addr, Type *ty, int32_t align_hint) {
   if (ty->qual & Q_ATOMIC) {
     int64_t sz = ty->size > 0 ? ty->size : (pir_ty_bits(pt) / 8);
     if (sz > 1 && sz <= 8) {
-      need_atomic_lock_helpers = true;
-      int b_fast = new_bid(), b_slow = new_bid(), b_done = new_bid();
-      int pi = new_tid(), mis = new_tid(), is_mis = new_tid();
-      sb_printf(&fc->body_sb, "    %%t%d = ptrtoint.i64 %%t%d\n", pi, addr.id);
-      sb_printf(&fc->body_sb, "    %%t%d = and.i64 %%t%d, %" PRIi64 "\n", mis, pi, sz - 1);
-      sb_printf(&fc->body_sb, "    %%t%d = cmp_ne.i64 %%t%d, 0\n", is_mis, mis);
-      sb_printf(&fc->body_sb, "    br %%t%d, .at_slow_%d, .at_fast_%d\n", is_mis, b_slow, b_fast);
-      fc->terminated = true;
-
-      sb_printf(&fc->body_sb, "\n.at_fast_%d:\n", b_fast);
-      fc->terminated = false;
+      AtomicAlignBlocks ab = emit_atomic_align_begin(addr, sz, "at");
       int rf = new_tid();
       if (!strcmp(pt, "f32") || !strcmp(pt, "f64")) {
         const char *it = !strcmp(pt, "f32") ? "i32" : "i64";
@@ -1406,22 +1441,14 @@ static PirVal emit_load_scalar(PirVal addr, Type *ty, int32_t align_hint) {
       } else {
         sb_printf(&fc->body_sb, "    %%t%d = atomic_load.%s %%t%d [seq_cst]\n", rf, pt, addr.id);
       }
-      sb_printf(&fc->body_sb, "    jmp .at_done_%d(%%t%d)\n", b_done, rf);
-      fc->terminated = true;
-
-      sb_printf(&fc->body_sb, "\n.at_slow_%d:\n", b_slow);
-      fc->terminated = false;
+      emit_atomic_align_slow(&ab, "at", rf);
       int slot = emit_entry_scalar_alloca(pt, sz, (int32_t)sz);
       int tp = new_tid(), sz_id = new_tid(), rs = new_tid();
       sb_printf(&fc->body_sb, "    %%t%d = ptr_add.i64 %%loc_%d, 0\n", tp, slot);
       sb_printf(&fc->body_sb, "    %%t%d = const.i64 %" PRIi64 "\n", sz_id, sz);
       sb_printf(&fc->body_sb, "    call @__pir_atomic_load_n(%%t%d, %%t%d, %%t%d)\n", tp, addr.id, sz_id);
       sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %" PRIi64 "\n", rs, pt, tp, sz);
-      sb_printf(&fc->body_sb, "    jmp .at_done_%d(%%t%d)\n", b_done, rs);
-      fc->terminated = true;
-
-      sb_printf(&fc->body_sb, "\n.at_done_%d(%%t%d: %s):\n", b_done, r, pt);
-      fc->terminated = false;
+      emit_atomic_align_end(&ab, "at", rs, r, pt);
     } else if (!strcmp(pt, "f32") || !strcmp(pt, "f64")) {
       const char *it = !strcmp(pt, "f32") ? "i32" : "i64";
       int raw = new_tid();
@@ -1447,17 +1474,7 @@ static void emit_store_scalar(PirVal val, PirVal addr, Type *ty, int32_t align_h
   if (ty->qual & Q_ATOMIC) {
     int64_t sz = ty->size > 0 ? ty->size : (pir_ty_bits(pt) / 8);
     if (sz > 1 && sz <= 8) {
-      need_atomic_lock_helpers = true;
-      int b_fast = new_bid(), b_slow = new_bid(), b_done = new_bid();
-      int pi = new_tid(), mis = new_tid(), is_mis = new_tid();
-      sb_printf(&fc->body_sb, "    %%t%d = ptrtoint.i64 %%t%d\n", pi, addr.id);
-      sb_printf(&fc->body_sb, "    %%t%d = and.i64 %%t%d, %" PRIi64 "\n", mis, pi, sz - 1);
-      sb_printf(&fc->body_sb, "    %%t%d = cmp_ne.i64 %%t%d, 0\n", is_mis, mis);
-      sb_printf(&fc->body_sb, "    br %%t%d, .at_slow_%d, .at_fast_%d\n", is_mis, b_slow, b_fast);
-      fc->terminated = true;
-
-      sb_printf(&fc->body_sb, "\n.at_fast_%d:\n", b_fast);
-      fc->terminated = false;
+      AtomicAlignBlocks ab = emit_atomic_align_begin(addr, sz, "at");
       if (!strcmp(pt, "f32") || !strcmp(pt, "f64")) {
         const char *it = !strcmp(pt, "f32") ? "i32" : "i64";
         int raw = new_tid();
@@ -1466,22 +1483,14 @@ static void emit_store_scalar(PirVal val, PirVal addr, Type *ty, int32_t align_h
       } else {
         sb_printf(&fc->body_sb, "    atomic_store.%s %%t%d, %%t%d [seq_cst]\n", pt, val.id, addr.id);
       }
-      sb_printf(&fc->body_sb, "    jmp .at_done_%d\n", b_done);
-      fc->terminated = true;
-
-      sb_printf(&fc->body_sb, "\n.at_slow_%d:\n", b_slow);
-      fc->terminated = false;
+      emit_atomic_align_slow(&ab, "at", -1);
       int slot = emit_entry_scalar_alloca(pt, sz, (int32_t)sz);
       int tp = new_tid(), sz_id = new_tid();
       sb_printf(&fc->body_sb, "    %%t%d = ptr_add.i64 %%loc_%d, 0\n", tp, slot);
       sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %" PRIi64 "\n", pt, val.id, tp, sz);
       sb_printf(&fc->body_sb, "    %%t%d = const.i64 %" PRIi64 "\n", sz_id, sz);
       sb_printf(&fc->body_sb, "    call @__pir_atomic_store_n(%%t%d, %%t%d, %%t%d)\n", addr.id, tp, sz_id);
-      sb_printf(&fc->body_sb, "    jmp .at_done_%d\n", b_done);
-      fc->terminated = true;
-
-      sb_printf(&fc->body_sb, "\n.at_done_%d:\n", b_done);
-      fc->terminated = false;
+      emit_atomic_align_end(&ab, "at", -1, -1, NULL);
     } else if (!strcmp(pt, "f32") || !strcmp(pt, "f64")) {
       const char *it = !strcmp(pt, "f32") ? "i32" : "i64";
       int raw = new_tid();
@@ -1800,34 +1809,16 @@ static PirVal emit_load_node(Node *node, PirVal addr) {
       int tmp = new_tid();
       sb_printf(&fc->body_sb, "    %%t%d = ptr_add.i64 %%loc_%d, 0\n", tmp, slot);
       if (sz > 1) {
-        need_atomic_lock_helpers = true;
-        int b_fast = new_bid(), b_slow = new_bid(), b_done = new_bid();
-        int pi = new_tid(), mis = new_tid(), is_mis = new_tid();
-        sb_printf(&fc->body_sb, "    %%t%d = ptrtoint.i64 %%t%d\n", pi, addr.id);
-        sb_printf(&fc->body_sb, "    %%t%d = and.i64 %%t%d, %" PRIi64 "\n", mis, pi, sz - 1);
-        sb_printf(&fc->body_sb, "    %%t%d = cmp_ne.i64 %%t%d, 0\n", is_mis, mis);
-        sb_printf(&fc->body_sb, "    br %%t%d, .at_slow_%d, .at_fast_%d\n", is_mis, b_slow, b_fast);
-        fc->terminated = true;
-
-        sb_printf(&fc->body_sb, "\n.at_fast_%d:\n", b_fast);
-        fc->terminated = false;
+        AtomicAlignBlocks ab = emit_atomic_align_begin(addr, sz, "at");
         int raw = new_tid();
         sb_printf(&fc->body_sb, "    %%t%d = atomic_load.%s %%t%d [seq_cst]\n", raw, it, addr.id);
         sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d\n", it, raw, tmp, al);
-        sb_printf(&fc->body_sb, "    jmp .at_done_%d\n", b_done);
-        fc->terminated = true;
-
-        sb_printf(&fc->body_sb, "\n.at_slow_%d:\n", b_slow);
-        fc->terminated = false;
+        emit_atomic_align_slow(&ab, "at", -1);
         int sz_id = new_tid();
         sb_printf(&fc->body_sb, "    %%t%d = const.i64 %" PRIi64 "\n", sz_id, sz);
         sb_printf(&fc->body_sb, "    call @__pir_atomic_load_n(%%t%d, %%t%d, %%t%d)\n",
                   tmp, addr.id, sz_id);
-        sb_printf(&fc->body_sb, "    jmp .at_done_%d\n", b_done);
-        fc->terminated = true;
-
-        sb_printf(&fc->body_sb, "\n.at_done_%d:\n", b_done);
-        fc->terminated = false;
+        emit_atomic_align_end(&ab, "at", -1, -1, NULL);
       } else {
         int raw = new_tid();
         sb_printf(&fc->body_sb, "    %%t%d = atomic_load.%s %%t%d [seq_cst]\n", raw, it, addr.id);
@@ -1906,34 +1897,16 @@ static PirVal emit_store_node(Node *lhs, PirVal val, PirVal addr, Node *rhs_node
     if (it) {
       int64_t sz = lhs->ty->size;
       if (sz > 1) {
-        need_atomic_lock_helpers = true;
-        int b_fast = new_bid(), b_slow = new_bid(), b_done = new_bid();
-        int pi = new_tid(), mis = new_tid(), is_mis = new_tid();
-        sb_printf(&fc->body_sb, "    %%t%d = ptrtoint.i64 %%t%d\n", pi, addr.id);
-        sb_printf(&fc->body_sb, "    %%t%d = and.i64 %%t%d, %" PRIi64 "\n", mis, pi, sz - 1);
-        sb_printf(&fc->body_sb, "    %%t%d = cmp_ne.i64 %%t%d, 0\n", is_mis, mis);
-        sb_printf(&fc->body_sb, "    br %%t%d, .at_slow_%d, .at_fast_%d\n", is_mis, b_slow, b_fast);
-        fc->terminated = true;
-
-        sb_printf(&fc->body_sb, "\n.at_fast_%d:\n", b_fast);
-        fc->terminated = false;
+        AtomicAlignBlocks ab = emit_atomic_align_begin(addr, sz, "at");
         int raw = new_tid();
         sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", raw, it, src_ptr.id, src_al);
         sb_printf(&fc->body_sb, "    atomic_store.%s %%t%d, %%t%d [seq_cst]\n", it, raw, addr.id);
-        sb_printf(&fc->body_sb, "    jmp .at_done_%d\n", b_done);
-        fc->terminated = true;
-
-        sb_printf(&fc->body_sb, "\n.at_slow_%d:\n", b_slow);
-        fc->terminated = false;
+        emit_atomic_align_slow(&ab, "at", -1);
         int sz_id = new_tid();
         sb_printf(&fc->body_sb, "    %%t%d = const.i64 %" PRIi64 "\n", sz_id, sz);
         sb_printf(&fc->body_sb, "    call @__pir_atomic_store_n(%%t%d, %%t%d, %%t%d)\n",
                   addr.id, src_ptr.id, sz_id);
-        sb_printf(&fc->body_sb, "    jmp .at_done_%d\n", b_done);
-        fc->terminated = true;
-
-        sb_printf(&fc->body_sb, "\n.at_done_%d:\n", b_done);
-        fc->terminated = false;
+        emit_atomic_align_end(&ab, "at", -1, -1, NULL);
       } else {
         int raw = new_tid();
         sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", raw, it, src_ptr.id, src_al);
@@ -2851,37 +2824,19 @@ static PirVal gen_expr(Node *node) {
         int tmp = new_tid();
         sb_printf(&fc->body_sb, "    %%t%d = ptr_add.i64 %%loc_%d, 0\n", tmp, slot);
         if (sz > 1) {
-          need_atomic_lock_helpers = true;
-          int b_fast = new_bid(), b_slow = new_bid(), b_done = new_bid();
-          int pi = new_tid(), mis = new_tid(), is_mis = new_tid();
-          sb_printf(&fc->body_sb, "    %%t%d = ptrtoint.i64 %%t%d\n", pi, addr.id);
-          sb_printf(&fc->body_sb, "    %%t%d = and.i64 %%t%d, %" PRIi64 "\n", mis, pi, sz - 1);
-          sb_printf(&fc->body_sb, "    %%t%d = cmp_ne.i64 %%t%d, 0\n", is_mis, mis);
-          sb_printf(&fc->body_sb, "    br %%t%d, .at_slow_%d, .at_fast_%d\n", is_mis, b_slow, b_fast);
-          fc->terminated = true;
-
-          sb_printf(&fc->body_sb, "\n.at_fast_%d:\n", b_fast);
-          fc->terminated = false;
+          AtomicAlignBlocks ab = emit_atomic_align_begin(addr, sz, "at");
           int new_raw = new_tid();
           int old_raw = new_tid();
           sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", new_raw, it, src_ptr.id, p2);
           sb_printf(&fc->body_sb, "    %%t%d = atomic_rmw.xchg.%s %%t%d, %%t%d [seq_cst]\n",
                     old_raw, it, addr.id, new_raw);
           sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d\n", it, old_raw, tmp, tmp_al);
-          sb_printf(&fc->body_sb, "    jmp .at_done_%d\n", b_done);
-          fc->terminated = true;
-
-          sb_printf(&fc->body_sb, "\n.at_slow_%d:\n", b_slow);
-          fc->terminated = false;
+          emit_atomic_align_slow(&ab, "at", -1);
           int sz_id = new_tid();
           sb_printf(&fc->body_sb, "    %%t%d = const.i64 %" PRIi64 "\n", sz_id, sz);
           sb_printf(&fc->body_sb, "    call @__pir_atomic_exch_n(%%t%d, %%t%d, %%t%d, %%t%d)\n",
                     addr.id, src_ptr.id, tmp, sz_id);
-          sb_printf(&fc->body_sb, "    jmp .at_done_%d\n", b_done);
-          fc->terminated = true;
-
-          sb_printf(&fc->body_sb, "\n.at_done_%d:\n", b_done);
-          fc->terminated = false;
+          emit_atomic_align_end(&ab, "at", -1, -1, NULL);
         } else {
           int new_raw = new_tid();
           int old_raw = new_tid();
@@ -2911,17 +2866,7 @@ static PirVal gen_expr(Node *node) {
     const char *pt = is_flonum(ty) ? ((ty->kind == TY_FLOAT) ? "f32" : "f64") : pir_scalar_ty_name(ty);
     int64_t sz = ty->size > 0 ? ty->size : (pir_ty_bits(pt) / 8);
     if (sz > 1 && sz <= 8) {
-      need_atomic_lock_helpers = true;
-      int b_fast = new_bid(), b_slow = new_bid(), b_done = new_bid();
-      int pi = new_tid(), mis = new_tid(), is_mis = new_tid();
-      sb_printf(&fc->body_sb, "    %%t%d = ptrtoint.i64 %%t%d\n", pi, addr.id);
-      sb_printf(&fc->body_sb, "    %%t%d = and.i64 %%t%d, %" PRIi64 "\n", mis, pi, sz - 1);
-      sb_printf(&fc->body_sb, "    %%t%d = cmp_ne.i64 %%t%d, 0\n", is_mis, mis);
-      sb_printf(&fc->body_sb, "    br %%t%d, .at_slow_%d, .at_fast_%d\n", is_mis, b_slow, b_fast);
-      fc->terminated = true;
-
-      sb_printf(&fc->body_sb, "\n.at_fast_%d:\n", b_fast);
-      fc->terminated = false;
+      AtomicAlignBlocks ab = emit_atomic_align_begin(addr, sz, "at");
       int rf = new_tid();
       if (is_flonum(ty)) {
         const char *it = (ty->kind == TY_FLOAT) ? "i32" : "i64";
@@ -2934,11 +2879,7 @@ static PirVal gen_expr(Node *node) {
         sb_printf(&fc->body_sb, "    %%t%d = atomic_rmw.xchg.%s %%t%d, %%t%d [seq_cst]\n",
                   rf, pt, addr.id, val.id);
       }
-      sb_printf(&fc->body_sb, "    jmp .at_done_%d(%%t%d)\n", b_done, rf);
-      fc->terminated = true;
-
-      sb_printf(&fc->body_sb, "\n.at_slow_%d:\n", b_slow);
-      fc->terminated = false;
+      emit_atomic_align_slow(&ab, "at", rf);
       int new_slot = emit_entry_scalar_alloca(pt, sz, (int32_t)sz);
       int old_slot = emit_entry_scalar_alloca(pt, sz, (int32_t)sz);
       int np = new_tid(), op = new_tid(), sz_id = new_tid(), rs = new_tid();
@@ -2949,12 +2890,8 @@ static PirVal gen_expr(Node *node) {
       sb_printf(&fc->body_sb, "    call @__pir_atomic_exch_n(%%t%d, %%t%d, %%t%d, %%t%d)\n",
                 addr.id, np, op, sz_id);
       sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %" PRIi64 "\n", rs, pt, op, sz);
-      sb_printf(&fc->body_sb, "    jmp .at_done_%d(%%t%d)\n", b_done, rs);
-      fc->terminated = true;
-
       int r = new_tid();
-      sb_printf(&fc->body_sb, "\n.at_done_%d(%%t%d: %s):\n", b_done, r, pt);
-      fc->terminated = false;
+      emit_atomic_align_end(&ab, "at", rs, r, pt);
       PirVal v = {r, pt};
       return is_flonum(ty) ? v : emit_bitint_norm(v, node->ty);
     }
@@ -3027,17 +2964,8 @@ static PirVal gen_expr(Node *node) {
 
     int64_t cas_sz = ty->size > 0 ? ty->size : (pir_ty_bits(it) / 8);
     if (cas_sz > 1 && cas_sz <= 8) {
-      need_atomic_lock_helpers = true;
-      int b_fast = new_bid(), b_slow = new_bid(), b_done = new_bid();
-      int pi = new_tid(), mis = new_tid(), is_mis = new_tid();
-      sb_printf(&fc->body_sb, "    %%t%d = ptrtoint.i64 %%t%d\n", pi, addr.id);
-      sb_printf(&fc->body_sb, "    %%t%d = and.i64 %%t%d, %" PRIi64 "\n", mis, pi, cas_sz - 1);
-      sb_printf(&fc->body_sb, "    %%t%d = cmp_ne.i64 %%t%d, 0\n", is_mis, mis);
-      sb_printf(&fc->body_sb, "    br %%t%d, .cas_slow_%d, .cas_fast_%d\n", is_mis, b_slow, b_fast);
-      fc->terminated = true;
-
-      sb_printf(&fc->body_sb, "\n.cas_fast_%d:\n", b_fast);
-      fc->terminated = false;
+      AtomicAlignBlocks ab = emit_atomic_align_begin(addr, cas_sz, "cas");
+      int b_slow = ab.b_slow, b_done = ab.b_done;
       int exp_id = new_tid();
       sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", exp_id, it, eff_old.id, p2_old);
       int new_id = eff_new.id;

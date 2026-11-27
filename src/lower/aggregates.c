@@ -279,40 +279,11 @@ static bool lower_mem_intrinsic(PirModule *mod, const PirTargetSpec *target,
     ptys[1] = (inst->op == PIR_OP_MEMSET) ? pir_type_scalar(PIR_SCALAR_I32)
                                           : pir_type_scalar(PIR_SCALAR_PTR);
     ptys[2] = idx_ty;
-    /* Ensure symbol name does not collide with an existing global, sig, or aggregate type. */
-    for (uint32_t gi = 0u; gi < mod->globals.len; ++gi) {
-        if (mod->globals.data[gi].name && strcmp(mod->globals.data[gi].name, cname) == 0) {
-            pir_diag_error(diag, inst->src_line, 0u,
-                           "symbol '@%s' collides with global during memory intrinsic lowering", cname);
-            return false;
-        }
-    }
-    for (uint32_t si = 0u; si < mod->sigs.len; ++si) {
-        if (mod->sigs.data[si].name && strcmp(mod->sigs.data[si].name, cname) == 0) {
-            pir_diag_error(diag, inst->src_line, 0u,
-                           "symbol '@%s' collides with signature during memory intrinsic lowering", cname);
-            return false;
-        }
-    }
-    PirFuncId cid = pir_ensure_extern_func(mod, cname, ptys, 3u, pir_type_scalar(PIR_SCALAR_PTR));
-    const PirFunction *callee = &mod->funcs.data[cid];
-    bool sig_ok = (!callee->is_variadic && callee->param_count == 3u &&
-                   callee->cc == PIR_CC_C && callee->linkage != PIR_LINK_INTERNAL &&
-                   callee->cabi_ret.kind == PIR_CABI_RET_NONE &&
-                   pir_type_eq(callee->ret_type, pir_type_scalar(PIR_SCALAR_PTR)));
-    for (uint32_t k = 0u; k < 3u && sig_ok; ++k) {
-        if (callee->params[k].abi_kind != PIR_PARAM_NORMAL ||
-            callee->params[k].abi_byval_size != 0u ||
-            callee->params[k].abi_stack_align != 0u ||
-            callee->params[k].abi_force_stack ||
-            !pir_type_eq(callee->params[k].type, ptys[k])) {
-            sig_ok = false;
-        }
-    }
-    if (!sig_ok) {
-        pir_diag_error(diag, inst->src_line, 0u,
-                       "predeclared '@%s' has incompatible signature for memory intrinsic lowering",
-                       cname);
+    PirFuncId cid = pir_ensure_verified_extern_func(mod, cname, ptys, 3u,
+                                                    pir_type_scalar(PIR_SCALAR_PTR),
+                                                    inst->src_line,
+                                                    "memory intrinsic lowering", diag);
+    if (cid == PIR_INVALID_ID) {
         return false;
     }
     fn = &mod->funcs.data[fi]; /* Re-fetch after potential mod->funcs realloc */
@@ -428,15 +399,15 @@ static uint64_t gitem_vec_bytes_since(const GItemVec *v, uint32_t start, uint8_t
     return total;
 }
 
-static bool is_pad_only_type_rec(const PirModule *mod, PirType ty, int8_t *cache, uint32_t depth) {
-    if (depth > 256u || ty.kind != PIR_TYPE_NAMED_AGG || ty.u.agg_id >= mod->agg_types.len) {
+static bool pir_agg_is_pad_only_rec(const PirModule *mod, PirType ty, int8_t *cache, uint32_t depth) {
+    if (depth > 256u || !mod || ty.kind != PIR_TYPE_NAMED_AGG || ty.u.agg_id >= mod->agg_types.len) {
         return false;
     }
     uint32_t aid = ty.u.agg_id;
     if (cache) {
         if (cache[aid] == 1) return true;
         if (cache[aid] == 0 || cache[aid] == 2) return false;
-        cache[aid] = 2;
+        cache[aid] = 2; /* visiting */
     }
     const PirAggDef *agg = &mod->agg_types.data[aid];
     bool res = false;
@@ -445,14 +416,14 @@ static bool is_pad_only_type_rec(const PirModule *mod, PirType ty, int8_t *cache
             res = true;
             break;
         case PIR_AGG_ARRAY:
-            res = is_pad_only_type_rec(mod, agg->elem_type, cache, depth + 1u);
+            res = (agg->array_len == 0u || pir_agg_is_pad_only_rec(mod, agg->elem_type, cache, depth + 1u));
             break;
         case PIR_AGG_STRUCT:
         case PIR_AGG_PACKED_STRUCT:
         case PIR_AGG_UNION:
             res = (agg->field_count > 0u);
             for (uint32_t f = 0u; f < agg->field_count && res; ++f) {
-                if (!is_pad_only_type_rec(mod, agg->fields[f], cache, depth + 1u)) res = false;
+                if (!pir_agg_is_pad_only_rec(mod, agg->fields[f], cache, depth + 1u)) res = false;
             }
             break;
     }
@@ -460,8 +431,23 @@ static bool is_pad_only_type_rec(const PirModule *mod, PirType ty, int8_t *cache
     return res;
 }
 
+bool pir_agg_is_pad_only_cached(const PirModule *mod, PirType ty, int8_t *cache) {
+    return pir_agg_is_pad_only_rec(mod, ty, cache, 0u);
+}
+
+bool pir_agg_is_pad_only(const PirModule *mod, PirType ty) {
+    if (ty.kind != PIR_TYPE_NAMED_AGG || !mod || mod->agg_types.len == 0u) return false;
+    int8_t stack_cache[64];
+    int8_t *cache = (mod->agg_types.len <= 64u) ? stack_cache : (int8_t *)malloc(mod->agg_types.len);
+    if (!cache) abort();
+    memset(cache, -1, mod->agg_types.len);
+    bool r = pir_agg_is_pad_only_rec(mod, ty, cache, 0u);
+    if (cache != stack_cache) free(cache);
+    return r;
+}
+
 static bool is_pad_only_type(const PirModule *mod, PirType ty, int8_t *cache) {
-    return is_pad_only_type_rec(mod, ty, cache, 0u);
+    return pir_agg_is_pad_only_cached(mod, ty, cache);
 }
 
 static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirType ty,

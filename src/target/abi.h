@@ -39,6 +39,28 @@ typedef struct {
     uint32_t fp_used;
 } PirAbiRegState;
 
+/* Unified variadic argument plan derived directly from pir_abi_classify_param */
+typedef struct {
+    PirType       arg_ty;      /* Original va_arg / va_arg_buf type */
+    PirType       load_ty;     /* Promoted load type (f32 -> f64 for scalar va_arg) */
+    uint64_t      size;        /* Size of load_ty in bytes */
+    uint32_t      align;       /* Effective alignment of load_ty in bytes */
+    uint32_t      nat_align;   /* Natural alignment of load_ty (ignoring outer _Alignas) */
+    PirAbiArgInfo abi;         /* Fresh-state pir_abi_classify_param result */
+    bool          abi_valid;   /* Whether pir_abi_classify_param succeeded */
+    bool          is_buf;      /* True for va_arg_buf (aggregate), false for scalar/vector */
+    bool          promote_f32; /* True when scalar f32 promotes to f64 */
+    bool          is_empty;    /* Zero-size or pad-only aggregate (no advance, no copy) */
+    bool          is_indirect; /* Passed via hidden pointer (caller copy) */
+    bool          is_hfa;      /* AAPCS64 HFA/HVA composite in FP reg save area */
+    bool          is_fp;       /* Uses FP reg save area */
+    bool          force_mem;   /* Always passed in overflow/stack area, never reg save area */
+    bool          split_vec;   /* Oversized vector split into piece-wise va_args */
+    uint64_t      mem_step;    /* Overflow/stack cursor advance in bytes */
+    uint64_t      mem_align;   /* Overflow/stack alignment (<= slot_sz means no dynamic align) */
+    bool          align_gp16;  /* Linux AAPCS64: round __gr_offs up to 16 bytes */
+} PirVaArgPlan;
+
 /* Shared aggregate/vector ABI helper queries */
 bool     pir_abi_is_pad_only_agg(const PirModule *mod, PirType ty);
 uint32_t pir_abi_natural_align(const PirModule *mod, const PirTargetSpec *target, PirType ty);
@@ -53,6 +75,10 @@ bool pir_abi_classify_param(const PirModule *mod, const PirTargetSpec *target,
 /* Classify a C ABI retbuf(@T) return aggregate. */
 bool pir_abi_classify_retbuf(const PirModule *mod, const PirTargetSpec *target,
                              PirType agg_ty, PirAbiArgInfo *out);
+
+/* Build a unified variadic argument lowering plan from the target's C ABI classifier. */
+void pir_abi_plan_va_arg(const PirModule *mod, const PirTargetSpec *target,
+                         PirType arg_ty, bool is_buf, PirVaArgPlan *out);
 
 /* Target-specific classifiers */
 bool pir_abi_sysv_x64_param(const PirModule *mod, const PirTargetSpec *target,

@@ -11,83 +11,13 @@
 #include "analysis/cfg.h"
 #include "lower/lower.h"
 
-static bool inst_is_live_root(const PirInst *ins) {
-    uint32_t trap_ub = PIR_FLAG_TRAP | PIR_FLAG_TRAP_S | PIR_FLAG_TRAP_U |
-                       PIR_FLAG_UNSAFE | PIR_FLAG_UNSAFE_S | PIR_FLAG_UNSAFE_U;
-    switch (ins->op) {
-        case PIR_OP_JMP:
-        case PIR_OP_BR:
-        case PIR_OP_SWITCH:
-        case PIR_OP_INVOKE:
-        case PIR_OP_INVOKE_INDIRECT:
-        case PIR_OP_RESUME:
-        case PIR_OP_RET:
-        case PIR_OP_TRAP:
-        case PIR_OP_UNREACHABLE:
-        case PIR_OP_STORE:
-        case PIR_OP_MEMCPY:
-        case PIR_OP_MEMMOVE:
-        case PIR_OP_MEMSET:
-        case PIR_OP_ATOMIC_LOAD:
-        case PIR_OP_ATOMIC_STORE:
-        case PIR_OP_ATOMIC_RMW:
-        case PIR_OP_ATOMIC_CMPXCHG:
-        case PIR_OP_FENCE:
-        case PIR_OP_CALL:
-        case PIR_OP_CALL_INDIRECT:
-        case PIR_OP_VA_START:
-        case PIR_OP_VA_ARG:
-        case PIR_OP_VA_ARG_BUF:
-        case PIR_OP_VA_COPY:
-        case PIR_OP_VA_END:
-        case PIR_OP_STACKRESTORE:
-        case PIR_OP_ALLOCA_DYN:
-        case PIR_OP_DIV_S:
-        case PIR_OP_DIV_U:
-        case PIR_OP_REM_S:
-        case PIR_OP_REM_U:
-            return true;
-        case PIR_OP_LOAD:
-            return (ins->flags & PIR_FLAG_VOLATILE) != 0u;
-        case PIR_OP_FPTOSI:
-        case PIR_OP_FPTOUI:
-            return (ins->flags & PIR_FLAG_SAT) == 0u;
-        case PIR_OP_CLZ:
-        case PIR_OP_CTZ:
-            return (ins->flags & PIR_FLAG_NONZERO) != 0u;
-        case PIR_OP_ADD:
-        case PIR_OP_SUB:
-        case PIR_OP_MUL:
-        case PIR_OP_SHL:
-        case PIR_OP_SHR:
-        case PIR_OP_SAR:
-            return (ins->flags & trap_ub) != 0u;
-        case PIR_OP_CONST: case PIR_OP_ADDR:
-        case PIR_OP_ADD_OVF_S: case PIR_OP_ADD_OVF_U:
-        case PIR_OP_SUB_OVF_S: case PIR_OP_SUB_OVF_U:
-        case PIR_OP_MUL_OVF_S: case PIR_OP_MUL_OVF_U:
-        case PIR_OP_MUL_WIDE_U: case PIR_OP_MUL_WIDE_S:
-        case PIR_OP_ADD_CARRY: case PIR_OP_SUB_BORROW:
-        case PIR_OP_AND: case PIR_OP_OR: case PIR_OP_XOR:
-        case PIR_OP_POPCNT: case PIR_OP_BSWAP:
-        case PIR_OP_FADD: case PIR_OP_FSUB: case PIR_OP_FMUL: case PIR_OP_FDIV: case PIR_OP_FNEG:
-        case PIR_OP_CMP_EQ: case PIR_OP_CMP_NE:
-        case PIR_OP_CMP_LT_S: case PIR_OP_CMP_LT_U: case PIR_OP_CMP_LE_S: case PIR_OP_CMP_LE_U:
-        case PIR_OP_CMP_GT_S: case PIR_OP_CMP_GT_U: case PIR_OP_CMP_GE_S: case PIR_OP_CMP_GE_U:
-        case PIR_OP_FCMP_OEQ: case PIR_OP_FCMP_ONE: case PIR_OP_FCMP_OLT:
-        case PIR_OP_FCMP_OLE: case PIR_OP_FCMP_OGT: case PIR_OP_FCMP_OGE:
-        case PIR_OP_FCMP_UEQ: case PIR_OP_FCMP_UNE: case PIR_OP_FCMP_ULT:
-        case PIR_OP_FCMP_ULE: case PIR_OP_FCMP_UGT: case PIR_OP_FCMP_UGE:
-        case PIR_OP_SELECT:
-        case PIR_OP_ZEXT: case PIR_OP_SEXT: case PIR_OP_TRUNC:
-        case PIR_OP_SITOFP: case PIR_OP_UITOFP: case PIR_OP_FPEXT: case PIR_OP_FPTRUNC:
-        case PIR_OP_BITCAST: case PIR_OP_PTRTOINT: case PIR_OP_INTTOPTR:
-        case PIR_OP_SPLAT: case PIR_OP_EXTRACT: case PIR_OP_INSERT: case PIR_OP_SHUFFLE:
-        case PIR_OP_ALLOCA: case PIR_OP_ALLOCA_PTR: case PIR_OP_STACKSAVE:
-        case PIR_OP_FIELD_PTR: case PIR_OP_ELEM_PTR: case PIR_OP_PTR_ADD:
-            return false;
+static bool inst_is_live_root(const PirModule *mod, const PirFunction *fn, const PirInst *ins) {
+    uint32_t eff = pir_inst_effects(mod, fn, ins);
+    if ((eff & (PIR_EFF_CONTROL_FLOW | PIR_EFF_MAY_TRAP | PIR_EFF_MAY_WRITE_MEM |
+                PIR_EFF_MEM_BARRIER | PIR_EFF_HAS_UB_FLAG)) != 0u) {
+        return true;
     }
-    return false;
+    return ins->op == PIR_OP_CALL;
 }
 
 typedef struct {
@@ -193,7 +123,7 @@ void pir_opt_dce(PirModule *mod, PirFunction *fn) {
         }
         for (uint32_t j = 0u; j < blk->insts.len; ++j) {
             PirInstId iid = blk->insts.data[j];
-            if (inst_is_live_root(&fn->insts.data[iid])) {
+            if (inst_is_live_root(mod, fn, &fn->insts.data[iid])) {
                 mark_inst(&ctx, iid);
             }
         }

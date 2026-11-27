@@ -31,10 +31,12 @@ bool pir_legalize_i128(PirModule *mod, const PirTargetSpec *target, PirDiag *dia
 bool pir_legalize_simd(PirModule *mod, const PirTargetSpec *target, PirDiag *diag);
 bool pir_legalize_optional_ops(PirModule *mod, const PirTargetSpec *target, PirDiag *diag);
 
-/* Layout queries (reused by aggregates, cabi, and tests) */
+/* Layout & aggregate property queries (single source of truth across verifier, lowering, ABI) */
 PirTypeLayout pir_type_layout(const PirModule *mod, const PirTargetSpec *target, PirType ty);
 uint64_t      pir_field_offset(const PirModule *mod, const PirTargetSpec *target,
                                PirTypeId agg_id, uint32_t field_idx);
+bool          pir_agg_is_pad_only_cached(const PirModule *mod, PirType ty, int8_t *cache);
+bool          pir_agg_is_pad_only(const PirModule *mod, PirType ty);
 
 /* Shared IR builder helpers for lowering & optimization passes */
 PirValueId pir_fn_new_val(PirModule *mod, PirFunction *fn, const char *prefix,
@@ -47,10 +49,15 @@ PirOperand pir_op_val(PirValueId id, PirType ty);
 PirOperand pir_op_imm_i(uint64_t val, bool is_neg, PirType ty);
 PirOperand pir_op_imm_f(uint64_t bits, PirType ty);
 PirOperand pir_op_sym_func(const char *name, PirFuncId id);
+void       pir_op_strip_call_meta(PirOperand *op);
 PirOperand *pir_alloc_ops(PirModule *mod, uint32_t n);
 PirFuncId  pir_ensure_extern_func(PirModule *mod, const char *name,
                                   const PirType *param_tys, uint32_t param_count,
                                   PirType ret_ty);
+PirFuncId  pir_ensure_verified_extern_func(PirModule *mod, const char *name,
+                                           const PirType *param_tys, uint32_t param_count,
+                                           PirType ret_ty, uint32_t src_line,
+                                           const char *pass_ctx, PirDiag *diag);
 void       pir_fn_replace_val_uses(PirFunction *fn, PirValueId old_v, PirValueId new_v);
 PirValueId pir_emit_ptr_add_const(PirModule *mod, PirFunction *fn, PirBlockId b,
                                   PirInstIdVec *out, PirValueId base, uint64_t off,

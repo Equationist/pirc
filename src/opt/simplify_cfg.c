@@ -285,27 +285,19 @@ static bool thread_empty_jumps(PirModule *mod, PirFunction *fn, const PirCfg *cf
     return changed;
 }
 
-static bool is_pure_speculatable_alu(const PirFunction *fn, const PirInst *ins, bool allow_cmp) {
+static bool is_pure_speculatable_alu(const PirModule *mod, const PirFunction *fn,
+                                     const PirInst *ins, bool allow_cmp) {
     if (ins->results[0] == PIR_INVALID_ID || ins->results[1] != PIR_INVALID_ID) return false;
     if (ins->ty.kind != PIR_TYPE_SCALAR) return false;
-    uint32_t bad_flags = PIR_FLAG_TRAP | PIR_FLAG_TRAP_S | PIR_FLAG_TRAP_U |
-                         PIR_FLAG_UNSAFE | PIR_FLAG_NONZERO | PIR_FLAG_VOLATILE;
-    if ((ins->flags & bad_flags) != 0u) return false;
-    bool has_unsafe_int = (ins->flags & (PIR_FLAG_UNSAFE_S | PIR_FLAG_UNSAFE_U)) != 0u;
-    if (has_unsafe_int &&
-        ins->op != PIR_OP_ADD && ins->op != PIR_OP_SUB && ins->op != PIR_OP_MUL) {
-        return false;
-    }
+    if ((pir_inst_effects(mod, fn, ins) & PIR_EFF_PURE_HOISTABLE) == 0u) return false;
 
     PirOpcode op = ins->op;
-    if (op == PIR_OP_SELECT) {
-        return ins->operand_count == 3u && pir_operand_is_proven_bool_i8(fn, ins->operands[0]);
-    }
     if (op == PIR_OP_CONST) {
-        /* Never speculatively hoist symbol addresses (e.g., weak extern TLS triggers a TLV thunk). */
+        /* Never speculatively hoist symbol addresses (e.g., weak extern TLS or GOT loads). */
         return ins->operand_count >= 1u && ins->operands[0].kind != PIR_OPER_SYM;
     }
-    if (op == PIR_OP_ADD || op == PIR_OP_SUB || op == PIR_OP_MUL ||
+    if (op == PIR_OP_SELECT ||
+        op == PIR_OP_ADD || op == PIR_OP_SUB || op == PIR_OP_MUL ||
         op == PIR_OP_AND || op == PIR_OP_OR || op == PIR_OP_XOR ||
         op == PIR_OP_SHL || op == PIR_OP_SHR || op == PIR_OP_SAR ||
         op == PIR_OP_ZEXT || op == PIR_OP_SEXT || op == PIR_OP_TRUNC ||
@@ -354,7 +346,7 @@ static bool if_convert_diamonds(PirModule *mod, PirFunction *fn, const PirCfg *c
 
             bool alu_ok = true;
             for (uint32_t j = 0u; j < n_alu; ++j) {
-                if (!is_pure_speculatable_alu(fn, &fn->insts.data[sb->insts.data[j]], false)) {
+                if (!is_pure_speculatable_alu(mod, fn, &fn->insts.data[sb->insts.data[j]], false)) {
                     alu_ok = false;
                     break;
                 }
@@ -450,10 +442,10 @@ static bool if_convert_diamonds(PirModule *mod, PirFunction *fn, const PirCfg *c
                                fjmp->targets[0].arg_count == nparams &&
                                nparams <= 4u);
                     for (uint32_t j = 0u; j < nt && ok; ++j) {
-                        if (!is_pure_speculatable_alu(fn, &fn->insts.data[tb->insts.data[j]], false)) ok = false;
+                        if (!is_pure_speculatable_alu(mod, fn, &fn->insts.data[tb->insts.data[j]], false)) ok = false;
                     }
                     for (uint32_t j = 0u; j < nf && ok; ++j) {
-                        if (!is_pure_speculatable_alu(fn, &fn->insts.data[fb->insts.data[j]], false)) ok = false;
+                        if (!is_pure_speculatable_alu(mod, fn, &fn->insts.data[fb->insts.data[j]], false)) ok = false;
                     }
                     for (uint32_t k = 0u; k < nparams && ok; ++k) {
                         if (fn->values.data[fn->blocks.data[mblk].params.data[k]].type.kind != PIR_TYPE_SCALAR) {
@@ -909,14 +901,7 @@ static bool eliminate_self_tail_calls(PirModule *mod, PirFunction *fn) {
             PirOperand *jargs = pir_alloc_ops(mod, lp_argc);
             for (uint32_t k = 0u; k < np; ++k) {
                 PirOperand a = call_copy.operands[1u + k];
-                a.has_explicit_type   = false;
-                a.call_abi            = PIR_PARAM_NORMAL;
-                a.call_abi_type       = pir_type_scalar(PIR_SCALAR_VOID);
-                a.call_byval_size     = 0u;
-                a.call_byval_align    = 0u;
-                a.call_stack_align    = 0u;
-                a.call_force_stack    = false;
-                a.call_no_f32_promote = false;
+                pir_op_strip_call_meta(&a);
                 jargs[k] = a;
             }
             jargs[np] = pir_op_val(nacc, fn->ret_type);
@@ -937,14 +922,7 @@ static bool eliminate_self_tail_calls(PirModule *mod, PirFunction *fn) {
             PirOperand *jargs = lp_argc ? pir_alloc_ops(mod, lp_argc) : NULL;
             for (uint32_t k = 0u; k < np; ++k) {
                 PirOperand a = call_copy.operands[1u + k];
-                a.has_explicit_type   = false;
-                a.call_abi            = PIR_PARAM_NORMAL;
-                a.call_abi_type       = pir_type_scalar(PIR_SCALAR_VOID);
-                a.call_byval_size     = 0u;
-                a.call_byval_align    = 0u;
-                a.call_stack_align    = 0u;
-                a.call_force_stack    = false;
-                a.call_no_f32_promote = false;
+                pir_op_strip_call_meta(&a);
                 jargs[k] = a;
             }
             if (use_acc) jargs[np] = pir_op_val(acc_param, fn->ret_type);
@@ -1178,7 +1156,7 @@ static bool try_rotate_one_loop(PirModule *mod, PirFunction *fn, const PirCfg *c
 
         bool alu_ok = true;
         for (uint32_t j = 0u; j < n_alu; ++j) {
-            if (!is_pure_speculatable_alu(fn, &fn->insts.data[hb->insts.data[j]], true)) {
+            if (!is_pure_speculatable_alu(mod, fn, &fn->insts.data[hb->insts.data[j]], true)) {
                 alu_ok = false;
                 break;
             }

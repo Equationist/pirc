@@ -56,63 +56,6 @@ static void resolve_ops(PirValueId *alias, uint32_t nvals, PirOperand *ops, uint
     }
 }
 
-static bool is_mem_barrier(PirOpcode op) {
-    switch (op) {
-        case PIR_OP_CALL:
-        case PIR_OP_CALL_INDIRECT:
-        case PIR_OP_INVOKE:
-        case PIR_OP_INVOKE_INDIRECT:
-        case PIR_OP_RESUME:
-        case PIR_OP_ATOMIC_LOAD:
-        case PIR_OP_ATOMIC_STORE:
-        case PIR_OP_ATOMIC_RMW:
-        case PIR_OP_ATOMIC_CMPXCHG:
-        case PIR_OP_FENCE:
-        case PIR_OP_VA_START:
-        case PIR_OP_VA_ARG:
-        case PIR_OP_VA_ARG_BUF:
-        case PIR_OP_VA_COPY:
-        case PIR_OP_VA_END:
-        case PIR_OP_STACKRESTORE:
-        case PIR_OP_MEMCPY:
-        case PIR_OP_MEMMOVE:
-        case PIR_OP_MEMSET:
-            return true;
-        case PIR_OP_CONST: case PIR_OP_ADDR:
-        case PIR_OP_ADD: case PIR_OP_SUB: case PIR_OP_MUL:
-        case PIR_OP_DIV_S: case PIR_OP_DIV_U: case PIR_OP_REM_S: case PIR_OP_REM_U:
-        case PIR_OP_ADD_OVF_S: case PIR_OP_ADD_OVF_U:
-        case PIR_OP_SUB_OVF_S: case PIR_OP_SUB_OVF_U:
-        case PIR_OP_MUL_OVF_S: case PIR_OP_MUL_OVF_U:
-        case PIR_OP_MUL_WIDE_U: case PIR_OP_MUL_WIDE_S:
-        case PIR_OP_ADD_CARRY: case PIR_OP_SUB_BORROW:
-        case PIR_OP_AND: case PIR_OP_OR: case PIR_OP_XOR:
-        case PIR_OP_SHL: case PIR_OP_SHR: case PIR_OP_SAR:
-        case PIR_OP_CLZ: case PIR_OP_CTZ: case PIR_OP_POPCNT: case PIR_OP_BSWAP:
-        case PIR_OP_FADD: case PIR_OP_FSUB: case PIR_OP_FMUL: case PIR_OP_FDIV: case PIR_OP_FNEG:
-        case PIR_OP_CMP_EQ: case PIR_OP_CMP_NE:
-        case PIR_OP_CMP_LT_S: case PIR_OP_CMP_LT_U: case PIR_OP_CMP_LE_S: case PIR_OP_CMP_LE_U:
-        case PIR_OP_CMP_GT_S: case PIR_OP_CMP_GT_U: case PIR_OP_CMP_GE_S: case PIR_OP_CMP_GE_U:
-        case PIR_OP_FCMP_OEQ: case PIR_OP_FCMP_ONE: case PIR_OP_FCMP_OLT:
-        case PIR_OP_FCMP_OLE: case PIR_OP_FCMP_OGT: case PIR_OP_FCMP_OGE:
-        case PIR_OP_FCMP_UEQ: case PIR_OP_FCMP_UNE: case PIR_OP_FCMP_ULT:
-        case PIR_OP_FCMP_ULE: case PIR_OP_FCMP_UGT: case PIR_OP_FCMP_UGE:
-        case PIR_OP_SELECT:
-        case PIR_OP_ZEXT: case PIR_OP_SEXT: case PIR_OP_TRUNC:
-        case PIR_OP_FPTOSI: case PIR_OP_FPTOUI: case PIR_OP_SITOFP: case PIR_OP_UITOFP:
-        case PIR_OP_FPEXT: case PIR_OP_FPTRUNC: case PIR_OP_BITCAST:
-        case PIR_OP_PTRTOINT: case PIR_OP_INTTOPTR:
-        case PIR_OP_SPLAT: case PIR_OP_EXTRACT: case PIR_OP_INSERT: case PIR_OP_SHUFFLE:
-        case PIR_OP_ALLOCA: case PIR_OP_ALLOCA_PTR: case PIR_OP_ALLOCA_DYN:
-        case PIR_OP_STACKSAVE: case PIR_OP_FIELD_PTR: case PIR_OP_ELEM_PTR:
-        case PIR_OP_PTR_ADD: case PIR_OP_LOAD: case PIR_OP_STORE:
-        case PIR_OP_JMP: case PIR_OP_BR: case PIR_OP_SWITCH:
-        case PIR_OP_RET: case PIR_OP_TRAP: case PIR_OP_UNREACHABLE:
-            return false;
-    }
-    return false;
-}
-
 typedef struct {
     PirModule           *mod;
     PirFunction         *fn;
@@ -247,18 +190,17 @@ static void dse_process_block(DseCtx *ctx, PirBlockId b, const ActiveLoadVec *pa
                     al.size = lsz;
                     PIR_VEC_PUSH(&loads, al);
                 }
-            } else if (is_mem_barrier(ins->op) && !pir_inst_is_pure_math_call(ctx->mod, fn, ins)) {
-                active.len = 0u;
-                loads.len  = 0u;
-            } else if (ins->op == PIR_OP_TRAP ||
-                       (ins->flags & (PIR_FLAG_TRAP | PIR_FLAG_TRAP_S | PIR_FLAG_TRAP_U)) != 0u ||
-                       ((ins->op == PIR_OP_DIV_S || ins->op == PIR_OP_DIV_U ||
-                         ins->op == PIR_OP_REM_S || ins->op == PIR_OP_REM_U) &&
-                        (ins->flags & PIR_FLAG_UNSAFE) == 0u)) {
-                /* Deterministic traps may be observed by signal/trap handlers; do not delete
-                 * preceding stores that must be visible before the trap fires. */
-                for (uint32_t k = 0u; k < active.len; ++k) {
-                    active.data[k].observed = true;
+            } else {
+                uint32_t eff = pir_inst_effects(ctx->mod, fn, ins);
+                if ((eff & PIR_EFF_MEM_BARRIER) != 0u) {
+                    active.len = 0u;
+                    loads.len  = 0u;
+                } else if ((eff & PIR_EFF_MAY_TRAP) != 0u) {
+                    /* Deterministic traps may be observed by signal/trap handlers; do not delete
+                     * preceding stores that must be visible before the trap fires. */
+                    for (uint32_t k = 0u; k < active.len; ++k) {
+                        active.data[k].observed = true;
+                    }
                 }
             }
         }

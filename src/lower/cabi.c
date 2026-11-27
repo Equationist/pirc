@@ -78,14 +78,7 @@ static bool build_plan(const PirModule *mod, const PirTargetSpec *target,
 }
 
 static PirOperand clear_call_meta(PirOperand op) {
-    op.call_abi            = PIR_PARAM_NORMAL;
-    op.call_abi_type       = pir_type_scalar(PIR_SCALAR_VOID);
-    op.call_stack_align    = 0u;
-    op.call_byval_size     = 0u;
-    op.call_byval_align    = 0u;
-    op.call_force_stack    = false;
-    op.call_no_f32_promote = false;
-    op.has_explicit_type   = false;
+    pir_op_strip_call_meta(&op);
     return op;
 }
 

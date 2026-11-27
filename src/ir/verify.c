@@ -2183,39 +2183,8 @@ static void verify_scalar_global_item(Verifier *v, const PirGlobal *g, PirScalar
     }
 }
 
-static bool agg_type_is_pad_only_rec(const PirModule *mod, PirType ty, int8_t *cache, uint32_t depth) {
-    if (depth > 256u) return false;
-    if (ty.kind != PIR_TYPE_NAMED_AGG || ty.u.agg_id >= mod->agg_types.len) return false;
-    uint32_t aid = ty.u.agg_id;
-    if (cache) {
-        if (cache[aid] == 1) return true;
-        if (cache[aid] == 0 || cache[aid] == 2) return false;
-        cache[aid] = 2; /* visiting */
-    }
-    const PirAggDef *ad = &mod->agg_types.data[aid];
-    bool res = false;
-    switch (ad->kind) {
-        case PIR_AGG_PAD:
-            res = true;
-            break;
-        case PIR_AGG_ARRAY:
-            res = agg_type_is_pad_only_rec(mod, ad->elem_type, cache, depth + 1u);
-            break;
-        case PIR_AGG_STRUCT:
-        case PIR_AGG_PACKED_STRUCT:
-        case PIR_AGG_UNION:
-            res = (ad->field_count > 0u);
-            for (uint32_t f = 0u; f < ad->field_count && res; ++f) {
-                if (!agg_type_is_pad_only_rec(mod, ad->fields[f], cache, depth + 1u)) res = false;
-            }
-            break;
-    }
-    if (cache) cache[aid] = res ? 1 : 0;
-    return res;
-}
-
 static bool agg_type_is_pad_only(const PirModule *mod, PirType ty, int8_t *cache) {
-    return agg_type_is_pad_only_rec(mod, ty, cache, 0u);
+    return pir_agg_is_pad_only_cached(mod, ty, cache);
 }
 
 static bool agg_contains_valist_rec(const PirModule *mod, PirType ty, int8_t *cache, uint32_t depth) {

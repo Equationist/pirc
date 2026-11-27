@@ -140,11 +140,7 @@ static bool a64_emit_header(PirCodeEmitter *em, const PirModule *mod,
     A64AsmCtx *ctx = (A64AsmCtx *)em->ctx;
     FILE *out = ctx->out;
 
-    if (pir_asm_is_macho(target)) {
-        fprintf(out, "\t.section __TEXT,__text,regular,pure_instructions\n");
-    } else {
-        fprintf(out, "\t.text\n");
-    }
+    pir_asm_emit_section_directive(out, mod, target, NULL, PIR_GSEG_RODATA, false, false, true);
     /* Emit DWARF .file directives (1-based IDs for universal Apple as + GNU as compatibility). */
     pir_asm_emit_dwarf_files(out, mod);
     return true;
@@ -933,70 +929,12 @@ static bool a64_emit_function(PirCodeEmitter *em, const PirModule *mod, const MF
     const PirFunction *fn = mf->pir_fn;
     const char *lp = pir_asm_lbl_pfx(target);
 
-    if (fn->section && fn->section[0] != '\0') {
-        pir_asm_emit_section_directive(out, mod, target, fn->section, PIR_GSEG_RODATA, false, false, true);
-    } else if (pir_asm_is_macho(target)) {
-        fprintf(out, "\t.section __TEXT,__text,regular,pure_instructions\n");
-    } else {
-        fprintf(out, "\t.text\n");
-    }
+    pir_asm_emit_func_prologue(out, mod, target, mf, 2u, "%", a64_needs_sym_quote);
 
-    if (fn->linkage == PIR_LINK_EXPORT) {
-        fputs("\t.globl ", out); a64_emit_sym(out, target, fn->name); fputc('\n', out);
-    } else if (fn->linkage == PIR_LINK_WEAK) {
-        if (pir_asm_is_macho(target)) {
-            fputs("\t.globl ", out); a64_emit_sym(out, target, fn->name); fputc('\n', out);
-            fputs("\t.weak_definition ", out); a64_emit_sym(out, target, fn->name); fputc('\n', out);
-        } else {
-            fputs("\t.weak ", out); a64_emit_sym(out, target, fn->name); fputc('\n', out);
-        }
-    }
-    if (!pir_asm_is_macho(target)) {
-        fputs("\t.type ", out); a64_emit_sym(out, target, fn->name); fputs(", %function\n", out);
-    }
-    fprintf(out, "\t.p2align 2\n");
-    a64_emit_sym(out, target, fn->name); fputs(":\n", out);
-    if (mod->files.len > 0u && pir_asm_is_macho(target)) {
-        fprintf(out, "%sfunc_begin%u:\n", lp, mf->fn_index);
-    }
-    fprintf(out, "\t.cfi_startproc\n");
-
-    /* Build empty jump-only trampoline redirection table so coalesced loop back-edges
-     * branch directly to their destination with zero empty trampoline blocks. */
     uint32_t nblks = mf->blocks.len;
-    uint32_t *blk_redir = nblks ? (uint32_t *)malloc((size_t)nblks * sizeof(uint32_t)) : NULL;
-    bool     *blk_skip  = nblks ? (bool *)calloc((size_t)nblks, sizeof(bool)) : NULL;
-    uint32_t *vis_mark  = nblks ? (uint32_t *)calloc((size_t)nblks, sizeof(uint32_t)) : NULL;
-    if (nblks && (!blk_redir || !blk_skip || !vis_mark)) abort();
-    for (uint32_t b = 0u; b < nblks; ++b) blk_redir[b] = b;
-    for (uint32_t b = 1u; b < nblks; ++b) {
-        const MBlock *blk = &mf->blocks.data[b];
-        if (blk->insts.len == 1u && blk->insts.data[0].op == MI_A64_B) {
-            uint32_t dst = blk->insts.data[0].ops[0].u.block_id;
-            if (dst < nblks && dst != b) blk_redir[b] = dst;
-        }
-    }
-    /* Break any empty-block cycles by pinning one canonical representative per cycle. */
-    for (uint32_t b = 1u; b < nblks; ++b) {
-        uint32_t cur = b;
-        while (blk_redir[cur] != cur) {
-            if (vis_mark[cur] == b) {
-                blk_redir[cur] = cur;
-                break;
-            }
-            if (vis_mark[cur] != 0u) break;
-            vis_mark[cur] = b;
-            cur = blk_redir[cur];
-        }
-    }
-    free(vis_mark);
-    /* Path-compress every block to its live root (guaranteed blk_redir[root] == root). */
-    for (uint32_t b = 1u; b < nblks; ++b) {
-        uint32_t cur = blk_redir[b];
-        while (blk_redir[cur] != cur) cur = blk_redir[cur];
-        blk_redir[b] = cur;
-        if (cur != b) blk_skip[b] = true;
-    }
+    uint32_t *blk_redir = NULL;
+    bool     *blk_skip  = NULL;
+    pir_asm_build_blk_redir(mf, MI_A64_B, &blk_redir, &blk_skip);
     ctx->blk_redir = blk_redir;
 
     /* Relax 19-bit conditional branches (b.cond/cbz/cbnz, +-1 MiB) when function exceeds ~512 KiB. */
@@ -1020,8 +958,7 @@ static bool a64_emit_function(PirCodeEmitter *em, const PirModule *mod, const MF
     }
     ctx->need_branch_relax = (est_insts * 4u > 524288u);
 
-    uint32_t last_loc = 0u;
-    bool emitted_any_loc_inst = false;
+    PirDwarfLocState loc_st = { 0u, false };
     for (uint32_t b = 0u; b < nblks; ++b) {
         if (blk_skip[b]) continue;
         const MBlock *blk = &mf->blocks.data[b];
@@ -1072,45 +1009,19 @@ static bool a64_emit_function(PirCodeEmitter *em, const PirModule *mod, const MF
             if (ins->op == MI_A64_B && redir_blk(ctx, ins->ops[0].u.block_id) == next_live) {
                 continue;
             }
-            if (ins->loc_idx != 0u && ins->loc_idx != last_loc &&
-                ins->loc_idx < fn->locs.len) {
-                const PirSourceLoc *sl = &fn->locs.data[ins->loc_idx];
-                fprintf(out, "\t.loc %u %u %u\n",
-                        pir_asm_dwarf_file_num(mod, sl->file_id), sl->line, sl->col);
-                last_loc = ins->loc_idx;
-                emitted_any_loc_inst = true;
-            } else if (!emitted_any_loc_inst && mod->files.len > 0u) {
-                fprintf(out, "\t.loc 1 0 0\n");
-                emitted_any_loc_inst = true;
-            }
+            pir_asm_emit_dwarf_loc(out, mod, fn, &loc_st, ins->loc_idx);
             emit_inst(ctx, mf, ins);
         }
     }
 
     /* Emit PC-relative switch jump tables right after function in __TEXT (zero absolute relocs!). */
-    for (uint32_t j = 0u; j < mf->jtables.len; ++j) {
-        const MJTable *jt = &mf->jtables.data[j];
-        fprintf(out, "\t.p2align 2\n");
-        fprintf(out, "%sJT%u_%u:\n", lp, mf->fn_index, j);
-        for (uint32_t k = 0u; k < jt->num_entries; ++k) {
-            fprintf(out, "\t.long %sBB%u_%u - %sJT%u_%u\n",
-                    lp, mf->fn_index, redir_blk(ctx, jt->targets[k]), lp, mf->fn_index, j);
-        }
-    }
+    pir_asm_emit_jtables(out, target, mf, blk_redir);
 
     ctx->blk_redir = NULL;
     free(blk_redir);
     free(blk_skip);
 
-    if (mod->files.len > 0u && pir_asm_is_macho(target)) {
-        fprintf(out, "%sfunc_end%u:\n", lp, mf->fn_index);
-    }
-    fprintf(out, "\t.cfi_endproc\n");
-    if (!pir_asm_is_macho(target)) {
-        fputs("\t.size ", out); a64_emit_sym(out, target, fn->name);
-        fputs(", .-", out); a64_emit_sym(out, target, fn->name); fputc('\n', out);
-    }
-    fprintf(out, "\n");
+    pir_asm_emit_func_epilogue(out, mod, target, mf, a64_needs_sym_quote);
     return true;
 }
 

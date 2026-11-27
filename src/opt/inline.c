@@ -212,15 +212,8 @@ static void inline_call_site(PirModule *mod, PirFunction *caller,
             PirInst ci = pir_make_inst(cop, pty, call_line, call_loc);
             ci.operands      = pir_alloc_ops(mod, 1u);
             ci.operands[0]   = arg;
-            ci.operands[0].type                = pty;
-            ci.operands[0].has_explicit_type   = false;
-            ci.operands[0].call_abi            = PIR_PARAM_NORMAL;
-            ci.operands[0].call_abi_type       = pir_type_scalar(PIR_SCALAR_VOID);
-            ci.operands[0].call_byval_size     = 0u;
-            ci.operands[0].call_byval_align    = 0u;
-            ci.operands[0].call_stack_align    = 0u;
-            ci.operands[0].call_force_stack    = false;
-            ci.operands[0].call_no_f32_promote = false;
+            ci.operands[0].type = pty;
+            pir_op_strip_call_meta(&ci.operands[0]);
             ci.operand_count = 1u;
             ci.results[0]    = nv;
             PIR_VEC_PUSH(&caller->insts, ci);

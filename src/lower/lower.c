@@ -173,6 +173,60 @@ PirFuncId pir_ensure_extern_func(PirModule *mod, const char *name,
     return id;
 }
 
+void pir_op_strip_call_meta(PirOperand *op) {
+    if (!op) return;
+    op->has_explicit_type   = false;
+    op->call_abi            = PIR_PARAM_NORMAL;
+    op->call_abi_type       = pir_type_scalar(PIR_SCALAR_VOID);
+    op->call_byval_size     = 0u;
+    op->call_byval_align    = 0u;
+    op->call_stack_align    = 0u;
+    op->call_force_stack    = false;
+    op->call_no_f32_promote = false;
+}
+
+PirFuncId pir_ensure_verified_extern_func(PirModule *mod, const char *name,
+                                          const PirType *param_tys, uint32_t param_count,
+                                          PirType ret_ty, uint32_t src_line,
+                                          const char *pass_ctx, PirDiag *diag) {
+    for (uint32_t gi = 0u; gi < mod->globals.len; ++gi) {
+        if (mod->globals.data[gi].name && strcmp(mod->globals.data[gi].name, name) == 0) {
+            pir_diag_error(diag, src_line, 0u,
+                           "symbol '@%s' collides with global during %s", name, pass_ctx);
+            return PIR_INVALID_ID;
+        }
+    }
+    for (uint32_t si = 0u; si < mod->sigs.len; ++si) {
+        if (mod->sigs.data[si].name && strcmp(mod->sigs.data[si].name, name) == 0) {
+            pir_diag_error(diag, src_line, 0u,
+                           "symbol '@%s' collides with signature during %s", name, pass_ctx);
+            return PIR_INVALID_ID;
+        }
+    }
+    PirFuncId cid = pir_ensure_extern_func(mod, name, param_tys, param_count, ret_ty);
+    const PirFunction *callee = &mod->funcs.data[cid];
+    bool sig_ok = (!callee->is_variadic && callee->param_count == param_count &&
+                   callee->cc == PIR_CC_C && callee->linkage != PIR_LINK_INTERNAL &&
+                   callee->cabi_ret.kind == PIR_CABI_RET_NONE &&
+                   pir_type_eq(callee->ret_type, ret_ty));
+    for (uint32_t k = 0u; k < param_count && sig_ok; ++k) {
+        if (callee->params[k].abi_kind != PIR_PARAM_NORMAL ||
+            callee->params[k].abi_byval_size != 0u ||
+            callee->params[k].abi_stack_align != 0u ||
+            callee->params[k].abi_force_stack ||
+            !pir_type_eq(callee->params[k].type, param_tys[k])) {
+            sig_ok = false;
+        }
+    }
+    if (!sig_ok) {
+        pir_diag_error(diag, src_line, 0u,
+                       "predeclared '@%s' has incompatible signature for %s",
+                       name, pass_ctx);
+        return PIR_INVALID_ID;
+    }
+    return cid;
+}
+
 static void replace_in_ops(PirOperand *ops, uint32_t n, PirValueId old_v, PirValueId new_v) {
     for (uint32_t i = 0u; i < n; ++i) {
         if (ops[i].kind == PIR_OPER_VAL && ops[i].u.val == old_v) {

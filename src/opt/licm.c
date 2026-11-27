@@ -30,167 +30,15 @@ static bool all_ops_invariant(const PirFunction *fn, const PirLoop *lp, const Pi
     return true;
 }
 
-static bool is_tls_sym_op(const PirModule *mod, const PirOperand *op) {
-    if (!mod || !op || op->kind != PIR_OPER_SYM || op->u.sym.is_func || !op->u.sym.name) {
-        return false;
-    }
-    if (op->u.sym.id < mod->globals.len) {
-        const PirGlobal *g = &mod->globals.data[op->u.sym.id];
-        if (g->name && strcmp(g->name, op->u.sym.name) == 0) {
-            return g->seg == PIR_GSEG_TLS;
-        }
-    }
-    for (uint32_t i = 0u; i < mod->globals.len; ++i) {
-        const PirGlobal *g = &mod->globals.data[i];
-        if (g->name && strcmp(g->name, op->u.sym.name) == 0) {
-            return g->seg == PIR_GSEG_TLS;
-        }
-    }
-    return false;
-}
-
-static bool is_pure_hoistable_op(const PirModule *mod, const PirFunction *fn, const PirInst *ins) {
-    uint32_t trap_ub = PIR_FLAG_TRAP | PIR_FLAG_TRAP_S | PIR_FLAG_TRAP_U |
-                       PIR_FLAG_UNSAFE | PIR_FLAG_NONZERO | PIR_FLAG_VOLATILE;
-    if (ins->flags & trap_ub) return false;
-    bool has_unsafe_int = (ins->flags & (PIR_FLAG_UNSAFE_S | PIR_FLAG_UNSAFE_U)) != 0u;
-    if (has_unsafe_int &&
-        ins->op != PIR_OP_ADD && ins->op != PIR_OP_SUB && ins->op != PIR_OP_MUL) {
-        return false;
-    }
-
-    switch (ins->op) {
-        case PIR_OP_CONST: case PIR_OP_ADDR:
-            if (ins->operand_count >= 1u && is_tls_sym_op(mod, &ins->operands[0])) {
-                return false;
-            }
-            return true;
-        case PIR_OP_ADD: case PIR_OP_SUB: case PIR_OP_MUL:
-        case PIR_OP_ADD_OVF_S: case PIR_OP_ADD_OVF_U:
-        case PIR_OP_SUB_OVF_S: case PIR_OP_SUB_OVF_U:
-        case PIR_OP_MUL_OVF_S: case PIR_OP_MUL_OVF_U:
-        case PIR_OP_MUL_WIDE_U: case PIR_OP_MUL_WIDE_S:
-        case PIR_OP_ADD_CARRY: case PIR_OP_SUB_BORROW:
-        case PIR_OP_AND: case PIR_OP_OR: case PIR_OP_XOR:
-        case PIR_OP_SHL: case PIR_OP_SHR: case PIR_OP_SAR:
-        case PIR_OP_CLZ: case PIR_OP_CTZ: case PIR_OP_POPCNT: case PIR_OP_BSWAP:
-        case PIR_OP_FADD: case PIR_OP_FSUB: case PIR_OP_FMUL: case PIR_OP_FDIV: case PIR_OP_FNEG:
-        case PIR_OP_CMP_EQ: case PIR_OP_CMP_NE:
-        case PIR_OP_CMP_LT_S: case PIR_OP_CMP_LT_U: case PIR_OP_CMP_LE_S: case PIR_OP_CMP_LE_U:
-        case PIR_OP_CMP_GT_S: case PIR_OP_CMP_GT_U: case PIR_OP_CMP_GE_S: case PIR_OP_CMP_GE_U:
-        case PIR_OP_FCMP_OEQ: case PIR_OP_FCMP_ONE: case PIR_OP_FCMP_OLT:
-        case PIR_OP_FCMP_OLE: case PIR_OP_FCMP_OGT: case PIR_OP_FCMP_OGE:
-        case PIR_OP_FCMP_UEQ: case PIR_OP_FCMP_UNE: case PIR_OP_FCMP_ULT:
-        case PIR_OP_FCMP_ULE: case PIR_OP_FCMP_UGT: case PIR_OP_FCMP_UGE:
-        case PIR_OP_ZEXT: case PIR_OP_SEXT: case PIR_OP_TRUNC:
-        case PIR_OP_SITOFP: case PIR_OP_UITOFP: case PIR_OP_FPEXT: case PIR_OP_FPTRUNC:
-        case PIR_OP_BITCAST: case PIR_OP_PTRTOINT: case PIR_OP_INTTOPTR:
-        case PIR_OP_PTR_ADD: case PIR_OP_SPLAT: case PIR_OP_EXTRACT:
-        case PIR_OP_INSERT: case PIR_OP_SHUFFLE:
-            return true;
-        case PIR_OP_SELECT:
-            return ins->ty.kind == PIR_TYPE_SCALAR && ins->operand_count == 3u &&
-                   pir_operand_is_proven_bool_i8(fn, ins->operands[0]);
-        case PIR_OP_FPTOSI: case PIR_OP_FPTOUI:
-            return (ins->flags & PIR_FLAG_SAT) != 0u;
-        case PIR_OP_DIV_S: case PIR_OP_DIV_U: case PIR_OP_REM_S: case PIR_OP_REM_U:
-        case PIR_OP_ALLOCA: case PIR_OP_ALLOCA_PTR: case PIR_OP_ALLOCA_DYN:
-        case PIR_OP_STACKSAVE: case PIR_OP_STACKRESTORE:
-        case PIR_OP_FIELD_PTR: case PIR_OP_ELEM_PTR:
-        case PIR_OP_LOAD: case PIR_OP_STORE:
-        case PIR_OP_MEMCPY: case PIR_OP_MEMMOVE: case PIR_OP_MEMSET:
-        case PIR_OP_ATOMIC_LOAD: case PIR_OP_ATOMIC_STORE:
-        case PIR_OP_ATOMIC_RMW: case PIR_OP_ATOMIC_CMPXCHG: case PIR_OP_FENCE:
-        case PIR_OP_VA_START: case PIR_OP_VA_ARG: case PIR_OP_VA_ARG_BUF:
-        case PIR_OP_VA_COPY: case PIR_OP_VA_END:
-        case PIR_OP_CALL: case PIR_OP_CALL_INDIRECT:
-        case PIR_OP_JMP: case PIR_OP_BR: case PIR_OP_SWITCH:
-        case PIR_OP_INVOKE: case PIR_OP_INVOKE_INDIRECT: case PIR_OP_RESUME:
-        case PIR_OP_RET: case PIR_OP_TRAP: case PIR_OP_UNREACHABLE:
-            return false;
-    }
-    return false;
-}
-
-static bool inst_may_trap_or_exit(const PirModule *mod, const PirFunction *fn, const PirInst *ins) {
-    if (ins->op == PIR_OP_TRAP || ins->op == PIR_OP_UNREACHABLE ||
-        ins->op == PIR_OP_CALL_INDIRECT || ins->op == PIR_OP_INVOKE ||
-        ins->op == PIR_OP_INVOKE_INDIRECT || ins->op == PIR_OP_RESUME ||
-        ins->op == PIR_OP_FENCE || ins->op == PIR_OP_STACKRESTORE ||
-        ins->op == PIR_OP_ATOMIC_LOAD || ins->op == PIR_OP_ATOMIC_STORE ||
-        ins->op == PIR_OP_ATOMIC_RMW || ins->op == PIR_OP_ATOMIC_CMPXCHG) {
-        return true;
-    }
-    if ((ins->op == PIR_OP_LOAD || ins->op == PIR_OP_STORE) &&
-        (ins->flags & PIR_FLAG_VOLATILE) != 0u) {
-        return true;
-    }
-    if ((ins->flags & (PIR_FLAG_TRAP | PIR_FLAG_TRAP_S | PIR_FLAG_TRAP_U)) != 0u) {
-        return true;
-    }
-    if ((ins->op == PIR_OP_DIV_S || ins->op == PIR_OP_DIV_U ||
-         ins->op == PIR_OP_REM_S || ins->op == PIR_OP_REM_U) &&
-        (ins->flags & PIR_FLAG_UNSAFE) == 0u) {
-        return true;
-    }
-    if ((ins->op == PIR_OP_CONST || ins->op == PIR_OP_ADDR) &&
-        ins->operand_count >= 1u && is_tls_sym_op(mod, &ins->operands[0])) {
-        return true;
-    }
-    if (ins->op == PIR_OP_CALL) {
-        /* Only total, non-exiting pure math intrinsics are guaranteed to return normally. */
-        return !pir_inst_is_pure_math_call(mod, fn, ins);
-    }
-    return false;
-}
-
-static bool loop_has_mem_barrier(const PirModule *mod, const PirFunction *fn, const PirLoop *lp) {
+static uint32_t loop_scan_effects(const PirModule *mod, const PirFunction *fn, const PirLoop *lp) {
+    uint32_t eff = PIR_EFF_NONE;
     for (uint32_t bi = 0u; bi < lp->blocks.len; ++bi) {
         const PirBlock *blk = &fn->blocks.data[lp->blocks.data[bi]];
         for (uint32_t j = 0u; j < blk->insts.len; ++j) {
-            const PirInst *ins = &fn->insts.data[blk->insts.data[j]];
-            if (((ins->op == PIR_OP_LOAD || ins->op == PIR_OP_STORE) &&
-                 (ins->flags & PIR_FLAG_VOLATILE) != 0u) ||
-                ins->op == PIR_OP_CALL_INDIRECT || ins->op == PIR_OP_FENCE ||
-                ins->op == PIR_OP_INVOKE || ins->op == PIR_OP_INVOKE_INDIRECT ||
-                ins->op == PIR_OP_RESUME ||
-                ins->op == PIR_OP_ATOMIC_LOAD || ins->op == PIR_OP_ATOMIC_STORE ||
-                ins->op == PIR_OP_ATOMIC_RMW || ins->op == PIR_OP_ATOMIC_CMPXCHG ||
-                ins->op == PIR_OP_MEMCPY || ins->op == PIR_OP_MEMMOVE || ins->op == PIR_OP_MEMSET ||
-                ins->op == PIR_OP_VA_START || ins->op == PIR_OP_VA_ARG || ins->op == PIR_OP_VA_ARG_BUF ||
-                ins->op == PIR_OP_VA_COPY || ins->op == PIR_OP_VA_END || ins->op == PIR_OP_STACKRESTORE) {
-                return true;
-            }
-            if (ins->op == PIR_OP_CALL) {
-                /* Even [readonly] callees may perform atomic acquire loads or fences to synchronize
-                 * with another thread's writes; only exempt pure side-effect-free math calls. */
-                if (!pir_inst_is_pure_math_call(mod, fn, ins)) return true;
-            }
+            eff |= pir_inst_effects(mod, fn, &fn->insts.data[blk->insts.data[j]]);
         }
     }
-    return false;
-}
-
-static bool loop_has_real_call(const PirModule *mod, const PirFunction *fn, const PirLoop *lp) {
-    for (uint32_t bi = 0u; bi < lp->blocks.len; ++bi) {
-        const PirBlock *blk = &fn->blocks.data[lp->blocks.data[bi]];
-        for (uint32_t j = 0u; j < blk->insts.len; ++j) {
-            const PirInst *ins = &fn->insts.data[blk->insts.data[j]];
-            if (ins->op == PIR_OP_CALL_INDIRECT || ins->op == PIR_OP_INVOKE ||
-                ins->op == PIR_OP_INVOKE_INDIRECT) {
-                return true;
-            }
-            if ((ins->op == PIR_OP_CONST || ins->op == PIR_OP_ADDR) &&
-                ins->operand_count >= 1u && is_tls_sym_op(mod, &ins->operands[0])) {
-                return true;
-            }
-            if (ins->op == PIR_OP_CALL) {
-                if (pir_inst_is_pure_math_call(mod, fn, ins)) continue;
-                return true;
-            }
-        }
-    }
-    return false;
+    return eff;
 }
 
 static bool alloca_init_dominates(const PirFunction *fn, const PirDom *dom,
@@ -248,7 +96,7 @@ static bool load_is_safe_to_hoist(const PirModule *mod, const PirFunction *fn,
         const PirBlock *hblk = &fn->blocks.data[b];
         bool preceded_by_hazard = false;
         for (uint32_t k = 0u; k < inst_idx; ++k) {
-            if (inst_may_trap_or_exit(mod, fn, &fn->insts.data[hblk->insts.data[k]])) {
+            if ((pir_inst_effects(mod, fn, &fn->insts.data[hblk->insts.data[k]]) & PIR_EFF_MAY_TRAP) != 0u) {
                 preceded_by_hazard = true;
                 break;
             }
@@ -351,8 +199,9 @@ void pir_opt_licm(PirModule *mod, PirFunction *fn, const PirTargetSpec *target) 
 
         for (uint32_t oi = 0u; oi < nl && !rebuilt_needed; ++oi) {
             PirLoop *lp = &li.loops.data[order[oi]];
-            bool has_barrier = loop_has_mem_barrier(mod, fn, lp);
-            bool has_call    = loop_has_real_call(mod, fn, lp);
+            uint32_t leff    = loop_scan_effects(mod, fn, lp);
+            bool has_barrier = (leff & PIR_EFF_MEM_BARRIER) != 0u;
+            bool has_call    = (leff & PIR_EFF_REAL_CALL) != 0u;
 
             bool loop_changed = true;
             while (loop_changed) {
@@ -367,7 +216,8 @@ void pir_opt_licm(PirModule *mod, PirFunction *fn, const PirTargetSpec *target) 
                         const PirInst *ins = &fn->insts.data[iid];
                         bool can_hoist = false;
 
-                        if (is_pure_hoistable_op(mod, fn, ins) && all_ops_invariant(fn, lp, ins)) {
+                        if ((pir_inst_effects(mod, fn, ins) & PIR_EFF_PURE_HOISTABLE) != 0u &&
+                            all_ops_invariant(fn, lp, ins)) {
                             /* 128-bit vector regs are caller-saved on AAPCS64 and SysV x64, and
                              * trivial constants are cheaper to rematerialize than to hold in a
                              * callee-saved register or spill slot across a call. */

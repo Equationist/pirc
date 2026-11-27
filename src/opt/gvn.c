@@ -133,69 +133,26 @@ static bool op_less(PirOperand a, PirOperand b) {
     return false;
 }
 
-static bool is_gvn_eligible(const PirInst *ins) {
+static bool is_gvn_eligible(const PirModule *mod, const PirFunction *fn, const PirInst *ins) {
     if (ins->results[0] == PIR_INVALID_ID || ins->results[1] != PIR_INVALID_ID) return false;
     if (ins->operand_count > 3u) return false;
-    uint32_t bad_flags = PIR_FLAG_TRAP | PIR_FLAG_TRAP_S | PIR_FLAG_TRAP_U |
-                         PIR_FLAG_UNSAFE | PIR_FLAG_UNSAFE_S | PIR_FLAG_UNSAFE_U |
-                         PIR_FLAG_NONZERO | PIR_FLAG_VOLATILE | PIR_FLAG_INBOUNDS;
-    if (ins->flags & bad_flags) return false;
-
-    switch (ins->op) {
-        case PIR_OP_CONST: case PIR_OP_ADDR:
-        case PIR_OP_ADD: case PIR_OP_SUB: case PIR_OP_MUL:
-        case PIR_OP_AND: case PIR_OP_OR: case PIR_OP_XOR:
-        case PIR_OP_SHL: case PIR_OP_SHR: case PIR_OP_SAR:
-        case PIR_OP_CLZ: case PIR_OP_CTZ: case PIR_OP_POPCNT: case PIR_OP_BSWAP:
-        case PIR_OP_FADD: case PIR_OP_FSUB: case PIR_OP_FMUL: case PIR_OP_FDIV: case PIR_OP_FNEG:
-        case PIR_OP_CMP_EQ: case PIR_OP_CMP_NE:
-        case PIR_OP_CMP_LT_S: case PIR_OP_CMP_LT_U: case PIR_OP_CMP_LE_S: case PIR_OP_CMP_LE_U:
-        case PIR_OP_CMP_GT_S: case PIR_OP_CMP_GT_U: case PIR_OP_CMP_GE_S: case PIR_OP_CMP_GE_U:
-        case PIR_OP_FCMP_OEQ: case PIR_OP_FCMP_ONE: case PIR_OP_FCMP_OLT:
-        case PIR_OP_FCMP_OLE: case PIR_OP_FCMP_OGT: case PIR_OP_FCMP_OGE:
-        case PIR_OP_FCMP_UEQ: case PIR_OP_FCMP_UNE: case PIR_OP_FCMP_ULT:
-        case PIR_OP_FCMP_ULE: case PIR_OP_FCMP_UGT: case PIR_OP_FCMP_UGE:
-        case PIR_OP_SELECT:
-        case PIR_OP_ZEXT: case PIR_OP_SEXT: case PIR_OP_TRUNC:
-        case PIR_OP_SITOFP: case PIR_OP_UITOFP: case PIR_OP_FPEXT: case PIR_OP_FPTRUNC:
-        case PIR_OP_PTRTOINT:
-        case PIR_OP_PTR_ADD: case PIR_OP_SPLAT: case PIR_OP_EXTRACT: case PIR_OP_INSERT:
-            return true;
-        case PIR_OP_BITCAST:
-            if (ins->ty.kind == PIR_TYPE_SCALAR && ins->ty.u.scalar == PIR_SCALAR_PTR &&
-                (ins->operand_count < 1u ||
-                 !(ins->operands[0].type.kind == PIR_TYPE_SCALAR &&
-                   ins->operands[0].type.u.scalar == PIR_SCALAR_PTR))) {
-                return false;
-            }
-            return true;
-        case PIR_OP_INTTOPTR:
-            return false;
-        case PIR_OP_FPTOSI: case PIR_OP_FPTOUI:
-            return (ins->flags & PIR_FLAG_SAT) != 0u;
-        case PIR_OP_DIV_S: case PIR_OP_DIV_U: case PIR_OP_REM_S: case PIR_OP_REM_U:
-        case PIR_OP_ADD_OVF_S: case PIR_OP_ADD_OVF_U:
-        case PIR_OP_SUB_OVF_S: case PIR_OP_SUB_OVF_U:
-        case PIR_OP_MUL_OVF_S: case PIR_OP_MUL_OVF_U:
-        case PIR_OP_MUL_WIDE_U: case PIR_OP_MUL_WIDE_S:
-        case PIR_OP_ADD_CARRY: case PIR_OP_SUB_BORROW:
-        case PIR_OP_SHUFFLE:
-        case PIR_OP_ALLOCA: case PIR_OP_ALLOCA_PTR: case PIR_OP_ALLOCA_DYN:
-        case PIR_OP_STACKSAVE: case PIR_OP_STACKRESTORE:
-        case PIR_OP_FIELD_PTR: case PIR_OP_ELEM_PTR:
-        case PIR_OP_LOAD: case PIR_OP_STORE:
-        case PIR_OP_MEMCPY: case PIR_OP_MEMMOVE: case PIR_OP_MEMSET:
-        case PIR_OP_ATOMIC_LOAD: case PIR_OP_ATOMIC_STORE:
-        case PIR_OP_ATOMIC_RMW: case PIR_OP_ATOMIC_CMPXCHG: case PIR_OP_FENCE:
-        case PIR_OP_VA_START: case PIR_OP_VA_ARG: case PIR_OP_VA_ARG_BUF:
-        case PIR_OP_VA_COPY: case PIR_OP_VA_END:
-        case PIR_OP_CALL: case PIR_OP_CALL_INDIRECT:
-        case PIR_OP_JMP: case PIR_OP_BR: case PIR_OP_SWITCH:
-        case PIR_OP_INVOKE: case PIR_OP_INVOKE_INDIRECT: case PIR_OP_RESUME:
-        case PIR_OP_RET: case PIR_OP_TRAP: case PIR_OP_UNREACHABLE:
-            return false;
+    if ((ins->flags & (PIR_FLAG_INBOUNDS | PIR_FLAG_UNSAFE_S | PIR_FLAG_UNSAFE_U)) != 0u) {
+        return false;
     }
-    return false;
+    if (ins->op == PIR_OP_INTTOPTR || ins->op == PIR_OP_SHUFFLE) return false;
+    if (ins->op == PIR_OP_BITCAST &&
+        ins->ty.kind == PIR_TYPE_SCALAR && ins->ty.u.scalar == PIR_SCALAR_PTR &&
+        (ins->operand_count < 1u ||
+         !(ins->operands[0].type.kind == PIR_TYPE_SCALAR &&
+           ins->operands[0].type.u.scalar == PIR_SCALAR_PTR))) {
+        return false;
+    }
+    uint32_t eff = pir_inst_effects(mod, fn, ins);
+    if ((eff & PIR_EFF_PURE_HOISTABLE) != 0u) return true;
+    /* Dominated CSE of `select` does not speculate, so it needs only clean flags. */
+    return ins->op == PIR_OP_SELECT &&
+           (eff & (PIR_EFF_MAY_TRAP | PIR_EFF_HAS_UB_FLAG)) == 0u &&
+           (ins->flags & PIR_FLAG_VOLATILE) == 0u;
 }
 
 static void rewrite_to_const_int(GvnCtx *ctx, PirInst *ins, uint64_t val, PirType ty) {
@@ -754,7 +711,7 @@ static void gvn_walk_dom_tree(GvnCtx *ctx, PirBlockId root_b) {
                 }
                 propagate_int_imms(ctx, ins);
 
-                if (!is_gvn_eligible(ins)) continue;
+                if (!is_gvn_eligible(ctx->mod, ctx->fn, ins)) continue;
 
                 PirOperand canon[3];
                 for (uint32_t k = 0u; k < ins->operand_count; ++k) canon[k] = ins->operands[k];

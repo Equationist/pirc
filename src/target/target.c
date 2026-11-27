@@ -119,37 +119,8 @@ bool pir_target_apply_caps(PirTargetSpec *spec, const char *profile) {
     return false;
 }
 
-static bool pir_abi_is_pad_only_rec(const PirModule *mod, PirType ty, int8_t *cache) {
-    if (ty.kind != PIR_TYPE_NAMED_AGG || ty.u.agg_id >= mod->agg_types.len) return false;
-    uint32_t aid = ty.u.agg_id;
-    if (cache && cache[aid] >= 0) return cache[aid] != 0;
-    const PirAggDef *agg = &mod->agg_types.data[aid];
-    bool res = true;
-    if (agg->kind == PIR_AGG_PAD) {
-        res = true;
-    } else if (agg->kind == PIR_AGG_ARRAY) {
-        res = (agg->array_len == 0u || pir_abi_is_pad_only_rec(mod, agg->elem_type, cache));
-    } else {
-        for (uint32_t i = 0u; i < agg->field_count; ++i) {
-            if (!pir_abi_is_pad_only_rec(mod, agg->fields[i], cache)) {
-                res = false;
-                break;
-            }
-        }
-    }
-    if (cache) cache[aid] = res ? 1 : 0;
-    return res;
-}
-
 bool pir_abi_is_pad_only_agg(const PirModule *mod, PirType ty) {
-    if (ty.kind != PIR_TYPE_NAMED_AGG || !mod || mod->agg_types.len == 0u) return false;
-    int8_t stack_cache[64];
-    int8_t *cache = (mod->agg_types.len <= 64u) ? stack_cache : (int8_t *)malloc(mod->agg_types.len);
-    if (!cache) abort();
-    memset(cache, -1, mod->agg_types.len);
-    bool r = pir_abi_is_pad_only_rec(mod, ty, cache);
-    if (cache != stack_cache) free(cache);
-    return r;
+    return pir_agg_is_pad_only(mod, ty);
 }
 
 static uint32_t pir_abi_natural_align_rec(const PirModule *mod, const PirTargetSpec *target,
@@ -247,4 +218,87 @@ bool pir_abi_classify_retbuf(const PirModule *mod, const PirTargetSpec *target,
         return pir_abi_aapcs64_retbuf(mod, target, agg_ty, out);
     }
     return false;
+}
+
+static uint64_t abi_align_up_u64(uint64_t v, uint64_t al) {
+    return (v + al - 1u) & ~(al - 1u);
+}
+
+void pir_abi_plan_va_arg(const PirModule *mod, const PirTargetSpec *target,
+                         PirType arg_ty, bool is_buf, PirVaArgPlan *out) {
+    memset(out, 0, sizeof(*out));
+    out->arg_ty      = arg_ty;
+    out->is_buf      = is_buf;
+    out->promote_f32 = (!is_buf && arg_ty.kind == PIR_TYPE_SCALAR &&
+                        arg_ty.u.scalar == PIR_SCALAR_F32);
+    out->load_ty     = out->promote_f32 ? pir_type_scalar(PIR_SCALAR_F64) : arg_ty;
+    PirTypeLayout ly = pir_type_layout(mod, target, out->load_ty);
+    out->size        = ly.size;
+    out->align       = ly.align;
+    out->nat_align   = pir_abi_natural_align(mod, target, out->load_ty);
+
+    PirParamDecl pd;
+    memset(&pd, 0, sizeof(pd));
+    if (is_buf) {
+        pd.abi_kind = PIR_PARAM_BYVAL;
+        pd.abi_type = arg_ty;
+        pd.type     = pir_type_scalar(PIR_SCALAR_PTR);
+    } else {
+        pd.abi_kind = PIR_PARAM_NORMAL;
+        pd.type     = out->load_ty;
+    }
+    PirAbiRegState st0 = { 0u, 0u };
+    out->abi_valid = pir_abi_classify_param(mod, target, &pd, &st0, &out->abi);
+
+    out->is_empty = is_buf &&
+                    (out->size == 0u ||
+                     (out->abi_valid && out->abi.kind == PIR_ABI_DIRECT && out->abi.reg_count == 0u));
+
+    out->is_indirect = out->abi_valid &&
+                       out->abi.kind == PIR_ABI_INDIRECT &&
+                       out->abi.stack_byval_size == 0u;
+
+    bool is_sysv_x64    = (target->arch == PIR_ARCH_X86_64 && target->os != PIR_OS_WINDOWS);
+    bool is_aapcs64_lin = (target->arch == PIR_ARCH_ARM64  && target->os != PIR_OS_MACOS);
+    bool is_darwin_a64  = (target->arch == PIR_ARCH_ARM64  && target->os == PIR_OS_MACOS);
+
+    if (is_sysv_x64) {
+        if (is_buf) {
+            out->force_mem = !(out->abi_valid && out->abi.kind == PIR_ABI_DIRECT &&
+                               out->abi.reg_count > 0u &&
+                               (out->abi.gp_used > 0u || out->abi.fp_used > 0u));
+        } else {
+            /* SysV AMD64 §3.5.7: 256-bit vectors always come from overflow_arg_area. */
+            out->force_mem = (out->load_ty.kind == PIR_TYPE_VECTOR && out->size > 16u);
+        }
+    }
+
+    out->is_hfa = (is_aapcs64_lin && is_buf && !out->is_indirect &&
+                   out->abi_valid && out->abi.kind == PIR_ABI_DIRECT && out->abi.fp_used > 0u);
+    out->is_fp  = out->is_hfa ||
+                  (!is_buf && !out->is_indirect &&
+                   (pir_type_is_float(out->load_ty) || out->load_ty.kind == PIR_TYPE_VECTOR));
+
+    out->split_vec = (!is_buf && out->load_ty.kind == PIR_TYPE_VECTOR &&
+                      pir_vec_bits(out->load_ty.u.vec) > target->caps.max_simd_bits &&
+                      !out->is_indirect && !out->force_mem);
+
+    uint64_t slot_sz = (target->ptr_bytes == 4u) ? 4u : 8u;
+    out->mem_step = out->is_indirect
+                    ? slot_sz
+                    : abi_align_up_u64(out->size > 0u ? out->size : slot_sz, slot_sz);
+
+    out->mem_align = slot_sz;
+    if (is_sysv_x64) {
+        if (out->align > 8u) {
+            out->mem_align = (is_buf && out->align < 16u) ? 16u : out->align;
+        }
+    } else if (is_aapcs64_lin && !out->is_indirect) {
+        uint32_t stk_al = out->is_hfa ? out->align : out->nat_align;
+        if (stk_al > 8u) out->mem_align = (stk_al > 16u) ? 16u : stk_al;
+    } else if (is_darwin_a64 && !out->is_indirect) {
+        if (out->align > 8u) out->mem_align = (out->align > 16u) ? 16u : out->align;
+    }
+
+    out->align_gp16 = (is_aapcs64_lin && !out->is_fp && !out->is_indirect && out->nat_align >= 16u);
 }
