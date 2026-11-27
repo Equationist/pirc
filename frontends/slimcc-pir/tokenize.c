@@ -235,9 +235,15 @@ static Token *read_ident(const char *p) {
       p++;
       continue;
     }
-    if (*p == '\\' && read_ucn(&p, p + 1, &(uint32_t){0}, &invalid)) {
-      has_ucn = true;
-      continue;
+    if (*p == '\\') {
+      const char *ucn_pos = p;
+      uint32_t c = 0;
+      if (read_ucn(&p, p + 1, &c, &invalid)) {
+        if (!invalid && (c < 0xA0 || !(ucn_pos == start ? is_ident1(c) : is_ident2(c))))
+          invalid = true;
+        has_ucn = true;
+        continue;
+      }
     }
     if ((unsigned char)*p >= 128) {
       const char *pos;
@@ -491,7 +497,7 @@ static bool read_ucn(const char **new_pos, const char *p, uint32_t *val, bool *i
   int len = (*p == 'u') ? 4 : 8;
 
   bool has_brace = p[1] == '{';
-  if (has_brace && (*p == 'U' || (is_iso_std && opt_std < STD_C23)))
+  if (has_brace && (*p == 'U' || (is_iso_std && opt_std < STD_C2Y)))
     *invalid = true;
   p += 1 + has_brace;
 
@@ -535,7 +541,7 @@ static uint32_t read_escape_seq(const char **new_pos, const char *p, bool *inval
   }
 
   if (*p == 'o' && p[1] == '{') {
-    if (is_iso_std && opt_std < STD_C23)
+    if (is_iso_std && opt_std < STD_C2Y)
       *invalid = true;
     p += 2;
     if (!Inrange(*p, '0', '7'))
@@ -555,7 +561,7 @@ static uint32_t read_escape_seq(const char **new_pos, const char *p, bool *inval
 
   if (*p == 'x') {
     bool has_brace = p[1] == '{';
-    if (has_brace && is_iso_std && opt_std < STD_C23)
+    if (has_brace && is_iso_std && opt_std < STD_C2Y)
       *invalid = true;
     p += 1 + has_brace;
 
@@ -787,6 +793,7 @@ static Token *read_unicode_char_literal(const char *start, const char *quote, Ty
     error_at(start, "unclosed character literal");
 
   uint32_t c;
+  bool is_hex_oct = (*p == '\\' && (Inrange(p[1], '0', '7') || p[1] == 'x' || p[1] == 'o'));
   if (*p == '\\')
     c = read_escape_seq(&p, p + 1, &invalid);
   else
@@ -804,7 +811,7 @@ static Token *read_unicode_char_literal(const char *start, const char *quote, Ty
     return new_token(TK_INVALID, start, p + 1);
   }
 
-  if (start[0] == 'u' && start[1] == '8' && c > 0x7F)
+  if (start[0] == 'u' && start[1] == '8' && c > (is_hex_oct ? 0xFFu : 0x7Fu))
     invalid = true;
 
   if (invalid)
@@ -1305,7 +1312,7 @@ Token *tokenize(File *file, SlashDelta *delta, Token **end) {
     }
 
     // UTF-8 string literal
-    if (Startswith3(p, 'u', '8', '\"')) {
+    if (Startswith3(p, 'u', '8', '\"') && (!is_iso_std || opt_std >= STD_C11)) {
       if (opt_std >= STD_C23)
         cur = cur->next = read_string_literal(p, p + 2, ty_uchar);
       else
@@ -1315,7 +1322,7 @@ Token *tokenize(File *file, SlashDelta *delta, Token **end) {
     }
 
     // UTF-16 string literal
-    if (Startswith2(p, 'u', '\"')) {
+    if (Startswith2(p, 'u', '\"') && (!is_iso_std || opt_std >= STD_C11)) {
       cur = cur->next = read_utf16_string_literal(p, p + 1);
       p += cur->len;
       continue;
@@ -1329,7 +1336,7 @@ Token *tokenize(File *file, SlashDelta *delta, Token **end) {
     }
 
     // UTF-32 string literal
-    if (Startswith2(p, 'U', '\"')) {
+    if (Startswith2(p, 'U', '\"') && (!is_iso_std || opt_std >= STD_C11)) {
       cur = cur->next = read_utf32_string_literal(p, p + 1, ty_char32_t);
       p += cur->len;
       continue;
@@ -1350,7 +1357,7 @@ Token *tokenize(File *file, SlashDelta *delta, Token **end) {
     }
 
     // UTF-16 character literal
-    if (Startswith2(p, 'u', '\'')) {
+    if (Startswith2(p, 'u', '\'') && (!is_iso_std || opt_std >= STD_C11)) {
       cur = cur->next = read_unicode_char_literal(p, p + 1, ty_char16_t);
       p += cur->len;
       continue;
@@ -1364,7 +1371,7 @@ Token *tokenize(File *file, SlashDelta *delta, Token **end) {
     }
 
     // UTF-32 character literal
-    if (Startswith2(p, 'U', '\'')) {
+    if (Startswith2(p, 'U', '\'') && (!is_iso_std || opt_std >= STD_C11)) {
       cur = cur->next = read_unicode_char_literal(p, p + 1, ty_char32_t);
       p += cur->len;
       continue;
@@ -1432,6 +1439,8 @@ Token *tokenize_file(const char *path, Token *tok, Token **end) {
 
   // Make sure that the last line is properly terminated with '\n'.
   fflush(out);
+  if (buflen > 0 && memchr(buf, '\0', buflen))
+    error("%s: embedded null character in input", path);
   if (buflen == 0 || buf[buflen - 1] != '\n')
     fputc('\n', out);
   fputc('\0', out);

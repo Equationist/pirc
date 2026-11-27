@@ -115,9 +115,11 @@ void pir_asm_emit_sym(FILE *out, const PirTargetSpec *target,
         if (c == '"' || c == '\\') {
             fputc('\\', out);
             fputc((int)c, out);
-        } else if (c < 0x20u || c >= 0x7fu) {
+        } else if (c < 0x20u || c == 0x7fu) {
             fprintf(out, "\\%03o", (unsigned)c);
         } else {
+            /* Emit printable ASCII and raw UTF-8 bytes (>= 0x80) verbatim so LLVM-MC/GAS
+             * preserves the exact byte sequence in Mach-O/ELF symbol tables. */
             fputc((int)c, out);
         }
     }
@@ -144,31 +146,110 @@ static void emit_elf_section_name(FILE *out, const char *sec) {
     }
 }
 
-void pir_asm_emit_section_directive(FILE *out, const PirTargetSpec *target,
+static bool global_has_reloc(const PirGlobal *g);
+static bool global_is_all_zero(const PirGlobal *g);
+
+static bool elf_sec_is_prefix(const char *sec, const char *pfx) {
+    size_t n = strlen(pfx);
+    return strncmp(sec, pfx, n) == 0 && (sec[n] == '\0' || sec[n] == '.');
+}
+
+void pir_asm_emit_section_directive(FILE *out, const PirModule *mod, const PirTargetSpec *target,
                                     const char *custom_sec, PirGlobalSeg seg,
                                     bool has_reloc, bool is_zero, bool is_func) {
     if (custom_sec && custom_sec[0] != '\0') {
         if (!pir_asm_is_macho(target)) {
             if (strchr(custom_sec, ',') == NULL) {
-                bool force_nobits = (strcmp(custom_sec, ".bss") == 0 ||
-                                     strcmp(custom_sec, ".tbss") == 0);
+                /* Standard ELF built-in sections have fixed flags/types. */
+                if (strcmp(custom_sec, ".text") == 0) {
+                    fputs("\t.text\n", out);
+                    return;
+                }
+                if (strcmp(custom_sec, ".data") == 0) {
+                    fputs("\t.data\n", out);
+                    return;
+                }
+                if (strcmp(custom_sec, ".rodata") == 0) {
+                    fputs("\t.section .rodata,\"a\",@progbits\n", out);
+                    return;
+                }
+                if (strcmp(custom_sec, ".tdata") == 0) {
+                    fputs("\t.section .tdata,\"awT\",@progbits\n", out);
+                    return;
+                }
+                if (strcmp(custom_sec, ".bss") == 0) {
+                    fputs("\t.bss\n", out);
+                    return;
+                }
+                if (strcmp(custom_sec, ".tbss") == 0) {
+                    fputs("\t.section .tbss,\"awT\",@nobits\n", out);
+                    return;
+                }
+                if (elf_sec_is_prefix(custom_sec, ".init_array")) {
+                    fputs("\t.section ", out);
+                    emit_elf_section_name(out, custom_sec);
+                    fputs(",\"aw\",@init_array\n", out);
+                    return;
+                }
+                if (elf_sec_is_prefix(custom_sec, ".fini_array")) {
+                    fputs("\t.section ", out);
+                    emit_elf_section_name(out, custom_sec);
+                    fputs(",\"aw\",@fini_array\n", out);
+                    return;
+                }
+                if (elf_sec_is_prefix(custom_sec, ".preinit_array")) {
+                    fputs("\t.section ", out);
+                    emit_elf_section_name(out, custom_sec);
+                    fputs(",\"aw\",@preinit_array\n", out);
+                    return;
+                }
+
+                /* Merge ELF flags/type across ALL funcs and globals sharing this custom section. */
+                bool eff_exec  = is_func;
+                bool eff_write = (!is_func && (seg != PIR_GSEG_RODATA || has_reloc));
+                bool eff_tls   = (!is_func && seg == PIR_GSEG_TLS);
+                bool eff_zero  = (!is_func && is_zero);
+                if (mod) {
+                    for (uint32_t fi = 0u; fi < mod->funcs.len; ++fi) {
+                        const PirFunction *f = &mod->funcs.data[fi];
+                        if (f->is_defined && f->section && strcmp(f->section, custom_sec) == 0) {
+                            eff_exec = true;
+                            eff_zero = false;
+                        }
+                    }
+                    for (uint32_t gi = 0u; gi < mod->globals.len; ++gi) {
+                        const PirGlobal *og = &mod->globals.data[gi];
+                        if (og->linkage == PIR_LINK_EXTERN || !og->section ||
+                            strcmp(og->section, custom_sec) != 0) {
+                            continue;
+                        }
+                        if (!global_is_all_zero(og)) eff_zero = false;
+                        if (og->seg == PIR_GSEG_TLS) { eff_tls = true; eff_write = true; }
+                        else if (og->seg != PIR_GSEG_RODATA || global_has_reloc(og)) eff_write = true;
+                    }
+                }
+                char flags[8];
+                size_t fl = 0u;
+                flags[fl++] = 'a';
+                if (eff_write) flags[fl++] = 'w';
+                if (eff_exec)  flags[fl++] = 'x';
+                if (eff_tls)   flags[fl++] = 'T';
+                flags[fl] = '\0';
                 fputs("\t.section ", out);
                 emit_elf_section_name(out, custom_sec);
-                if (is_func) {
-                    fputs(",\"ax\",@progbits\n", out);
-                } else if (seg == PIR_GSEG_TLS) {
-                    fprintf(out, ",\"awT\",%s\n", (is_zero || force_nobits) ? "@nobits" : "@progbits");
-                } else if (seg == PIR_GSEG_RODATA && !has_reloc && !force_nobits) {
-                    fputs(",\"a\",@progbits\n", out);
-                } else {
-                    fprintf(out, ",\"aw\",%s\n", (is_zero || force_nobits) ? "@nobits" : "@progbits");
-                }
+                fprintf(out, ",\"%s\",%s\n", flags, eff_zero ? "@nobits" : "@progbits");
             } else {
-                fprintf(out, "\t.section %s\n", custom_sec);
+                /* Comma in ELF section name: quote as section name to avoid directive injection. */
+                fputs("\t.section ", out);
+                pir_asm_emit_escaped_cstr(out, custom_sec);
+                if (is_func) fputs(",\"ax\",@progbits\n", out);
+                else if (seg == PIR_GSEG_TLS) fprintf(out, ",\"awT\",%s\n", is_zero ? "@nobits" : "@progbits");
+                else if (seg == PIR_GSEG_RODATA && !has_reloc) fputs(",\"a\",@progbits\n", out);
+                else fprintf(out, ",\"aw\",%s\n", is_zero ? "@nobits" : "@progbits");
             }
             return;
         }
-        if (strchr(custom_sec, ',') != NULL) {
+        if (strchr(custom_sec, ',') != NULL && strchr(custom_sec, ';') == NULL) {
             fprintf(out, "\t.section %s\n", custom_sec);
             return;
         }
@@ -437,17 +518,18 @@ bool pir_asm_emit_globals(FILE *out, const PirModule *mod, const PirTargetSpec *
         bool all_zero = global_is_all_zero(g);
         uint64_t sz = compute_global_bytes(mod, target, g);
 
-        /* Darwin Mach-O TLS: __DATA,__thread_vars descriptor + __thread_data / .tbss backing */
+        /* Darwin Mach-O TLS: __DATA,__thread_vars descriptor + __thread_data / .tbss backing.
+         * Use 'l_' (linker-visible private local, NOT 'L' assembler-local) so ld64
+         * preserves per-variable offsets in __thread_data/__thread_bss. */
         if (pir_asm_is_macho(target) && g->seg == PIR_GSEG_TLS) {
+            char tlv_init_lbl[64];
+            snprintf(tlv_init_lbl, sizeof(tlv_init_lbl), "l_pir_tlv_init_%u$tlv$init", i);
             if (all_zero) {
-                fputs("\t.tbss ", out);
-                pir_asm_emit_sym(out, target, g->name, "$tlv$init", arch_needs_quote);
-                fprintf(out, ", %" PRIu64 ", %u\n", sz, p2);
+                fprintf(out, "\t.tbss %s, %" PRIu64 ", %u\n", tlv_init_lbl, sz, p2);
             } else {
                 fprintf(out, "\t.section __DATA,__thread_data,thread_local_regular\n");
                 if (p2 > 0u) fprintf(out, "\t.p2align %u\n", p2);
-                pir_asm_emit_sym(out, target, g->name, "$tlv$init", arch_needs_quote);
-                fputs(":\n", out);
+                fprintf(out, "%s:\n", tlv_init_lbl);
                 emit_global_data_items(out, mod, target, g, arch_needs_quote);
             }
             fprintf(out, "\t.section __DATA,__thread_vars,thread_local_variables\n");
@@ -468,15 +550,19 @@ bool pir_asm_emit_globals(FILE *out, const PirModule *mod, const PirTargetSpec *
             fputs(":\n", out);
             fprintf(out, "\t.quad __tlv_bootstrap\n");
             fprintf(out, "\t.quad 0\n");
-            fputs("\t.quad ", out);
-            pir_asm_emit_sym(out, target, g->name, "$tlv$init", arch_needs_quote);
-            fputs("\n\n", out);
+            fprintf(out, "\t.quad %s\n\n", tlv_init_lbl);
             continue;
         }
 
-        /* Mach-O internal zeroinit mutable data in default section -> .zerofill __DATA,__bss */
+        /* Mach-O zeroinit mutable data in default section -> .zerofill __DATA,__bss */
         if (pir_asm_is_macho(target) && g->seg == PIR_GSEG_DATA && all_zero &&
-            (!g->section || g->section[0] == '\0') && g->linkage == PIR_LINK_INTERNAL) {
+            (!g->section || g->section[0] == '\0') &&
+            (g->linkage == PIR_LINK_INTERNAL || g->linkage == PIR_LINK_EXPORT)) {
+            if (g->linkage == PIR_LINK_EXPORT) {
+                fputs("\t.globl ", out);
+                pir_asm_emit_sym(out, target, g->name, NULL, arch_needs_quote);
+                fputc('\n', out);
+            }
             fputs("\t.zerofill __DATA,__bss,", out);
             pir_asm_emit_sym(out, target, g->name, NULL, arch_needs_quote);
             fprintf(out, ",%" PRIu64 ",%u\n\n", sz, p2);
@@ -484,26 +570,7 @@ bool pir_asm_emit_globals(FILE *out, const PirModule *mod, const PirTargetSpec *
         }
 
         bool has_rel = global_has_reloc(g);
-        PirGlobalSeg eff_seg = g->seg;
-        bool eff_zero = all_zero;
-        bool eff_rel  = has_rel;
-        if (!pir_asm_is_macho(target) && g->section && g->section[0] != '\0' &&
-            strchr(g->section, ',') == NULL) {
-            /* Merge ELF section flags/type across all globals sharing the same custom section
-             * so GAS/LLVM-MC never rejects conflicting flags or @nobits/@progbits changes. */
-            for (uint32_t j = 0u; j < mod->globals.len; ++j) {
-                const PirGlobal *og = &mod->globals.data[j];
-                if (og->linkage == PIR_LINK_EXTERN || !og->section ||
-                    strcmp(og->section, g->section) != 0) {
-                    continue;
-                }
-                if (!global_is_all_zero(og)) eff_zero = false;
-                if (global_has_reloc(og)) eff_rel = true;
-                if (og->seg == PIR_GSEG_TLS) eff_seg = PIR_GSEG_TLS;
-                else if (og->seg == PIR_GSEG_DATA && eff_seg == PIR_GSEG_RODATA) eff_seg = PIR_GSEG_DATA;
-            }
-        }
-        pir_asm_emit_section_directive(out, target, g->section, eff_seg, eff_rel, eff_zero, false);
+        pir_asm_emit_section_directive(out, mod, target, g->section, g->seg, has_rel, all_zero, false);
 
         if (g->linkage == PIR_LINK_EXPORT) {
             fputs("\t.globl ", out);

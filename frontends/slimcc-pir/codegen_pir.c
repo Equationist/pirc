@@ -73,12 +73,18 @@ static void sb_free(SBuf *sb) {
   sb->cap = 0;
 }
 
+typedef struct {
+  const char *sym_name;
+  char *buf;
+  size_t len;
+} StaticLvarOut;
+
 /* Backend per-function output stored on Obj::output */
 struct FuncObj {
   char *buf;
   size_t buflen;
-  char *static_lvars_buf;
-  size_t static_lvars_len;
+  StaticLvarOut *static_lvars;
+  int static_lvar_cnt;
   Obj **refs;
   int ref_cnt;
   int ref_cap;
@@ -340,10 +346,26 @@ static const char *pir_scalar_ty_name(Type *ty) {
   }
 }
 
+static bool is_darwin_a64_bitint_i32_abi(Type *ty) {
+  if (!ty || ty->kind != TY_BITINT)
+    return false;
+  if (is_x64_pir_target())
+    return false;
+  if (opt_pir_target && strstr(opt_pir_target, "darwin") == NULL)
+    return false;
+  return ty->bit_cnt < 32 && ty->bit_cnt != 1 && ty->bit_cnt != 8 && ty->bit_cnt != 16;
+}
+
+static const char *pir_abi_scalar_ty_name(Type *ty) {
+  if (is_darwin_a64_bitint_i32_abi(ty))
+    return "i32";
+  return pir_scalar_ty_name(ty);
+}
+
 static const char *pir_ret_ty_name(Type *rty) {
   if (!rty || rty->kind == TY_VOID || (is_agg_ty(rty) && rty->size <= 0))
     return "void";
-  return pir_scalar_ty_name(rty);
+  return pir_abi_scalar_ty_name(rty);
 }
 
 static int pir_scalar_align(Type *ty) {
@@ -440,6 +462,8 @@ static void check_hfa_walk(Type *ty, int64_t base_off, HfaCheck *hc) {
     return;
   }
   if (ty->kind == TY_ARRAY) {
+    if (ty->array_len > 0 && ty->size == 0)
+      return;
     if (ty->array_len <= 0) {
       hc->valid = false;
       return;
@@ -456,6 +480,8 @@ static void check_hfa_walk(Type *ty, int64_t base_off, HfaCheck *hc) {
         hc->valid = false;
         return;
       }
+      if ((m->ty->kind == TY_STRUCT || m->ty->kind == TY_UNION) && m->ty->size == 0)
+        continue;
       check_hfa_walk(m->ty, base_off + m->offset, hc);
     }
     return;
@@ -506,9 +532,9 @@ static void check_hfa_walk(Type *ty, int64_t base_off, HfaCheck *hc) {
 }
 
 static const char *register_pir_type_def(const char *def_str) {
-  PirTypeEntry *existing = hashmap_get(&pir_type_by_def, def_str);
+  const char *existing = hashmap_get(&pir_type_by_def, def_str);
   if (existing)
-    return existing->name;
+    return existing;
 
   if (pir_type_cnt == pir_type_cap) {
     pir_type_cap = pir_type_cap ? pir_type_cap * 2 : 32;
@@ -519,7 +545,7 @@ static const char *register_pir_type_def(const char *def_str) {
   char *def = arena_strdup(&cc1_arena, def_str);
   pir_types[id].name = name;
   pir_types[id].def_str = def;
-  hashmap_put(&pir_type_by_def, def, &pir_types[id]);
+  hashmap_put(&pir_type_by_def, def, name);
   return name;
 }
 
@@ -550,7 +576,7 @@ static void walk_sysv_x64_agg(Type *ty, int64_t base_off, SysvX64Walk *w) {
     w->unaligned = true;
     return;
   }
-  if (ty->size > 0 && ty->align > 1 && (base_off % ty->align) != 0) {
+  if (ty->align > 1 && (base_off % ty->align) != 0) {
     w->unaligned = true;
     return;
   }
@@ -596,7 +622,7 @@ static void walk_sysv_x64_agg(Type *ty, int64_t base_off, SysvX64Walk *w) {
         }
         continue;
       }
-      if (m->alt_align > 1 && m->ty->size > 0 && ((base_off + m->offset) % m->alt_align) != 0) {
+      if (m->alt_align > 1 && ((base_off + m->offset) % m->alt_align) != 0) {
         w->unaligned = true;
         return;
       }
@@ -632,19 +658,15 @@ static const char *get_pir_agg_type_name(Type *ty) {
       csz > 0 && csz <= 16) {
     SysvX64Walk w = {0};
     walk_sysv_x64_agg(ty, 0, &w);
-    if (w.unaligned && sz >= 3) {
-      /* SysV AMD64 §3.2.3: any unaligned field forces the entire aggregate to
-       * MEMORY class (passed on the stack / returned via hidden sret pointer).
-       * Emit a packed PIR struct containing an unaligned i16 at offset 1 so
-       * abi_sysv_x64 classifies it as MEMORY while preserving exact size/align. */
+    if (w.unaligned) {
+      /* SysV AMD64 §3.2.3: unaligned fields, _Atomic, or flexible array members
+       * force the entire aggregate to MEMORY class (stack / sret). */
       SBuf sb;
       sb_init(&sb);
-      if (sz == 3)
-        sb_printf(&sb, "packed { i8, i16 }");
-      else
-        sb_printf(&sb, "packed { i8, i16, [%" PRIi64 " x i8] }", sz - 3);
+      sb_printf(&sb, "[%" PRIi64 " x i8]", sz);
       if (al > 1)
         sb_printf(&sb, ", align %d", align_ceil_pow2(al, 4096));
+      sb_printf(&sb, ", memory");
       const char *res = register_pir_type_def(sb.buf);
       sb_free(&sb);
       return res;
@@ -820,9 +842,9 @@ static const char *get_pir_agg_type_name(Type *ty) {
 }
 
 static const char *register_pir_sig(const char *def_str) {
-  PirSigEntry *existing = hashmap_get(&pir_sig_by_def, def_str);
+  const char *existing = hashmap_get(&pir_sig_by_def, def_str);
   if (existing)
-    return existing->name;
+    return existing;
 
   if (pir_sig_cnt == pir_sig_cap) {
     pir_sig_cap = pir_sig_cap ? pir_sig_cap * 2 : 32;
@@ -833,13 +855,13 @@ static const char *register_pir_sig(const char *def_str) {
   char *def = arena_strdup(&cc1_arena, def_str);
   pir_sigs[id].name = name;
   pir_sigs[id].def_str = def;
-  hashmap_put(&pir_sig_by_def, def, &pir_sigs[id]);
+  hashmap_put(&pir_sig_by_def, def, name);
   return name;
 }
 
 /* Format parameter type list + return type for `sig` declaration. */
 static const char *pir_int_ext_attr(Type *ty) {
-  if (!ty || !is_int_class(ty) || ty->size >= 4)
+  if (!ty || !is_int_class(ty) || ty->size >= 4 || is_darwin_a64_bitint_i32_abi(ty))
     return "";
   if (ty->kind == TY_BOOL || ty->is_unsigned)
     return " zeroext";
@@ -860,7 +882,8 @@ static const char *get_pir_sig_for_call(Type *fnty, Obj *call_args) {
   }
 
   if (fnty->is_oldstyle) {
-    /* Old-style K&R function pointer: derive fixed params from call-site args */
+    /* Old-style K&R function pointer: derive fixed params from call-site args.
+     * Append `, ...` on SysV x86-64 so the backend sets %al = fp_used per ABI. */
     for (Obj *a = call_args; a; a = a->param_next) {
       if (a->ty->size <= 0 && is_agg_ty(a->ty))
         continue;
@@ -870,7 +893,12 @@ static const char *get_pir_sig_for_call(Type *fnty, Obj *call_args) {
       if (is_mem_val_ty(a->ty))
         sb_printf(&sb, "byval(@%s)", get_pir_agg_type_name(a->ty));
       else
-        sb_printf(&sb, "%s%s", pir_scalar_ty_name(a->ty), pir_int_ext_attr(a->ty));
+        sb_printf(&sb, "%s%s", pir_abi_scalar_ty_name(a->ty), pir_int_ext_attr(a->ty));
+    }
+    if (is_x64_pir_target()) {
+      if (!first)
+        sb_printf(&sb, ", ");
+      sb_printf(&sb, "...");
     }
   } else {
     for (Obj *p = fnty->param_list; p; p = p->param_next) {
@@ -882,7 +910,7 @@ static const char *get_pir_sig_for_call(Type *fnty, Obj *call_args) {
       if (is_mem_val_ty(p->ty))
         sb_printf(&sb, "byval(@%s)", get_pir_agg_type_name(p->ty));
       else
-        sb_printf(&sb, "%s%s", pir_scalar_ty_name(p->ty), pir_int_ext_attr(p->ty));
+        sb_printf(&sb, "%s%s", pir_abi_scalar_ty_name(p->ty), pir_int_ext_attr(p->ty));
     }
     if (fnty->is_variadic) {
       if (!first)
@@ -1766,13 +1794,45 @@ static PirVal emit_load_node(Node *node, PirVal addr) {
     const char *it = atomic_int_ty_for_size(node->ty->size);
     if (it) {
       ensure_open_block();
-      int raw = new_tid();
-      sb_printf(&fc->body_sb, "    %%t%d = atomic_load.%s %%t%d [seq_cst]\n", raw, it, addr.id);
-      int32_t al = (int32_t)node->ty->size;
-      int slot = emit_entry_alloca(node->ty->size, al);
+      int64_t sz = node->ty->size;
+      int32_t al = (int32_t)sz;
+      int slot = emit_entry_alloca(sz, al);
       int tmp = new_tid();
       sb_printf(&fc->body_sb, "    %%t%d = ptr_add.i64 %%loc_%d, 0\n", tmp, slot);
-      sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d\n", it, raw, tmp, al);
+      if (sz > 1) {
+        need_atomic_lock_helpers = true;
+        int b_fast = new_bid(), b_slow = new_bid(), b_done = new_bid();
+        int pi = new_tid(), mis = new_tid(), is_mis = new_tid();
+        sb_printf(&fc->body_sb, "    %%t%d = ptrtoint.i64 %%t%d\n", pi, addr.id);
+        sb_printf(&fc->body_sb, "    %%t%d = and.i64 %%t%d, %" PRIi64 "\n", mis, pi, sz - 1);
+        sb_printf(&fc->body_sb, "    %%t%d = cmp_ne.i64 %%t%d, 0\n", is_mis, mis);
+        sb_printf(&fc->body_sb, "    br %%t%d, .at_slow_%d, .at_fast_%d\n", is_mis, b_slow, b_fast);
+        fc->terminated = true;
+
+        sb_printf(&fc->body_sb, "\n.at_fast_%d:\n", b_fast);
+        fc->terminated = false;
+        int raw = new_tid();
+        sb_printf(&fc->body_sb, "    %%t%d = atomic_load.%s %%t%d [seq_cst]\n", raw, it, addr.id);
+        sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d\n", it, raw, tmp, al);
+        sb_printf(&fc->body_sb, "    jmp .at_done_%d\n", b_done);
+        fc->terminated = true;
+
+        sb_printf(&fc->body_sb, "\n.at_slow_%d:\n", b_slow);
+        fc->terminated = false;
+        int sz_id = new_tid();
+        sb_printf(&fc->body_sb, "    %%t%d = const.i64 %" PRIi64 "\n", sz_id, sz);
+        sb_printf(&fc->body_sb, "    call @__pir_atomic_load_n(%%t%d, %%t%d, %%t%d)\n",
+                  tmp, addr.id, sz_id);
+        sb_printf(&fc->body_sb, "    jmp .at_done_%d\n", b_done);
+        fc->terminated = true;
+
+        sb_printf(&fc->body_sb, "\n.at_done_%d:\n", b_done);
+        fc->terminated = false;
+      } else {
+        int raw = new_tid();
+        sb_printf(&fc->body_sb, "    %%t%d = atomic_load.%s %%t%d [seq_cst]\n", raw, it, addr.id);
+        sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d\n", it, raw, tmp, al);
+      }
       PirVal v = {tmp, "ptr"};
       return v;
     }
@@ -1844,9 +1904,41 @@ static PirVal emit_store_node(Node *lhs, PirVal val, PirVal addr, Node *rhs_node
       src_al = align_floor_pow2(stage_al);
     }
     if (it) {
-      int raw = new_tid();
-      sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", raw, it, src_ptr.id, src_al);
-      sb_printf(&fc->body_sb, "    atomic_store.%s %%t%d, %%t%d [seq_cst]\n", it, raw, addr.id);
+      int64_t sz = lhs->ty->size;
+      if (sz > 1) {
+        need_atomic_lock_helpers = true;
+        int b_fast = new_bid(), b_slow = new_bid(), b_done = new_bid();
+        int pi = new_tid(), mis = new_tid(), is_mis = new_tid();
+        sb_printf(&fc->body_sb, "    %%t%d = ptrtoint.i64 %%t%d\n", pi, addr.id);
+        sb_printf(&fc->body_sb, "    %%t%d = and.i64 %%t%d, %" PRIi64 "\n", mis, pi, sz - 1);
+        sb_printf(&fc->body_sb, "    %%t%d = cmp_ne.i64 %%t%d, 0\n", is_mis, mis);
+        sb_printf(&fc->body_sb, "    br %%t%d, .at_slow_%d, .at_fast_%d\n", is_mis, b_slow, b_fast);
+        fc->terminated = true;
+
+        sb_printf(&fc->body_sb, "\n.at_fast_%d:\n", b_fast);
+        fc->terminated = false;
+        int raw = new_tid();
+        sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", raw, it, src_ptr.id, src_al);
+        sb_printf(&fc->body_sb, "    atomic_store.%s %%t%d, %%t%d [seq_cst]\n", it, raw, addr.id);
+        sb_printf(&fc->body_sb, "    jmp .at_done_%d\n", b_done);
+        fc->terminated = true;
+
+        sb_printf(&fc->body_sb, "\n.at_slow_%d:\n", b_slow);
+        fc->terminated = false;
+        int sz_id = new_tid();
+        sb_printf(&fc->body_sb, "    %%t%d = const.i64 %" PRIi64 "\n", sz_id, sz);
+        sb_printf(&fc->body_sb, "    call @__pir_atomic_store_n(%%t%d, %%t%d, %%t%d)\n",
+                  addr.id, src_ptr.id, sz_id);
+        sb_printf(&fc->body_sb, "    jmp .at_done_%d\n", b_done);
+        fc->terminated = true;
+
+        sb_printf(&fc->body_sb, "\n.at_done_%d:\n", b_done);
+        fc->terminated = false;
+      } else {
+        int raw = new_tid();
+        sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", raw, it, src_ptr.id, src_al);
+        sb_printf(&fc->body_sb, "    atomic_store.%s %%t%d, %%t%d [seq_cst]\n", it, raw, addr.id);
+      }
       return val;
     }
     if (lhs->ty->size > 0) {
@@ -2002,7 +2094,8 @@ static PirVal gen_funcall(Node *node) {
   /* Determine whether we can use direct `call @fn` or need `call_indirect @Sig`.
    * Use `call_indirect` if calling through a function pointer OR calling a K&R
    * old-style function with arguments (to match PIR's strict parameter arity). */
-  bool use_direct = (direct != NULL) && !direct->ty->is_oldstyle && !fnty->is_oldstyle &&
+  bool use_direct = (direct != NULL) && !direct->asm_name &&
+                    !direct->ty->is_oldstyle && !fnty->is_oldstyle &&
                     (direct->ty->is_variadic == fnty->is_variadic);
   if (use_direct) {
     /* Also verify call-site arg count matches fixed params (or >= if variadic) */
@@ -2051,7 +2144,7 @@ static PirVal gen_funcall(Node *node) {
             break;
           }
         } else {
-          if (strcmp(pir_scalar_ty_name(dp->ty), pir_scalar_ty_name(ca->ty)) != 0 ||
+          if (strcmp(pir_abi_scalar_ty_name(dp->ty), pir_abi_scalar_ty_name(ca->ty)) != 0 ||
               strcmp(pir_int_ext_attr(dp->ty), pir_int_ext_attr(ca->ty)) != 0) {
             use_direct = false;
             break;
@@ -2117,6 +2210,29 @@ static PirVal gen_funcall(Node *node) {
     fixed_cnt = arg_cnt;
   }
 
+  /* Promote narrow _BitInt arguments to i32 when required by Darwin ARM64 ABI
+   * or when passed as variadic arguments (where PIR carries no signext tag). */
+  {
+    int p_idx = 0;
+    for (int i = 0; i < arg_cnt; i++) {
+      if (arg_tys[i]->size <= 0 && is_agg_ty(arg_tys[i]))
+        continue;
+      bool is_va_extra = sig_fnty->is_variadic && p_idx >= fixed_cnt;
+      if (!is_mem_val_ty(arg_tys[i]) &&
+          (is_darwin_a64_bitint_i32_abi(arg_tys[i]) ||
+           (is_va_extra && arg_tys[i]->kind == TY_BITINT && arg_tys[i]->bit_cnt < 32)) &&
+          strcmp(arg_vals[i].ty, "i32") != 0) {
+        ensure_open_block();
+        int ext = new_tid();
+        sb_printf(&fc->body_sb, "    %%t%d = %s.i32 %%t%d\n", ext,
+                  arg_tys[i]->is_unsigned ? "zext" : "sext", arg_vals[i].id);
+        arg_vals[i].id = ext;
+        arg_vals[i].ty = "i32";
+      }
+      p_idx++;
+    }
+  }
+
   Type *rty = node->ty;
   bool has_retbuf = is_mem_val_ty(rty) && rty->size > 0;
   LocalInfo *rb_li = NULL;
@@ -2179,7 +2295,14 @@ static PirVal gen_funcall(Node *node) {
     return v;
   }
   if (has_scalar_ret) {
-    PirVal v = {res_id, pir_scalar_ty_name(rty)};
+    const char *st = pir_scalar_ty_name(rty);
+    if (is_darwin_a64_bitint_i32_abi(rty) && strcmp(st, "i32") != 0) {
+      int tr = new_tid();
+      sb_printf(&fc->body_sb, "    %%t%d = trunc.%s %%t%d\n", tr, st, res_id);
+      PirVal v = {tr, st};
+      return emit_bitint_norm(v, rty);
+    }
+    PirVal v = {res_id, st};
     return emit_bitint_norm(v, rty);
   }
   return pir_void_val();
@@ -2722,16 +2845,51 @@ static PirVal gen_expr(Node *node) {
         p2 = align_floor_pow2(stage_al);
       }
       if (it) {
-        int new_raw = new_tid();
-        int old_raw = new_tid();
-        sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", new_raw, it, src_ptr.id, p2);
-        sb_printf(&fc->body_sb, "    %%t%d = atomic_rmw.xchg.%s %%t%d, %%t%d [seq_cst]\n",
-                  old_raw, it, addr.id, new_raw);
-        int32_t tmp_al = (int32_t)atom_ty->size;
-        int slot = emit_entry_alloca(atom_ty->size, tmp_al);
+        int64_t sz = atom_ty->size;
+        int32_t tmp_al = (int32_t)sz;
+        int slot = emit_entry_alloca(sz, tmp_al);
         int tmp = new_tid();
         sb_printf(&fc->body_sb, "    %%t%d = ptr_add.i64 %%loc_%d, 0\n", tmp, slot);
-        sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d\n", it, old_raw, tmp, tmp_al);
+        if (sz > 1) {
+          need_atomic_lock_helpers = true;
+          int b_fast = new_bid(), b_slow = new_bid(), b_done = new_bid();
+          int pi = new_tid(), mis = new_tid(), is_mis = new_tid();
+          sb_printf(&fc->body_sb, "    %%t%d = ptrtoint.i64 %%t%d\n", pi, addr.id);
+          sb_printf(&fc->body_sb, "    %%t%d = and.i64 %%t%d, %" PRIi64 "\n", mis, pi, sz - 1);
+          sb_printf(&fc->body_sb, "    %%t%d = cmp_ne.i64 %%t%d, 0\n", is_mis, mis);
+          sb_printf(&fc->body_sb, "    br %%t%d, .at_slow_%d, .at_fast_%d\n", is_mis, b_slow, b_fast);
+          fc->terminated = true;
+
+          sb_printf(&fc->body_sb, "\n.at_fast_%d:\n", b_fast);
+          fc->terminated = false;
+          int new_raw = new_tid();
+          int old_raw = new_tid();
+          sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", new_raw, it, src_ptr.id, p2);
+          sb_printf(&fc->body_sb, "    %%t%d = atomic_rmw.xchg.%s %%t%d, %%t%d [seq_cst]\n",
+                    old_raw, it, addr.id, new_raw);
+          sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d\n", it, old_raw, tmp, tmp_al);
+          sb_printf(&fc->body_sb, "    jmp .at_done_%d\n", b_done);
+          fc->terminated = true;
+
+          sb_printf(&fc->body_sb, "\n.at_slow_%d:\n", b_slow);
+          fc->terminated = false;
+          int sz_id = new_tid();
+          sb_printf(&fc->body_sb, "    %%t%d = const.i64 %" PRIi64 "\n", sz_id, sz);
+          sb_printf(&fc->body_sb, "    call @__pir_atomic_exch_n(%%t%d, %%t%d, %%t%d, %%t%d)\n",
+                    addr.id, src_ptr.id, tmp, sz_id);
+          sb_printf(&fc->body_sb, "    jmp .at_done_%d\n", b_done);
+          fc->terminated = true;
+
+          sb_printf(&fc->body_sb, "\n.at_done_%d:\n", b_done);
+          fc->terminated = false;
+        } else {
+          int new_raw = new_tid();
+          int old_raw = new_tid();
+          sb_printf(&fc->body_sb, "    %%t%d = load.%s %%t%d, align %d\n", new_raw, it, src_ptr.id, p2);
+          sb_printf(&fc->body_sb, "    %%t%d = atomic_rmw.xchg.%s %%t%d, %%t%d [seq_cst]\n",
+                    old_raw, it, addr.id, new_raw);
+          sb_printf(&fc->body_sb, "    store.%s %%t%d, %%t%d, align %d\n", it, old_raw, tmp, tmp_al);
+        }
         PirVal v = {tmp, "ptr"};
         return v;
       }
@@ -3513,8 +3671,20 @@ static void gen_stmt(Node *node) {
       fc->terminated = true;
       return;
     }
-    if (strcmp(rv.ty, fc->ret_pir_ty) != 0)
+    if (is_darwin_a64_bitint_i32_abi(rty)) {
+      const char *st = pir_scalar_ty_name(rty);
+      if (strcmp(rv.ty, st) != 0)
+        rv = emit_cast_val(rv, node->m.lhs->ty, rty);
+      if (strcmp(rv.ty, "i32") != 0) {
+        int ext = new_tid();
+        sb_printf(&fc->body_sb, "    %%t%d = %s.i32 %%t%d\n", ext,
+                  rty->is_unsigned ? "zext" : "sext", rv.id);
+        rv.id = ext;
+        rv.ty = "i32";
+      }
+    } else if (strcmp(rv.ty, fc->ret_pir_ty) != 0) {
       rv = emit_cast_val(rv, node->m.lhs->ty, rty);
+    }
     gen_defr(node);
     ensure_open_block();
     sb_printf(&fc->body_sb, "    ret %%t%d\n", rv.id);
@@ -3572,11 +3742,28 @@ void emit_text(Obj *fn) {
     if (li->is_byval_param) {
       sb_printf(&hdr, "%%p_%d: byval(@%s)", li->slot_id, get_pir_agg_type_name(p->ty));
     } else {
-      sb_printf(&hdr, "%%p_%d: %s%s", li->slot_id, li->pir_ty, pir_int_ext_attr(p->ty));
+      const char *abi_ty = pir_abi_scalar_ty_name(p->ty);
+      sb_printf(&hdr, "%%p_%d: %s%s", li->slot_id, abi_ty, pir_int_ext_attr(p->ty));
       if (p->ty->kind == TY_PTR && (p->ty->qual & Q_RESTRICT))
         sb_printf(&hdr, " noalias");
       int32_t p2 = align_floor_pow2(li->align);
-      if (p->ty->kind == TY_BITINT && p->ty->bit_cnt < pir_ty_bits(li->pir_ty)) {
+      if (strcmp(abi_ty, li->pir_ty) != 0) {
+        int tr = new_tid();
+        sb_printf(&ctx.entry_sb, "    %%t%d = trunc.%s %%p_%d\n", tr, li->pir_ty, li->slot_id);
+        if (p->ty->kind == TY_BITINT && p->ty->bit_cnt < pir_ty_bits(li->pir_ty)) {
+          int sh = pir_ty_bits(li->pir_ty) - (int)p->ty->bit_cnt;
+          int s1 = new_tid(), s2 = new_tid();
+          sb_printf(&ctx.entry_sb, "    %%t%d = shl.%s %%t%d, %d [mask]\n",
+                    s1, li->pir_ty, tr, sh);
+          sb_printf(&ctx.entry_sb, "    %%t%d = %s.%s %%t%d, %d [mask]\n",
+                    s2, p->ty->is_unsigned ? "shr" : "sar", li->pir_ty, s1, sh);
+          sb_printf(&ctx.entry_sb, "    store.%s %%t%d, %%loc_%d, align %d\n",
+                    li->pir_ty, s2, li->slot_id, p2);
+        } else {
+          sb_printf(&ctx.entry_sb, "    store.%s %%t%d, %%loc_%d, align %d\n",
+                    li->pir_ty, tr, li->slot_id, p2);
+        }
+      } else if (p->ty->kind == TY_BITINT && p->ty->bit_cnt < pir_ty_bits(li->pir_ty)) {
         int sh = pir_ty_bits(li->pir_ty) - (int)p->ty->bit_cnt;
         int s1 = new_tid(), s2 = new_tid();
         sb_printf(&ctx.entry_sb, "    %%t%d = shl.%s %%p_%d, %d [mask]\n",
@@ -3656,9 +3843,10 @@ void emit_text(Obj *fn) {
   fn->output->buf = full.buf;
   fn->output->buflen = full.len;
   /* Emit live static local variables NOW while ast_arena is still alive!
-   * (slimcc frees ast_arena right after emit_text returns.) */
-  SBuf sl_sb;
-  sb_init(&sl_sb);
+   * Store each entry with its PIR symbol name so codegen() deduplicates it
+   * against top-level definitions and extern declarations. */
+  StaticLvarOut *sl_list = NULL;
+  int sl_cnt = 0, sl_cap = 0;
   {
     Obj head = {.next = fn->static_lvars};
     bool has_change;
@@ -3671,7 +3859,17 @@ void emit_text(Obj *fn) {
             if (rel->var)
               fc_add_ref(rel->var);
           }
-          emit_global_def(&sl_sb, sv);
+          SBuf one_sb;
+          sb_init(&one_sb);
+          emit_global_def(&one_sb, sv);
+          if (sl_cnt == sl_cap) {
+            sl_cap = sl_cap ? sl_cap * 2 : 8;
+            sl_list = pir_xrealloc(sl_list, (size_t)sl_cap * sizeof(StaticLvarOut));
+          }
+          sl_list[sl_cnt].sym_name = arena_strdup(&cc1_arena, pir_sym_name(sv));
+          sl_list[sl_cnt].buf = one_sb.buf;
+          sl_list[sl_cnt].len = one_sb.len;
+          sl_cnt++;
           has_change = true;
           continue;
         }
@@ -3684,8 +3882,8 @@ void emit_text(Obj *fn) {
   fn->output->refs = ctx.refs;
   fn->output->ref_cnt = ctx.ref_cnt;
   fn->output->ref_cap = ctx.ref_cap;
-  fn->output->static_lvars_buf = sl_sb.buf;
-  fn->output->static_lvars_len = sl_sb.len;
+  fn->output->static_lvars = sl_list;
+  fn->output->static_lvar_cnt = sl_cnt;
 
   sb_free(&hdr);
   sb_free(&ctx.entry_sb);
@@ -3747,7 +3945,7 @@ static void emit_extern_decl(SBuf *sb, Obj *var) {
       if (is_mem_val_ty(p->ty))
         sb_printf(sb, "byval(@%s)", get_pir_agg_type_name(p->ty));
       else
-        sb_printf(sb, "%s%s", pir_scalar_ty_name(p->ty), pir_int_ext_attr(p->ty));
+        sb_printf(sb, "%s%s", pir_abi_scalar_ty_name(p->ty), pir_int_ext_attr(p->ty));
     }
     if (var->ty->is_variadic) {
       if (!first)
@@ -3873,6 +4071,21 @@ int codegen(Obj *prog, FILE *out) {
       emit_global_def(&glob_sb, var);
   }
 
+  /* Emit live static local variables BEFORE extern declarations so a static
+   * local definition sharing an __asm__ name wins over an extern declaration. */
+  for (Obj *var = prog; var; var = var->next) {
+    if (!var->is_live || !var->is_definition || var->ty->kind != TY_FUNC || !var->output)
+      continue;
+    for (int i = 0; i < var->output->static_lvar_cnt; i++) {
+      StaticLvarOut *sl = &var->output->static_lvars[i];
+      if (hashmap_get(&emitted_syms, sl->sym_name))
+        continue;
+      hashmap_put(&emitted_syms, sl->sym_name, (void *)1);
+      if (sl->len > 0)
+        sb_append(&glob_sb, sl->buf, sl->len);
+    }
+  }
+
   for (Obj *var = prog; var; var = var->next) {
     if (!var->is_live || var->is_definition)
       continue;
@@ -3897,14 +4110,6 @@ int codegen(Obj *prog, FILE *out) {
       hashmap_put(&emitted_syms, sname, (void *)1);
       emit_extern_decl(&ext_sb, r);
     }
-  }
-
-  /* Emit live static local variables (serialized during emit_text while ast_arena was live) */
-  for (Obj *var = prog; var; var = var->next) {
-    if (!var->is_live || !var->is_definition || var->ty->kind != TY_FUNC || !var->output)
-      continue;
-    if (var->output->static_lvars_len > 0)
-      sb_append(&glob_sb, var->output->static_lvars_buf, var->output->static_lvars_len);
   }
 
   if (need_atomic_lock_helpers) {

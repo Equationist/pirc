@@ -110,52 +110,105 @@ static bool shim_printf(PirInterp *it, const PirVal *args, uint32_t arg_count, i
             continue;
         }
         /* Capture optional flags/width/precision/length into small format buffer. */
-        char fbuf[32];
-        size_t fl = 0u;
-        fbuf[fl++] = '%';
-        while (*s && strchr("-+ #0", *s) != NULL) {
-            if (fl >= sizeof(fbuf) - 4u) {
-                free(fmt);
-                pir_interp_fail(it, PIR_INTERP_UB, "printf format specifier too long");
-                return false;
-            }
-            fbuf[fl++] = *s++;
+        bool flag_minus = false, flag_plus = false, flag_space = false;
+        bool flag_hash = false, flag_zero = false;
+        while (*s) {
+            if (*s == '-')      { flag_minus = true; s++; }
+            else if (*s == '+') { flag_plus  = true; s++; }
+            else if (*s == ' ') { flag_space = true; s++; }
+            else if (*s == '#') { flag_hash  = true; s++; }
+            else if (*s == '0') { flag_zero  = true; s++; }
+            else break;
         }
+        bool has_width = false;
         uint32_t width_val = 0u;
-        while (*s >= '0' && *s <= '9') {
-            width_val = width_val * 10u + (uint32_t)(*s - '0');
-            if (fl >= sizeof(fbuf) - 4u || width_val > 4096u) {
+        if (*s == '*') {
+            s++;
+            if (ai >= arg_count) {
                 free(fmt);
-                pir_interp_fail(it, PIR_INTERP_UB, "printf format width too large");
+                pir_interp_fail(it, PIR_INTERP_UB, "printf missing dynamic width argument");
                 return false;
             }
-            fbuf[fl++] = *s++;
+            int32_t wv = (int32_t)pir_val_get_u64(&args[ai++]);
+            if (wv < 0) {
+                flag_minus = true;
+                uint64_t mag = (uint64_t)(-(int64_t)wv);
+                if (mag > 65536u) {
+                    free(fmt);
+                    pir_interp_fail(it, PIR_INTERP_UB, "printf format width too large");
+                    return false;
+                }
+                width_val = (uint32_t)mag;
+            } else {
+                if ((uint32_t)wv > 65536u) {
+                    free(fmt);
+                    pir_interp_fail(it, PIR_INTERP_UB, "printf format width too large");
+                    return false;
+                }
+                width_val = (uint32_t)wv;
+            }
+            has_width = true;
+        } else {
+            while (*s >= '0' && *s <= '9') {
+                has_width = true;
+                width_val = width_val * 10u + (uint32_t)(*s - '0');
+                if (width_val > 65536u) {
+                    free(fmt);
+                    pir_interp_fail(it, PIR_INTERP_UB, "printf format width too large");
+                    return false;
+                }
+                s++;
+            }
         }
         bool has_prec = false;
         uint32_t prec_val = 0u;
-        size_t prec_start = fl;
         if (*s == '.') {
-            has_prec = true;
-            if (fl >= sizeof(fbuf) - 4u) {
-                free(fmt);
-                pir_interp_fail(it, PIR_INTERP_UB, "printf format specifier too long");
-                return false;
-            }
-            fbuf[fl++] = *s++;
-            while (*s >= '0' && *s <= '9') {
-                prec_val = prec_val * 10u + (uint32_t)(*s - '0');
-                if (fl >= sizeof(fbuf) - 4u || prec_val > 4096u) {
+            s++;
+            if (*s == '*') {
+                s++;
+                if (ai >= arg_count) {
                     free(fmt);
-                    pir_interp_fail(it, PIR_INTERP_UB, "printf format precision too large");
+                    pir_interp_fail(it, PIR_INTERP_UB, "printf missing dynamic precision argument");
                     return false;
                 }
-                fbuf[fl++] = *s++;
+                int32_t pv = (int32_t)pir_val_get_u64(&args[ai++]);
+                if (pv >= 0) {
+                    if ((uint32_t)pv > 65536u) {
+                        free(fmt);
+                        pir_interp_fail(it, PIR_INTERP_UB, "printf format precision too large");
+                        return false;
+                    }
+                    has_prec = true;
+                    prec_val = (uint32_t)pv;
+                }
+            } else {
+                has_prec = true;
+                while (*s >= '0' && *s <= '9') {
+                    prec_val = prec_val * 10u + (uint32_t)(*s - '0');
+                    if (prec_val > 65536u) {
+                        free(fmt);
+                        pir_interp_fail(it, PIR_INTERP_UB, "printf format precision too large");
+                        return false;
+                    }
+                    s++;
+                }
             }
         }
-        int long_cnt = 0;
-        while (*s == 'l' && long_cnt < 2) {
-            long_cnt++;
+        enum { LEN_NONE = 0, LEN_HH, LEN_H, LEN_L, LEN_LL, LEN_Z, LEN_T, LEN_J } lmod = LEN_NONE;
+        if (*s == 'h') {
             s++;
+            if (*s == 'h') { lmod = LEN_HH; s++; }
+            else lmod = LEN_H;
+        } else if (*s == 'l') {
+            s++;
+            if (*s == 'l') { lmod = LEN_LL; s++; }
+            else lmod = LEN_L;
+        } else if (*s == 'z') {
+            lmod = LEN_Z; s++;
+        } else if (*s == 't') {
+            lmod = LEN_T; s++;
+        } else if (*s == 'j') {
+            lmod = LEN_J; s++;
         }
         char spec = *s;
         if (spec == '\0') break;
@@ -165,35 +218,47 @@ static bool shim_printf(PirInterp *it, const PirVal *args, uint32_t arg_count, i
             return false;
         }
         const PirVal *av = &args[ai++];
+        bool is_64 = (lmod == LEN_LL || lmod == LEN_J ||
+                      ((lmod == LEN_L || lmod == LEN_Z || lmod == LEN_T) && it->ptr_bytes >= 8u));
+        char fbuf[48];
+        size_t fl = 0u;
+        fbuf[fl++] = '%';
         switch (spec) {
             case 'd': case 'i': {
                 int64_t sv = 0;
                 uint64_t raw = pir_val_get_u64(av);
-                if (long_cnt > 0 && av->ty.kind == PIR_TYPE_SCALAR &&
-                    av->ty.u.scalar == PIR_SCALAR_I64) {
-                    sv = (int64_t)raw;
-                } else if (av->ty.kind == PIR_TYPE_SCALAR && av->ty.u.scalar == PIR_SCALAR_I16) {
-                    sv = (int64_t)(int16_t)raw;
-                } else if (av->ty.kind == PIR_TYPE_SCALAR && av->ty.u.scalar == PIR_SCALAR_I8) {
-                    sv = (int64_t)(int8_t)raw;
-                } else {
-                    sv = (int64_t)(int32_t)raw;
-                }
-                fbuf[fl++] = 'l'; fbuf[fl++] = 'l'; fbuf[fl++] = 'd'; fbuf[fl] = '\0';
+                if (lmod == LEN_HH)     sv = (int64_t)(int8_t)raw;
+                else if (lmod == LEN_H) sv = (int64_t)(int16_t)raw;
+                else if (is_64)         sv = (int64_t)raw;
+                else                    sv = (int64_t)(int32_t)raw;
+                if (flag_minus) fbuf[fl++] = '-';
+                if (flag_plus)  fbuf[fl++] = '+';
+                else if (flag_space) fbuf[fl++] = ' ';
+                if (flag_zero && !flag_minus && !has_prec) fbuf[fl++] = '0';
+                if (has_width) fl += (size_t)snprintf(fbuf + fl, sizeof(fbuf) - fl, "%u", width_val);
+                if (has_prec)  fl += (size_t)snprintf(fbuf + fl, sizeof(fbuf) - fl, ".%u", prec_val);
+                snprintf(fbuf + fl, sizeof(fbuf) - fl, "lld");
                 total += printf(fbuf, (long long)sv);
                 break;
             }
-            case 'u': case 'x': case 'X': {
+            case 'u': case 'o': case 'x': case 'X': {
                 uint64_t uv = pir_val_get_u64(av);
-                if (long_cnt == 0) {
-                    uv = (uint32_t)uv;
-                }
-                fbuf[fl++] = 'l'; fbuf[fl++] = 'l'; fbuf[fl++] = spec; fbuf[fl] = '\0';
+                if (lmod == LEN_HH)     uv = (uint8_t)uv;
+                else if (lmod == LEN_H) uv = (uint16_t)uv;
+                else if (!is_64)        uv = (uint32_t)uv;
+                if (flag_minus) fbuf[fl++] = '-';
+                if (flag_hash && spec != 'u') fbuf[fl++] = '#';
+                if (flag_zero && !flag_minus && !has_prec) fbuf[fl++] = '0';
+                if (has_width) fl += (size_t)snprintf(fbuf + fl, sizeof(fbuf) - fl, "%u", width_val);
+                if (has_prec)  fl += (size_t)snprintf(fbuf + fl, sizeof(fbuf) - fl, ".%u", prec_val);
+                snprintf(fbuf + fl, sizeof(fbuf) - fl, "ll%c", spec);
                 total += printf(fbuf, (unsigned long long)uv);
                 break;
             }
             case 'c': {
                 int ch = (int)(unsigned char)pir_val_get_u64(av);
+                if (flag_minus) fbuf[fl++] = '-';
+                if (has_width) fl += (size_t)snprintf(fbuf + fl, sizeof(fbuf) - fl, "%u", width_val);
                 fbuf[fl++] = 'c'; fbuf[fl] = '\0';
                 total += printf(fbuf, ch);
                 break;
@@ -204,6 +269,9 @@ static bool shim_printf(PirInterp *it, const PirVal *args, uint32_t arg_count, i
                     free(fmt);
                     return false;
                 }
+                if (flag_minus) fbuf[fl++] = '-';
+                if (has_width) fl += (size_t)snprintf(fbuf + fl, sizeof(fbuf) - fl, "%u", width_val);
+                if (has_prec)  fl += (size_t)snprintf(fbuf + fl, sizeof(fbuf) - fl, ".%u", prec_val);
                 fbuf[fl++] = 's'; fbuf[fl] = '\0';
                 total += printf(fbuf, str);
                 free(str);
@@ -213,12 +281,13 @@ static bool shim_printf(PirInterp *it, const PirVal *args, uint32_t arg_count, i
                 uint64_t addr = pir_interp_ptr_to_int(it, av->ptr);
                 char pbuf[32];
                 snprintf(pbuf, sizeof(pbuf), "0x%" PRIx64, addr);
-                if (has_prec) fl = prec_start;
+                if (flag_minus) fbuf[fl++] = '-';
+                if (has_width) fl += (size_t)snprintf(fbuf + fl, sizeof(fbuf) - fl, "%u", width_val);
                 fbuf[fl++] = 's'; fbuf[fl] = '\0';
                 total += printf(fbuf, pbuf);
                 break;
             }
-            case 'f': case 'g': case 'e': {
+            case 'f': case 'F': case 'g': case 'G': case 'e': case 'E': case 'a': case 'A': {
                 double dv = 0.0;
                 if (av->ty.kind == PIR_TYPE_SCALAR && av->ty.u.scalar == PIR_SCALAR_F32) {
                     float fv = 0.0f;
@@ -227,6 +296,13 @@ static bool shim_printf(PirInterp *it, const PirVal *args, uint32_t arg_count, i
                 } else {
                     memcpy(&dv, av->bytes, sizeof(dv));
                 }
+                if (flag_minus) fbuf[fl++] = '-';
+                if (flag_plus)  fbuf[fl++] = '+';
+                else if (flag_space) fbuf[fl++] = ' ';
+                if (flag_hash)  fbuf[fl++] = '#';
+                if (flag_zero && !flag_minus) fbuf[fl++] = '0';
+                if (has_width) fl += (size_t)snprintf(fbuf + fl, sizeof(fbuf) - fl, "%u", width_val);
+                if (has_prec)  fl += (size_t)snprintf(fbuf + fl, sizeof(fbuf) - fl, ".%u", prec_val);
                 fbuf[fl++] = spec; fbuf[fl] = '\0';
                 total += printf(fbuf, dv);
                 break;

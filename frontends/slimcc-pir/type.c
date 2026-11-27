@@ -266,7 +266,7 @@ bool chk_qual_type(QualMask qual, Type *ty) {
     if (ty->kind != TY_PTR || ty->base->kind == TY_FUNC || ty->base->kind == TY_FUNC_INCMP)
       return true;
   if (qual & Q_ATOMIC)
-    if (is_decay_ty(ty) || ty->kind == TY_VOID)
+    if (is_decay_ty(ty) || ty->kind == TY_VOID || ty->size < 0)
       return true;
   if (is_iso_std && (qual & (Q_CONST | Q_VOLATILE)) &&
       (ty->kind == TY_FUNC || ty->kind == TY_FUNC_INCMP))
@@ -796,6 +796,8 @@ Type *array_of(Type *base, int64_t len) {
 
 void vla_setty(Type *ty, Node *len, int64_t arr_len) {
   ty->kind = TY_VLA;
+  if (ty->base && ty->base->align > 0)
+    ty->align = ty->base->align;
   if (len) {
     add_type(len);
     cast_if_not(ty_size_t, &len);
@@ -803,6 +805,19 @@ void vla_setty(Type *ty, Node *len, int64_t arr_len) {
   } else {
     ty->array_len = arr_len;
   }
+}
+
+bool is_compatible_unqual_ptr_target(Type *t1, Type *t2) {
+  if (is_array(t1) && is_array(t2)) {
+    int64_t *len1 = get_arr_len(t1);
+    int64_t *len2 = get_arr_len(t2);
+    if (!len1 || !len2 || *len1 == *len2)
+      return is_compatible_unqual_ptr_target(t1->base, t2->base);
+    return false;
+  }
+  if (!!(t1->qual & Q_ATOMIC) != !!(t2->qual & Q_ATOMIC))
+    return false;
+  return is_compatible(t1, t2);
 }
 
 Type *vla_of(Type *base, Node *len, int64_t arr_len) {
@@ -1149,14 +1164,12 @@ void _add_type(Node *node) {
         bool lfn = (lb->kind == TY_FUNC || lb->kind == TY_FUNC_INCMP);
         bool rfn = (rb->kind == TY_FUNC || rb->kind == TY_FUNC_INCMP);
         if (is_rel) {
-          if (lfn || rfn || !is_compatible(lb, rb) ||
-              (lb->qual & Q_ATOMIC) != (rb->qual & Q_ATOMIC))
+          if (lfn || rfn || !is_compatible_unqual_ptr_target(lb, rb))
             error_tok(node->tok, "invalid relational pointer comparison");
         } else if (!is_null_ptr_constant(node->m.lhs) &&
                    !is_null_ptr_constant(node->m.rhs)) {
           bool void_obj = (lb->kind == TY_VOID && !rfn) || (rb->kind == TY_VOID && !lfn);
-          if (!void_obj && (!is_compatible(lb, rb) ||
-                            (lb->qual & Q_ATOMIC) != (rb->qual & Q_ATOMIC)))
+          if (!void_obj && !is_compatible_unqual_ptr_target(lb, rb))
             error_tok(node->tok, "comparison of distinct pointer types");
         }
       }
@@ -1197,8 +1210,18 @@ void _add_type(Node *node) {
   case ND_SAR:
     add_int_type(node->m.lhs);
     add_int_type(node->m.rhs);
-    if (node->m.rhs->ty->kind == TY_BITINT)
-      node->m.rhs = new_cast(node->m.rhs, ty_ullong);
+    if (node->m.rhs->ty->kind == TY_BITINT) {
+      if (node->m.rhs->ty->bit_cnt > 64) {
+        Node *cn = arena_calloc(&ast_arena, sizeof(Node));
+        cn->kind = ND_CAST;
+        cn->tok = node->m.rhs->tok;
+        cn->m.lhs = node->m.rhs;
+        cn->ty = ty_ullong;
+        node->m.rhs = cn;
+      } else {
+        node->m.rhs = new_cast(node->m.rhs, ty_ullong);
+      }
+    }
     int_promotion(&node->m.lhs);
     node->ty = unenum(unqual(node->m.lhs->ty));
     return;

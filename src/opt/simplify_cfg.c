@@ -301,7 +301,11 @@ static bool is_pure_speculatable_alu(const PirFunction *fn, const PirInst *ins, 
     if (op == PIR_OP_SELECT) {
         return ins->operand_count == 3u && pir_operand_is_proven_bool_i8(fn, ins->operands[0]);
     }
-    if (op == PIR_OP_CONST || op == PIR_OP_ADD || op == PIR_OP_SUB || op == PIR_OP_MUL ||
+    if (op == PIR_OP_CONST) {
+        /* Never speculatively hoist symbol addresses (e.g., weak extern TLS triggers a TLV thunk). */
+        return ins->operand_count >= 1u && ins->operands[0].kind != PIR_OPER_SYM;
+    }
+    if (op == PIR_OP_ADD || op == PIR_OP_SUB || op == PIR_OP_MUL ||
         op == PIR_OP_AND || op == PIR_OP_OR || op == PIR_OP_XOR ||
         op == PIR_OP_SHL || op == PIR_OP_SHR || op == PIR_OP_SAR ||
         op == PIR_OP_ZEXT || op == PIR_OP_SEXT || op == PIR_OP_TRUNC ||
@@ -903,7 +907,18 @@ static bool eliminate_self_tail_calls(PirModule *mod, PirFunction *fn) {
             ains.results[0]    = nacc;
 
             PirOperand *jargs = pir_alloc_ops(mod, lp_argc);
-            for (uint32_t k = 0u; k < np; ++k) jargs[k] = call_copy.operands[1u + k];
+            for (uint32_t k = 0u; k < np; ++k) {
+                PirOperand a = call_copy.operands[1u + k];
+                a.has_explicit_type   = false;
+                a.call_abi            = PIR_PARAM_NORMAL;
+                a.call_abi_type       = pir_type_scalar(PIR_SCALAR_VOID);
+                a.call_byval_size     = 0u;
+                a.call_byval_align    = 0u;
+                a.call_stack_align    = 0u;
+                a.call_force_stack    = false;
+                a.call_no_f32_promote = false;
+                jargs[k] = a;
+            }
             jargs[np] = pir_op_val(nacc, fn->ret_type);
 
             PirInst jmp = pir_make_inst(PIR_OP_JMP, pir_type_scalar(PIR_SCALAR_VOID),
@@ -920,7 +935,18 @@ static bool eliminate_self_tail_calls(PirModule *mod, PirFunction *fn) {
             PirInstId cid = blk->insts.data[blk->insts.len - 2u];
             PirInst call_copy = fn->insts.data[cid];
             PirOperand *jargs = lp_argc ? pir_alloc_ops(mod, lp_argc) : NULL;
-            for (uint32_t k = 0u; k < np; ++k) jargs[k] = call_copy.operands[1u + k];
+            for (uint32_t k = 0u; k < np; ++k) {
+                PirOperand a = call_copy.operands[1u + k];
+                a.has_explicit_type   = false;
+                a.call_abi            = PIR_PARAM_NORMAL;
+                a.call_abi_type       = pir_type_scalar(PIR_SCALAR_VOID);
+                a.call_byval_size     = 0u;
+                a.call_byval_align    = 0u;
+                a.call_stack_align    = 0u;
+                a.call_force_stack    = false;
+                a.call_no_f32_promote = false;
+                jargs[k] = a;
+            }
             if (use_acc) jargs[np] = pir_op_val(acc_param, fn->ret_type);
             PirInst jmp = pir_make_inst(PIR_OP_JMP, pir_type_scalar(PIR_SCALAR_VOID),
                                         call_copy.src_line, call_copy.loc_idx);

@@ -161,7 +161,7 @@ void *eval_bitint_bitfield_load(int32_t bits, BitBuf *src, BitBuf *dst, int32_t 
   return src;
 }
 
-void eval_bitint_bitfield_save(int32_t bits, BitBuf *src, BitBuf *dst, int32_t width,
+void eval_bitint_bitfield_save(int32_t bits, BitBuf *src, uint8_t *dst, int32_t width,
                                int32_t ofs) {
 #ifndef BOOTSTRAP_NO_VLA
   int32_t src_cnt = (bits + 63) / 64;
@@ -186,7 +186,7 @@ void eval_bitint_bitfield_save(int32_t bits, BitBuf *src, BitBuf *dst, int32_t w
   int32_t top = (width + ofs - 1) / 8;
 
   for (int32_t j = ofs / 8; j <= top; j++)
-    (&dst->as8)[j] = ((&dst->as8)[j] & (&mb->as8)[j]) | (&sb->as8)[j];
+    dst[j] = (dst[j] & (&mb->as8)[j]) | (&sb->as8)[j];
 #endif
 }
 

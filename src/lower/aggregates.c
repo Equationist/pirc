@@ -143,7 +143,8 @@ static PirTypeLayout pir_type_layout_rec(const PirModule *mod, const PirTargetSp
                 res.align = agg->min_align;
                 res.size  = align_up_u64_chk(res.size, res.align, &res.overflow);
             }
-            if (res.size > (UINT64_C(1) << 48) || res.stride > (UINT64_C(1) << 48)) {
+            uint64_t max_sz = (target->ptr_bytes == 4u) ? (UINT64_C(1) << 31) : (UINT64_C(1) << 40);
+            if (res.size > max_sz || res.stride > max_sz) {
                 res.overflow = true;
             }
             if (cache && done && aid < mod->agg_types.len) {
@@ -240,12 +241,8 @@ static bool lower_mem_intrinsic(PirModule *mod, const PirTargetSpec *target,
     bool const_small = (len.kind == PIR_OPER_IMM_INT && !len.u.imm_int.is_negative &&
                         len.u.imm_int.hi == 0u && len.u.imm_int.lo <= 64u);
 
-    if (const_small && (inst->op == PIR_OP_MEMCPY || inst->op == PIR_OP_MEMMOVE)) {
-        if (len.u.imm_int.lo == 0u) {
-            return true;
-        }
-        /* Keep memcpy/memmove as extern @memcpy/@memmove calls rather than typed integer
-         * loads/stores so byte-level uninitialized padding and pointer provenance are preserved. */
+    if (const_small && len.u.imm_int.lo == 0u) {
+        return true;
     }
 
     if (const_small && inst->op == PIR_OP_MEMSET && src.kind == PIR_OPER_IMM_INT) {
@@ -282,13 +279,32 @@ static bool lower_mem_intrinsic(PirModule *mod, const PirTargetSpec *target,
     ptys[1] = (inst->op == PIR_OP_MEMSET) ? pir_type_scalar(PIR_SCALAR_I32)
                                           : pir_type_scalar(PIR_SCALAR_PTR);
     ptys[2] = idx_ty;
+    /* Ensure symbol name does not collide with an existing global, sig, or aggregate type. */
+    for (uint32_t gi = 0u; gi < mod->globals.len; ++gi) {
+        if (mod->globals.data[gi].name && strcmp(mod->globals.data[gi].name, cname) == 0) {
+            pir_diag_error(diag, inst->src_line, 0u,
+                           "symbol '@%s' collides with global during memory intrinsic lowering", cname);
+            return false;
+        }
+    }
+    for (uint32_t si = 0u; si < mod->sigs.len; ++si) {
+        if (mod->sigs.data[si].name && strcmp(mod->sigs.data[si].name, cname) == 0) {
+            pir_diag_error(diag, inst->src_line, 0u,
+                           "symbol '@%s' collides with signature during memory intrinsic lowering", cname);
+            return false;
+        }
+    }
     PirFuncId cid = pir_ensure_extern_func(mod, cname, ptys, 3u, pir_type_scalar(PIR_SCALAR_PTR));
     const PirFunction *callee = &mod->funcs.data[cid];
     bool sig_ok = (!callee->is_variadic && callee->param_count == 3u &&
+                   callee->cc == PIR_CC_C && callee->linkage != PIR_LINK_INTERNAL &&
                    callee->cabi_ret.kind == PIR_CABI_RET_NONE &&
                    pir_type_eq(callee->ret_type, pir_type_scalar(PIR_SCALAR_PTR)));
     for (uint32_t k = 0u; k < 3u && sig_ok; ++k) {
         if (callee->params[k].abi_kind != PIR_PARAM_NORMAL ||
+            callee->params[k].abi_byval_size != 0u ||
+            callee->params[k].abi_stack_align != 0u ||
+            callee->params[k].abi_force_stack ||
             !pir_type_eq(callee->params[k].type, ptys[k])) {
             sig_ok = false;
         }
@@ -412,36 +428,49 @@ static uint64_t gitem_vec_bytes_since(const GItemVec *v, uint32_t start, uint8_t
     return total;
 }
 
-static bool is_pad_only_type(const PirModule *mod, PirType ty, uint32_t depth) {
+static bool is_pad_only_type_rec(const PirModule *mod, PirType ty, int8_t *cache, uint32_t depth) {
     if (depth > 256u || ty.kind != PIR_TYPE_NAMED_AGG || ty.u.agg_id >= mod->agg_types.len) {
         return false;
     }
-    const PirAggDef *agg = &mod->agg_types.data[ty.u.agg_id];
+    uint32_t aid = ty.u.agg_id;
+    if (cache) {
+        if (cache[aid] == 1) return true;
+        if (cache[aid] == 0 || cache[aid] == 2) return false;
+        cache[aid] = 2;
+    }
+    const PirAggDef *agg = &mod->agg_types.data[aid];
+    bool res = false;
     switch (agg->kind) {
         case PIR_AGG_PAD:
-            return true;
+            res = true;
+            break;
         case PIR_AGG_ARRAY:
-            return is_pad_only_type(mod, agg->elem_type, depth + 1u);
+            res = is_pad_only_type_rec(mod, agg->elem_type, cache, depth + 1u);
+            break;
         case PIR_AGG_STRUCT:
         case PIR_AGG_PACKED_STRUCT:
-            for (uint32_t f = 0u; f < agg->field_count; ++f) {
-                if (!is_pad_only_type(mod, agg->fields[f], depth + 1u)) return false;
-            }
-            return true;
         case PIR_AGG_UNION:
-            return agg->field_count > 0u && is_pad_only_type(mod, agg->fields[0], depth + 1u);
+            res = (agg->field_count > 0u);
+            for (uint32_t f = 0u; f < agg->field_count && res; ++f) {
+                if (!is_pad_only_type_rec(mod, agg->fields[f], cache, depth + 1u)) res = false;
+            }
+            break;
     }
-    return false;
+    if (cache) cache[aid] = res ? 1 : 0;
+    return res;
+}
+
+static bool is_pad_only_type(const PirModule *mod, PirType ty, int8_t *cache) {
+    return is_pad_only_type_rec(mod, ty, cache, 0u);
 }
 
 static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirType ty,
                                const PirGlobalItem *src, uint32_t src_cnt, uint32_t *idx,
-                               GItemVec *out) {
+                               GItemVec *out, int8_t *pad_cache) {
     PirTypeLayout ly = pir_type_layout(mod, target, ty);
     if (ly.size == 0u) return;
-    /* Padding fields never consume any initializer items (not even zeroinit). */
-    if (ty.kind == PIR_TYPE_NAMED_AGG &&
-        mod->agg_types.data[ty.u.agg_id].kind == PIR_AGG_PAD) {
+    /* Padding / pad-only fields never consume any initializer items (not even zeroinit). */
+    if (is_pad_only_type(mod, ty, pad_cache)) {
         emit_zero_gitem(out, ly.size);
         return;
     }
@@ -466,11 +495,15 @@ static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirT
             if (copy_n < ly.size) emit_zero_gitem(out, ly.size - copy_n);
         } else if (it->kind == PIR_GITEM_FLOAT) {
             if (ty.u.scalar == PIR_SCALAR_F32) {
-                double dv = 0.0;
-                memcpy(&dv, &it->float_bits, 8u);
-                float fv = (float)dv;
                 uint32_t fb = 0u;
-                memcpy(&fb, &fv, 4u);
+                if (it->has_f32_bits) {
+                    fb = it->float32_bits;
+                } else {
+                    double dv = 0.0;
+                    memcpy(&dv, &it->float_bits, 8u);
+                    float fv = (float)dv;
+                    memcpy(&fb, &fv, 4u);
+                }
                 uint8_t buf[4];
                 encode_u64_bytes(buf, (uint64_t)fb, 4u, target->is_big_endian);
                 emit_bytes_gitem(mod, out, buf, 4u);
@@ -526,7 +559,7 @@ static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirT
         PirType ety = pir_type_scalar(pir_vec_elem_scalar(ty.u.vec));
         uint32_t lanes = pir_vec_lanes(ty.u.vec);
         for (uint32_t l = 0u; l < lanes; ++l) {
-            flatten_agg_global(mod, target, ety, src, src_cnt, idx, out);
+            flatten_agg_global(mod, target, ety, src, src_cnt, idx, out, pad_cache);
         }
         return;
     }
@@ -536,7 +569,7 @@ static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirT
             emit_zero_gitem(out, ly.size);
             break;
         case PIR_AGG_ARRAY:
-            if (is_pad_only_type(mod, agg->elem_type, 0u)) {
+            if (is_pad_only_type(mod, agg->elem_type, pad_cache)) {
                 emit_zero_gitem(out, ly.size);
             } else if (*idx < src_cnt && src[*idx].kind == PIR_GITEM_BYTES &&
                 agg->elem_type.kind == PIR_TYPE_SCALAR &&
@@ -553,7 +586,7 @@ static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirT
                         emit_zero_gitem(out, (agg->array_len - i) * ly.stride);
                         break;
                     }
-                    flatten_agg_global(mod, target, agg->elem_type, src, src_cnt, idx, out);
+                    flatten_agg_global(mod, target, agg->elem_type, src, src_cnt, idx, out, pad_cache);
                     if (ly.stride > el.size) emit_zero_gitem(out, ly.stride - el.size);
                 }
                 uint64_t emitted = agg->array_len * ly.stride;
@@ -570,7 +603,7 @@ static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirT
                     if (next_off > off) emit_zero_gitem(out, next_off - off);
                     off = next_off;
                 }
-                flatten_agg_global(mod, target, agg->fields[f], src, src_cnt, idx, out);
+                flatten_agg_global(mod, target, agg->fields[f], src, src_cnt, idx, out, pad_cache);
                 off += fl.size;
             }
             if (ly.size > off) emit_zero_gitem(out, ly.size - off);
@@ -578,8 +611,25 @@ static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirT
         }
         case PIR_AGG_UNION:
             if (agg->field_count > 0u) {
+                if (src[*idx].kind == PIR_GITEM_RELOC) {
+                    bool has_ptr = false;
+                    for (uint32_t f = 0u; f < agg->field_count; ++f) {
+                        if (agg->fields[f].kind == PIR_TYPE_SCALAR &&
+                            agg->fields[f].u.scalar == PIR_SCALAR_PTR) {
+                            has_ptr = true;
+                            break;
+                        }
+                    }
+                    if (has_ptr) {
+                        PIR_VEC_PUSH(out, src[(*idx)++]);
+                        if (ly.size > target->ptr_bytes) {
+                            emit_zero_gitem(out, ly.size - target->ptr_bytes);
+                        }
+                        break;
+                    }
+                }
                 uint64_t start_bytes = gitem_vec_bytes_since(out, 0u, target->ptr_bytes);
-                flatten_agg_global(mod, target, agg->fields[0], src, src_cnt, idx, out);
+                flatten_agg_global(mod, target, agg->fields[0], src, src_cnt, idx, out, pad_cache);
                 uint64_t end_bytes = gitem_vec_bytes_since(out, 0u, target->ptr_bytes);
                 uint64_t emitted   = (end_bytes >= start_bytes) ? (end_bytes - start_bytes) : 0u;
                 if (ly.size > emitted) emit_zero_gitem(out, ly.size - emitted);
@@ -775,6 +825,9 @@ bool pir_lower_aggregates(PirModule *mod, const PirTargetSpec *target, PirDiag *
     }
 
     /* 2. Flatten typed aggregate globals into byte-count zeroinit / raw data. */
+    int8_t *pad_cache = (int8_t *)malloc(mod->agg_types.len + 1u);
+    if (!pad_cache) abort();
+    memset(pad_cache, -1, mod->agg_types.len + 1u);
     for (uint32_t i = 0u; i < mod->globals.len; ++i) {
         PirGlobal *g = &mod->globals.data[i];
         if (g->has_type && g->type.kind == PIR_TYPE_NAMED_AGG) {
@@ -782,6 +835,7 @@ bool pir_lower_aggregates(PirModule *mod, const PirTargetSpec *target, PirDiag *
             PirTypeLayout ly = pir_type_layout(mod, target, orig_ty);
             if (ly.overflow) {
                 pir_diag_error(diag, g->src_line, 0u, "global aggregate type size overflow");
+                free(pad_cache);
                 return false;
             }
             if (g->align < ly.align) g->align = ly.align;
@@ -806,7 +860,7 @@ bool pir_lower_aggregates(PirModule *mod, const PirTargetSpec *target, PirDiag *
             } else {
                 GItemVec flat = {0};
                 uint32_t idx = 0u;
-                flatten_agg_global(mod, target, orig_ty, g->items, g->item_count, &idx, &flat);
+                flatten_agg_global(mod, target, orig_ty, g->items, g->item_count, &idx, &flat, pad_cache);
                 g->is_braced  = true;
                 g->item_count = flat.len;
                 if (flat.len > 0u) {
@@ -819,6 +873,7 @@ bool pir_lower_aggregates(PirModule *mod, const PirTargetSpec *target, PirDiag *
             }
         }
     }
+    free(pad_cache);
 
     /* 3. Remove all HIR aggregate type declarations. */
     mod->agg_types.len = 0u;

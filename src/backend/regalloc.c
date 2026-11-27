@@ -1210,6 +1210,11 @@ static bool verify_mir_common(const MFunc *mf, bool post_ra, PirDiag *diag) {
     }
     for (uint32_t j = 0u; j < nj; ++j) {
         const MJTable *jt = &mf->jtables.data[j];
+        if (jt->default_blk >= nb) {
+            pir_diag_error(diag, 0u, 0u, "MIR verifier: jtable default block %u out of range",
+                           jt->default_blk);
+            return false;
+        }
         for (uint32_t k = 0u; k < jt->num_entries; ++k) {
             if (jt->targets[k] >= nb) {
                 pir_diag_error(diag, 0u, 0u, "MIR verifier: jtable target block %u out of range",

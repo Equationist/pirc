@@ -102,12 +102,12 @@ static bool is_ident(const Parser *p, const char *s) {
     return p->cur.kind == TOK_IDENT && p->cur.text && strcmp(p->cur.text, s) == 0;
 }
 
-static uint64_t encode_float_bits(double v, PirType ty) {
+static uint64_t encode_float_bits_tok(double v, float vf, bool has_f32, PirType ty) {
     PirScalarType sc = (ty.kind == PIR_TYPE_VECTOR)
                        ? pir_vec_elem_scalar(ty.u.vec)
                        : (ty.kind == PIR_TYPE_SCALAR ? ty.u.scalar : PIR_SCALAR_F64);
     if (sc == PIR_SCALAR_F32) {
-        float f = (float)v;
+        float f = has_f32 ? vf : (float)v;
         uint32_t bits = 0u;
         memcpy(&bits, &f, sizeof(bits));
         return (uint64_t)bits;
@@ -115,6 +115,10 @@ static uint64_t encode_float_bits(double v, PirType ty) {
     uint64_t bits = 0u;
     memcpy(&bits, &v, sizeof(bits));
     return bits;
+}
+
+static uint64_t encode_float_bits(double v, PirType ty) {
+    return encode_float_bits_tok(v, 0.0f, false, ty);
 }
 
 /* =========================================================================
@@ -462,6 +466,10 @@ static bool parse_flags_brackets(Parser *p, uint32_t *flags_out) {
                 pir_diag_error(p->diag, p->cur.line, p->cur.col, "unknown flag '%s'", p->cur.text);
                 return false;
             }
+            if ((*flags_out & bit) != 0u) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate flag '%s'", p->cur.text);
+                return false;
+            }
             *flags_out |= bit;
             advance_tok(p);
         } while (match_tok(p, TOK_COMMA));
@@ -539,9 +547,13 @@ static bool parse_operand(Parser *p, PirFuncId func_idx, PirBlockId blk_idx,
         out->u.imm_int.is_negative = p->cur.int_neg;
         advance_tok(p);
     } else if (p->cur.kind == TOK_FLOAT) {
-        out->kind                = PIR_OPER_IMM_FLOAT;
-        out->u.imm_float.raw_val = p->cur.float_val;
-        out->u.imm_float.bits    = encode_float_bits(p->cur.float_val, pir_type_scalar(PIR_SCALAR_F64));
+        uint32_t f32b = 0u;
+        memcpy(&f32b, &p->cur.float_val_f32, sizeof(f32b));
+        out->kind                     = PIR_OPER_IMM_FLOAT;
+        out->u.imm_float.raw_val      = p->cur.float_val;
+        out->u.imm_float.f32_bits     = f32b;
+        out->u.imm_float.has_f32_bits = true;
+        out->u.imm_float.bits         = encode_float_bits(p->cur.float_val, pir_type_scalar(PIR_SCALAR_F64));
         advance_tok(p);
     } else if (p->cur.kind == TOK_GLOBAL) {
         out->kind       = PIR_OPER_SYM;
@@ -601,25 +613,50 @@ static bool parse_operand(Parser *p, PirFuncId func_idx, PirBlockId blk_idx,
         } else {
             if (!parse_type(p, &out->type)) return false;
             if (out->kind == PIR_OPER_IMM_FLOAT) {
-                out->u.imm_float.bits = encode_float_bits(out->u.imm_float.raw_val, out->type);
+                float f32v = 0.0f;
+                if (out->u.imm_float.has_f32_bits) {
+                    memcpy(&f32v, &out->u.imm_float.f32_bits, sizeof(f32v));
+                }
+                out->u.imm_float.bits = encode_float_bits_tok(out->u.imm_float.raw_val, f32v,
+                                                              out->u.imm_float.has_f32_bits, out->type);
             }
         }
     }
     if (allow_type_tag) {
         while (p->cur.kind == TOK_IDENT) {
             if (strcmp(p->cur.text, "byval_size") == 0) {
+                if (out->call_byval_size != 0u) {
+                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'byval_size' attribute");
+                    return false;
+                }
                 advance_tok(p);
                 if (!parse_u64_positive(p, &out->call_byval_size, "byval_size")) return false;
             } else if (strcmp(p->cur.text, "byval_align") == 0) {
+                if (out->call_byval_align != 0u) {
+                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'byval_align' attribute");
+                    return false;
+                }
                 advance_tok(p);
                 if (!parse_u32_positive(p, &out->call_byval_align, "byval_align")) return false;
             } else if (strcmp(p->cur.text, "stack_align") == 0) {
+                if (out->call_stack_align != 0u) {
+                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'stack_align' attribute");
+                    return false;
+                }
                 advance_tok(p);
                 if (!parse_u32_positive(p, &out->call_stack_align, "stack_align")) return false;
             } else if (strcmp(p->cur.text, "force_stack") == 0) {
+                if (out->call_force_stack) {
+                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'force_stack' attribute");
+                    return false;
+                }
                 out->call_force_stack = true;
                 advance_tok(p);
             } else if (strcmp(p->cur.text, "no_f32_promote") == 0) {
+                if (out->call_no_f32_promote) {
+                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'no_f32_promote' attribute");
+                    return false;
+                }
                 out->call_no_f32_promote = true;
                 advance_tok(p);
             } else {
@@ -791,7 +828,12 @@ static void assign_literal_type(PirOperand *op, PirType ty) {
         if (op->type.kind == PIR_TYPE_SCALAR && op->type.u.scalar == PIR_SCALAR_VOID) {
             op->type = ty;
         }
-        op->u.imm_float.bits = encode_float_bits(op->u.imm_float.raw_val, op->type);
+        float f32v = 0.0f;
+        if (op->u.imm_float.has_f32_bits) {
+            memcpy(&f32v, &op->u.imm_float.f32_bits, sizeof(f32v));
+        }
+        op->u.imm_float.bits = encode_float_bits_tok(op->u.imm_float.raw_val, f32v,
+                                                     op->u.imm_float.has_f32_bits, op->type);
     }
 }
 
@@ -1422,6 +1464,10 @@ static bool parse_instruction(Parser *p, PirFuncId func_idx, PirBlockId blk_idx,
                 skip_newlines(p);
                 if (match_tok(p, TOK_COMMA)) {
                     skip_newlines(p);
+                } else if (p->cur.kind != TOK_RBRACKET) {
+                    PIR_VEC_FREE(&cases);
+                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected ',' or ']' in switch");
+                    goto fail;
                 }
             }
             if (!expect_tok(p, TOK_RBRACKET, "']'")) { PIR_VEC_FREE(&cases); goto fail; }
@@ -1613,36 +1659,76 @@ static bool parse_param_list(Parser *p, bool require_names,
 
             while (p->cur.kind == TOK_IDENT) {
                 if (strcmp(p->cur.text, "noalias") == 0) {
+                    if ((pd.attrs & PIR_PATTR_NOALIAS) != 0u) {
+                        pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'noalias' attribute");
+                        PIR_VEC_FREE(&params);
+                        return false;
+                    }
                     pd.attrs |= PIR_PATTR_NOALIAS;
                     advance_tok(p);
                 } else if (strcmp(p->cur.text, "readonly") == 0) {
+                    if ((pd.attrs & PIR_PATTR_READONLY) != 0u) {
+                        pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'readonly' attribute");
+                        PIR_VEC_FREE(&params);
+                        return false;
+                    }
                     pd.attrs |= PIR_PATTR_READONLY;
                     advance_tok(p);
                 } else if (strcmp(p->cur.text, "signext") == 0) {
+                    if ((pd.attrs & PIR_PATTR_SIGNEXT) != 0u) {
+                        pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'signext' attribute");
+                        PIR_VEC_FREE(&params);
+                        return false;
+                    }
                     pd.attrs |= PIR_PATTR_SIGNEXT;
                     advance_tok(p);
                 } else if (strcmp(p->cur.text, "zeroext") == 0) {
+                    if ((pd.attrs & PIR_PATTR_ZEROEXT) != 0u) {
+                        pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'zeroext' attribute");
+                        PIR_VEC_FREE(&params);
+                        return false;
+                    }
                     pd.attrs |= PIR_PATTR_ZEROEXT;
                     advance_tok(p);
                 } else if (strcmp(p->cur.text, "byval_size") == 0) {
+                    if (pd.abi_byval_size != 0u) {
+                        pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'byval_size' attribute");
+                        PIR_VEC_FREE(&params);
+                        return false;
+                    }
                     advance_tok(p);
                     if (!parse_u64_positive(p, &pd.abi_byval_size, "byval_size")) {
                         PIR_VEC_FREE(&params);
                         return false;
                     }
                 } else if (strcmp(p->cur.text, "byval_align") == 0) {
+                    if (pd.abi_byval_align != 0u) {
+                        pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'byval_align' attribute");
+                        PIR_VEC_FREE(&params);
+                        return false;
+                    }
                     advance_tok(p);
                     if (!parse_u32_positive(p, &pd.abi_byval_align, "byval_align")) {
                         PIR_VEC_FREE(&params);
                         return false;
                     }
                 } else if (strcmp(p->cur.text, "stack_align") == 0) {
+                    if (pd.abi_stack_align != 0u) {
+                        pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'stack_align' attribute");
+                        PIR_VEC_FREE(&params);
+                        return false;
+                    }
                     advance_tok(p);
                     if (!parse_u32_positive(p, &pd.abi_stack_align, "stack_align")) {
                         PIR_VEC_FREE(&params);
                         return false;
                     }
                 } else if (strcmp(p->cur.text, "force_stack") == 0) {
+                    if (pd.abi_force_stack) {
+                        pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'force_stack' attribute");
+                        PIR_VEC_FREE(&params);
+                        return false;
+                    }
                     pd.abi_force_stack = true;
                     advance_tok(p);
                 } else {
@@ -1674,8 +1760,14 @@ static bool parse_fn_cc_and_attrs(Parser *p, PirCallingConv *cc_out,
     if (sec_out) *sec_out = NULL;
     if (cabi_ret_out) memset(cabi_ret_out, 0, sizeof(*cabi_ret_out));
 
+    bool saw_cc = false;
     for (;;) {
         if (is_ident(p, "cc")) {
+            if (saw_cc) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'cc' clause");
+                return false;
+            }
+            saw_cc = true;
             advance_tok(p);
             if (p->cur.kind != TOK_STRING || token_has_nul(&p->cur)) {
                 pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected calling convention string");
@@ -1691,6 +1783,10 @@ static bool parse_fn_cc_and_attrs(Parser *p, PirCallingConv *cc_out,
             }
             advance_tok(p);
         } else if (is_ident(p, "section") && sec_out) {
+            if (*sec_out != NULL) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'section' clause");
+                return false;
+            }
             advance_tok(p);
             if (p->cur.kind != TOK_STRING || token_has_nul(&p->cur) || token_has_newline(&p->cur)) {
                 pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected valid section name string");
@@ -1714,12 +1810,24 @@ static bool parse_fn_cc_and_attrs(Parser *p, PirCallingConv *cc_out,
             *attrs_out |= PIR_FATTR_RET_ZEROEXT;
             advance_tok(p);
         } else if (cabi_ret_out && is_ident(p, "sret_x8")) {
+            if (cabi_ret_out->kind != PIR_CABI_RET_NONE) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate or conflicting return ABI attribute");
+                return false;
+            }
             cabi_ret_out->kind = PIR_CABI_RET_SRET_X8;
             advance_tok(p);
         } else if (cabi_ret_out && is_ident(p, "sret_rax")) {
+            if (cabi_ret_out->kind != PIR_CABI_RET_NONE) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate or conflicting return ABI attribute");
+                return false;
+            }
             cabi_ret_out->kind = PIR_CABI_RET_SRET_RAX;
             advance_tok(p);
         } else if (cabi_ret_out && is_ident(p, "multi_ret")) {
+            if (cabi_ret_out->kind != PIR_CABI_RET_NONE) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate or conflicting return ABI attribute");
+                return false;
+            }
             advance_tok(p);
             if (!expect_tok(p, TOK_LPAREN, "'('")) return false;
             cabi_ret_out->kind = PIR_CABI_RET_MULTI_REG;
@@ -1845,22 +1953,36 @@ static bool parse_type_decl(Parser *p) {
         PIR_VEC_FREE(&fields);
     }
 
-    if (match_tok(p, TOK_COMMA)) {
-        if (!is_ident(p, "align")) {
+    while (match_tok(p, TOK_COMMA)) {
+        if (is_ident(p, "align")) {
+            if (p->mod->agg_types.data[id].min_align != 0u) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col,
+                               "duplicate 'align' in type declaration");
+                return false;
+            }
+            advance_tok(p);
+            if (p->cur.kind != TOK_INT || p->cur.int_neg || p->cur.int_hi != 0u ||
+                p->cur.int_lo == 0u || (p->cur.int_lo & (p->cur.int_lo - 1u)) != 0u ||
+                p->cur.int_lo > 4096u) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col,
+                               "expected power-of-two alignment in type declaration");
+                return false;
+            }
+            p->mod->agg_types.data[id].min_align = (uint32_t)p->cur.int_lo;
+            advance_tok(p);
+        } else if (is_ident(p, "memory")) {
+            if (p->mod->agg_types.data[id].abi_memory) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col,
+                               "duplicate 'memory' in type declaration");
+                return false;
+            }
+            p->mod->agg_types.data[id].abi_memory = true;
+            advance_tok(p);
+        } else {
             pir_diag_error(p->diag, p->cur.line, p->cur.col,
-                           "expected 'align' after ',' in type declaration");
+                           "expected 'align' or 'memory' after ',' in type declaration");
             return false;
         }
-        advance_tok(p);
-        if (p->cur.kind != TOK_INT || p->cur.int_neg || p->cur.int_hi != 0u ||
-            p->cur.int_lo == 0u || (p->cur.int_lo & (p->cur.int_lo - 1u)) != 0u ||
-            p->cur.int_lo > 4096u) {
-            pir_diag_error(p->diag, p->cur.line, p->cur.col,
-                           "expected power-of-two alignment in type declaration");
-            return false;
-        }
-        p->mod->agg_types.data[id].min_align = (uint32_t)p->cur.int_lo;
-        advance_tok(p);
     }
 
     mark_agg_defined(p, id);
@@ -1907,11 +2029,27 @@ static bool parse_global_item(Parser *p, PirType hint_ty, PirGlobalItem *out) {
     }
     if (p->cur.kind == TOK_FLOAT || is_ident(p, "nan") || is_ident(p, "inf")) {
         double v = 0.0;
-        if (p->cur.kind == TOK_FLOAT) v = p->cur.float_val;
-        else if (strcmp(p->cur.text, "nan") == 0) v = (double)NAN;
-        else v = HUGE_VAL;
-        out->kind       = PIR_GITEM_FLOAT;
-        out->float_bits = encode_float_bits(v, hint_ty);
+        float vf = 0.0f;
+        bool has_f32 = false;
+        if (p->cur.kind == TOK_FLOAT) {
+            v = p->cur.float_val;
+            vf = p->cur.float_val_f32;
+            has_f32 = true;
+        } else if (strcmp(p->cur.text, "nan") == 0) {
+            v = (double)NAN;
+            vf = (float)NAN;
+            has_f32 = true;
+        } else {
+            v = HUGE_VAL;
+            vf = HUGE_VALF;
+            has_f32 = true;
+        }
+        uint32_t f32b = 0u;
+        memcpy(&f32b, &vf, sizeof(f32b));
+        out->kind         = PIR_GITEM_FLOAT;
+        out->float32_bits = f32b;
+        out->has_f32_bits = has_f32;
+        out->float_bits   = encode_float_bits_tok(v, vf, has_f32, hint_ty);
         advance_tok(p);
         return true;
     }
@@ -1984,8 +2122,16 @@ static bool parse_global_decl(Parser *p, PirLinkage linkage, bool is_weak_extern
 
     for (;;) {
         if (is_ident(p, "align")) {
+            if (g.align != 0u) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'align' clause");
+                return false;
+            }
             if (!parse_align_clause(p, &g.align)) return false;
         } else if (is_ident(p, "section")) {
+            if (g.section != NULL) {
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'section' clause");
+                return false;
+            }
             advance_tok(p);
             if (p->cur.kind != TOK_STRING || token_has_nul(&p->cur) || token_has_newline(&p->cur)) {
                 pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected valid section string");
@@ -2013,6 +2159,10 @@ static bool parse_global_decl(Parser *p, PirLinkage linkage, bool is_weak_extern
             skip_newlines(p);
             if (match_tok(p, TOK_COMMA)) {
                 skip_newlines(p);
+            } else if (p->cur.kind != TOK_RBRACE) {
+                PIR_VEC_FREE(&items);
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected ',' or '}' in global initializer");
+                return false;
             }
         }
         if (!expect_tok(p, TOK_RBRACE, "'}'")) { PIR_VEC_FREE(&items); return false; }
@@ -2036,14 +2186,13 @@ static bool parse_global_decl(Parser *p, PirLinkage linkage, bool is_weak_extern
             }
             g.has_type    = false;
             g.is_zeroinit = true;
-            if (match_tok(p, TOK_EQ)) {
-                if (!is_ident(p, "zeroinit")) {
-                    PIR_VEC_FREE(&items);
-                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected 'zeroinit'");
-                    return false;
-                }
-                advance_tok(p);
+            if (!expect_tok(p, TOK_EQ, "'='")) { PIR_VEC_FREE(&items); return false; }
+            if (!is_ident(p, "zeroinit")) {
+                PIR_VEC_FREE(&items);
+                pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected 'zeroinit'");
+                return false;
             }
+            advance_tok(p);
             PirGlobalItem zi;
             memset(&zi, 0, sizeof(zi));
             zi.kind = PIR_GITEM_ZERO;
@@ -2074,7 +2223,13 @@ static bool parse_global_decl(Parser *p, PirLinkage linkage, bool is_weak_extern
                         if (!parse_global_item(p, g.type, &it)) { PIR_VEC_FREE(&items); return false; }
                         PIR_VEC_PUSH(&items, it);
                         skip_newlines(p);
-                        if (match_tok(p, TOK_COMMA)) skip_newlines(p);
+                        if (match_tok(p, TOK_COMMA)) {
+                            skip_newlines(p);
+                        } else if (p->cur.kind != TOK_RBRACE) {
+                            PIR_VEC_FREE(&items);
+                            pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected ',' or '}' in global initializer");
+                            return false;
+                        }
                     }
                     if (!expect_tok(p, TOK_RBRACE, "'}'")) { PIR_VEC_FREE(&items); return false; }
                 } else {
@@ -2087,8 +2242,18 @@ static bool parse_global_decl(Parser *p, PirLinkage linkage, bool is_weak_extern
         for (;;) {
             bool had_comma = match_tok(p, TOK_COMMA);
             if (is_ident(p, "align")) {
+                if (g.align != 0u) {
+                    PIR_VEC_FREE(&items);
+                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'align' clause");
+                    return false;
+                }
                 if (!parse_align_clause(p, &g.align)) { PIR_VEC_FREE(&items); return false; }
             } else if (is_ident(p, "section")) {
+                if (g.section != NULL) {
+                    PIR_VEC_FREE(&items);
+                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'section' clause");
+                    return false;
+                }
                 advance_tok(p);
                 if (p->cur.kind != TOK_STRING || token_has_nul(&p->cur) || token_has_newline(&p->cur)) {
                     PIR_VEC_FREE(&items);
@@ -2122,7 +2287,13 @@ static bool parse_global_decl(Parser *p, PirLinkage linkage, bool is_weak_extern
                     if (!parse_global_item(p, g.type, &it)) { PIR_VEC_FREE(&items); return false; }
                     PIR_VEC_PUSH(&items, it);
                     skip_newlines(p);
-                    if (match_tok(p, TOK_COMMA)) skip_newlines(p);
+                    if (match_tok(p, TOK_COMMA)) {
+                        skip_newlines(p);
+                    } else if (p->cur.kind != TOK_RBRACE) {
+                        PIR_VEC_FREE(&items);
+                        pir_diag_error(p->diag, p->cur.line, p->cur.col, "expected ',' or '}' in global initializer");
+                        return false;
+                    }
                 }
                 if (!expect_tok(p, TOK_RBRACE, "'}'")) { PIR_VEC_FREE(&items); return false; }
             } else {
@@ -2134,8 +2305,18 @@ static bool parse_global_decl(Parser *p, PirLinkage linkage, bool is_weak_extern
         for (;;) {
             bool had_comma = match_tok(p, TOK_COMMA);
             if (is_ident(p, "align")) {
+                if (g.align != 0u) {
+                    PIR_VEC_FREE(&items);
+                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'align' clause");
+                    return false;
+                }
                 if (!parse_align_clause(p, &g.align)) { PIR_VEC_FREE(&items); return false; }
             } else if (is_ident(p, "section")) {
+                if (g.section != NULL) {
+                    PIR_VEC_FREE(&items);
+                    pir_diag_error(p->diag, p->cur.line, p->cur.col, "duplicate 'section' clause");
+                    return false;
+                }
                 advance_tok(p);
                 if (p->cur.kind != TOK_STRING || token_has_nul(&p->cur) || token_has_newline(&p->cur)) {
                     PIR_VEC_FREE(&items);
@@ -2444,20 +2625,62 @@ static bool resolve_module(Parser *p) {
         }
     }
 
-    /* 5. Resolve %val references using exact dominator-tree lookup for same-named block params. */
-    PirFuncId dom_fn_id = PIR_INVALID_ID;
-    PirCfg dom_cfg;
-    PirDom dom_tree;
+    /* 5. Resolve %val references using O(1) hash-indexed name buckets + dominator lookup. */
+    PirFuncId idx_fn_id = PIR_INVALID_ID;
+    uint32_t *ht_head   = NULL;
+    uint32_t *ht_next   = NULL;
+    uint32_t  ht_mask   = 0u;
+    bool      dom_built = false;
+    PirCfg    dom_cfg;
+    PirDom    dom_tree;
     memset(&dom_cfg, 0, sizeof(dom_cfg));
     memset(&dom_tree, 0, sizeof(dom_tree));
 
     for (uint32_t i = 0u; i < p->pending_vals.len; ++i) {
         PendingValRef *vr = &p->pending_vals.data[i];
         PirFunction *fn = &mod->funcs.data[vr->func_idx];
+        if (idx_fn_id != vr->func_idx) {
+            if (dom_built) {
+                pir_dom_destroy(&dom_tree);
+                pir_cfg_destroy(&dom_cfg);
+                dom_built = false;
+            }
+            free(ht_head);
+            free(ht_next);
+            uint32_t nv = fn->values.len;
+            uint32_t nbuck = 64u;
+            while (nbuck < nv * 2u && nbuck < (1u << 24)) nbuck <<= 1u;
+            ht_mask = nbuck - 1u;
+            ht_head = (uint32_t *)malloc(nbuck * sizeof(uint32_t));
+            ht_next = (uint32_t *)malloc((nv + 1u) * sizeof(uint32_t));
+            if (!ht_head || !ht_next) abort();
+            for (uint32_t b = 0u; b < nbuck; ++b) ht_head[b] = PIR_INVALID_ID;
+            /* Insert in reverse so traversing each bucket visits lower ValueIds first. */
+            for (uint32_t v = nv; v > 0u; --v) {
+                uint32_t vid = v - 1u;
+                const char *s = fn->values.data[vid].name;
+                uint32_t h = 2166136261u;
+                for (const unsigned char *q = (const unsigned char *)s; *q; ++q) {
+                    h ^= (uint32_t)*q;
+                    h *= 16777619u;
+                }
+                uint32_t bkt = h & ht_mask;
+                ht_next[vid] = ht_head[bkt];
+                ht_head[bkt] = vid;
+            }
+            idx_fn_id = vr->func_idx;
+        }
+
+        uint32_t vh = 2166136261u;
+        for (const unsigned char *q = (const unsigned char *)vr->name; *q; ++q) {
+            vh ^= (uint32_t)*q;
+            vh *= 16777619u;
+        }
+        uint32_t bkt = vh & ht_mask;
         PirValueId found = PIR_INVALID_ID;
 
         /* Prefer definition in the same block (supports same-named block params in nested blocks). */
-        for (uint32_t v = 0u; v < fn->values.len; ++v) {
+        for (uint32_t v = ht_head[bkt]; v != PIR_INVALID_ID; v = ht_next[v]) {
             if (fn->values.data[v].def_block == vr->use_block &&
                 strcmp(fn->values.data[v].name, vr->name) == 0) {
                 found = v;
@@ -2466,7 +2689,7 @@ static bool resolve_module(Parser *p) {
         }
         if (found == PIR_INVALID_ID) {
             /* Next prefer non-block-param defs (function params or instruction results). */
-            for (uint32_t v = 0u; v < fn->values.len; ++v) {
+            for (uint32_t v = ht_head[bkt]; v != PIR_INVALID_ID; v = ht_next[v]) {
                 if ((fn->values.data[v].def_block == PIR_INVALID_ID ||
                      fn->values.data[v].def_inst != PIR_INVALID_ID) &&
                     strcmp(fn->values.data[v].name, vr->name) == 0) {
@@ -2476,36 +2699,46 @@ static bool resolve_module(Parser *p) {
             }
         }
         if (found == PIR_INVALID_ID) {
-            /* Walk strict dominators of use_block to pick the nearest dominating block param. */
-            if (dom_fn_id != vr->func_idx) {
-                if (dom_fn_id != PIR_INVALID_ID) {
-                    pir_dom_destroy(&dom_tree);
-                    pir_cfg_destroy(&dom_cfg);
+            /* Collect same-named block params in this bucket. */
+            uint32_t bp_cnt = 0u;
+            PirValueId single_bp = PIR_INVALID_ID;
+            for (uint32_t v = ht_head[bkt]; v != PIR_INVALID_ID; v = ht_next[v]) {
+                if (fn->values.data[v].def_block != PIR_INVALID_ID &&
+                    fn->values.data[v].def_inst == PIR_INVALID_ID &&
+                    strcmp(fn->values.data[v].name, vr->name) == 0) {
+                    single_bp = v;
+                    bp_cnt++;
                 }
-                pir_cfg_build(&dom_cfg, fn);
-                pir_dom_build(&dom_tree, &dom_cfg);
-                dom_fn_id = vr->func_idx;
             }
-            if (vr->use_block < dom_cfg.num_blocks && dom_cfg.reachable[vr->use_block]) {
-                uint32_t cur_b = dom_tree.idom[vr->use_block];
-                while (cur_b != UINT32_MAX && cur_b != vr->use_block) {
-                    for (uint32_t v = 0u; v < fn->values.len; ++v) {
-                        if (fn->values.data[v].def_block == cur_b &&
-                            fn->values.data[v].def_inst == PIR_INVALID_ID &&
-                            strcmp(fn->values.data[v].name, vr->name) == 0) {
-                            found = v;
-                            break;
+            if (bp_cnt == 1u) {
+                found = single_bp;
+            } else if (bp_cnt > 1u) {
+                if (!dom_built) {
+                    pir_cfg_build(&dom_cfg, fn);
+                    pir_dom_build(&dom_tree, &dom_cfg);
+                    dom_built = true;
+                }
+                if (vr->use_block < dom_cfg.num_blocks && dom_cfg.reachable[vr->use_block]) {
+                    uint32_t cur_b = dom_tree.idom[vr->use_block];
+                    while (cur_b != UINT32_MAX && cur_b != vr->use_block) {
+                        for (uint32_t v = ht_head[bkt]; v != PIR_INVALID_ID; v = ht_next[v]) {
+                            if (fn->values.data[v].def_block == cur_b &&
+                                fn->values.data[v].def_inst == PIR_INVALID_ID &&
+                                strcmp(fn->values.data[v].name, vr->name) == 0) {
+                                found = v;
+                                break;
+                            }
                         }
+                        if (found != PIR_INVALID_ID) break;
+                        uint32_t next_b = dom_tree.idom[cur_b];
+                        if (next_b == cur_b) break;
+                        cur_b = next_b;
                     }
-                    if (found != PIR_INVALID_ID) break;
-                    uint32_t next_b = dom_tree.idom[cur_b];
-                    if (next_b == cur_b) break;
-                    cur_b = next_b;
                 }
             }
         }
         if (found == PIR_INVALID_ID) {
-            for (uint32_t v = 0u; v < fn->values.len; ++v) {
+            for (uint32_t v = ht_head[bkt]; v != PIR_INVALID_ID; v = ht_next[v]) {
                 if (strcmp(fn->values.data[v].name, vr->name) == 0) {
                     found = v;
                     break;
@@ -2523,10 +2756,12 @@ static bool resolve_module(Parser *p) {
             slot->type = fn->values.data[found].type;
         }
     }
-    if (dom_fn_id != PIR_INVALID_ID) {
+    if (dom_built) {
         pir_dom_destroy(&dom_tree);
         pir_cfg_destroy(&dom_cfg);
     }
+    free(ht_head);
+    free(ht_next);
 
     return !pir_diag_has_errors(p->diag);
 }

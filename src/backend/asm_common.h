@@ -31,7 +31,7 @@ void pir_asm_emit_sym(FILE *out, const PirTargetSpec *target,
                       PirAsmNeedsQuoteFn arch_needs_quote);
 
 /* Emit section directive for functions or globals (Mach-O & ELF). */
-void pir_asm_emit_section_directive(FILE *out, const PirTargetSpec *target,
+void pir_asm_emit_section_directive(FILE *out, const PirModule *mod, const PirTargetSpec *target,
                                     const char *custom_sec, PirGlobalSeg seg,
                                     bool has_reloc, bool is_zero, bool is_func);
 

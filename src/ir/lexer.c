@@ -6,6 +6,7 @@
 #include "ir/lexer.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -213,11 +214,23 @@ static PirToken lex_number(PirLexer *lex, bool neg, uint32_t line, uint32_t col,
         memcpy(buf + off, lex->src + num_start, flen);
         buf[off + flen] = '\0';
         char *endp = NULL;
+        errno = 0;
         tok.float_val = strtod(buf, &endp);
+        int err_d = errno;
         bool ok = (endp == buf + off + flen);
+        if (ok) {
+            char *endp_f = NULL;
+            tok.float_val_f32 = strtof(buf, &endp_f);
+            if (endp_f != buf + off + flen) ok = false;
+        }
         free(buf);
         if (!ok) {
             pir_diag_error(lex->diag, line, col, "invalid float literal");
+            tok.kind = TOK_ERR;
+            return tok;
+        }
+        if (err_d == ERANGE && isinf(tok.float_val)) {
+            pir_diag_error(lex->diag, line, col, "float literal overflows f64 range");
             tok.kind = TOK_ERR;
             return tok;
         }
@@ -328,15 +341,17 @@ PirToken pir_lexer_next(PirLexer *lex) {
         if (peek(lex, 1) == 'i' && peek(lex, 2) == 'n' && peek(lex, 3) == 'f' &&
             !is_ident_cont((unsigned char)peek(lex, 4))) {
             advance(lex); advance(lex); advance(lex); advance(lex);
-            tok.kind      = TOK_FLOAT;
-            tok.float_val = -HUGE_VAL;
+            tok.kind          = TOK_FLOAT;
+            tok.float_val     = -HUGE_VAL;
+            tok.float_val_f32 = -HUGE_VALF;
             return tok;
         }
         if (peek(lex, 1) == 'n' && peek(lex, 2) == 'a' && peek(lex, 3) == 'n' &&
             !is_ident_cont((unsigned char)peek(lex, 4))) {
             advance(lex); advance(lex); advance(lex); advance(lex);
-            tok.kind      = TOK_FLOAT;
-            tok.float_val = -(double)NAN;
+            tok.kind          = TOK_FLOAT;
+            tok.float_val     = -(double)NAN;
+            tok.float_val_f32 = -(float)NAN;
             return tok;
         }
         advance(lex);
@@ -371,6 +386,11 @@ PirToken pir_lexer_next(PirLexer *lex) {
             while (is_ident_cont((unsigned char)peek(lex, 0))) advance(lex);
         } else if (isdigit((unsigned char)peek(lex, 0))) {
             while (isdigit((unsigned char)peek(lex, 0))) advance(lex);
+            if (is_ident_cont((unsigned char)peek(lex, 0))) {
+                pir_diag_error(lex->diag, tok.line, tok.col, "invalid numeric local name after '%%'");
+                tok.kind = TOK_ERR;
+                return tok;
+            }
         } else {
             pir_diag_error(lex->diag, tok.line, tok.col, "expected local name after '%%'");
             tok.kind = TOK_ERR;

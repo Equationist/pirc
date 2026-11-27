@@ -341,12 +341,12 @@ typedef enum {
 static LoopVecAlias classify_loop_pair(const PirFunction *fn,
                                        PirOperand a_base, int64_t a_delta,
                                        PirOperand b_base, int64_t b_delta,
-                                       uint32_t elem_bytes) {
+                                       uint32_t elem_bytes, uint8_t ptr_bytes) {
     if (op_same_base(a_base, b_base)) {
         return (a_delta == b_delta) ? LV_ALIAS_EXACT_SAME : LV_ALIAS_DIFF_OFF;
     }
-    PirPtrInfo pa = pir_alias_decompose(fn, a_base, 8u);
-    PirPtrInfo pb = pir_alias_decompose(fn, b_base, 8u);
+    PirPtrInfo pa = pir_alias_decompose(fn, a_base, ptr_bytes);
+    PirPtrInfo pb = pir_alias_decompose(fn, b_base, ptr_bytes);
     bool same_obj = (pa.kind != PIR_PTR_UNKNOWN && pa.kind == pb.kind) &&
                     ((pa.kind == PIR_PTR_GLOBAL)
                      ? (pa.global_name && pb.global_name && strcmp(pa.global_name, pb.global_name) == 0)
@@ -638,7 +638,7 @@ static bool try_vectorize_loop(PirModule *mod, PirFunction *fn, const PirTargetS
         for (uint32_t sj = si + 1u; sj < store_cnt; ++sj) {
             LoopVecAlias al = classify_loop_pair(fn, store_descs[si].base, store_descs[si].delta,
                                                  store_descs[sj].base, store_descs[sj].delta,
-                                                 elem_bytes);
+                                                 elem_bytes, target->ptr_bytes);
             if (al == LV_ALIAS_NONE || al == LV_ALIAS_EXACT_SAME) continue;
             if (al == LV_ALIAS_DIFF_OFF) { legal = false; break; }
             if (rt_pair_cnt >= 4u) { legal = false; break; }
@@ -651,7 +651,7 @@ static bool try_vectorize_loop(PirModule *mod, PirFunction *fn, const PirTargetS
         for (uint32_t li = 0u; li < load_cnt && legal; ++li) {
             LoopVecAlias al = classify_loop_pair(fn, store_descs[si].base, store_descs[si].delta,
                                                  load_descs[li].base, load_descs[li].delta,
-                                                 elem_bytes);
+                                                 elem_bytes, target->ptr_bytes);
             /* Exact same-index RMW (a[i+d] = f(a[i+d])) or disjoint bases have zero dependence! */
             if (al == LV_ALIAS_NONE || al == LV_ALIAS_EXACT_SAME) continue;
             if (al == LV_ALIAS_DIFF_OFF) { legal = false; break; }
@@ -1300,7 +1300,7 @@ static bool try_vectorize_loop(PirModule *mod, PirFunction *fn, const PirTargetS
                         eff_base = pir_op_val(ab, ptr_ty);
                     }
                     PirValueId bp = pir_fn_new_val(mod, fn, "vbp", ptr_ty, vbody_bid, PIR_INVALID_ID, 0u);
-                    PirInst pa = pir_make_inst(PIR_OP_PTR_ADD, i64_ty, orig.src_line, 0u);
+                    PirInst pa = pir_make_inst(PIR_OP_PTR_ADD, i64_ty, orig.src_line, orig.loc_idx);
                     /* Never fabricate [inbounds]: base may have been pre-shifted out of bounds
                      * (e.g. negative mem_delta or caller-provided pre-shifted base + positive offset). */
                     pa.flags = PIR_FLAG_NONE;
@@ -1321,7 +1321,7 @@ static bool try_vectorize_loop(PirModule *mod, PirFunction *fn, const PirTargetS
                     PirValueId mem_ptr = base_ptrs[bi];
                     if (u > 0u) {
                         PirValueId bp2 = pir_fn_new_val(mod, fn, "vbp", ptr_ty, vbody_bid, PIR_INVALID_ID, 0u);
-                        PirInst pa2 = pir_make_inst(PIR_OP_PTR_ADD, i64_ty, orig.src_line, 0u);
+                        PirInst pa2 = pir_make_inst(PIR_OP_PTR_ADD, i64_ty, orig.src_line, orig.loc_idx);
                         pa2.flags = PIR_FLAG_NONE;
                         pa2.operands = pir_alloc_ops(mod, 2u);
                         pa2.operands[0] = pir_op_val(mem_ptr, ptr_ty);
@@ -1333,7 +1333,7 @@ static bool try_vectorize_loop(PirModule *mod, PirFunction *fn, const PirTargetS
                     }
                     if (orig.op == PIR_OP_LOAD) {
                         PirValueId rv = pir_fn_new_val(mod, fn, "vld", vty, vbody_bid, PIR_INVALID_ID, 0u);
-                        PirInst ld = pir_make_inst(PIR_OP_LOAD, vty, orig.src_line, 0u);
+                        PirInst ld = pir_make_inst(PIR_OP_LOAD, vty, orig.src_line, orig.loc_idx);
                         ld.align = orig.align;
                         ld.operands = pir_alloc_ops(mod, 1u);
                         ld.operands[0] = pir_op_val(mem_ptr, ptr_ty);
@@ -1349,7 +1349,7 @@ static bool try_vectorize_loop(PirModule *mod, PirFunction *fn, const PirTargetS
                         } else {
                             vsv = get_or_emit_splat(mod, fn, vpre_bid, splats, &nsplats, 32u, sv, vty, sline);
                         }
-                        PirInst st = pir_make_inst(PIR_OP_STORE, vty, orig.src_line, 0u);
+                        PirInst st = pir_make_inst(PIR_OP_STORE, vty, orig.src_line, orig.loc_idx);
                         st.align = orig.align;
                         st.operands = pir_alloc_ops(mod, 2u);
                         st.operands[0] = pir_op_val(vsv, vty);
@@ -1370,7 +1370,7 @@ static bool try_vectorize_loop(PirModule *mod, PirFunction *fn, const PirTargetS
                 vres_ty = pir_type_vec(pir_vec_mask_type(vvt));
             }
             for (uint32_t u = 0u; u < unroll; ++u) {
-                PirInst vi = pir_make_inst(orig.op, vop_ty, orig.src_line, 0u);
+                PirInst vi = pir_make_inst(orig.op, vop_ty, orig.src_line, orig.loc_idx);
                 vi.flags = orig.flags;
                 vi.operands = pir_alloc_ops(mod, orig.operand_count);
                 vi.operand_count = orig.operand_count;

@@ -275,6 +275,32 @@ static Token *split_paren(Token **rest, Token *tok) {
   return split_paren2(rest, tok, NULL);
 }
 
+static Token *split_paren_pop_locks(Token **rest, Token *start, Token *tok) {
+  pop_macro_lock(start);
+  pop_macro_lock(start->next);
+  Token *orig_tok = tok;
+  Token head = {0};
+  Token *cur = &head;
+
+  int level = 0;
+  while (!(level == 0 && tok->kind == TK_RPAREN)) {
+    pop_macro_lock(tok);
+    if (tok->kind == TK_LPAREN)
+      level++;
+    else if (tok->kind == TK_RPAREN)
+      level--;
+    else if (tok->kind == TK_EOF)
+      error_tok(orig_tok, "unterminated list");
+
+    cur = cur->next = tok;
+    tok = tok->next;
+  }
+  pop_macro_lock(tok);
+  *rest = tok->next;
+  cur->next = to_eof(tok);
+  return head.next;
+}
+
 static Token *split_bracket(Token **rest, Token *tok) {
   Token *start = tok;
   Token head = {0};
@@ -496,7 +522,12 @@ static bool is_predefined_macro_name(Token *tok) {
   return equal(tok, "__LINE__") || equal(tok, "__FILE__") ||
          equal(tok, "__DATE__") || equal(tok, "__TIME__") ||
          equal(tok, "__STDC__") || equal(tok, "__STDC_VERSION__") ||
-         equal(tok, "__STDC_HOSTED__");
+         equal(tok, "__STDC_HOSTED__") || equal(tok, "_Pragma") ||
+         equal(tok, "__STDC_UTF_16__") || equal(tok, "__STDC_UTF_32__") ||
+         equal(tok, "__STDC_NO_COMPLEX__") || equal(tok, "__STDC_NO_ATOMICS__") ||
+         equal(tok, "__STDC_NO_THREADS__") || equal(tok, "__STDC_NO_VLA__") ||
+         equal(tok, "__STDC_ISO_10646__") || equal(tok, "__STDC_IEC_559__") ||
+         equal(tok, "__STDC_IEC_60559_BFP__");
 }
 
 static Macro *new_funclike_macro(char *name, Token **rest, Token *tok) {
@@ -556,6 +587,8 @@ static Macro *read_macro_name(Token **rest, Token *tok) {
       error_tok(tok, "'defined' cannot be used as a macro name");
     if (equal(tok, "__VA_ARGS__"))
       error_tok(tok, "'__VA_ARGS__' cannot be used as a macro name");
+    if (opt_std >= STD_C23 && equal(tok, "__VA_OPT__"))
+      error_tok(tok, "'__VA_OPT__' cannot be used as a macro name");
     if (is_predefined_macro_name(tok))
       error_tok(tok, "redefining predefined macro '%.*s'", tok->len, tok->loc);
   }
@@ -626,6 +659,32 @@ static void chk_macro_hash(Macro *m) {
   }
 }
 
+static void chk_macro_va_opt(Macro *m) {
+  if (opt_std < STD_C23 || !m->has_va_arg)
+    return;
+  for (Token *t = m->body; t && t->kind != TK_EOF; t = t->next) {
+    if (t->kind == TK_IDENT && equal(t, "__VA_OPT__")) {
+      if (t->next->kind != TK_LPAREN)
+        error_tok(t, "'__VA_OPT__' must be followed by '('");
+      int lvl = 1;
+      Token *q = t->next->next;
+      while (q->kind != TK_EOF && lvl > 0) {
+        if (q->kind == TK_LPAREN)
+          lvl++;
+        else if (q->kind == TK_RPAREN)
+          lvl--;
+        else if (q->kind == TK_IDENT && equal(q, "__VA_OPT__"))
+          error_tok(q, "nested '__VA_OPT__' is not allowed");
+        if (lvl > 0)
+          q = q->next;
+      }
+      if (lvl != 0)
+        error_tok(t, "unterminated '__VA_OPT__'");
+      t = q;
+    }
+  }
+}
+
 static void read_macro_definition(Token **rest, Token *tok) {
   if (tok->at_bol)
     error_tok(tok, "macro name must be an identifier");
@@ -639,6 +698,7 @@ static void read_macro_definition(Token **rest, Token *tok) {
 
   chk_macro_startend(m->body, last);
   chk_macro_hash(m);
+  chk_macro_va_opt(m);
   if (is_iso_std && !name_tok->file->is_syshdr) {
     if (m->is_objlike && m->body->kind != TK_EOF && !m->body->has_space)
       error_tok(m->body, "ISO C requires whitespace after the macro name");
@@ -793,11 +853,8 @@ static MacroArg *find_arg(Token **rest, Token *tok, MacroContext *ctx) {
     idx++;
   }
 
-  static int va_opt_depth = 0;
   if (opt_std >= STD_C23 && ctx->m->has_va_arg &&
       equal(tok, "__VA_OPT__") && tok->next->kind == TK_LPAREN) {
-    if (va_opt_depth > 0)
-      error_tok(tok, "nested '__VA_OPT__' is not allowed");
     MacroArg *arg = arena_malloc(&pp_arena, sizeof(MacroArg));
     arg->tok = read_macro_arg_one(&tok, tok->next->next, true);
     if (arg->tok->kind != TK_EOF) {
@@ -807,12 +864,10 @@ static MacroArg *find_arg(Token **rest, Token *tok, MacroContext *ctx) {
       chk_macro_startend(arg->tok, last);
     }
 
-    va_opt_depth++;
     if (has_non_empty_va_arg(ctx, NULL))
       arg->tok = subst(arg->tok, ctx);
     else
       arg->tok = new_eof(tok);
-    va_opt_depth--;
 
     arg->expanded = arg->tok;
     if (rest)
@@ -832,8 +887,7 @@ static char *join_tokens(Token *tok, Token *end, bool is_stringize) {
       len++;
 
     if (is_stringize) {
-      if (t->kind == TK_STR || t->kind == TK_CHAR_LIT || t->kind == TK_INVALID ||
-          (t->len == 1 && t->loc[0] == '\\')) {
+      if (t->kind == TK_STR || t->kind == TK_CHAR_LIT) {
         for (int i = 0; i < t->len; i++) {
           if (t->loc[i] == '\\' || t->loc[i] == '"')
             len++;
@@ -855,8 +909,7 @@ static char *join_tokens(Token *tok, Token *end, bool is_stringize) {
       buf[pos++] = ' ';
 
     if (is_stringize) {
-      if (t->kind == TK_STR || t->kind == TK_CHAR_LIT || t->kind == TK_INVALID ||
-          (t->len == 1 && t->loc[0] == '\\')) {
+      if (t->kind == TK_STR || t->kind == TK_CHAR_LIT) {
         for (int i = 0; i < t->len; i++) {
           if (t->loc[i] == '\\' || t->loc[i] == '"')
             buf[pos++] = '\\';
@@ -911,7 +964,7 @@ static Token *paste(Token *lhs, Token *rhs) {
   Token *tok = tokenize_buf(buf, lhs, NULL);
   align_token(tok, lhs);
 
-  if (tok->kind == TK_EOF || tok->next->kind != TK_EOF)
+  if (tok->kind == TK_EOF || tok->kind == TK_INVALID || tok->next->kind != TK_EOF)
     error_tok(lhs, "pasting forms '%s', an invalid token", buf);
   if (tok->origin == lhs)
     tok->origin = copy_token(lhs);
@@ -939,9 +992,9 @@ static Token *subst(Token *tok, MacroContext *ctx) {
     if (tok->kind == TK_COMMA && tok->next->kind == TK_HASH2 && ctx->m->has_va_arg) {
       MacroArg *arg = find_arg(NULL, tok->next->next, ctx);
       if (arg && (arg == &ctx->args[ctx->m->arg_cnt - 1])) {
+        if (is_iso_std && !tok->file->is_syshdr)
+          error_tok(tok, "GNU ', ## __VA_ARGS__' extension is not allowed in ISO C");
         if (ctx->omit_comma) {
-          if (is_iso_std && !tok->file->is_syshdr)
-            error_tok(tok, "GNU ', ## __VA_ARGS__' extension is not allowed in ISO C");
           tok = tok->next->next->next;
           continue;
         }
@@ -1407,22 +1460,32 @@ static Token *include_file(Token *tok, const char *path, Token *filename_tok, In
 }
 
 static Token *embed_file(Token *cont, Token *tok, const char *path, Token *start) {
+  tok = expand_tok(tok);
   Token *limit_seq = NULL;
   Token *if_empty_seq = NULL;
   Token *prefix_seq = NULL;
   Token *suffix_seq = NULL;
 
   for (;;) {
-    if (equal(tok, "limit"))
+    if (equal(tok, "limit") || equal(tok, "__limit__")) {
+      if (limit_seq)
+        error_tok(tok, "duplicate 'limit' embed parameter");
       tok = skip_paren(limit_seq = skip_tk(tok->next, TK_LPAREN));
-    else if (equal(tok, "if_empty"))
+    } else if (equal(tok, "if_empty") || equal(tok, "__if_empty__")) {
+      if (if_empty_seq)
+        error_tok(tok, "duplicate 'if_empty' embed parameter");
       tok = skip_paren(if_empty_seq = skip_tk(tok->next, TK_LPAREN));
-    else if (equal(tok, "prefix"))
+    } else if (equal(tok, "prefix") || equal(tok, "__prefix__")) {
+      if (prefix_seq)
+        error_tok(tok, "duplicate 'prefix' embed parameter");
       tok = skip_paren(prefix_seq = skip_tk(tok->next, TK_LPAREN));
-    else if (equal(tok, "suffix"))
+    } else if (equal(tok, "suffix") || equal(tok, "__suffix__")) {
+      if (suffix_seq)
+        error_tok(tok, "duplicate 'suffix' embed parameter");
       tok = skip_paren(suffix_seq = skip_tk(tok->next, TK_LPAREN));
-    else
+    } else {
       break;
+    }
   }
   Token *dummy;
   int64_t limit = 0;
@@ -1649,6 +1712,8 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
         error_tok(tok, "'defined' cannot be used as a macro name");
       if (equal(tok, "__VA_ARGS__"))
         error_tok(tok, "'__VA_ARGS__' cannot be used as a macro name");
+      if (opt_std >= STD_C23 && equal(tok, "__VA_OPT__"))
+        error_tok(tok, "'__VA_OPT__' cannot be used as a macro name");
       if (is_predefined_macro_name(tok))
         error_tok(tok, "undefining predefined macro '%.*s'", tok->len, tok->loc);
     }
@@ -2034,13 +2099,11 @@ static Token *pragma_macro(Token *start) {
 
 static Token *has_include_macro(Token *start) {
   Token *tok = skip_tk(start->next, TK_LPAREN);
-
+  Token *end;
   const char *dir = NULL;
-  char *filename = read_include_filename(split_paren(&tok, tok), &dir);
+  char *filename = read_include_filename(split_paren_pop_locks(&end, start, tok), &dir);
   bool found = search_include_paths2(filename, dir, &(InclIdx){INCL_REL}, true);
-
-  pop_macro_lock_until(start, tok);
-  return new_bool_int_token(found, start, tok);
+  return new_bool_int_token(found, start, end);
 }
 
 static Token *has_include_next_macro(Token *start) {
@@ -2048,10 +2111,8 @@ static Token *has_include_next_macro(Token *start) {
   InclIdx idx = file_tok->file->incl_idx + 1;
   const char *dir = NULL;
   Token *end;
-  char *filename = read_include_filename(split_paren(&end, file_tok), &dir);
+  char *filename = read_include_filename(split_paren_pop_locks(&end, start, file_tok), &dir);
   bool found = search_include_paths2(filename, dir, &idx, true);
-
-  pop_macro_lock_until(start, end);
   return new_bool_int_token(found, start, end);
 }
 
@@ -2060,11 +2121,9 @@ static Token *has_embed_macro(Token *start) {
   Token *end;
 
   const char *dir = NULL;
-  char *filename = read_filename(&tok, split_paren(&end, tok), &dir);
+  char *filename = read_filename(&tok, split_paren_pop_locks(&end, start, tok), &dir);
   const char *path = search_include_paths(filename, dir);
   Token *tok2 = embed_file(NULL, tok, path, start->next->next);
-
-  pop_macro_lock_until(start, end);
   tok2->next = end;
   return tok2;
 }
@@ -2072,33 +2131,31 @@ static Token *has_embed_macro(Token *start) {
 static Token *has_attribute_macro(Token *start) {
   Token *tok = skip_tk(start->next, TK_LPAREN);
   Token *end;
-  Token *arg = expand_tok(split_paren(&end, tok));
+  Token *arg = expand_tok(split_paren_pop_locks(&end, start, tok));
 
   bool val = is_supported_attr(arg);
   if (arg->next->kind != TK_EOF)
     error_tok(arg->next, "expected ')'");
 
-  pop_macro_lock_until(start, end);
   return new_bool_int_token(val, start, end);
 }
 
 static Token *has_c_attribute_macro(Token *start) {
   Token *tok = skip_tk(start->next, TK_LPAREN);
   Token *end;
-  Token *arg = expand_tok(split_paren(&end, tok));
+  Token *arg = expand_tok(split_paren_pop_locks(&end, start, tok));
 
   const char *str = supported_c_attr(&arg, arg);
   if (arg->next->kind != TK_EOF)
     error_tok(arg->next, "expected ')'");
 
-  pop_macro_lock_until(start, end);
   return make_token(str ? str : "0", start, end);
 }
 
 static Token *has_builtin_macro(Token *start) {
   Token *tok = skip_tk(start->next, TK_LPAREN);
   Token *end;
-  Token *arg = expand_tok(split_paren(&end, tok));
+  Token *arg = expand_tok(split_paren_pop_locks(&end, start, tok));
   if (arg->kind != TK_IDENT)
     error_tok(arg, "expected builtin name");
   if (arg->next->kind != TK_EOF)
@@ -2120,14 +2177,13 @@ static Token *has_builtin_macro(Token *start) {
                 equal(arg, "__builtin_va_end") ||
                 equal(arg, "__builtin_va_arg");
 
-  pop_macro_lock_until(start, end);
   return new_bool_int_token(has_it, start, end);
 }
 
 static Token *has_extension_macro(Token *start) {
   Token *tok = skip_tk(start->next, TK_LPAREN);
   Token *end;
-  Token *arg = expand_tok(split_paren(&end, tok));
+  Token *arg = expand_tok(split_paren_pop_locks(&end, start, tok));
   if (arg->kind != TK_IDENT)
     error_tok(arg, "expected extension name");
   if (arg->next->kind != TK_EOF)
@@ -2144,7 +2200,6 @@ static Token *has_extension_macro(Token *start) {
                 equal(arg, "c_fixed_enum") ||
                 equal(arg, "c_countof");
 
-  pop_macro_lock_until(start, end);
   return new_bool_int_token(has_it, start, end);
 }
 

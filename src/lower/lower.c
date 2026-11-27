@@ -292,7 +292,8 @@ static bool pir_legalize_overaligned_allocas(PirModule *mod, const PirTargetSpec
                 if (copy.op == PIR_OP_ALLOCA_PTR && copy.align > 16u &&
                     copy.results[0] != PIR_INVALID_ID) {
                     uint64_t al = (uint64_t)copy.align;
-                    if (copy.imm_u64 > UINT64_MAX - (al - 16u)) {
+                    uint64_t max_sz = (target->ptr_bytes == 4u) ? (UINT64_C(1) << 31) : (UINT64_C(1) << 40);
+                    if (al - 16u > max_sz || copy.imm_u64 > max_sz - (al - 16u)) {
                         pir_diag_error(diag, copy.src_line, 0u,
                                        "overaligned alloca.ptr size overflow");
                         PIR_VEC_FREE(&out);

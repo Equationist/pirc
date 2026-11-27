@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -29,25 +30,74 @@ static char *read_entire_file(const char *path, size_t *out_len) {
         fprintf(stderr, "pirc: cannot open '%s'\n", path);
         return NULL;
     }
-    if (fseek(fp, 0, SEEK_END) != 0) {
+    struct stat st;
+    if (fstat(fileno(fp), &st) == 0 && S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "pirc: '%s' is a directory\n", path);
         fclose(fp);
         return NULL;
     }
-    long sz = ftell(fp);
-    if (sz < 0) {
-        fclose(fp);
-        return NULL;
+    if (fseek(fp, 0, SEEK_END) == 0) {
+        long sz = ftell(fp);
+        if (sz >= 0) {
+            rewind(fp);
+            char *buf = (char *)malloc((size_t)sz + 1u);
+            if (!buf) {
+                fclose(fp);
+                return NULL;
+            }
+            size_t nread = fread(buf, 1u, (size_t)sz, fp);
+            bool failed = (ferror(fp) != 0);
+            fclose(fp);
+            if (failed) {
+                fprintf(stderr, "pirc: read error on '%s'\n", path);
+                free(buf);
+                return NULL;
+            }
+            buf[nread] = '\0';
+            *out_len = nread;
+            return buf;
+        }
     }
-    rewind(fp);
-    char *buf = (char *)malloc((size_t)sz + 1u);
+    /* Streaming fallback for non-seekable streams (e.g., /dev/stdin, pipes, FIFOs). */
+    size_t cap = 4096u;
+    size_t len = 0u;
+    char *buf = (char *)malloc(cap);
     if (!buf) {
         fclose(fp);
         return NULL;
     }
-    size_t nread = fread(buf, 1u, (size_t)sz, fp);
+    for (;;) {
+        if (len + 4096u + 1u > cap) {
+            if (cap > SIZE_MAX / 2u) {
+                fprintf(stderr, "pirc: input '%s' too large\n", path);
+                free(buf);
+                fclose(fp);
+                return NULL;
+            }
+            cap *= 2u;
+            char *nb = (char *)realloc(buf, cap);
+            if (!nb) {
+                free(buf);
+                fclose(fp);
+                return NULL;
+            }
+            buf = nb;
+        }
+        size_t got = fread(buf + len, 1u, 4096u, fp);
+        len += got;
+        if (got < 4096u) {
+            if (ferror(fp)) {
+                fprintf(stderr, "pirc: read error on '%s'\n", path);
+                free(buf);
+                fclose(fp);
+                return NULL;
+            }
+            break;
+        }
+    }
     fclose(fp);
-    buf[nread] = '\0';
-    *out_len = nread;
+    buf[len] = '\0';
+    *out_len = len;
     return buf;
 }
 
@@ -83,6 +133,10 @@ static bool assemble_to_obj(const char *asm_path, const char *obj_path,
             execlp("cc", "cc", "-arch", "x86_64", "-x", "assembler", "-c", asm_path, "-o", obj_path, (char *)NULL);
         } else if (target && target->os == PIR_OS_MACOS && target->arch == PIR_ARCH_ARM64) {
             execlp("cc", "cc", "-arch", "arm64", "-x", "assembler", "-c", asm_path, "-o", obj_path, (char *)NULL);
+        } else if (target && target->triple) {
+            char target_flag[128];
+            snprintf(target_flag, sizeof(target_flag), "--target=%s", target->triple);
+            execlp("cc", "cc", target_flag, "-x", "assembler", "-c", asm_path, "-o", obj_path, (char *)NULL);
         } else {
             execlp("cc", "cc", "-x", "assembler", "-c", asm_path, "-o", obj_path, (char *)NULL);
         }
@@ -119,7 +173,10 @@ static void dump_module_layout(const PirModule *mod, const PirTargetSpec *target
 }
 
 int main(int argc, char **argv) {
+    bool do_version     = false;
     bool do_verify      = false;
+    bool want_hir       = false;
+    bool want_lir       = false;
     bool do_print       = false;
     bool do_emit_lir    = false;
     bool do_dump_layout = false;
@@ -136,8 +193,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
         if (strcmp(arg, "--version") == 0) {
-            printf("pirc 0.3.0-m8 (PIR Specification v0.3.0)\n");
-            return 0;
+            do_version = true;
         } else if (strcmp(arg, "-O0") == 0) {
             opt_level = 0;
         } else if (strcmp(arg, "-O1") == 0) {
@@ -147,11 +203,11 @@ int main(int argc, char **argv) {
         } else if (strcmp(arg, "-S") == 0 || strcmp(arg, "--emit-asm") == 0) {
             do_emit_asm = true;
             do_verify   = true;
-            mode        = PIR_VERIFY_HIR;
+            want_hir    = true;
         } else if (strcmp(arg, "-c") == 0) {
             do_emit_obj = true;
             do_verify   = true;
-            mode        = PIR_VERIFY_HIR;
+            want_hir    = true;
         } else if (strcmp(arg, "-o") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "pirc: '-o' requires an output file path\n");
@@ -160,28 +216,28 @@ int main(int argc, char **argv) {
             output_path = argv[++i];
         } else if (strcmp(arg, "--verify-hir") == 0) {
             do_verify = true;
-            mode      = PIR_VERIFY_HIR;
+            want_hir  = true;
         } else if (strcmp(arg, "--verify-lir") == 0) {
             do_verify = true;
-            mode      = PIR_VERIFY_LIR;
+            want_lir  = true;
         } else if (strcmp(arg, "--verify-only") == 0) {
             do_verify = true;
         } else if (strcmp(arg, "--lir") == 0) {
-            mode = PIR_VERIFY_LIR;
+            want_lir = true;
         } else if (strcmp(arg, "--print") == 0 || strcmp(arg, "--emit-hir") == 0) {
             do_print = true;
         } else if (strcmp(arg, "--emit-lir") == 0) {
             do_emit_lir = true;
             do_verify   = true;
-            mode        = PIR_VERIFY_HIR;
+            want_hir    = true;
         } else if (strcmp(arg, "--dump-layout") == 0) {
             do_dump_layout = true;
             do_verify      = true;
-            mode           = PIR_VERIFY_HIR;
+            want_hir       = true;
         } else if (strcmp(arg, "--interp") == 0) {
             do_interp = true;
             do_verify = true;
-            mode      = PIR_VERIFY_HIR;
+            want_hir  = true;
         } else if (strncmp(arg, "--target=", 9u) == 0) {
             target_override = arg + 9;
         } else if (strcmp(arg, "--target") == 0) {
@@ -211,6 +267,21 @@ int main(int argc, char **argv) {
             input_path = arg;
         }
     }
+
+    if (do_version) {
+        printf("pirc 0.3.0-m8 (PIR Specification v0.3.0)\n");
+        return 0;
+    }
+
+    if (do_emit_asm && do_emit_obj) {
+        fprintf(stderr, "pirc: conflicting options '-S' and '-c'\n");
+        return 1;
+    }
+    if (want_hir && want_lir) {
+        fprintf(stderr, "pirc: conflicting HIR and LIR verification/lowering modes\n");
+        return 1;
+    }
+    mode = want_lir ? PIR_VERIFY_LIR : PIR_VERIFY_HIR;
 
     if (!input_path) {
         print_usage();
@@ -247,6 +318,22 @@ int main(int argc, char **argv) {
             goto cleanup;
         }
         target_ptr = &tspec;
+    } else {
+        if (target_override || (do_print && triple)) {
+            fprintf(stderr, "pirc: invalid or unsupported target triple '%s'\n",
+                    triple ? triple : "(null)");
+            rc = 1;
+            goto cleanup;
+        }
+        if (caps_profile) {
+            PirTargetSpec dummy;
+            memset(&dummy, 0, sizeof(dummy));
+            if (!pir_target_apply_caps(&dummy, caps_profile)) {
+                fprintf(stderr, "pirc: unknown caps profile '%s'\n", caps_profile);
+                rc = 1;
+                goto cleanup;
+            }
+        }
     }
 
     if (do_verify || !do_print) {

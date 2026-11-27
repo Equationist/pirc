@@ -7,6 +7,7 @@
 #include "target/abi.h"
 #include "lower/lower.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 bool pir_target_from_triple(const char *triple, PirTargetSpec *out) {
@@ -118,43 +119,81 @@ bool pir_target_apply_caps(PirTargetSpec *spec, const char *profile) {
     return false;
 }
 
-bool pir_abi_is_pad_only_agg(const PirModule *mod, PirType ty) {
+static bool pir_abi_is_pad_only_rec(const PirModule *mod, PirType ty, int8_t *cache) {
     if (ty.kind != PIR_TYPE_NAMED_AGG || ty.u.agg_id >= mod->agg_types.len) return false;
-    const PirAggDef *agg = &mod->agg_types.data[ty.u.agg_id];
-    if (agg->kind == PIR_AGG_PAD) return true;
-    if (agg->kind == PIR_AGG_ARRAY) {
-        return agg->array_len == 0u || pir_abi_is_pad_only_agg(mod, agg->elem_type);
+    uint32_t aid = ty.u.agg_id;
+    if (cache && cache[aid] >= 0) return cache[aid] != 0;
+    const PirAggDef *agg = &mod->agg_types.data[aid];
+    bool res = true;
+    if (agg->kind == PIR_AGG_PAD) {
+        res = true;
+    } else if (agg->kind == PIR_AGG_ARRAY) {
+        res = (agg->array_len == 0u || pir_abi_is_pad_only_rec(mod, agg->elem_type, cache));
+    } else {
+        for (uint32_t i = 0u; i < agg->field_count; ++i) {
+            if (!pir_abi_is_pad_only_rec(mod, agg->fields[i], cache)) {
+                res = false;
+                break;
+            }
+        }
     }
-    for (uint32_t i = 0u; i < agg->field_count; ++i) {
-        if (!pir_abi_is_pad_only_agg(mod, agg->fields[i])) return false;
-    }
-    return true;
+    if (cache) cache[aid] = res ? 1 : 0;
+    return res;
+}
+
+bool pir_abi_is_pad_only_agg(const PirModule *mod, PirType ty) {
+    if (ty.kind != PIR_TYPE_NAMED_AGG || !mod || mod->agg_types.len == 0u) return false;
+    int8_t stack_cache[64];
+    int8_t *cache = (mod->agg_types.len <= 64u) ? stack_cache : (int8_t *)malloc(mod->agg_types.len);
+    if (!cache) abort();
+    memset(cache, -1, mod->agg_types.len);
+    bool r = pir_abi_is_pad_only_rec(mod, ty, cache);
+    if (cache != stack_cache) free(cache);
+    return r;
 }
 
 static uint32_t pir_abi_natural_align_rec(const PirModule *mod, const PirTargetSpec *target,
-                                          PirType ty, bool is_outer) {
+                                          PirType ty, bool is_outer, uint32_t *cache) {
     if (ty.kind != PIR_TYPE_NAMED_AGG || ty.u.agg_id >= mod->agg_types.len) {
         return pir_type_layout(mod, target, ty).align;
     }
-    const PirAggDef *agg = &mod->agg_types.data[ty.u.agg_id];
+    uint32_t aid = ty.u.agg_id;
+    if (!is_outer && cache && cache[aid] != 0u) {
+        return cache[aid];
+    }
+    const PirAggDef *agg = &mod->agg_types.data[aid];
+    uint32_t res = 1u;
     if (agg->kind == PIR_AGG_PACKED_STRUCT || agg->kind == PIR_AGG_PAD) {
-        return (!is_outer && agg->min_align > 1u) ? agg->min_align : 1u;
-    }
-    if (agg->kind == PIR_AGG_ARRAY) {
-        uint32_t ea = pir_abi_natural_align_rec(mod, target, agg->elem_type, false);
+        res = (!is_outer && agg->min_align > 1u) ? agg->min_align : 1u;
+    } else if (agg->kind == PIR_AGG_ARRAY) {
+        uint32_t ea = pir_abi_natural_align_rec(mod, target, agg->elem_type, false, cache);
         if (!is_outer && agg->min_align > ea) ea = agg->min_align;
-        return ea;
+        res = ea;
+    } else {
+        uint32_t max_al = (!is_outer && agg->min_align > 1u) ? agg->min_align : 1u;
+        for (uint32_t i = 0u; i < agg->field_count; ++i) {
+            uint32_t fa = pir_abi_natural_align_rec(mod, target, agg->fields[i], false, cache);
+            if (fa > max_al) max_al = fa;
+        }
+        res = max_al;
     }
-    uint32_t max_al = (!is_outer && agg->min_align > 1u) ? agg->min_align : 1u;
-    for (uint32_t i = 0u; i < agg->field_count; ++i) {
-        uint32_t fa = pir_abi_natural_align_rec(mod, target, agg->fields[i], false);
-        if (fa > max_al) max_al = fa;
-    }
-    return max_al;
+    if (!is_outer && cache) cache[aid] = res;
+    return res;
 }
 
 uint32_t pir_abi_natural_align(const PirModule *mod, const PirTargetSpec *target, PirType ty) {
-    return pir_abi_natural_align_rec(mod, target, ty, true);
+    if (ty.kind != PIR_TYPE_NAMED_AGG || !mod || mod->agg_types.len == 0u) {
+        return pir_type_layout(mod, target, ty).align;
+    }
+    uint32_t stack_cache[64];
+    uint32_t *cache = (mod->agg_types.len <= 64u)
+                      ? stack_cache
+                      : (uint32_t *)calloc(mod->agg_types.len, sizeof(uint32_t));
+    if (!cache) abort();
+    if (cache == stack_cache) memset(stack_cache, 0, mod->agg_types.len * sizeof(uint32_t));
+    uint32_t r = pir_abi_natural_align_rec(mod, target, ty, true, cache);
+    if (cache != stack_cache) free(cache);
+    return r;
 }
 
 void pir_abi_vec_param_regs(const PirTargetSpec *target, PirVecType vt,

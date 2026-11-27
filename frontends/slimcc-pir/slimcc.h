@@ -643,9 +643,10 @@ typedef union {
 struct Node {
   Node *next;
   NodeKind kind;
-  NodeKind arith_kind : 30; // Arithmetic Assignment
+  NodeKind arith_kind : 29; // Arithmetic Assignment
   bool no_label : 1;
   bool is_nonlval : 1;
+  bool is_implicit_cast : 1;
   Type *ty;
   Token *tok; // Representative token
 
@@ -697,6 +698,7 @@ struct Node {
     Node *for_inc;
     CaseRange *sw_cases;
     ANON_UNION_END
+    Type *sw_orig_ty;
     int64_t id;
   } ctrl;
 
@@ -788,7 +790,7 @@ void eval_bitint_shr(int32_t bits, BitBuf *src, BitBuf *dst, int32_t amount,
                      bool is_unsigned);
 void *eval_bitint_bitfield_load(int32_t bits, BitBuf *src, BitBuf *dst, int32_t width,
                                 int32_t ofs, bool is_unsigned);
-void eval_bitint_bitfield_save(int32_t bits, BitBuf *src, BitBuf *dst, int32_t width,
+void eval_bitint_bitfield_save(int32_t bits, BitBuf *src, uint8_t *dst, int32_t width,
                                int32_t ofs);
 void eval_bitint_add(int32_t bits, BitBuf *lh, BitBuf *rh);
 void eval_bitint_sub(int32_t bits, BitBuf *lh, BitBuf *rh);
@@ -966,6 +968,7 @@ bool is_bitfield(Node *node);
 bool is_redundant_cast(Node *expr, Type *ty);
 bool is_compatible(Type *t1, Type *t2);
 bool is_compatible2(Type *t1, Type *t2);
+bool is_compatible_unqual_ptr_target(Type *t1, Type *t2);
 Type *composite_type(Type *t1, Type *t2);
 void int_promotion(Node **node);
 bool is_record_compat(Type *t1, Type *t2, bool is_redecl);

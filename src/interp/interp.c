@@ -88,6 +88,12 @@ uint32_t pir_interp_alloc_new(PirInterp *it, size_t size, uint32_t align,
 
 uint64_t pir_interp_ptr_to_int(const PirInterp *it, PirPtr p) {
     uint64_t pmask = (it->ptr_bytes >= 8u) ? UINT64_MAX : (((uint64_t)1u << (it->ptr_bytes * 8u)) - 1u);
+    if ((p.alloc_id & 0x80000000u) != 0u) {
+        /* Preserve frame_id + token_id for stacksave sentinel pointers. */
+        uint64_t fid = (uint64_t)(p.alloc_id & 0x7FFFFFFFu);
+        uint64_t tok = (uint64_t)p.offset & 0xFFFFFFFFu;
+        return ((fid << 32u) | tok) & pmask;
+    }
     if (p.alloc_id == 0u || p.alloc_id >= it->allocs.len) {
         return (uint64_t)p.offset & pmask;
     }
@@ -105,6 +111,20 @@ PirPtr pir_interp_int_to_ptr(PirInterp *it, uint64_t addr) {
         if (addr >= base && addr <= base + (uint64_t)a->size) {
             res.alloc_id = i;
             res.offset   = (int64_t)(addr - base);
+            return res;
+        }
+    }
+    /* Fallback: recover provenance for wrapping OOB pointers within the 2048B half-guard window
+     * (e.g. `ptr_add %arr, -8` round-tripped through byval/retbuf integer register packing). */
+    for (uint32_t i = 1u; i < it->allocs.len; ++i) {
+        const PirAlloc *a = &it->allocs.data[i];
+        uint64_t base = a->base_addr & pmask;
+        int64_t rel = (it->ptr_bytes == 4u)
+                      ? (int64_t)(int32_t)((uint32_t)addr - (uint32_t)base)
+                      : (int64_t)(addr - base);
+        if (rel >= -2048 && rel <= (int64_t)a->size + 2048) {
+            res.alloc_id = i;
+            res.offset   = rel;
             return res;
         }
     }
@@ -588,17 +608,20 @@ static PirVal eval_operand(PirInterp *it, const CallFrame *fr, const PirOperand 
             return v;
         case PIR_OPER_SYM: {
             const PirModule *mod = it->mod;
+            int64_t sym_off = (it->ptr_bytes == 4u)
+                              ? (int64_t)(int32_t)(uint32_t)op->u.sym.offset
+                              : op->u.sym.offset;
             for (uint32_t i = 0u; i < mod->globals.len; ++i) {
                 if (strcmp(mod->globals.data[i].name, op->u.sym.name) == 0) {
                     v.ptr.alloc_id = it->global_allocs[i];
-                    v.ptr.offset   = op->u.sym.offset;
+                    v.ptr.offset   = sym_off;
                     return v;
                 }
             }
             for (uint32_t i = 0u; i < mod->funcs.len; ++i) {
                 if (strcmp(mod->funcs.data[i].name, op->u.sym.name) == 0) {
                     v.ptr.alloc_id = it->func_allocs[i];
-                    v.ptr.offset   = op->u.sym.offset;
+                    v.ptr.offset   = sym_off;
                     return v;
                 }
             }
@@ -1205,6 +1228,19 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                     PirVal offv = eval_operand(it, &fr, &inst->operands[1]);
                     unsigned obits = pir_scalar_bits(inst->ty.u.scalar, it->ptr_bytes);
                     int64_t delta = sext_u64(pir_val_get_u64(&offv), obits);
+                    if ((base.ptr.alloc_id & 0x80000000u) != 0u) {
+                        /* Never allow ptr_add on a stacksave token to forge another stacksave token. */
+                        if (inst->flags & PIR_FLAG_INBOUNDS) {
+                            pir_interp_fail(it, PIR_INTERP_UB, "ptr_add [inbounds] on stacksave token");
+                            break;
+                        }
+                        uint64_t raw = pir_interp_ptr_to_int(it, base.ptr) + (uint64_t)delta;
+                        r0.ptr.alloc_id = 0u;
+                        r0.ptr.offset   = (it->ptr_bytes == 4u)
+                                          ? (int64_t)(int32_t)(uint32_t)raw
+                                          : (int64_t)raw;
+                        break;
+                    }
                     int64_t next_off = (int64_t)((uint64_t)base.ptr.offset + (uint64_t)delta);
                     if (inst->flags & PIR_FLAG_INBOUNDS) {
                         if (base.ptr.alloc_id == 0u) {
@@ -1645,6 +1681,8 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                         if (sig->cc != callee->cc ||
                             sig->is_variadic != callee->is_variadic ||
                             !pir_type_eq(sig->ret_type, callee->ret_type) ||
+                            sig->cabi_ret.kind != callee->cabi_ret.kind ||
+                            sig->cabi_ret.reg_count != callee->cabi_ret.reg_count ||
                             sig->param_count != callee->param_count) {
                             pir_interp_fail(it, PIR_INTERP_UB,
                                             "call_indirect signature mismatch for '@%s'", callee->name);
@@ -1652,7 +1690,9 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                         }
                         bool param_ok = true;
                         for (uint32_t k = 0u; k < callee->param_count; ++k) {
-                            if (!pir_type_eq(sig->params[k].type, callee->params[k].type)) {
+                            if (!pir_type_eq(sig->params[k].type, callee->params[k].type) ||
+                                sig->params[k].abi_byval_size != callee->params[k].abi_byval_size ||
+                                sig->params[k].abi_force_stack != callee->params[k].abi_force_stack) {
                                 param_ok = false;
                                 break;
                             }
@@ -1816,7 +1856,13 @@ static bool init_globals(PirInterp *it) {
     it->func_allocs = (uint32_t *)calloc(mod->funcs.len + 1u, sizeof(uint32_t));
     if (!it->func_allocs) abort();
     for (uint32_t i = 0u; i < mod->funcs.len; ++i) {
+        const PirFunction *fn = &mod->funcs.data[i];
+        if (fn->linkage == PIR_LINK_EXTERN && fn->is_weak_extern) {
+            it->func_allocs[i] = 0u;
+            continue;
+        }
         uint32_t aid = pir_interp_alloc_new(it, 1u, 16u, true, false, false, true);
+        if (aid == 0u) return false;
         it->allocs.data[aid].is_func = true;
         it->allocs.data[aid].func_id = i;
         it->func_allocs[i] = aid;
@@ -1827,6 +1873,10 @@ static bool init_globals(PirInterp *it) {
     if (!it->global_allocs) abort();
     for (uint32_t i = 0u; i < mod->globals.len; ++i) {
         const PirGlobal *g = &mod->globals.data[i];
+        if (g->linkage == PIR_LINK_EXTERN && g->is_weak_extern) {
+            it->global_allocs[i] = 0u;
+            continue;
+        }
         size_t sz = compute_global_size(g, it->ptr_bytes);
         uint32_t al = g->align;
         if (al == 0u) {
@@ -1846,6 +1896,7 @@ static bool init_globals(PirInterp *it) {
     for (uint32_t i = 0u; i < mod->globals.len; ++i) {
         const PirGlobal *g = &mod->globals.data[i];
         uint32_t aid = it->global_allocs[i];
+        if (aid == 0u) continue;
         PirPtr base = { aid, 0 };
         if (g->has_type && g->type.kind == PIR_TYPE_VECTOR && g->is_braced && !g->is_zeroinit) {
             PirScalarType elem = pir_vec_elem_scalar(g->type.u.vec);

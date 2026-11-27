@@ -5,6 +5,7 @@
 
 #include "target/abi.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "lower/lower.h"
@@ -34,8 +35,16 @@ static SysvClass merge_cls(SysvClass a, SysvClass b) {
     return EB_SSEUP;
 }
 
+static uint64_t sysv_align_up(uint64_t v, uint32_t al) {
+    if (al <= 1u) return v;
+    uint64_t m = (uint64_t)al - 1u;
+    return (v + m) & ~m;
+}
+
 static void walk_sysv(const PirModule *mod, const PirTargetSpec *target,
-                      PirType ty, uint64_t base_off, SysvAggWalk *w) {
+                      PirType ty, uint64_t base_off, SysvAggWalk *w,
+                      uint16_t *seen_off) {
+    if (w->unaligned) return;
     if (ty.kind == PIR_TYPE_SCALAR) {
         PirTypeLayout ly = pir_type_layout(mod, target, ty);
         if (ly.align > 1u && (base_off % ly.align) != 0u) {
@@ -77,11 +86,21 @@ static void walk_sysv(const PirModule *mod, const PirTargetSpec *target,
         }
         return;
     }
-    if (ty.u.agg_id >= mod->agg_types.len) {
+    uint32_t aid = ty.u.agg_id;
+    if (aid >= mod->agg_types.len) {
         w->unaligned = true;
         return;
     }
-    const PirAggDef *agg = &mod->agg_types.data[ty.u.agg_id];
+    if (seen_off && base_off < 16u) {
+        uint16_t bit = (uint16_t)(1u << base_off);
+        if ((seen_off[aid] & bit) != 0u) return;
+        seen_off[aid] |= bit;
+    }
+    const PirAggDef *agg = &mod->agg_types.data[aid];
+    if (agg->abi_memory) {
+        w->unaligned = true;
+        return;
+    }
     if (agg->kind == PIR_AGG_PAD) {
         return; /* Explicit padding is NO_CLASS (EB_NONE) */
     }
@@ -94,13 +113,20 @@ static void walk_sysv(const PirModule *mod, const PirTargetSpec *target,
         PirTypeLayout el = pir_type_layout(mod, target, agg->elem_type);
         if (el.size == 0u || agg->array_len == 0u) return;
         uint64_t stride = el.size;
-        for (uint64_t i = 0u; i < agg->array_len; ++i) {
-            walk_sysv(mod, target, agg->elem_type, base_off + i * stride, w);
+        for (uint64_t i = 0u; i < agg->array_len && !w->unaligned; ++i) {
+            walk_sysv(mod, target, agg->elem_type, base_off + i * stride, w, seen_off);
+        }
+    } else if (agg->kind == PIR_AGG_UNION) {
+        for (uint32_t i = 0u; i < agg->field_count && !w->unaligned; ++i) {
+            walk_sysv(mod, target, agg->fields[i], base_off, w, seen_off);
         }
     } else {
-        for (uint32_t i = 0u; i < agg->field_count; ++i) {
-            uint64_t foff = pir_field_offset(mod, target, ty.u.agg_id, i);
-            walk_sysv(mod, target, agg->fields[i], base_off + foff, w);
+        uint64_t pos = 0u;
+        for (uint32_t i = 0u; i < agg->field_count && !w->unaligned; ++i) {
+            PirTypeLayout fl = pir_type_layout(mod, target, agg->fields[i]);
+            uint64_t foff = (agg->kind == PIR_AGG_STRUCT) ? sysv_align_up(pos, fl.align) : pos;
+            walk_sysv(mod, target, agg->fields[i], base_off + foff, w, seen_off);
+            pos = foff + fl.size;
         }
     }
 }
@@ -123,9 +149,16 @@ static void classify_sysv_agg(const PirModule *mod, const PirTargetSpec *target,
         out->stack_byval_align = ly.align;
         return;
     }
+    uint32_t n = mod->agg_types.len;
+    uint16_t stack_seen[64];
+    uint16_t *seen_off = (n <= 64u) ? stack_seen : (uint16_t *)calloc(n, sizeof(uint16_t));
+    if (!seen_off) abort();
+    if (seen_off == stack_seen) memset(stack_seen, 0, n * sizeof(uint16_t));
+
     SysvAggWalk w;
     memset(&w, 0, sizeof(w));
-    walk_sysv(mod, target, agg_ty, 0u, &w);
+    walk_sysv(mod, target, agg_ty, 0u, &w, seen_off);
+    if (seen_off != stack_seen) free(seen_off);
     if (w.unaligned) {
         out->kind              = PIR_ABI_INDIRECT;
         out->gp_used           = 0u;
@@ -202,6 +235,18 @@ bool pir_abi_sysv_x64_param(const PirModule *mod, const PirTargetSpec *target,
             out->force_stack = true;
         }
     } else if (pd->type.kind == PIR_TYPE_VECTOR) {
+        uint16_t vbits = pir_vec_bits(pd->type.u.vec);
+        if (vbits > 128u && target->caps.max_simd_bits < 256u) {
+            /* SysV AMD64 without AVX: 256-bit vectors are MEMORY class (inline 32B stack slot). */
+            PirTypeLayout vly = pir_type_layout(mod, target, pd->type);
+            out->kind              = PIR_ABI_INDIRECT;
+            out->reg_count         = 0u;
+            out->gp_used           = 0u;
+            out->fp_used           = 0u;
+            out->stack_byval_size  = vly.size;
+            out->stack_byval_align = vly.align;
+            return true;
+        }
         uint32_t vgp = 0u, vfp = 0u;
         pir_abi_vec_param_regs(target, pd->type.u.vec, &vgp, &vfp);
         out->gp_used = vgp;

@@ -378,6 +378,7 @@ bool pir_legalize_optional_ops(PirModule *mod, const PirTargetSpec *target, PirD
                 } else if (!c->has_switch && copy.op == PIR_OP_SWITCH) {
                     uint32_t nc = copy.switch_case_count;
                     SortedCase *sc = nc ? (SortedCase *)malloc(nc * sizeof(SortedCase)) : NULL;
+                    if (nc && !sc) abort();
                     unsigned bits = pir_scalar_bits(copy.ty.u.scalar, target->ptr_bytes);
                     for (uint32_t k = 0u; k < nc; ++k) {
                         uint64_t raw = copy.switch_cases[k].is_negative

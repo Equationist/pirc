@@ -871,11 +871,13 @@ void pir_print_module(const PirModule *mod, FILE *out) {
                 pir_print_type(mod, a->elem_type, out);
                 fputc(']', out);
                 if (a->min_align > 0u) fprintf(out, ", align %u", a->min_align);
+                if (a->abi_memory) fputs(", memory", out);
                 fputc('\n', out);
                 continue;
             case PIR_AGG_PAD:
                 fprintf(out, "pad %" PRIu64, a->array_len);
                 if (a->min_align > 0u) fprintf(out, ", align %u", a->min_align);
+                if (a->abi_memory) fputs(", memory", out);
                 fputc('\n', out);
                 continue;
         }
@@ -885,6 +887,7 @@ void pir_print_module(const PirModule *mod, FILE *out) {
         }
         fputs(" }", out);
         if (a->min_align > 0u) fprintf(out, ", align %u", a->min_align);
+        if (a->abi_memory) fputs(", memory", out);
         fputc('\n', out);
     }
 

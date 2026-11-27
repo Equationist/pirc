@@ -123,7 +123,8 @@ typedef struct {
     uint32_t             nvals;
 } DseCtx;
 
-static void dse_walk_block(DseCtx *ctx, PirBlockId b, const ActiveLoadVec *parent_loads) {
+static void dse_process_block(DseCtx *ctx, PirBlockId b, const ActiveLoadVec *parent_loads,
+                              ActiveLoadVec *out_loads) {
     PirFunction *fn = ctx->fn;
     PirBlock *blk = &fn->blocks.data[b];
     uint32_t n = blk->insts.len;
@@ -273,10 +274,42 @@ static void dse_walk_block(DseCtx *ctx, PirBlockId b, const ActiveLoadVec *paren
     }
 
     PIR_VEC_FREE(&active);
-    for (uint32_t ci = 0u; ci < ctx->dom->children[b].len; ++ci) {
-        dse_walk_block(ctx, ctx->dom->children[b].data[ci], &loads);
+    *out_loads = loads;
+}
+
+static void dse_walk_dom_tree(DseCtx *ctx, PirBlockId root_b) {
+    typedef struct {
+        PirBlockId    b;
+        uint32_t      next_child;
+        bool          entered;
+        ActiveLoadVec loads;
+    } DseFrame;
+    PIR_VEC(DseFrame) stk = {0};
+    DseFrame init;
+    memset(&init, 0, sizeof(init));
+    init.b = root_b;
+    PIR_VEC_PUSH(&stk, init);
+
+    while (stk.len > 0u) {
+        DseFrame *fr = &stk.data[stk.len - 1u];
+        PirBlockId b = fr->b;
+        if (!fr->entered) {
+            fr->entered = true;
+            const ActiveLoadVec *pl = (stk.len >= 2u) ? &stk.data[stk.len - 2u].loads : NULL;
+            dse_process_block(ctx, b, pl, &fr->loads);
+        }
+        if (fr->next_child < ctx->dom->children[b].len) {
+            PirBlockId child = ctx->dom->children[b].data[fr->next_child++];
+            DseFrame cf;
+            memset(&cf, 0, sizeof(cf));
+            cf.b = child;
+            PIR_VEC_PUSH(&stk, cf);
+        } else {
+            PIR_VEC_FREE(&fr->loads);
+            stk.len--;
+        }
     }
-    PIR_VEC_FREE(&loads);
+    PIR_VEC_FREE(&stk);
 }
 
 void pir_opt_dse(PirModule *mod, PirFunction *fn, const PirTargetSpec *target) {
@@ -301,7 +334,7 @@ void pir_opt_dse(PirModule *mod, PirFunction *fn, const PirTargetSpec *target) {
     ctx.alias  = alias;
     ctx.nvals  = nvals;
 
-    dse_walk_block(&ctx, 0u, NULL);
+    dse_walk_dom_tree(&ctx, 0u);
 
     /* Apply forwarded load aliases across all blocks. */
     for (uint32_t b = 0u; b < fn->blocks.len; ++b) {

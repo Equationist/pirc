@@ -45,7 +45,9 @@ static bool a64_needs_sym_quote(const char *s) {
         a64_ci_eq(s, "xzr") || a64_ci_eq(s, "wzr") ||
         a64_ci_eq(s, "lr") || a64_ci_eq(s, "fp") ||
         a64_ci_eq(s, "ip0") || a64_ci_eq(s, "ip1") ||
-        a64_ci_eq(s, "zt0") || a64_ci_eq(s, "vg") || a64_ci_eq(s, "ffr")) {
+        a64_ci_eq(s, "zt0") || a64_ci_eq(s, "vg") || a64_ci_eq(s, "ffr") ||
+        a64_ci_eq(s, "nzcv") || a64_ci_eq(s, "fpcr") ||
+        a64_ci_eq(s, "fpsr") || a64_ci_eq(s, "fpmr")) {
         return true;
     }
     unsigned char c = (unsigned char)s[0];
@@ -932,7 +934,7 @@ static bool a64_emit_function(PirCodeEmitter *em, const PirModule *mod, const MF
     const char *lp = pir_asm_lbl_pfx(target);
 
     if (fn->section && fn->section[0] != '\0') {
-        pir_asm_emit_section_directive(out, target, fn->section, PIR_GSEG_RODATA, false, false, true);
+        pir_asm_emit_section_directive(out, mod, target, fn->section, PIR_GSEG_RODATA, false, false, true);
     } else if (pir_asm_is_macho(target)) {
         fprintf(out, "\t.section __TEXT,__text,regular,pure_instructions\n");
     } else {
@@ -1019,6 +1021,7 @@ static bool a64_emit_function(PirCodeEmitter *em, const PirModule *mod, const MF
     ctx->need_branch_relax = (est_insts * 4u > 524288u);
 
     uint32_t last_loc = 0u;
+    bool emitted_any_loc_inst = false;
     for (uint32_t b = 0u; b < nblks; ++b) {
         if (blk_skip[b]) continue;
         const MBlock *blk = &mf->blocks.data[b];
@@ -1075,6 +1078,10 @@ static bool a64_emit_function(PirCodeEmitter *em, const PirModule *mod, const MF
                 fprintf(out, "\t.loc %u %u %u\n",
                         pir_asm_dwarf_file_num(mod, sl->file_id), sl->line, sl->col);
                 last_loc = ins->loc_idx;
+                emitted_any_loc_inst = true;
+            } else if (!emitted_any_loc_inst && mod->files.len > 0u) {
+                fprintf(out, "\t.loc 1 0 0\n");
+                emitted_any_loc_inst = true;
             }
             emit_inst(ctx, mf, ins);
         }

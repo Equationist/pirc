@@ -717,17 +717,24 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
 
     for (uint32_t i = 0u; i < aliases.len; ++i) {
         PirValueId root = aliases.data[i].to;
-        for (bool progress = true; progress; ) {
+        uint32_t steps = 0u;
+        for (bool progress = true; progress && steps <= aliases.len; ++steps) {
             progress = false;
             for (uint32_t k = 0u; k < aliases.len; ++k) {
                 if (aliases.data[k].from == root) {
+                    if (aliases.data[k].to == aliases.data[i].from) {
+                        progress = false;
+                        break;
+                    }
                     root = aliases.data[k].to;
                     progress = true;
                     break;
                 }
             }
         }
-        pir_fn_replace_val_uses(fn, aliases.data[i].from, root);
+        if (root != aliases.data[i].from) {
+            pir_fn_replace_val_uses(fn, aliases.data[i].from, root);
+        }
     }
     PIR_VEC_FREE(&aliases);
     free(splits);
@@ -776,10 +783,22 @@ bool pir_legalize_simd(PirModule *mod, const PirTargetSpec *target, PirDiag *dia
                 return false;
             }
         } else {
+            if (needs_split(mod->funcs.data[fi].ret_type, max_bits)) {
+                pir_diag_error(diag, mod->funcs.data[fi].src_line, 0u,
+                               "oversized vector return type exceeds target SIMD width (%u bits)",
+                               (unsigned)max_bits);
+                return false;
+            }
             split_simd_decl(mod, &mod->funcs.data[fi].params, &mod->funcs.data[fi].param_count, max_bits);
         }
     }
     for (uint32_t si = 0u; si < mod->sigs.len; ++si) {
+        if (needs_split(mod->sigs.data[si].ret_type, max_bits)) {
+            pir_diag_error(diag, mod->sigs.data[si].src_line, 0u,
+                           "oversized vector return type in signature exceeds target SIMD width (%u bits)",
+                           (unsigned)max_bits);
+            return false;
+        }
         split_simd_decl(mod, &mod->sigs.data[si].params, &mod->sigs.data[si].param_count, max_bits);
     }
 

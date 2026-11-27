@@ -5,6 +5,7 @@
 
 #include "target/abi.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "lower/lower.h"
@@ -14,7 +15,14 @@ typedef struct {
     bool     has_base;
     PirType  base_ty;
     uint32_t count;
+    uint32_t req_align;
 } HfaWalk;
+
+static uint64_t a64_align_up(uint64_t v, uint32_t al) {
+    if (al <= 1u) return v;
+    uint64_t m = (uint64_t)al - 1u;
+    return (v + m) & ~m;
+}
 
 static bool is_hfa_leaf(const PirTargetSpec *target, PirType ty) {
     if (ty.kind == PIR_TYPE_SCALAR) {
@@ -36,8 +44,9 @@ static bool hfa_leaf_compat(PirType a, PirType b) {
     return false;
 }
 
-static void walk_hfa(const PirModule *mod, const PirTargetSpec *target,
-                     PirType ty, uint64_t base_off, HfaWalk *w) {
+static void walk_hfa_memo(const PirModule *mod, const PirTargetSpec *target,
+                          PirType ty, uint64_t base_off, HfaWalk *w,
+                          HfaWalk *cache, uint8_t *done) {
     if (!w->valid) return;
     if (ty.kind != PIR_TYPE_NAMED_AGG) {
         if (!is_hfa_leaf(target, ty)) { w->valid = false; return; }
@@ -50,74 +59,109 @@ static void walk_hfa(const PirModule *mod, const PirTargetSpec *target,
             w->valid = false;
             return;
         }
+        if (ly.align > w->req_align) w->req_align = ly.align;
         w->count++;
         if (w->count > 4u) w->valid = false;
         return;
     }
-    if (ty.u.agg_id >= mod->agg_types.len) {
+    uint32_t aid = ty.u.agg_id;
+    if (aid >= mod->agg_types.len) {
         w->valid = false;
         return;
     }
-    const PirAggDef *agg = &mod->agg_types.data[ty.u.agg_id];
+    if (cache && done && done[aid]) {
+        const HfaWalk *sub = &cache[aid];
+        if (!sub->valid || !sub->has_base) { w->valid = false; return; }
+        if (sub->req_align > 1u && (base_off % sub->req_align) != 0u) { w->valid = false; return; }
+        if (!w->has_base) {
+            w->has_base = true;
+            w->base_ty  = sub->base_ty;
+        } else if (!hfa_leaf_compat(w->base_ty, sub->base_ty)) {
+            w->valid = false;
+            return;
+        }
+        if (sub->req_align > w->req_align) w->req_align = sub->req_align;
+        w->count += sub->count;
+        if (w->count > 4u) w->valid = false;
+        return;
+    }
+
+    HfaWalk local = { true, false, pir_type_scalar(PIR_SCALAR_VOID), 0u, 1u };
+    const PirAggDef *agg = &mod->agg_types.data[aid];
     if (agg->kind == PIR_AGG_PAD) {
-        w->valid = false;
-        return;
-    }
-    if (agg->kind == PIR_AGG_ARRAY) {
+        local.valid = false;
+    } else if (agg->kind == PIR_AGG_ARRAY) {
         PirTypeLayout el = pir_type_layout(mod, target, agg->elem_type);
-        if (el.size == 0u || agg->array_len == 0u) { w->valid = false; return; }
-        for (uint64_t i = 0u; i < agg->array_len && w->valid; ++i) {
-            walk_hfa(mod, target, agg->elem_type, base_off + i * el.size, w);
+        if (el.size == 0u || agg->array_len == 0u || agg->array_len > 4u) {
+            local.valid = false;
+        } else {
+            for (uint64_t i = 0u; i < agg->array_len && local.valid; ++i) {
+                walk_hfa_memo(mod, target, agg->elem_type, i * el.size, &local, cache, done);
+            }
         }
     } else if (agg->kind == PIR_AGG_UNION) {
         if (agg->field_count == 0u) {
-            w->valid = false;
-            return;
-        }
-        uint32_t max_cnt = 0u;
-        bool has_any = false;
-        for (uint32_t i = 0u; i < agg->field_count && w->valid; ++i) {
-            if (pir_abi_is_pad_only_agg(mod, agg->fields[i])) continue;
-            has_any = true;
-            HfaWalk mw = { true, false, pir_type_scalar(PIR_SCALAR_VOID), 0u };
-            walk_hfa(mod, target, agg->fields[i], base_off, &mw);
-            if (!mw.valid || !mw.has_base || mw.count < 1u || mw.count > 4u) {
-                w->valid = false;
-                return;
+            local.valid = false;
+        } else {
+            uint32_t max_cnt = 0u;
+            bool has_any = false;
+            for (uint32_t i = 0u; i < agg->field_count && local.valid; ++i) {
+                if (pir_abi_is_pad_only_agg(mod, agg->fields[i])) continue;
+                has_any = true;
+                HfaWalk mw = { true, false, pir_type_scalar(PIR_SCALAR_VOID), 0u, 1u };
+                walk_hfa_memo(mod, target, agg->fields[i], 0u, &mw, cache, done);
+                if (!mw.valid || !mw.has_base || mw.count < 1u || mw.count > 4u) {
+                    local.valid = false;
+                    break;
+                }
+                PirTypeLayout ml = pir_type_layout(mod, target, agg->fields[i]);
+                PirTypeLayout bl = pir_type_layout(mod, target, mw.base_ty);
+                if (ml.size != bl.size * (uint64_t)mw.count) {
+                    local.valid = false;
+                    break;
+                }
+                if (!local.has_base) {
+                    local.has_base = true;
+                    local.base_ty  = mw.base_ty;
+                } else if (!hfa_leaf_compat(local.base_ty, mw.base_ty)) {
+                    local.valid = false;
+                    break;
+                }
+                if (mw.req_align > local.req_align) local.req_align = mw.req_align;
+                if (mw.count > max_cnt) max_cnt = mw.count;
             }
-            PirTypeLayout ml = pir_type_layout(mod, target, agg->fields[i]);
-            PirTypeLayout bl = pir_type_layout(mod, target, mw.base_ty);
-            if (ml.size != bl.size * (uint64_t)mw.count) {
-                w->valid = false;
-                return;
-            }
-            if (!w->has_base) {
-                w->has_base = true;
-                w->base_ty  = mw.base_ty;
-            } else if (!hfa_leaf_compat(w->base_ty, mw.base_ty)) {
-                w->valid = false;
-                return;
-            }
-            if (mw.count > max_cnt) {
-                max_cnt = mw.count;
-            }
-        }
-        if (!has_any) {
-            w->valid = false;
-            return;
-        }
-        if (w->valid) {
-            w->count += max_cnt;
-            if (w->count > 4u) {
-                w->valid = false;
+            if (!has_any) local.valid = false;
+            if (local.valid) {
+                local.count = max_cnt;
+                if (local.count > 4u) local.valid = false;
             }
         }
     } else {
-        for (uint32_t i = 0u; i < agg->field_count && w->valid; ++i) {
-            uint64_t foff = pir_field_offset(mod, target, ty.u.agg_id, i);
-            walk_hfa(mod, target, agg->fields[i], base_off + foff, w);
+        uint64_t pos = 0u;
+        for (uint32_t i = 0u; i < agg->field_count && local.valid; ++i) {
+            PirTypeLayout fl = pir_type_layout(mod, target, agg->fields[i]);
+            uint64_t foff = (agg->kind == PIR_AGG_STRUCT) ? a64_align_up(pos, fl.align) : pos;
+            walk_hfa_memo(mod, target, agg->fields[i], foff, &local, cache, done);
+            pos = foff + fl.size;
         }
     }
+
+    if (cache && done) {
+        cache[aid] = local;
+        done[aid]  = 1u;
+    }
+    if (!local.valid || !local.has_base) { w->valid = false; return; }
+    if (local.req_align > 1u && (base_off % local.req_align) != 0u) { w->valid = false; return; }
+    if (!w->has_base) {
+        w->has_base = true;
+        w->base_ty  = local.base_ty;
+    } else if (!hfa_leaf_compat(w->base_ty, local.base_ty)) {
+        w->valid = false;
+        return;
+    }
+    if (local.req_align > w->req_align) w->req_align = local.req_align;
+    w->count += local.count;
+    if (w->count > 4u) w->valid = false;
 }
 
 static void classify_aapcs64_agg(const PirModule *mod, const PirTargetSpec *target,
@@ -132,8 +176,17 @@ static void classify_aapcs64_agg(const PirModule *mod, const PirTargetSpec *targ
         return;
     }
 
-    HfaWalk hw = { true, false, pir_type_scalar(PIR_SCALAR_VOID), 0u };
-    walk_hfa(mod, target, agg_ty, 0u, &hw);
+    uint32_t n = mod->agg_types.len;
+    HfaWalk stack_cache[64];
+    uint8_t stack_done[64];
+    HfaWalk *cache = (n <= 64u) ? stack_cache : (HfaWalk *)calloc(n, sizeof(HfaWalk));
+    uint8_t *done  = (n <= 64u) ? stack_done  : (uint8_t *)calloc(n, 1u);
+    if (!cache || !done) abort();
+    if (done == stack_done) memset(stack_done, 0, n);
+
+    HfaWalk hw = { true, false, pir_type_scalar(PIR_SCALAR_VOID), 0u, 1u };
+    walk_hfa_memo(mod, target, agg_ty, 0u, &hw, cache, done);
+    if (cache != stack_cache) { free(cache); free(done); }
     if (hw.valid && hw.has_base && hw.count >= 1u && hw.count <= 4u) {
         PirTypeLayout bl = pir_type_layout(mod, target, hw.base_ty);
         if (ly.size == bl.size * hw.count) {
@@ -247,6 +300,15 @@ bool pir_abi_aapcs64_param(const PirModule *mod, const PirTargetSpec *target,
             out->stack_align = 16u;
         }
     } else if (pd->type.kind == PIR_TYPE_VECTOR) {
+        if (pir_vec_bits(pd->type.u.vec) > 128u) {
+            /* AAPCS64 has no >128-bit NEON parameter registers; pass >16B vectors indirectly. */
+            out->kind      = PIR_ABI_INDIRECT;
+            out->reg_count = 0u;
+            out->gp_used   = 1u;
+            out->fp_used   = 0u;
+            if (st->gp_used < 8u) st->gp_used++;
+            return true;
+        }
         uint32_t vgp = 0u, vfp = 0u;
         pir_abi_vec_param_regs(target, pd->type.u.vec, &vgp, &vfp);
         out->gp_used = vgp;

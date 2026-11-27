@@ -213,11 +213,11 @@ static void expand_branch_target_i128(PirModule *mod, PirBranchTarget *bt, const
     PIR_VEC_FREE(&nargs);
 }
 
-static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirFuncId fi,
+static bool legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirFuncId fi,
                                const bool *fn_ret_i128, const bool *sig_ret_i128,
-                               uint32_t orig_funcs) {
+                               uint32_t orig_funcs, PirDiag *diag) {
     PirFunction *fn = &mod->funcs.data[fi];
-    if (!fn->is_defined) return;
+    if (!fn->is_defined) return true;
 
     bool ret_is_i128 = fn_ret_i128[fi];
     bool uses_i128 = ret_is_i128;
@@ -247,7 +247,7 @@ static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
             }
         }
     }
-    if (!uses_i128) return;
+    if (!uses_i128) return true;
 
     PirType t64 = pir_type_scalar(PIR_SCALAR_I64);
     PirType t8  = pir_type_scalar(PIR_SCALAR_I8);
@@ -971,8 +971,52 @@ static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                 const char *cname = (copy.op == PIR_OP_DIV_S) ? "__divti3"
                                   : (copy.op == PIR_OP_DIV_U) ? "__udivti3"
                                   : (copy.op == PIR_OP_REM_S) ? "__modti3" : "__umodti3";
+                for (uint32_t gi = 0u; gi < mod->globals.len; ++gi) {
+                    if (mod->globals.data[gi].name && strcmp(mod->globals.data[gi].name, cname) == 0) {
+                        pir_diag_error(diag, ln, 0u,
+                                       "symbol '@%s' collides with global during i128 division lowering", cname);
+                        PIR_VEC_FREE(&new_insts);
+                        PIR_VEC_FREE(&aliases);
+                        free(map);
+                        return false;
+                    }
+                }
+                for (uint32_t si = 0u; si < mod->sigs.len; ++si) {
+                    if (mod->sigs.data[si].name && strcmp(mod->sigs.data[si].name, cname) == 0) {
+                        pir_diag_error(diag, ln, 0u,
+                                       "symbol '@%s' collides with signature during i128 division lowering", cname);
+                        PIR_VEC_FREE(&new_insts);
+                        PIR_VEC_FREE(&aliases);
+                        free(map);
+                        return false;
+                    }
+                }
                 PirType ptys[5] = { tptr, t64, t64, t64, t64 };
                 PirFuncId cid = pir_ensure_extern_func(mod, cname, ptys, 5u, pir_type_scalar(PIR_SCALAR_VOID));
+                const PirFunction *callee = &mod->funcs.data[cid];
+                bool sig_ok = (!callee->is_variadic && callee->param_count == 5u &&
+                               callee->cc == PIR_CC_C && callee->linkage != PIR_LINK_INTERNAL &&
+                               callee->cabi_ret.kind == PIR_CABI_RET_NONE &&
+                               callee->ret_type.kind == PIR_TYPE_SCALAR &&
+                               callee->ret_type.u.scalar == PIR_SCALAR_VOID);
+                for (uint32_t k = 0u; k < 5u && sig_ok; ++k) {
+                    if (callee->params[k].abi_kind != PIR_PARAM_NORMAL ||
+                        callee->params[k].abi_byval_size != 0u ||
+                        callee->params[k].abi_stack_align != 0u ||
+                        callee->params[k].abi_force_stack ||
+                        !pir_type_eq(callee->params[k].type, ptys[k])) {
+                        sig_ok = false;
+                    }
+                }
+                if (!sig_ok) {
+                    pir_diag_error(diag, ln, 0u,
+                                   "predeclared '@%s' has incompatible signature for i128 division lowering",
+                                   cname);
+                    PIR_VEC_FREE(&new_insts);
+                    PIR_VEC_FREE(&aliases);
+                    free(map);
+                    return false;
+                }
                 fn = &mod->funcs.data[fi]; /* Re-fetch after potential realloc */
 
                 PirInst al = pir_make_inst(PIR_OP_ALLOCA_PTR, tptr, ln, lc);
@@ -1212,6 +1256,7 @@ static void legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
     }
     PIR_VEC_FREE(&aliases);
     free(map);
+    return true;
 }
 
 static void split_i128_decl(PirModule *mod, const PirTargetSpec *target,
@@ -1271,7 +1316,6 @@ static void split_i128_decl(PirModule *mod, const PirTargetSpec *target,
 }
 
 bool pir_legalize_i128(PirModule *mod, const PirTargetSpec *target, PirDiag *diag) {
-    (void)diag;
     uint32_t orig_funcs = mod->funcs.len;
     uint32_t orig_sigs  = mod->sigs.len;
     bool *fn_ret_i128  = (bool *)calloc(orig_funcs + 1u, sizeof(bool));
@@ -1285,13 +1329,21 @@ bool pir_legalize_i128(PirModule *mod, const PirTargetSpec *target, PirDiag *dia
         sig_ret_i128[si] = is_i128(mod->sigs.data[si].ret_type);
     }
 
+    bool ok = true;
     for (uint32_t fi = 0u; fi < orig_funcs; ++fi) {
         if (mod->funcs.data[fi].is_defined) {
-            legalize_i128_func(mod, target, fi, fn_ret_i128, sig_ret_i128, orig_funcs);
+            if (!legalize_i128_func(mod, target, fi, fn_ret_i128, sig_ret_i128, orig_funcs, diag)) {
+                ok = false;
+            }
         } else {
             split_i128_decl(mod, target, &mod->funcs.data[fi].params, &mod->funcs.data[fi].param_count,
                             &mod->funcs.data[fi].ret_type, &mod->funcs.data[fi].cabi_ret);
         }
+    }
+    if (!ok) {
+        free(fn_ret_i128);
+        free(sig_ret_i128);
+        return false;
     }
     for (uint32_t si = 0u; si < orig_sigs; ++si) {
         split_i128_decl(mod, target, &mod->sigs.data[si].params, &mod->sigs.data[si].param_count,

@@ -144,7 +144,7 @@ static void append_phi_args_to_target(RenameCtx *ctx, PirInstId tid, int target_
     if (succ >= ctx->nblks) return;
     uint32_t extra = 0u;
     for (uint32_t s = 0u; s < ctx->nslots; ++s) {
-        if (ctx->phi_param[s * ctx->nblks + succ] != PIR_INVALID_ID) extra++;
+        if (ctx->phi_param[(size_t)s * ctx->nblks + succ] != PIR_INVALID_ID) extra++;
     }
     if (extra == 0u) return;
 
@@ -156,7 +156,7 @@ static void append_phi_args_to_target(RenameCtx *ctx, PirInstId tid, int target_
     }
     uint32_t pos = orig_cnt;
     for (uint32_t s = 0u; s < ctx->nslots; ++s) {
-        if (ctx->phi_param[s * ctx->nblks + succ] != PIR_INVALID_ID) {
+        if (ctx->phi_param[(size_t)s * ctx->nblks + succ] != PIR_INVALID_ID) {
             PirValueId v = stack_top_or_zero(ctx, s);
             nargs[pos++] = pir_op_val(v, ctx->slots[s].slot_type);
         }
@@ -168,108 +168,128 @@ static void append_phi_args_to_target(RenameCtx *ctx, PirInstId tid, int target_
     bt->arg_count = pos;
 }
 
-static void rename_block(RenameCtx *ctx, PirBlockId b) {
-    uint32_t *saved = (uint32_t *)malloc(ctx->nslots * sizeof(uint32_t));
-    if (!saved) abort();
-    for (uint32_t s = 0u; s < ctx->nslots; ++s) {
-        saved[s] = ctx->stacks[s].len;
-        PirValueId pv = ctx->phi_param[s * ctx->nblks + b];
-        if (pv != PIR_INVALID_ID) {
-            PIR_VEC_PUSH(&ctx->stacks[s], pv);
-        }
-    }
+static void rename_block(RenameCtx *ctx, PirBlockId root_b) {
+    typedef struct {
+        PirBlockId b;
+        uint32_t   next_child;
+        bool       entered;
+        uint32_t  *saved;
+    } RenameFrame;
+    PIR_VEC(RenameFrame) stk = {0};
+    RenameFrame init = { root_b, 0u, false, NULL };
+    PIR_VEC_PUSH(&stk, init);
 
-    PirInstIdVec new_insts = {NULL, 0u, 0u};
-    uint32_t old_len = ctx->fn->blocks.data[b].insts.len;
-    for (uint32_t j = 0u; j < old_len; ++j) {
-        PirInstId iid = ctx->fn->blocks.data[b].insts.data[j];
-        PirInst *ins = &ctx->fn->insts.data[iid];
-        remap_ops(ctx, ins->operands, ins->operand_count);
-
-        /* Drop promoted allocas */
-        if (ins->op == PIR_OP_ALLOCA_PTR && ins->results[0] < ctx->orig_nvals) {
-            int32_t si = ctx->val_to_slot[ins->results[0]];
-            if (si >= 0) continue;
-        }
-
-        /* Promote load from slot */
-        if (ins->op == PIR_OP_LOAD && ins->operands[0].kind == PIR_OPER_VAL &&
-            ins->operands[0].u.val < ctx->orig_nvals) {
-            int32_t si = ctx->val_to_slot[ins->operands[0].u.val];
-            if (si >= 0) {
-                PirValueId dst_res = ins->results[0];
-                PirValueId cur = stack_top_or_zero(ctx, (uint32_t)si);
-                ctx->val_remap[dst_res] = cur;
-                continue;
-            }
-        }
-
-        /* Promote store to slot */
-        if (ins->op == PIR_OP_STORE && ins->operands[1].kind == PIR_OPER_VAL &&
-            ins->operands[1].u.val < ctx->orig_nvals) {
-            int32_t si = ctx->val_to_slot[ins->operands[1].u.val];
-            if (si >= 0) {
-                PirOperand val_op = ins->operands[0];
-                PirType sty = ctx->slots[si].slot_type;
-                uint32_t sline = ins->src_line;
-                uint32_t loc = ins->loc_idx;
-                PirValueId sv = PIR_INVALID_ID;
-                if (val_op.kind == PIR_OPER_VAL) {
-                    sv = val_op.u.val;
-                } else {
-                    sv = pir_fn_new_val(ctx->mod, ctx->fn, "m2r_c", sty, b, PIR_INVALID_ID, 0u);
-                    PirOpcode cop = (val_op.kind == PIR_OPER_SYM) ? PIR_OP_ADDR : PIR_OP_CONST;
-                    PirInst ci = pir_make_inst(cop, sty, sline, loc);
-                    ci.operands = pir_alloc_ops(ctx->mod, 1u);
-                    ci.operands[0] = val_op;
-                    ci.operand_count = 1u;
-                    ci.results[0] = sv;
-                    pir_fn_append_inst(ctx->fn, &new_insts, ci);
+    while (stk.len > 0u) {
+        RenameFrame *fr = &stk.data[stk.len - 1u];
+        PirBlockId b = fr->b;
+        if (!fr->entered) {
+            fr->entered = true;
+            fr->saved = (uint32_t *)malloc(ctx->nslots * sizeof(uint32_t));
+            if (!fr->saved) abort();
+            for (uint32_t s = 0u; s < ctx->nslots; ++s) {
+                fr->saved[s] = ctx->stacks[s].len;
+                PirValueId pv = ctx->phi_param[(size_t)s * ctx->nblks + b];
+                if (pv != PIR_INVALID_ID) {
+                    PIR_VEC_PUSH(&ctx->stacks[s], pv);
                 }
-                PIR_VEC_PUSH(&ctx->stacks[si], sv);
-                continue;
+            }
+
+            PirInstIdVec new_insts = {NULL, 0u, 0u};
+            uint32_t old_len = ctx->fn->blocks.data[b].insts.len;
+            for (uint32_t j = 0u; j < old_len; ++j) {
+                PirInstId iid = ctx->fn->blocks.data[b].insts.data[j];
+                PirInst *ins = &ctx->fn->insts.data[iid];
+                remap_ops(ctx, ins->operands, ins->operand_count);
+
+                /* Drop promoted allocas */
+                if (ins->op == PIR_OP_ALLOCA_PTR && ins->results[0] < ctx->orig_nvals) {
+                    int32_t si = ctx->val_to_slot[ins->results[0]];
+                    if (si >= 0) continue;
+                }
+
+                /* Promote load from slot */
+                if (ins->op == PIR_OP_LOAD && ins->operands[0].kind == PIR_OPER_VAL &&
+                    ins->operands[0].u.val < ctx->orig_nvals) {
+                    int32_t si = ctx->val_to_slot[ins->operands[0].u.val];
+                    if (si >= 0) {
+                        PirValueId dst_res = ins->results[0];
+                        PirValueId cur = stack_top_or_zero(ctx, (uint32_t)si);
+                        ctx->val_remap[dst_res] = cur;
+                        continue;
+                    }
+                }
+
+                /* Promote store to slot */
+                if (ins->op == PIR_OP_STORE && ins->operands[1].kind == PIR_OPER_VAL &&
+                    ins->operands[1].u.val < ctx->orig_nvals) {
+                    int32_t si = ctx->val_to_slot[ins->operands[1].u.val];
+                    if (si >= 0) {
+                        PirOperand val_op = ins->operands[0];
+                        PirType sty = ctx->slots[si].slot_type;
+                        uint32_t sline = ins->src_line;
+                        uint32_t loc = ins->loc_idx;
+                        PirValueId sv = PIR_INVALID_ID;
+                        if (val_op.kind == PIR_OPER_VAL) {
+                            sv = val_op.u.val;
+                        } else {
+                            sv = pir_fn_new_val(ctx->mod, ctx->fn, "m2r_c", sty, b, PIR_INVALID_ID, 0u);
+                            PirOpcode cop = (val_op.kind == PIR_OPER_SYM) ? PIR_OP_ADDR : PIR_OP_CONST;
+                            PirInst ci = pir_make_inst(cop, sty, sline, loc);
+                            ci.operands = pir_alloc_ops(ctx->mod, 1u);
+                            ci.operands[0] = val_op;
+                            ci.operand_count = 1u;
+                            ci.results[0] = sv;
+                            pir_fn_append_inst(ctx->fn, &new_insts, ci);
+                        }
+                        PIR_VEC_PUSH(&ctx->stacks[si], sv);
+                        continue;
+                    }
+                }
+
+                PIR_VEC_PUSH(&new_insts, iid);
+            }
+
+            PIR_VEC_FREE(&ctx->fn->blocks.data[b].insts);
+            ctx->fn->blocks.data[b].insts = new_insts;
+
+            /* Update terminator args & append phi arguments for outgoing edges. */
+            if (ctx->fn->blocks.data[b].insts.len > 0u) {
+                PirInstId tid = ctx->fn->blocks.data[b].insts.data[ctx->fn->blocks.data[b].insts.len - 1u];
+                PirInst *term = &ctx->fn->insts.data[tid];
+                remap_ops(ctx, term->targets[0].args, term->targets[0].arg_count);
+                remap_ops(ctx, term->targets[1].args, term->targets[1].arg_count);
+                for (uint32_t c = 0u; c < term->switch_case_count; ++c) {
+                    remap_ops(ctx, term->switch_cases[c].target.args, term->switch_cases[c].target.arg_count);
+                }
+
+                PirOpcode top = term->op;
+                if (top == PIR_OP_JMP) {
+                    append_phi_args_to_target(ctx, tid, 0, 0u);
+                } else if (top == PIR_OP_BR) {
+                    append_phi_args_to_target(ctx, tid, 0, 0u);
+                    append_phi_args_to_target(ctx, tid, 0, 1u);
+                } else if (top == PIR_OP_SWITCH) {
+                    append_phi_args_to_target(ctx, tid, 0, 0u);
+                    uint32_t nc = ctx->fn->insts.data[tid].switch_case_count;
+                    for (uint32_t c = 0u; c < nc; ++c) {
+                        append_phi_args_to_target(ctx, tid, 1, c);
+                    }
+                }
             }
         }
-
-        PIR_VEC_PUSH(&new_insts, iid);
-    }
-
-    PIR_VEC_FREE(&ctx->fn->blocks.data[b].insts);
-    ctx->fn->blocks.data[b].insts = new_insts;
-
-    /* Update terminator args & append phi arguments for outgoing edges. */
-    if (ctx->fn->blocks.data[b].insts.len > 0u) {
-        PirInstId tid = ctx->fn->blocks.data[b].insts.data[ctx->fn->blocks.data[b].insts.len - 1u];
-        PirInst *term = &ctx->fn->insts.data[tid];
-        remap_ops(ctx, term->targets[0].args, term->targets[0].arg_count);
-        remap_ops(ctx, term->targets[1].args, term->targets[1].arg_count);
-        for (uint32_t c = 0u; c < term->switch_case_count; ++c) {
-            remap_ops(ctx, term->switch_cases[c].target.args, term->switch_cases[c].target.arg_count);
-        }
-
-        PirOpcode top = term->op;
-        if (top == PIR_OP_JMP) {
-            append_phi_args_to_target(ctx, tid, 0, 0u);
-        } else if (top == PIR_OP_BR) {
-            append_phi_args_to_target(ctx, tid, 0, 0u);
-            append_phi_args_to_target(ctx, tid, 0, 1u);
-        } else if (top == PIR_OP_SWITCH) {
-            append_phi_args_to_target(ctx, tid, 0, 0u);
-            uint32_t nc = ctx->fn->insts.data[tid].switch_case_count;
-            for (uint32_t c = 0u; c < nc; ++c) {
-                append_phi_args_to_target(ctx, tid, 1, c);
+        if (fr->next_child < ctx->dom->children[b].len) {
+            PirBlockId child = ctx->dom->children[b].data[fr->next_child++];
+            RenameFrame cf = { child, 0u, false, NULL };
+            PIR_VEC_PUSH(&stk, cf);
+        } else {
+            for (uint32_t s = 0u; s < ctx->nslots; ++s) {
+                ctx->stacks[s].len = fr->saved[s];
             }
+            free(fr->saved);
+            stk.len--;
         }
     }
-
-    for (uint32_t ci = 0u; ci < ctx->dom->children[b].len; ++ci) {
-        rename_block(ctx, ctx->dom->children[b].data[ci]);
-    }
-
-    for (uint32_t s = 0u; s < ctx->nslots; ++s) {
-        ctx->stacks[s].len = saved[s];
-    }
-    free(saved);
+    PIR_VEC_FREE(&stk);
 }
 
 /* =========================================================================
@@ -870,12 +890,12 @@ void pir_opt_mem2reg(PirModule *mod, PirFunction *fn, const PirTargetSpec *targe
             PirBlockId x = wl[--wl_len];
             for (uint32_t i = 0u; i < df[x].len; ++i) {
                 PirBlockId y = df[x].data[i];
-                if (y == 0u || phi_param[s * nblks + y] != PIR_INVALID_ID) continue;
+                if (y == 0u || phi_param[(size_t)s * nblks + y] != PIR_INVALID_ID) continue;
                 uint32_t pidx = fn->blocks.data[y].params.len;
                 PirValueId pv = pir_fn_new_val(mod, fn, "m2r", cands.data[s].slot_type,
                                                y, PIR_INVALID_ID, pidx);
                 PIR_VEC_PUSH(&fn->blocks.data[y].params, pv);
-                phi_param[s * nblks + y] = pv;
+                phi_param[(size_t)s * nblks + y] = pv;
                 if (!in_wl[y]) {
                     in_wl[y] = true;
                     wl[wl_len++] = y;

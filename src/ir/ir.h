@@ -128,6 +128,8 @@ typedef struct {
     uint64_t    array_len;
     /* Optional minimum alignment override (0 = natural alignment) */
     uint32_t    min_align;
+    /* Optional ABI hint: force MEMORY class on SysV AMD64 (e.g. <=2B _Atomic/FAM structs) */
+    bool        abi_memory;
 } PirAggDef;
 
 /* =========================================================================
@@ -425,8 +427,10 @@ typedef struct {
             bool     is_negative;
         } imm_int;
         struct {
-            uint64_t bits;    /* IEEE 754 bits (f32 in low 32, f64 in 64) */
-            double   raw_val; /* Parsed double before f32/f64 narrowing */
+            uint64_t bits;         /* IEEE 754 bits (f32 in low 32, f64 in 64) */
+            double   raw_val;      /* Parsed double before f32/f64 narrowing */
+            uint32_t f32_bits;     /* Direct strtof IEEE 754 bits (avoids f32 double rounding) */
+            bool     has_f32_bits;
         } imm_float;
         struct {
             const char *name;
@@ -541,6 +545,8 @@ typedef struct {
     uint64_t          int_hi;
     bool              int_neg;
     uint64_t          float_bits;
+    uint32_t          float32_bits;
+    bool              has_f32_bits;
 } PirGlobalItem;
 
 typedef struct {

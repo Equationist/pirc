@@ -182,6 +182,10 @@ static bool align_valid_u32(uint32_t al) {
     return pir_is_pow2_u32(al) && al <= (1u << 28);
 }
 
+static uint64_t max_obj_bytes(const PirTargetSpec *target) {
+    return (target && target->ptr_bytes == 4u) ? (UINT64_C(1) << 31) : (UINT64_C(1) << 40);
+}
+
 static bool is_pad_agg_type(const PirModule *mod, PirType t) {
     return t.kind == PIR_TYPE_NAMED_AGG && t.u.agg_id < mod->agg_types.len &&
            mod->agg_types.data[t.u.agg_id].kind == PIR_AGG_PAD;
@@ -192,6 +196,7 @@ static void verify_params_and_ret(Verifier *v, const char *owner, uint32_t line,
                                   const PirParamDecl *params,
                                   uint32_t param_count, bool is_variadic, PirType ret_type,
                                   const PirCabiRetInfo *cabi_ret) {
+    uint64_t max_sz = max_obj_bytes(v->target);
     if (is_variadic && cc != PIR_CC_C) {
         pir_diag_error(v->diag, line, 0u, "'%s': variadic '...' requires cc \"c\"", owner);
     }
@@ -246,10 +251,16 @@ static void verify_params_and_ret(Verifier *v, const char *owner, uint32_t line,
         } else {
             check_ssa_type(v, pd->type, line, "parameter");
         }
+        if (pd->abi_byval_size > 0u || pd->abi_byval_align != 0u ||
+            pd->abi_stack_align != 0u || pd->abi_force_stack) {
+            if (cc != PIR_CC_C) {
+                pir_diag_error(v->diag, line, 0u, "'%s': lowered C ABI parameter metadata requires cc \"c\"", owner);
+            }
+        }
         if (pd->abi_byval_size > 0u) {
             if (pd->abi_kind != PIR_PARAM_NORMAL || !is_ptr_type(pd->type)) {
                 pir_diag_error(v->diag, line, 0u, "'%s': byval_size only valid on normal ptr parameter", owner);
-            } else if (pd->abi_byval_size > (UINT64_C(1) << 40)) {
+            } else if (pd->abi_byval_size > max_sz) {
                 pir_diag_error(v->diag, line, 0u, "'%s': byval_size %" PRIu64 " exceeds maximum", owner, pd->abi_byval_size);
             }
         }
@@ -276,21 +287,48 @@ static void verify_params_and_ret(Verifier *v, const char *owner, uint32_t line,
         }
     }
     if (cabi_ret && cabi_ret->kind != PIR_CABI_RET_NONE) {
+        if (cc != PIR_CC_C) {
+            pir_diag_error(v->diag, line, 0u, "'%s': sret/multi_ret requires cc \"c\"", owner);
+        }
+        if (v->target) {
+            if (cabi_ret->kind == PIR_CABI_RET_SRET_X8 && v->target->arch != PIR_ARCH_ARM64) {
+                pir_diag_error(v->diag, line, 0u, "'%s': sret_x8 is only valid on ARM64 targets", owner);
+            }
+            if (cabi_ret->kind == PIR_CABI_RET_SRET_RAX && v->target->arch != PIR_ARCH_X86_64) {
+                pir_diag_error(v->diag, line, 0u, "'%s': sret_rax is only valid on x86-64 targets", owner);
+            }
+            if (cabi_ret->kind == PIR_CABI_RET_MULTI_REG &&
+                v->target->arch == PIR_ARCH_X86_64 && cabi_ret->reg_count > 2u) {
+                pir_diag_error(v->diag, line, 0u, "'%s': multi_ret on x86-64 supports at most 2 registers", owner);
+            }
+        }
         if (!(ret_type.kind == PIR_TYPE_SCALAR && ret_type.u.scalar == PIR_SCALAR_VOID)) {
             pir_diag_error(v->diag, line, 0u, "'%s': sret/multi_ret requires void return type", owner);
         }
         if (param_count == 0u || params[0].abi_kind != PIR_PARAM_NORMAL || !is_ptr_type(params[0].type)) {
             pir_diag_error(v->diag, line, 0u, "'%s': sret/multi_ret requires normal ptr parameter 0", owner);
+        } else if (params[0].abi_byval_size != 0u) {
+            pir_diag_error(v->diag, line, 0u, "'%s': sret/multi_ret parameter 0 cannot have byval_size", owner);
         }
         if (cabi_ret->kind == PIR_CABI_RET_MULTI_REG) {
             if (cabi_ret->reg_count < 2u || cabi_ret->reg_count > 4u) {
                 pir_diag_error(v->diag, line, 0u, "'%s': multi_ret requires 2..4 registers", owner);
             } else {
                 for (uint32_t r = 0u; r < cabi_ret->reg_count; ++r) {
-                    check_ssa_type(v, cabi_ret->regs[r], line, "multi_ret register");
+                    PirType rt = cabi_ret->regs[r];
+                    check_ssa_type(v, rt, line, "multi_ret register");
+                    if (rt.kind == PIR_TYPE_SCALAR && rt.u.scalar == PIR_SCALAR_I128) {
+                        pir_diag_error(v->diag, line, 0u, "'%s': multi_ret register cannot be i128", owner);
+                    }
+                    if (rt.kind == PIR_TYPE_VECTOR && v->target &&
+                        pir_vec_bits(rt.u.vec) > v->target->caps.max_simd_bits) {
+                        pir_diag_error(v->diag, line, 0u,
+                                       "'%s': multi_ret vector register exceeds target max_simd_bits", owner);
+                    }
                 }
             }
-            if (cabi_ret->agg_size == 0u || cabi_ret->agg_size > (UINT64_C(1) << 40)) {
+            uint64_t max_mr_sz = (uint64_t)cabi_ret->reg_count * 16u;
+            if (cabi_ret->agg_size == 0u || cabi_ret->agg_size > max_mr_sz) {
                 pir_diag_error(v->diag, line, 0u, "'%s': multi_ret size %" PRIu64 " is invalid",
                                owner, cabi_ret->agg_size);
             }
@@ -353,8 +391,11 @@ static void check_flags(Verifier *v, const PirInst *inst) {
                                "conflicting semantic flags on add/sub/mul");
             }
             return;
-        case PIR_OP_DIV_S: case PIR_OP_DIV_U: case PIR_OP_REM_S: case PIR_OP_REM_U:
+        case PIR_OP_DIV_S: case PIR_OP_REM_S:
             allowed = PIR_FLAG_TRAP | PIR_FLAG_WRAP | PIR_FLAG_UNSAFE;
+            break;
+        case PIR_OP_DIV_U: case PIR_OP_REM_U:
+            allowed = PIR_FLAG_TRAP | PIR_FLAG_UNSAFE;
             break;
         case PIR_OP_SHL: case PIR_OP_SHR: case PIR_OP_SAR:
             allowed = PIR_FLAG_MASK | PIR_FLAG_TRAP | PIR_FLAG_UNSAFE;
@@ -427,6 +468,8 @@ static void check_operand_kind_and_type(Verifier *v, const PirFunction *fn,
                                         const PirOperand *op, PirType expected,
                                         uint32_t line, const char *ctx);
 
+static bool operand_has_call_meta(const PirOperand *op);
+
 static void check_branch_target(Verifier *v, const PirFunction *fn, const PirInst *inst,
                                 const PirBranchTarget *bt, bool allow_ret, bool allow_exn,
                                 PirType invoke_ret_ty) {
@@ -448,6 +491,10 @@ static void check_branch_target(Verifier *v, const PirFunction *fn, const PirIns
     }
     for (uint32_t k = 0u; k < bt->arg_count; ++k) {
         const PirOperand *arg = &bt->args[k];
+        if (operand_has_call_meta(arg)) {
+            pir_diag_error(v->diag, inst->src_line, 0u,
+                           "call-site ABI metadata not allowed on branch argument");
+        }
         PirType expected = fn->values.data[dst->params.data[k]].type;
         if (arg->kind == PIR_OPER_INVOKE_RET) {
             if (!allow_ret || (invoke_ret_ty.kind == PIR_TYPE_SCALAR &&
@@ -486,9 +533,10 @@ static void check_branch_target(Verifier *v, const PirFunction *fn, const PirIns
 }
 
 static void check_call_args(Verifier *v, const PirFunction *fn, const PirInst *inst,
-                            const char *callee_name,
+                            const char *callee_name, PirCallingConv callee_cc,
                             const PirParamDecl *params, uint32_t param_count,
                             bool is_variadic, uint32_t first_arg_idx) {
+    uint64_t max_sz = max_obj_bytes(v->target);
     uint32_t provided = inst->operand_count - first_arg_idx;
     if ((!is_variadic && provided != param_count) || (is_variadic && provided < param_count)) {
         pir_diag_error(v->diag, inst->src_line, 0u,
@@ -498,14 +546,22 @@ static void check_call_args(Verifier *v, const PirFunction *fn, const PirInst *i
     }
     for (uint32_t i = 0u; i < provided; ++i) {
         const PirOperand *arg = &inst->operands[first_arg_idx + i];
+        if (callee_cc != PIR_CC_C && operand_has_call_meta(arg)) {
+            pir_diag_error(v->diag, inst->src_line, 0u,
+                           "call to '%s': C ABI call-site metadata requires cc \"c\"", callee_name);
+        }
         if (arg->call_abi == PIR_PARAM_BYVAL && v->mode == PIR_VERIFY_LIR) {
             pir_diag_error(v->diag, inst->src_line, 0u, "LIR forbids byval at call site");
+        }
+        if (arg->call_abi == PIR_PARAM_BYVAL && arg->call_byval_size > 0u) {
+            pir_diag_error(v->diag, inst->src_line, 0u,
+                           "call to '%s': cannot combine byval(@T) with byval_size", callee_name);
         }
         if (arg->call_byval_size > 0u) {
             if (!is_ptr_type(arg->type) || arg->kind == PIR_OPER_IMM_INT || arg->kind == PIR_OPER_IMM_FLOAT) {
                 pir_diag_error(v->diag, inst->src_line, 0u,
                                "call to '%s': byval_size requires ptr value or symbol", callee_name);
-            } else if (arg->call_byval_size > (UINT64_C(1) << 40)) {
+            } else if (arg->call_byval_size > max_sz) {
                 pir_diag_error(v->diag, inst->src_line, 0u,
                                "call to '%s': byval_size %" PRIu64 " exceeds maximum",
                                callee_name, arg->call_byval_size);
@@ -527,6 +583,14 @@ static void check_call_args(Verifier *v, const PirFunction *fn, const PirInst *i
                            "call to '%s': no_f32_promote only valid on f32 argument", callee_name);
         }
         if (i < param_count) {
+            if (arg->call_byval_size != params[i].abi_byval_size ||
+                arg->call_byval_align != params[i].abi_byval_align ||
+                arg->call_stack_align != params[i].abi_stack_align ||
+                arg->call_force_stack != params[i].abi_force_stack) {
+                pir_diag_error(v->diag, inst->src_line, 0u,
+                               "call to '%s': argument %u ABI metadata mismatches callee parameter",
+                               callee_name, i);
+            }
             if (arg->call_abi == PIR_PARAM_BYVAL) {
                 if (params[i].abi_kind != PIR_PARAM_BYVAL ||
                     !pir_type_eq(arg->call_abi_type, params[i].abi_type)) {
@@ -659,6 +723,16 @@ static void check_int_imm_range(Verifier *v, uint32_t bits, uint64_t lo, uint64_
         if (is_neg ? (lo > max_neg) : (lo > max_pos)) {
             pir_diag_error(v->diag, line, 0u,
                            "integer immediate out of %u-bit range in %s", bits, ctx);
+        }
+    } else if (bits == 64u) {
+        if (is_neg && lo > (UINT64_C(1) << 63)) {
+            pir_diag_error(v->diag, line, 0u,
+                           "integer immediate out of 64-bit range in %s", ctx);
+        }
+    } else if (bits == 128u) {
+        if (is_neg && (hi > (UINT64_C(1) << 63) || (hi == (UINT64_C(1) << 63) && lo != 0u))) {
+            pir_diag_error(v->diag, line, 0u,
+                           "integer immediate out of 128-bit range in %s", ctx);
         }
     }
 }
@@ -1120,12 +1194,18 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
                 if (op0->kind == PIR_OPER_VAL) {
                     check_operand_kind_and_type(v, fn, op0, src, inst->src_line, "bitcast");
                 } else if (op0->kind == PIR_OPER_SYM) {
-                    check_operand_kind_and_type(v, fn, op0, pir_type_scalar(PIR_SCALAR_PTR),
-                                                inst->src_line, "bitcast");
+                    if (!is_ptr_type(inst->ty)) {
+                        pir_diag_error(v->diag, inst->src_line, 0u,
+                                       "symbol operand in bitcast requires ptr destination type");
+                    } else {
+                        check_operand_kind_and_type(v, fn, op0, pir_type_scalar(PIR_SCALAR_PTR),
+                                                    inst->src_line, "bitcast");
+                    }
                 } else if (op0->kind == PIR_OPER_IMM_INT) {
                     uint32_t db_imm = pir_type_bits(inst->ty, ptr_bytes);
-                    if (inst->ty.kind == PIR_TYPE_VECTOR || src.kind == PIR_TYPE_VECTOR) {
-                        pir_diag_error(v->diag, inst->src_line, 0u, "integer immediate invalid for vector bitcast");
+                    if (inst->ty.kind != PIR_TYPE_SCALAR) {
+                        pir_diag_error(v->diag, inst->src_line, 0u,
+                                       "integer immediate invalid for non-scalar bitcast");
                     } else if (is_ptr_type(inst->ty) &&
                                (op0->u.imm_int.lo != 0u || op0->u.imm_int.hi != 0u || op0->u.imm_int.is_negative)) {
                         pir_diag_error(v->diag, inst->src_line, 0u, "only null literal '0' is valid for ptr bitcast");
@@ -1244,7 +1324,7 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
             check_op_count(v, inst, 0u);
             if (inst->imm_u64 == 0u) {
                 pir_diag_error(v->diag, inst->src_line, 0u, "alloca.ptr byte size must be > 0");
-            } else if (inst->imm_u64 > (UINT64_C(1) << 40)) {
+            } else if (inst->imm_u64 > max_obj_bytes(v->target)) {
                 pir_diag_error(v->diag, inst->src_line, 0u, "alloca.ptr byte size %" PRIu64 " exceeds maximum",
                                inst->imm_u64);
             }
@@ -1580,7 +1660,7 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
                 pir_diag_error(v->diag, inst->src_line, 0u,
                                "cannot assign result of void call '@%s'", callee->name);
             }
-            check_call_args(v, fn, inst, callee->name, callee->params, callee->param_count,
+            check_call_args(v, fn, inst, callee->name, callee->cc, callee->params, callee->param_count,
                             callee->is_variadic, 1u);
             break;
         }
@@ -1606,7 +1686,7 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
                 pir_diag_error(v->diag, inst->src_line, 0u,
                                "cannot assign result of void call_indirect '@%s'", sig->name);
             }
-            check_call_args(v, fn, inst, sig->name, sig->params, sig->param_count, sig->is_variadic, 1u);
+            check_call_args(v, fn, inst, sig->name, sig->cc, sig->params, sig->param_count, sig->is_variadic, 1u);
             break;
         }
 
@@ -1719,7 +1799,7 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
                 pir_diag_error(v->diag, inst->src_line, 0u, "invoke target cannot have non-zero offset");
             }
             const PirFunction *callee = &v->mod->funcs.data[inst->operands[0].u.sym.id];
-            check_call_args(v, fn, inst, callee->name, callee->params, callee->param_count,
+            check_call_args(v, fn, inst, callee->name, callee->cc, callee->params, callee->param_count,
                             callee->is_variadic, 1u);
             check_branch_target(v, fn, inst, &inst->targets[0], true, false, callee->ret_type);
             check_branch_target(v, fn, inst, &inst->targets[1], false, true, callee->ret_type);
@@ -1743,7 +1823,7 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
                                             inst->src_line, "invoke_indirect callee");
             }
             const PirSigDef *sig = &v->mod->sigs.data[inst->sig_id];
-            check_call_args(v, fn, inst, sig->name, sig->params, sig->param_count, sig->is_variadic, 1u);
+            check_call_args(v, fn, inst, sig->name, sig->cc, sig->params, sig->param_count, sig->is_variadic, 1u);
             check_branch_target(v, fn, inst, &inst->targets[0], true, false, sig->ret_type);
             check_branch_target(v, fn, inst, &inst->targets[1], false, true, sig->ret_type);
             break;
@@ -1982,6 +2062,72 @@ static void verify_function(Verifier *v, const PirFunction *fn) {
         }
     }
 
+    /* Reject cross-block SSA instruction definition cycles in unreachable blocks. */
+    if (fn->values.len > 0u) {
+        bool has_unreach = false;
+        for (uint32_t b = 0u; b < fn->blocks.len; ++b) {
+            if (!cfg.reachable[b]) { has_unreach = true; break; }
+        }
+        if (has_unreach) {
+            uint8_t *vcol = (uint8_t *)calloc(fn->values.len, 1u);
+            typedef struct { PirValueId vid; uint32_t op_i; } UFrame;
+            PIR_VEC(UFrame) ustk = {0};
+            if (!vcol) abort();
+            for (uint32_t sv = 0u; sv < fn->values.len; ++sv) {
+                if (vcol[sv] != 0u) continue;
+                const PirValueDef *svd = &fn->values.data[sv];
+                if (svd->def_block == PIR_INVALID_ID || svd->def_block >= fn->blocks.len ||
+                    cfg.reachable[svd->def_block] || svd->def_inst == PIR_INVALID_ID ||
+                    svd->def_inst >= fn->insts.len) {
+                    vcol[sv] = 2u;
+                    continue;
+                }
+                vcol[sv] = 1u;
+                UFrame uf = { sv, 0u };
+                PIR_VEC_PUSH(&ustk, uf);
+                while (ustk.len > 0u) {
+                    UFrame *top = &ustk.data[ustk.len - 1u];
+                    const PirValueDef *tvd = &fn->values.data[top->vid];
+                    const PirInst *tins = &fn->insts.data[tvd->def_inst];
+                    PirValueId nxt = PIR_INVALID_ID;
+                    while (top->op_i < tins->operand_count) {
+                        const PirOperand *op = &tins->operands[top->op_i++];
+                        if (op->kind == PIR_OPER_VAL && op->u.val < fn->values.len) {
+                            const PirValueDef *ovd = &fn->values.data[op->u.val];
+                            if (ovd->def_block != PIR_INVALID_ID && ovd->def_block < fn->blocks.len &&
+                                !cfg.reachable[ovd->def_block] && ovd->def_inst != PIR_INVALID_ID &&
+                                ovd->def_inst < fn->insts.len) {
+                                nxt = op->u.val;
+                                break;
+                            }
+                        }
+                    }
+                    if (nxt != PIR_INVALID_ID) {
+                        if (vcol[nxt] == 1u) {
+                            pir_diag_error(v->diag, tins->src_line, 0u,
+                                           "cyclic SSA definition involving '%%%s' in unreachable block",
+                                           fn->values.data[nxt].name);
+                            while (ustk.len > 0u) {
+                                vcol[ustk.data[--ustk.len].vid] = 2u;
+                            }
+                            break;
+                        }
+                        if (vcol[nxt] == 0u) {
+                            vcol[nxt] = 1u;
+                            UFrame nf = { nxt, 0u };
+                            PIR_VEC_PUSH(&ustk, nf);
+                        }
+                    } else {
+                        vcol[top->vid] = 2u;
+                        ustk.len--;
+                    }
+                }
+            }
+            PIR_VEC_FREE(&ustk);
+            free(vcol);
+        }
+    }
+
     pir_dom_destroy(&dom);
     pir_cfg_destroy(&cfg);
     free(inst_blk);
@@ -1990,6 +2136,11 @@ static void verify_function(Verifier *v, const PirFunction *fn) {
 
 static void verify_scalar_global_item(Verifier *v, const PirGlobal *g, PirScalarType sk,
                                       const PirGlobalItem *gi) {
+    if (sk == PIR_SCALAR_VALIST) {
+        pir_diag_error(v->diag, g->src_line, 0u,
+                       "va_list field is not allowed in global '@%s'", g->name);
+        return;
+    }
     PirGlobalItemKind ik = gi->kind;
     uint8_t ptr_bytes = v->target ? v->target->ptr_bytes : 8u;
     uint64_t scalar_sz = (v->target)
@@ -2032,35 +2183,82 @@ static void verify_scalar_global_item(Verifier *v, const PirGlobal *g, PirScalar
     }
 }
 
-static bool agg_type_is_pad_only(const PirModule *mod, PirType ty, uint32_t depth) {
+static bool agg_type_is_pad_only_rec(const PirModule *mod, PirType ty, int8_t *cache, uint32_t depth) {
     if (depth > 256u) return false;
     if (ty.kind != PIR_TYPE_NAMED_AGG || ty.u.agg_id >= mod->agg_types.len) return false;
-    const PirAggDef *ad = &mod->agg_types.data[ty.u.agg_id];
+    uint32_t aid = ty.u.agg_id;
+    if (cache) {
+        if (cache[aid] == 1) return true;
+        if (cache[aid] == 0 || cache[aid] == 2) return false;
+        cache[aid] = 2; /* visiting */
+    }
+    const PirAggDef *ad = &mod->agg_types.data[aid];
+    bool res = false;
     switch (ad->kind) {
         case PIR_AGG_PAD:
-            return true;
+            res = true;
+            break;
         case PIR_AGG_ARRAY:
-            return agg_type_is_pad_only(mod, ad->elem_type, depth + 1u);
+            res = agg_type_is_pad_only_rec(mod, ad->elem_type, cache, depth + 1u);
+            break;
         case PIR_AGG_STRUCT:
         case PIR_AGG_PACKED_STRUCT:
-            for (uint32_t f = 0u; f < ad->field_count; ++f) {
-                if (!agg_type_is_pad_only(mod, ad->fields[f], depth + 1u)) return false;
-            }
-            return true;
         case PIR_AGG_UNION:
-            return ad->field_count > 0u && agg_type_is_pad_only(mod, ad->fields[0], depth + 1u);
+            res = (ad->field_count > 0u);
+            for (uint32_t f = 0u; f < ad->field_count && res; ++f) {
+                if (!agg_type_is_pad_only_rec(mod, ad->fields[f], cache, depth + 1u)) res = false;
+            }
+            break;
     }
-    return false;
+    if (cache) cache[aid] = res ? 1 : 0;
+    return res;
+}
+
+static bool agg_type_is_pad_only(const PirModule *mod, PirType ty, int8_t *cache) {
+    return agg_type_is_pad_only_rec(mod, ty, cache, 0u);
+}
+
+static bool agg_contains_valist_rec(const PirModule *mod, PirType ty, int8_t *cache, uint32_t depth) {
+    if (depth > 256u) return false;
+    if (ty.kind == PIR_TYPE_SCALAR) return ty.u.scalar == PIR_SCALAR_VALIST;
+    if (ty.kind != PIR_TYPE_NAMED_AGG || ty.u.agg_id >= mod->agg_types.len) return false;
+    uint32_t aid = ty.u.agg_id;
+    if (cache) {
+        if (cache[aid] == 1) return true;
+        if (cache[aid] == 0 || cache[aid] == 2) return false;
+        cache[aid] = 2;
+    }
+    const PirAggDef *ad = &mod->agg_types.data[aid];
+    bool res = false;
+    switch (ad->kind) {
+        case PIR_AGG_PAD:
+            res = false;
+            break;
+        case PIR_AGG_ARRAY:
+            res = agg_contains_valist_rec(mod, ad->elem_type, cache, depth + 1u);
+            break;
+        case PIR_AGG_STRUCT:
+        case PIR_AGG_PACKED_STRUCT:
+        case PIR_AGG_UNION:
+            for (uint32_t f = 0u; f < ad->field_count; ++f) {
+                if (agg_contains_valist_rec(mod, ad->fields[f], cache, depth + 1u)) {
+                    res = true;
+                    break;
+                }
+            }
+            break;
+    }
+    if (cache) cache[aid] = res ? 1 : 0;
+    return res;
 }
 
 static void verify_agg_global_items(Verifier *v, const PirGlobal *g, PirType ty,
-                                    uint32_t *idx, uint32_t depth) {
+                                    uint32_t *idx, int8_t *pad_cache, uint32_t depth) {
     if (depth > 256u) {
         pir_diag_error(v->diag, g->src_line, 0u, "aggregate global '@%s' nesting exceeds maximum depth", g->name);
         return;
     }
-    if (ty.kind == PIR_TYPE_NAMED_AGG && ty.u.agg_id < v->mod->agg_types.len &&
-        v->mod->agg_types.data[ty.u.agg_id].kind == PIR_AGG_PAD) {
+    if (agg_type_is_pad_only(v->mod, ty, pad_cache)) {
         return;
     }
     if (*idx >= g->item_count) return;
@@ -2084,7 +2282,7 @@ static void verify_agg_global_items(Verifier *v, const PirGlobal *g, PirType ty,
         PirType ety = pir_type_scalar(pir_vec_elem_scalar(ty.u.vec));
         uint32_t lanes = pir_vec_lanes(ty.u.vec);
         for (uint32_t l = 0u; l < lanes && *idx < g->item_count; ++l) {
-            verify_agg_global_items(v, g, ety, idx, depth + 1u);
+            verify_agg_global_items(v, g, ety, idx, pad_cache, depth + 1u);
         }
         return;
     }
@@ -2094,7 +2292,7 @@ static void verify_agg_global_items(Verifier *v, const PirGlobal *g, PirType ty,
         case PIR_AGG_PAD:
             break;
         case PIR_AGG_ARRAY:
-            if (agg_type_is_pad_only(v->mod, ad->elem_type, depth + 1u)) {
+            if (agg_type_is_pad_only(v->mod, ad->elem_type, pad_cache)) {
                 break;
             }
             if (g->items[*idx].kind == PIR_GITEM_BYTES &&
@@ -2108,14 +2306,14 @@ static void verify_agg_global_items(Verifier *v, const PirGlobal *g, PirType ty,
                 }
             } else {
                 for (uint64_t k = 0u; k < ad->array_len && *idx < g->item_count; ++k) {
-                    verify_agg_global_items(v, g, ad->elem_type, idx, depth + 1u);
+                    verify_agg_global_items(v, g, ad->elem_type, idx, pad_cache, depth + 1u);
                 }
             }
             break;
         case PIR_AGG_STRUCT:
         case PIR_AGG_PACKED_STRUCT:
             for (uint32_t f = 0u; f < ad->field_count && *idx < g->item_count; ++f) {
-                verify_agg_global_items(v, g, ad->fields[f], idx, depth + 1u);
+                verify_agg_global_items(v, g, ad->fields[f], idx, pad_cache, depth + 1u);
             }
             break;
         case PIR_AGG_UNION:
@@ -2133,7 +2331,7 @@ static void verify_agg_global_items(Verifier *v, const PirGlobal *g, PirType ty,
                         break;
                     }
                 }
-                verify_agg_global_items(v, g, ad->fields[0], idx, depth + 1u);
+                verify_agg_global_items(v, g, ad->fields[0], idx, pad_cache, depth + 1u);
             }
             break;
     }
@@ -2183,8 +2381,13 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
     uint32_t seen_len = 0u;
 
     /* Aggregates. */
-    uint8_t *agg_color = (uint8_t *)calloc(mod->agg_types.len + 1u, 1u);
-    if (!agg_color) abort();
+    uint8_t *agg_color   = (uint8_t *)calloc(mod->agg_types.len + 1u, 1u);
+    bool    *agg_acyclic = (bool *)calloc(mod->agg_types.len + 1u, sizeof(bool));
+    int8_t  *pad_cache   = (int8_t *)malloc(mod->agg_types.len + 1u);
+    int8_t  *vl_cache    = (int8_t *)malloc(mod->agg_types.len + 1u);
+    if (!agg_color || !agg_acyclic || !pad_cache || !vl_cache) abort();
+    memset(pad_cache, -1, mod->agg_types.len + 1u);
+    memset(vl_cache,  -1, mod->agg_types.len + 1u);
     for (uint32_t i = 0u; i < mod->agg_types.len; ++i) {
         const PirAggDef *a = &mod->agg_types.data[i];
         if (a->name) {
@@ -2224,6 +2427,7 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
                            "aggregate type alignment %u is invalid", a->min_align);
         }
         bool acyclic = check_agg_cycles(&v, i, agg_color);
+        agg_acyclic[i] = acyclic;
         if (acyclic && target) {
             PirTypeLayout ly = pir_type_layout(mod, target, pir_type_agg(i));
             if (ly.overflow) {
@@ -2257,6 +2461,38 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
         } else {
             if (!g->is_zeroinit && g->item_count == 0u) {
                 pir_diag_error(diag, g->src_line, 0u, "global '@%s' requires an initializer", g->name);
+            }
+            if (target && target->os != PIR_OS_MACOS && target->os != PIR_OS_WINDOWS &&
+                g->section && (strcmp(g->section, ".bss") == 0 || strcmp(g->section, ".tbss") == 0)) {
+                bool all_zero = g->is_zeroinit;
+                if (!all_zero && g->item_count > 0u) {
+                    all_zero = true;
+                    for (uint32_t k = 0u; k < g->item_count && all_zero; ++k) {
+                        const PirGlobalItem *gi = &g->items[k];
+                        switch (gi->kind) {
+                            case PIR_GITEM_ZERO: break;
+                            case PIR_GITEM_INT:
+                                if (gi->int_lo != 0u || gi->int_hi != 0u) all_zero = false;
+                                break;
+                            case PIR_GITEM_FLOAT:
+                                if (gi->float_bits != 0u || (gi->has_f32_bits && gi->float32_bits != 0u)) all_zero = false;
+                                break;
+                            case PIR_GITEM_BYTES:
+                                for (uint64_t bi = 0u; bi < gi->len; ++bi) {
+                                    if (gi->bytes[bi] != 0u) { all_zero = false; break; }
+                                }
+                                break;
+                            case PIR_GITEM_RELOC:
+                                all_zero = false;
+                                break;
+                        }
+                    }
+                }
+                if (!all_zero) {
+                    pir_diag_error(diag, g->src_line, 0u,
+                                   "global '@%s' in nobits section '%s' cannot have non-zero initializer",
+                                   g->name, g->section);
+                }
             }
         }
         if (g->has_type) {
@@ -2310,6 +2546,11 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
                     }
                 }
             } else if (g->type.kind == PIR_TYPE_NAMED_AGG && g->type.u.agg_id < mod->agg_types.len) {
+                if (agg_acyclic[g->type.u.agg_id] &&
+                    agg_contains_valist_rec(mod, g->type, vl_cache, 0u)) {
+                    pir_diag_error(diag, g->src_line, 0u,
+                                   "global '@%s' aggregate type cannot contain va_list", g->name);
+                }
                 const PirAggDef *ad = &mod->agg_types.data[g->type.u.agg_id];
                 if (!g->is_zeroinit && !g->is_braced && g->item_count > 0u) {
                     bool is_i8_str = (ad->kind == PIR_AGG_ARRAY &&
@@ -2325,12 +2566,12 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
                                        "string initializer for '@%s' exceeds array length (%" PRIu64 " > %" PRIu64 ")",
                                        g->name, g->items[0].len, ad->array_len);
                     }
-                } else if (g->is_braced && g->item_count > 0u) {
+                } else if (g->is_braced && g->item_count > 0u && agg_acyclic[g->type.u.agg_id]) {
                     if (!(g->item_count == 1u && g->items[0].kind == PIR_GITEM_ZERO &&
                           (g->items[0].len == 0u ||
                            (target && g->items[0].len == pir_type_layout(mod, target, g->type).size)))) {
                         uint32_t idx = 0u;
-                        verify_agg_global_items(&v, g, g->type, &idx, 0u);
+                        verify_agg_global_items(&v, g, g->type, &idx, pad_cache, 0u);
                         if (idx < g->item_count) {
                             pir_diag_error(diag, g->src_line, 0u,
                                            "aggregate global '@%s' has too many initializer items (%u > %u)",
@@ -2341,10 +2582,16 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
             }
             check_lir_type(&v, g->type, g->src_line, "global");
         } else if (g->is_zeroinit && g->item_count == 1u &&
-                   g->items[0].kind == PIR_GITEM_ZERO && g->items[0].len == 0u) {
-            pir_diag_error(diag, g->src_line, 0u, "flattened zeroinit global '@%s' must have size > 0", g->name);
+                   g->items[0].kind == PIR_GITEM_ZERO) {
+            if (g->items[0].len == 0u) {
+                pir_diag_error(diag, g->src_line, 0u, "flattened zeroinit global '@%s' must have size > 0", g->name);
+            } else if (g->items[0].len > max_obj_bytes(target)) {
+                pir_diag_error(diag, g->src_line, 0u, "flattened zeroinit global '@%s' size %" PRIu64 " exceeds maximum",
+                               g->name, g->items[0].len);
+            }
         } else if (g->is_braced) {
             uint64_t total_bytes = 0u;
+            uint64_t max_sz = max_obj_bytes(target);
             uint8_t ptr_b = target ? target->ptr_bytes : 8u;
             for (uint32_t k = 0u; k < g->item_count; ++k) {
                 const PirGlobalItem *gi = &g->items[k];
@@ -2372,7 +2619,7 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
                                    "untyped braced global '@%s' only allows byte strings, byte ints, zeroinit N, or ptr relocations",
                                    g->name);
                 }
-                if (item_sz > (UINT64_C(1) << 40) || total_bytes > (UINT64_C(1) << 40) - item_sz) {
+                if (item_sz > max_sz || total_bytes > max_sz - item_sz) {
                     pir_diag_error(diag, g->src_line, 0u,
                                    "untyped global '@%s' byte size exceeds maximum", g->name);
                     break;
@@ -2381,13 +2628,30 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
             }
         }
         for (uint32_t k = 0u; k < g->item_count; ++k) {
-            if (g->items[k].kind == PIR_GITEM_RELOC && !has_symbol(mod, g->items[k].sym_name)) {
-                pir_diag_error(diag, g->src_line, 0u,
-                               "global '@%s' references undefined symbol '@%s'",
-                               g->name, g->items[k].sym_name);
+            if (g->items[k].kind == PIR_GITEM_RELOC) {
+                const char *rname = g->items[k].sym_name;
+                if (!has_symbol(mod, rname)) {
+                    pir_diag_error(diag, g->src_line, 0u,
+                                   "global '@%s' references undefined symbol '@%s'",
+                                   g->name, rname);
+                } else {
+                    for (uint32_t gi = 0u; gi < mod->globals.len; ++gi) {
+                        if (strcmp(mod->globals.data[gi].name, rname) == 0 &&
+                            mod->globals.data[gi].seg == PIR_GSEG_TLS) {
+                            pir_diag_error(diag, g->src_line, 0u,
+                                           "global '@%s' cannot take static address of tls global '@%s'",
+                                           g->name, rname);
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
+
+    free(vl_cache);
+    free(pad_cache);
+    free(agg_acyclic);
 
     /* Functions. */
     for (uint32_t i = 0u; i < mod->funcs.len; ++i) {

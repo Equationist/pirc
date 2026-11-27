@@ -1,7 +1,7 @@
 #ifndef __STDFLOAT_H
 #define __STDFLOAT_H
 
-#define DECIMAL_DIG 21
+#define DECIMAL_DIG 17
 #define FLT_RADIX 2
 
 #if defined(__has_include)
@@ -21,8 +21,8 @@
 #endif
 #endif
 
-#ifndef FLT_ROUND
-#define FLT_ROUND 1
+#ifndef FLT_ROUNDS
+#define FLT_ROUNDS 1
 #endif
 
 #define FLT_DIG 6
@@ -45,15 +45,15 @@
 #define DBL_MIN_10_EXP (-307)
 #define DBL_MIN_EXP (-1021)
 
-#define LDBL_DIG 18
-#define LDBL_EPSILON 0x1p-63L
-#define LDBL_MANT_DIG 64
-#define LDBL_MAX 0x1.fffffffffffffffep+16383L
-#define LDBL_MAX_10_EXP 4932
-#define LDBL_MAX_EXP 16384
-#define LDBL_MIN 0x1p-16382L
-#define LDBL_MIN_10_EXP (-4931)
-#define LDBL_MIN_EXP (-16381)
+#define LDBL_DIG 15
+#define LDBL_EPSILON 0x1p-52L
+#define LDBL_MANT_DIG 53
+#define LDBL_MAX 0x1.fffffffffffffp+1023L
+#define LDBL_MAX_10_EXP 308
+#define LDBL_MAX_EXP 1024
+#define LDBL_MIN 0x1p-1022L
+#define LDBL_MIN_10_EXP (-307)
+#define LDBL_MIN_EXP (-1021)
 
 #if __STDC_VERSION__ >= 199901L
 #define FLT_EVAL_METHOD 0
@@ -69,8 +69,8 @@
 #define DBL_TRUE_MIN 0x1p-1074
 
 #define LDBL_HAS_SUBNORM 1
-#define LDBL_DECIMAL_DIG 21
-#define LDBL_TRUE_MIN 0x1p-16445L
+#define LDBL_DECIMAL_DIG 17
+#define LDBL_TRUE_MIN 0x1p-1074L
 #endif
 
 #if __STDC_VERSION__ >= 202311L

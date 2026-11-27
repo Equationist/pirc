@@ -111,6 +111,10 @@ void *pir_arena_alloc(PirArena *arena, size_t size) {
 }
 
 char *pir_arena_strndup(PirArena *arena, const char *s, size_t len) {
+    if (len == SIZE_MAX) {
+        fprintf(stderr, "pirc: arena string duplication overflow\n");
+        abort();
+    }
     char *copy = (char *)pir_arena_alloc_aligned(arena, len + 1u, 1u);
     if (len > 0u) {
         memcpy(copy, s, len);

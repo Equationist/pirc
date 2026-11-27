@@ -597,9 +597,11 @@ static bool try_simplify_identity(GvnCtx *ctx, PirInst *ins) {
         return false;
     }
 
-    /* ptr_add p, 0 -> p (only without [inbounds], since ptr_add [inbounds] null, 0 is UB). */
+    /* ptr_add p, 0 -> p (only without [inbounds], since ptr_add [inbounds] null, 0 is UB;
+     * and only on 64-bit targets, since 32-bit ptr_add wraps non-canonical 64-bit sym offsets). */
     if (ins->op == PIR_OP_PTR_ADD && ins->operand_count == 2u &&
-        (ins->flags & PIR_FLAG_INBOUNDS) == 0u) {
+        (ins->flags & PIR_FLAG_INBOUNDS) == 0u &&
+        ctx->target->ptr_bytes != 4u) {
         uint32_t pbits = scalar_int_bits(ins->ty);
         if (pbits == 0u) pbits = (uint32_t)ctx->target->ptr_bytes * 8u;
         uint64_t off = 0u;
@@ -711,68 +713,89 @@ static bool entry_matches(const GvnEntry *e, const PirInst *ins, const PirOperan
     return true;
 }
 
-static void gvn_walk_block(GvnCtx *ctx, PirBlockId b) {
-    uint32_t saved_len = ctx->table.len;
-    const PirBlock *blk = &ctx->fn->blocks.data[b];
+static void gvn_walk_dom_tree(GvnCtx *ctx, PirBlockId root_b) {
+    typedef struct {
+        PirBlockId b;
+        uint32_t   next_child;
+        uint32_t   saved_len;
+        bool       entered;
+    } GvnFrame;
+    PIR_VEC(GvnFrame) stk = {0};
+    GvnFrame init = { root_b, 0u, 0u, false };
+    PIR_VEC_PUSH(&stk, init);
 
-    for (uint32_t j = 0u; j < blk->insts.len; ++j) {
-        PirInst *ins = &ctx->fn->insts.data[blk->insts.data[j]];
-        resolve_ops(ctx, ins->operands, ins->operand_count);
+    while (stk.len > 0u) {
+        GvnFrame *fr = &stk.data[stk.len - 1u];
+        PirBlockId b = fr->b;
+        if (!fr->entered) {
+            fr->entered   = true;
+            fr->saved_len = ctx->table.len;
+            const PirBlock *blk = &ctx->fn->blocks.data[b];
 
-        if (ins->op == PIR_OP_CONST && ins->results[0] < ctx->nvals) {
-            if (ins->operands[0].kind == PIR_OPER_IMM_INT) {
-                uint64_t v = ins->operands[0].u.imm_int.is_negative
-                             ? (0u - ins->operands[0].u.imm_int.lo)
-                             : ins->operands[0].u.imm_int.lo;
-                ctx->consts[ins->results[0]].is_int = true;
-                ctx->consts[ins->results[0]].bits   = v;
+            for (uint32_t j = 0u; j < blk->insts.len; ++j) {
+                PirInst *ins = &ctx->fn->insts.data[blk->insts.data[j]];
+                resolve_ops(ctx, ins->operands, ins->operand_count);
+
+                if (ins->op == PIR_OP_CONST && ins->results[0] < ctx->nvals) {
+                    if (ins->operands[0].kind == PIR_OPER_IMM_INT) {
+                        uint64_t v = ins->operands[0].u.imm_int.is_negative
+                                     ? (0u - ins->operands[0].u.imm_int.lo)
+                                     : ins->operands[0].u.imm_int.lo;
+                        ctx->consts[ins->results[0]].is_int = true;
+                        ctx->consts[ins->results[0]].bits   = v;
+                    }
+                }
+
+                if (try_fold_const_int_op(ctx, ins)) {
+                    continue;
+                }
+                if (try_simplify_identity(ctx, ins)) {
+                    continue;
+                }
+                propagate_int_imms(ctx, ins);
+
+                if (!is_gvn_eligible(ins)) continue;
+
+                PirOperand canon[3];
+                for (uint32_t k = 0u; k < ins->operand_count; ++k) canon[k] = ins->operands[k];
+                if (ins->operand_count == 2u && is_commutative(ins) && op_less(canon[1], canon[0])) {
+                    PirOperand tmp = canon[0];
+                    canon[0] = canon[1];
+                    canon[1] = tmp;
+                }
+
+                bool found = false;
+                for (uint32_t i = 0u; i < ctx->table.len; ++i) {
+                    if (entry_matches(&ctx->table.data[i], ins, canon)) {
+                        ctx->alias[ins->results[0]] = ctx->table.data[i].val_id;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    GvnEntry e;
+                    memset(&e, 0, sizeof(e));
+                    e.op       = ins->op;
+                    e.ty       = ins->ty;
+                    e.flags    = ins->flags;
+                    e.imm_u64  = ins->imm_u64;
+                    e.op_count = ins->operand_count;
+                    for (uint32_t k = 0u; k < ins->operand_count; ++k) e.ops[k] = canon[k];
+                    e.val_id   = ins->results[0];
+                    PIR_VEC_PUSH(&ctx->table, e);
+                }
             }
         }
-
-        if (try_fold_const_int_op(ctx, ins)) {
-            continue;
-        }
-        if (try_simplify_identity(ctx, ins)) {
-            continue;
-        }
-        propagate_int_imms(ctx, ins);
-
-        if (!is_gvn_eligible(ins)) continue;
-
-        PirOperand canon[3];
-        for (uint32_t k = 0u; k < ins->operand_count; ++k) canon[k] = ins->operands[k];
-        if (ins->operand_count == 2u && is_commutative(ins) && op_less(canon[1], canon[0])) {
-            PirOperand tmp = canon[0];
-            canon[0] = canon[1];
-            canon[1] = tmp;
-        }
-
-        bool found = false;
-        for (uint32_t i = 0u; i < ctx->table.len; ++i) {
-            if (entry_matches(&ctx->table.data[i], ins, canon)) {
-                ctx->alias[ins->results[0]] = ctx->table.data[i].val_id;
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            GvnEntry e;
-            memset(&e, 0, sizeof(e));
-            e.op       = ins->op;
-            e.ty       = ins->ty;
-            e.flags    = ins->flags;
-            e.imm_u64  = ins->imm_u64;
-            e.op_count = ins->operand_count;
-            for (uint32_t k = 0u; k < ins->operand_count; ++k) e.ops[k] = canon[k];
-            e.val_id   = ins->results[0];
-            PIR_VEC_PUSH(&ctx->table, e);
+        if (fr->next_child < ctx->dom->children[b].len) {
+            PirBlockId child = ctx->dom->children[b].data[fr->next_child++];
+            GvnFrame cf = { child, 0u, 0u, false };
+            PIR_VEC_PUSH(&stk, cf);
+        } else {
+            ctx->table.len = fr->saved_len;
+            stk.len--;
         }
     }
-
-    for (uint32_t ci = 0u; ci < ctx->dom->children[b].len; ++ci) {
-        gvn_walk_block(ctx, ctx->dom->children[b].data[ci]);
-    }
-    ctx->table.len = saved_len;
+    PIR_VEC_FREE(&stk);
 }
 
 void pir_opt_gvn(PirModule *mod, PirFunction *fn, const PirTargetSpec *target) {
@@ -799,7 +822,7 @@ void pir_opt_gvn(PirModule *mod, PirFunction *fn, const PirTargetSpec *target) {
     ctx.consts = consts;
     ctx.nvals  = nvals;
 
-    gvn_walk_block(&ctx, 0u);
+    gvn_walk_dom_tree(&ctx, 0u);
 
     /* Rewrite all remaining uses across all blocks (including branch target args). */
     for (uint32_t b = 0u; b < fn->blocks.len; ++b) {

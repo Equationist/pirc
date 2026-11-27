@@ -50,6 +50,7 @@ typedef struct {
     uint64_t       int_hi;
     bool           int_neg;
     double         float_val;
+    float          float_val_f32;
 } PirToken;
 
 typedef struct {
