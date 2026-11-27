@@ -7286,6 +7286,36 @@ static void clear_fn_obj_state(Obj *fn) {
   fn->dealloc_vla = false;
 }
 
+static Type *merge_external_decl_type(Token *name, Obj *obj, Type *ty,
+                                      bool is_func, bool is_def) {
+  Type *cty = obj->compat_ty ? obj->compat_ty : obj->ty;
+  bool compat = is_func ? is_compatible(cty, ty) : is_compatible2(cty, ty);
+  if (!compat)
+    error_tok(name, "incompatible redeclaration");
+  obj->compat_ty = composite_type(cty, ty);
+  if (scope->parent && !is_def)
+    return obj->has_file_decl ? composite_type(obj->ty, ty) : ty;
+  obj->ty = obj->has_file_decl ? composite_type(obj->ty, ty) : ty;
+  obj->has_file_decl = true;
+  return NULL;
+}
+
+static void bind_external_decl_scope(Token *name, Obj *obj, Type *scoped_ty,
+                                     VarScope *prev_vsc, bool is_func) {
+  VarScope *vsc = push_gvar_name2(name, obj);
+  if (scoped_ty && vsc) {
+    if (prev_vsc && prev_vsc->var == obj) {
+      Type *prev_ty = prev_vsc->var_ty ? prev_vsc->var_ty : obj->ty;
+      bool compat = is_func ? is_compatible(prev_ty, scoped_ty)
+                            : is_compatible2(prev_ty, scoped_ty);
+      if (!compat)
+        error_tok(name, "incompatible redeclaration");
+      scoped_ty = composite_type(prev_ty, scoped_ty);
+    }
+    vsc->var_ty = scoped_ty;
+  }
+}
+
 static Obj *func_prototype(Token *tok, Token *name, Type *ty, VarAttr *attr, bool is_def) {
   if (!name)
     error_tok(tok, "function name omitted");
@@ -7307,16 +7337,7 @@ static Obj *func_prototype(Token *tok, Token *name, Type *ty, VarAttr *attr, boo
   Type *scoped_fn_ty = NULL;
   VarScope *prev_vsc = scope->parent ? find_var(name) : NULL;
   if (fn) {
-    Type *cty = fn->compat_ty ? fn->compat_ty : fn->ty;
-    if (!is_compatible(cty, ty))
-      error_tok(name, "incompatible redeclaration");
-    fn->compat_ty = composite_type(cty, ty);
-    if (scope->parent && !is_def) {
-      scoped_fn_ty = fn->has_file_decl ? composite_type(fn->ty, ty) : ty;
-    } else {
-      fn->ty = fn->has_file_decl ? composite_type(fn->ty, ty) : ty;
-      fn->has_file_decl = true;
-    }
+    scoped_fn_ty = merge_external_decl_type(name, fn, ty, true, is_def);
 
     if (fn->is_gnu_inline && !fn->export_fn && !fn->is_static) {
       if (attr->strg & SC_STATIC) {
@@ -7349,16 +7370,7 @@ static Obj *func_prototype(Token *tok, Token *name, Type *ty, VarAttr *attr, boo
       scoped_fn_ty = ty;
     set_returns_twice(fn);
   }
-  VarScope *vsc = push_gvar_name2(name, fn);
-  if (scoped_fn_ty && vsc) {
-    if (prev_vsc && prev_vsc->var == fn) {
-      Type *prev_ty = prev_vsc->var_ty ? prev_vsc->var_ty : fn->ty;
-      if (!is_compatible(prev_ty, scoped_fn_ty))
-        error_tok(name, "incompatible redeclaration");
-      scoped_fn_ty = composite_type(prev_ty, scoped_fn_ty);
-    }
-    vsc->var_ty = scoped_fn_ty;
-  }
+  bind_external_decl_scope(name, fn, scoped_fn_ty, prev_vsc, true);
 
   fn->is_gnu_inline |= is_gnu_inline;
 
@@ -7443,22 +7455,13 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
     VarScope *prev_vsc = scope->parent ? find_var(name) : NULL;
     bool existed = (var != NULL);
     if (var) {
-      Type *cty = var->compat_ty ? var->compat_ty : var->ty;
-      if (!is_compatible2(cty, ty))
-        error_tok(name, "incompatible redeclaration");
       if ((!var->is_static && !!(attr->strg & SC_STATIC)) ||
           (var->is_static && !(attr->strg & (SC_STATIC | SC_EXTERN))))
         error_tok(name, "redeclaration has inconsistent 'static'");
       if ((var->kind == OBJ_TLS) != !!(attr->strg & SC_THREAD))
         error_tok(name, "redeclaration with%s thread local",
                   var->kind == OBJ_TLS ? "out" : "");
-      var->compat_ty = composite_type(cty, ty);
-      if (scope->parent) {
-        scoped_ty = var->has_file_decl ? composite_type(var->ty, ty) : ty;
-      } else {
-        var->ty = var->has_file_decl ? composite_type(var->ty, ty) : ty;
-        var->has_file_decl = true;
-      }
+      scoped_ty = merge_external_decl_type(name, var, ty, false, false);
     } else {
       var = ent->val = new_gvar(get_ident(&cc1_arena, name), ty);
       var->compat_ty = ty;
@@ -7469,16 +7472,7 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
       if (attr->strg & SC_THREAD)
         var->kind = OBJ_TLS;
     }
-    VarScope *vsc = push_gvar_name2(name, var);
-    if (scoped_ty && vsc) {
-      if (prev_vsc && prev_vsc->var == var) {
-        Type *prev_ty = prev_vsc->var_ty ? prev_vsc->var_ty : var->ty;
-        if (!is_compatible2(prev_ty, scoped_ty))
-          error_tok(name, "incompatible redeclaration");
-        scoped_ty = composite_type(prev_ty, scoped_ty);
-      }
-      vsc->var_ty = scoped_ty;
-    }
+    bind_external_decl_scope(name, var, scoped_ty, prev_vsc, false);
 
     assembler_name(&tok, tok, var);
     chk_alignas_natural(attr, ty, name);

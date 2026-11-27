@@ -2411,17 +2411,6 @@ static void check_unique_symbol(Verifier *v, const char *name, uint32_t line,
     }
 }
 
-static bool is_elf_builtin_section(const char *name) {
-    static const char *const BUILTINS[] = {
-        ".text", ".data", ".bss", ".rodata", ".tdata", ".tbss",
-        ".data.rel.ro", ".eh_frame", ".note.GNU-stack"
-    };
-    for (size_t i = 0u; i < sizeof(BUILTINS) / sizeof(BUILTINS[0]); ++i) {
-        if (strcmp(name, BUILTINS[i]) == 0) return true;
-    }
-    return false;
-}
-
 static void check_elf_symbol_name(Verifier *v, const char *name, PirLinkage linkage, uint32_t line) {
     if (!v->target || v->target->os == PIR_OS_MACOS || v->target->os == PIR_OS_WINDOWS || !name) {
         return;
@@ -2438,112 +2427,16 @@ static void check_elf_symbol_name(Verifier *v, const char *name, PirLinkage link
         pir_diag_error(v->diag, line, 0u,
                        "symbol '@%s' uses reserved ELF compiler label prefix '.L__pir_'", name);
     }
-    if (is_elf_builtin_section(name) || pir_symset_contains(&v->elf_secs, name)) {
+    if (pir_target_elf_builtin_section_dir(name) != NULL || pir_symset_contains(&v->elf_secs, name)) {
         pir_diag_error(v->diag, line, 0u,
                        "symbol '@%s' collides with ELF section name", name);
     }
 }
 
-static bool is_macho_ident_char(unsigned char c, bool allow_plus) {
-    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-           (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-' ||
-           (allow_plus && c == '+');
-}
-
-static bool is_macho_section_type(const char *s, size_t len) {
-    static const char *const TYPES[] = {
-        "regular", "zerofill", "cstring_literals", "4byte_literals",
-        "8byte_literals", "16byte_literals", "literal_pointers",
-        "non_lazy_symbol_pointers", "lazy_symbol_pointers", "symbol_stubs",
-        "mod_init_funcs", "mod_term_funcs", "coalesced", "gb_zerofill",
-        "interposing", "dtrace_dof", "lazy_dylib_symbol_pointers",
-        "thread_local_regular", "thread_local_zerofill", "thread_local_variables",
-        "thread_local_variable_pointers", "thread_local_init_function_pointers",
-        "init_func_offsets"
-    };
-    for (size_t i = 0u; i < sizeof(TYPES) / sizeof(TYPES[0]); ++i) {
-        if (strlen(TYPES[i]) == len && memcmp(s, TYPES[i], len) == 0) return true;
-    }
-    return false;
-}
-
-static bool is_macho_zerofill_section(const char *sec) {
-    if (!sec) return false;
-    const char *c1 = strchr(sec, ',');
-    if (!c1) return false;
-    size_t l0 = (size_t)(c1 - sec);
-    const char *p1 = c1 + 1;
-    const char *c2 = strchr(p1, ',');
-    size_t l1 = c2 ? (size_t)(c2 - p1) : strlen(p1);
-    if (l0 == 6u && memcmp(sec, "__DATA", 6u) == 0 &&
-        l1 == 5u && memcmp(p1, "__bss", 5u) == 0) {
-        return true;
-    }
-    if (c2) {
-        const char *p2 = c2 + 1;
-        const char *c3 = strchr(p2, ',');
-        size_t l2 = c3 ? (size_t)(c3 - p2) : strlen(p2);
-        if ((l2 == 8u && memcmp(p2, "zerofill", 8u) == 0) ||
-            (l2 == 11u && memcmp(p2, "gb_zerofill", 11u) == 0) ||
-            (l2 == 21u && memcmp(p2, "thread_local_zerofill", 21u) == 0)) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static void check_section_name(Verifier *v, const char *sec, uint32_t line) {
-    if (!v->target || !sec) return;
-    if (v->target->os == PIR_OS_MACOS) {
-        if (strchr(sec, ';') != NULL) {
-            pir_diag_error(v->diag, line, 0u, "invalid Mach-O section name '%s'", sec);
-            return;
-        }
-        if (strchr(sec, ',') == NULL) return;
-        const char *f[4] = { NULL, NULL, NULL, NULL };
-        size_t      fl[4] = { 0u, 0u, 0u, 0u };
-        uint32_t    nf = 0u;
-        const char *p = sec;
-        for (;;) {
-            if (nf >= 4u) {
-                pir_diag_error(v->diag, line, 0u, "Mach-O section '%s' has too many comma-separated fields", sec);
-                return;
-            }
-            const char *c = strchr(p, ',');
-            size_t len = c ? (size_t)(c - p) : strlen(p);
-            if (len == 0u) {
-                pir_diag_error(v->diag, line, 0u, "Mach-O section '%s' has empty field", sec);
-                return;
-            }
-            for (size_t k = 0u; k < len; ++k) {
-                if (!is_macho_ident_char((unsigned char)p[k], nf == 3u)) {
-                    pir_diag_error(v->diag, line, 0u, "Mach-O section '%s' contains invalid character", sec);
-                    return;
-                }
-            }
-            f[nf]  = p;
-            fl[nf] = len;
-            nf++;
-            if (!c) break;
-            p = c + 1;
-        }
-        if (fl[0] > 16u || fl[1] > 16u) {
-            pir_diag_error(v->diag, line, 0u, "Mach-O segment/section name in '%s' exceeds 16 characters", sec);
-            return;
-        }
-        if (nf >= 3u && !is_macho_section_type(f[2], fl[2])) {
-            pir_diag_error(v->diag, line, 0u, "unknown Mach-O section type in '%s'", sec);
-            return;
-        }
-        return;
-    }
-    if (v->target->os == PIR_OS_WINDOWS) return;
-    for (const char *p = sec; *p; ++p) {
-        if (*p == '\\' || *p == '"') {
-            pir_diag_error(v->diag, line, 0u,
-                           "ELF section name cannot contain backslash or quote");
-            return;
-        }
+    const char *err = pir_target_validate_section(v->target, sec);
+    if (err) {
+        pir_diag_error(v->diag, line, 0u, "%s ('%s')", err, sec);
     }
 }
 
@@ -2684,15 +2577,7 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
             if (!g->is_zeroinit && g->item_count == 0u) {
                 pir_diag_error(diag, g->src_line, 0u, "global '@%s' requires an initializer", g->name);
             }
-            bool is_nobits = false;
-            if (target && g->section) {
-                if (target->os == PIR_OS_MACOS) {
-                    is_nobits = is_macho_zerofill_section(g->section);
-                } else if (target->os != PIR_OS_WINDOWS) {
-                    is_nobits = (strcmp(g->section, ".bss") == 0 || strcmp(g->section, ".tbss") == 0);
-                }
-            }
-            if (is_nobits && !pir_global_is_all_zero(g)) {
+            if (pir_target_section_is_nobits(target, g->section) && !pir_global_is_all_zero(g)) {
                 pir_diag_error(diag, g->src_line, 0u,
                                "global '@%s' in nobits/zerofill section '%s' cannot have non-zero initializer",
                                g->name, g->section);
@@ -2855,16 +2740,10 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
         check_unique_symbol(&v, fn->name, fn->src_line, &seen);
         check_elf_symbol_name(&v, fn->name, fn->linkage, fn->src_line);
         check_section_name(&v, fn->section, fn->src_line);
-        if (target && fn->section) {
-            bool is_fn_nobits = (target->os == PIR_OS_MACOS)
-                ? is_macho_zerofill_section(fn->section)
-                : (target->os != PIR_OS_WINDOWS &&
-                   (strcmp(fn->section, ".bss") == 0 || strcmp(fn->section, ".tbss") == 0));
-            if (is_fn_nobits) {
-                pir_diag_error(diag, fn->src_line, 0u,
-                               "function '@%s' cannot be placed in nobits/zerofill section '%s'",
-                               fn->name, fn->section);
-            }
+        if (pir_target_section_is_nobits(target, fn->section)) {
+            pir_diag_error(diag, fn->src_line, 0u,
+                           "function '@%s' cannot be placed in nobits/zerofill section '%s'",
+                           fn->name, fn->section);
         }
         verify_function(&v, fn);
     }

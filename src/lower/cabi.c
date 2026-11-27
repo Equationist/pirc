@@ -404,6 +404,57 @@ static void pack_byval_arg(PirModule *mod, const PirTargetSpec *target,
     }
 }
 
+static PirOperand emit_indirect_arg_stage(PirModule *mod, const PirTargetSpec *target,
+                                          PirFunction *fn, PirInstIdVec *out,
+                                          PirInstIdVec *entry_allocas, PirOperand arg,
+                                          PirType val_ty, const PirAbiArgInfo *info,
+                                          const char *pfx, bool explicit_ty,
+                                          uint32_t ln, uint32_t lc) {
+    PirType tptr = pir_type_scalar(PIR_SCALAR_PTR);
+    PirTypeLayout vly = pir_type_layout(mod, target, val_ty);
+    uint32_t cp_al = vly.align > 0u ? vly.align : 1u;
+    PirValueId cp_v = pir_fn_emit_entry_alloca(mod, fn, pfx,
+                                               vly.size > 0u ? vly.size : 1u,
+                                               cp_al, ln, lc, entry_allocas);
+
+    PirInst st = pir_make_inst(PIR_OP_STORE, val_ty, ln, lc);
+    st.align         = cp_al;
+    st.operand_count = 2u;
+    st.operands      = pir_alloc_ops(mod, 2u);
+    st.operands[0]   = clear_call_meta(arg);
+    st.operands[1]   = pir_op_val(cp_v, tptr);
+    pir_fn_append_inst(fn, out, st);
+
+    PirOperand ptr_op = pir_op_val(cp_v, tptr);
+    if (explicit_ty) ptr_op.has_explicit_type = true;
+    apply_call_abi_meta(&ptr_op, info, 0u, false);
+    return ptr_op;
+}
+
+static void set_sysv_va_indirect_info(const PirTargetSpec *target, PirTypeLayout vly,
+                                      PirAbiArgInfo *vinfo) {
+    memset(vinfo, 0, sizeof(*vinfo));
+    vinfo->kind              = PIR_ABI_INDIRECT;
+    vinfo->stack_byval_size  = vly.size;
+    vinfo->stack_byval_align = (target->os == PIR_OS_MACOS &&
+                                target->caps.max_simd_bits < 256u &&
+                                vly.align > 16u)
+                               ? 16u : vly.align;
+}
+
+static void emit_va_reg_pads(PirOperandVec *new_ops, const PirAbiArgInfo *vinfo, PirType gp_pad) {
+    for (uint32_t p = 0u; p < vinfo->pad_gp_before; ++p) {
+        PirOperand pad = pir_op_imm_i(0u, false, gp_pad);
+        pad.has_explicit_type = true;
+        PIR_VEC_PUSH(new_ops, pad);
+    }
+    for (uint32_t p = 0u; p < vinfo->pad_fp_before; ++p) {
+        PirOperand pad = pir_op_imm_f(0u, pir_type_scalar(PIR_SCALAR_F64));
+        pad.has_explicit_type = true;
+        PIR_VEC_PUSH(new_ops, pad);
+    }
+}
+
 static bool rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
                               PirFunction *fn, PirBlockId blk, PirInstIdVec *out,
                               PirInstIdVec *entry_allocas,
@@ -454,23 +505,10 @@ static bool rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
                 pack_byval_arg(mod, target, fn, blk, out, entry_allocas, arg, orig_params[pi].abi_type,
                                info, false, &new_ops, ln, lc);
             } else if (info->kind == PIR_ABI_INDIRECT) {
-                PirTypeLayout vly = pir_type_layout(mod, target, orig_params[pi].type);
-                uint32_t cp_al = vly.align > 0u ? vly.align : 1u;
-                PirValueId cp_v = pir_fn_emit_entry_alloca(mod, fn, "ind_a",
-                                                           vly.size > 0u ? vly.size : 1u,
-                                                           cp_al, ln, lc, entry_allocas);
-
-                PirInst st = pir_make_inst(PIR_OP_STORE, orig_params[pi].type, ln, lc);
-                st.align         = cp_al;
-                st.operand_count = 2u;
-                st.operands      = pir_alloc_ops(mod, 2u);
-                st.operands[0]   = clear_call_meta(arg);
-                st.operands[1]   = pir_op_val(cp_v, tptr);
-                pir_fn_append_inst(fn, out, st);
-
-                PirOperand ptr_op = pir_op_val(cp_v, tptr);
-                apply_call_abi_meta(&ptr_op, info, 0u, false);
-                PIR_VEC_PUSH(&new_ops, ptr_op);
+                PIR_VEC_PUSH(&new_ops,
+                             emit_indirect_arg_stage(mod, target, fn, out, entry_allocas,
+                                                     arg, orig_params[pi].type, info,
+                                                     "ind_a", false, ln, lc));
             } else {
                 apply_call_abi_meta(&arg, info, 0u, false);
                 PIR_VEC_PUSH(&new_ops, arg);
@@ -517,13 +555,7 @@ static bool rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
                      * under AVX) in variadic positions ALWAYS pass in overflow_arg_area.
                      * Restore va_st so no GP/FP register is falsely consumed. */
                     va_st = saved_va_st;
-                    memset(&vinfo, 0, sizeof(vinfo));
-                    vinfo.kind              = PIR_ABI_INDIRECT;
-                    vinfo.stack_byval_size  = vly.size;
-                    vinfo.stack_byval_align = (target->os == PIR_OS_MACOS &&
-                                               target->caps.max_simd_bits < 256u &&
-                                               vly.align > 16u)
-                                              ? 16u : vly.align;
+                    set_sysv_va_indirect_info(target, vly, &vinfo);
                 } else if (vinfo.fp_used > 0u) {
                     /* SysV AMD64: variadic aggregate f32 eightbytes must NOT undergo C default
                      * float->double promotion (cvtss2sd). Widen f32 pieces to v2f32 (or f64 when
@@ -558,16 +590,7 @@ static bool rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
                     if (vly.align >= 8u) vinfo.stack_align = 8u;
                 }
             } else if (target->arch == PIR_ARCH_ARM64 && target->os != PIR_OS_MACOS) {
-                for (uint32_t p = 0u; p < vinfo.pad_gp_before; ++p) {
-                    PirOperand pad = pir_op_imm_i(0u, false, ti64);
-                    pad.has_explicit_type = true;
-                    PIR_VEC_PUSH(&new_ops, pad);
-                }
-                for (uint32_t p = 0u; p < vinfo.pad_fp_before; ++p) {
-                    PirOperand pad = pir_op_imm_f(0u, pir_type_scalar(PIR_SCALAR_F64));
-                    pad.has_explicit_type = true;
-                    PIR_VEC_PUSH(&new_ops, pad);
-                }
+                emit_va_reg_pads(&new_ops, &vinfo, ti64);
             }
             arg.call_abi          = PIR_PARAM_NORMAL;
             arg.has_explicit_type = false;
@@ -588,36 +611,16 @@ static bool rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
                     /* SysV AMD64 §3.5.7: 256-bit vectors in variadic positions are ALWAYS passed
                      * in overflow_arg_area (never ymm0..ymm7), even when AVX is enabled. */
                     PirTypeLayout vly = pir_type_layout(mod, target, arg.type);
-                    memset(&vinfo, 0, sizeof(vinfo));
-                    vinfo.kind              = PIR_ABI_INDIRECT;
-                    vinfo.stack_byval_size  = vly.size;
-                    vinfo.stack_byval_align = (target->os == PIR_OS_MACOS &&
-                                               target->caps.max_simd_bits < 256u &&
-                                               vly.align > 16u)
-                                              ? 16u : vly.align;
+                    set_sysv_va_indirect_info(target, vly, &vinfo);
                     classified = true;
                 } else {
                     classified = pir_abi_classify_param(mod, target, &vpd, &va_st, &vinfo);
                 }
                 if (classified) {
                     if (vinfo.kind == PIR_ABI_INDIRECT) {
-                        PirTypeLayout vly = pir_type_layout(mod, target, arg.type);
-                        uint32_t cp_al = vly.align > 0u ? vly.align : 1u;
-                        PirValueId cp_v = pir_fn_emit_entry_alloca(mod, fn, "va_ind",
-                                                                   vly.size > 0u ? vly.size : 1u,
-                                                                   cp_al, ln, lc, entry_allocas);
-
-                        PirInst st = pir_make_inst(PIR_OP_STORE, arg.type, ln, lc);
-                        st.align         = cp_al;
-                        st.operand_count = 2u;
-                        st.operands      = pir_alloc_ops(mod, 2u);
-                        st.operands[0]   = clear_call_meta(arg);
-                        st.operands[1]   = pir_op_val(cp_v, tptr);
-                        pir_fn_append_inst(fn, out, st);
-
-                        arg = pir_op_val(cp_v, tptr);
-                        arg.has_explicit_type = true;
-                        apply_call_abi_meta(&arg, &vinfo, 0u, false);
+                        arg = emit_indirect_arg_stage(mod, target, fn, out, entry_allocas,
+                                                      arg, arg.type, &vinfo,
+                                                      "va_ind", true, ln, lc);
                     } else if (target->arch == PIR_ARCH_ARM64 && target->os == PIR_OS_MACOS) {
                         if ((arg.type.kind == PIR_TYPE_SCALAR && arg.type.u.scalar == PIR_SCALAR_I128) ||
                             (arg.type.kind == PIR_TYPE_VECTOR &&
@@ -626,16 +629,7 @@ static bool rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
                             arg.call_stack_align = 16u;
                         }
                     } else {
-                        for (uint32_t p = 0u; p < vinfo.pad_gp_before; ++p) {
-                            PirOperand pad = pir_op_imm_i(0u, false, gp_pad);
-                            pad.has_explicit_type = true;
-                            PIR_VEC_PUSH(&new_ops, pad);
-                        }
-                        for (uint32_t p = 0u; p < vinfo.pad_fp_before; ++p) {
-                            PirOperand pad = pir_op_imm_f(0u, pir_type_scalar(PIR_SCALAR_F64));
-                            pad.has_explicit_type = true;
-                            PIR_VEC_PUSH(&new_ops, pad);
-                        }
+                        emit_va_reg_pads(&new_ops, &vinfo, gp_pad);
                         apply_call_abi_meta(&arg, &vinfo, 0u, false);
                     }
                 }

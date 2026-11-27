@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "lower/lower.h"
+#include "target/target.h"
 
 PirObjFormat pir_asm_obj_format(const PirTargetSpec *target) {
     if (target->os == PIR_OS_MACOS)   return PIR_OBJ_MACHO;
@@ -227,22 +228,10 @@ static void emit_elf_section_directive(FILE *out, const PirModule *mod,
     }
 
     if (strchr(custom_sec, ',') == NULL) {
-        static const struct { const char *name; const char *dir; } BUILTIN_SECS[] = {
-            { ".text",           "\t.text\n" },
-            { ".data",           "\t.data\n" },
-            { ".rodata",         "\t.section .rodata,\"a\",@progbits\n" },
-            { ".data.rel.ro",    "\t.section .data.rel.ro,\"aw\",@progbits\n" },
-            { ".tdata",          "\t.section .tdata,\"awT\",@progbits\n" },
-            { ".bss",            "\t.bss\n" },
-            { ".tbss",           "\t.section .tbss,\"awT\",@nobits\n" },
-            { ".eh_frame",       "\t.section .eh_frame,\"a\",@progbits\n" },
-            { ".note.GNU-stack", "\t.section .note.GNU-stack,\"\",@progbits\n" },
-        };
-        for (size_t i = 0u; i < sizeof(BUILTIN_SECS) / sizeof(BUILTIN_SECS[0]); ++i) {
-            if (strcmp(custom_sec, BUILTIN_SECS[i].name) == 0) {
-                fputs(BUILTIN_SECS[i].dir, out);
-                return;
-            }
+        const char *builtin_dir = pir_target_elf_builtin_section_dir(custom_sec);
+        if (builtin_dir) {
+            fputs(builtin_dir, out);
+            return;
         }
 
         static const struct { const char *pfx; const char *type; } ARRAY_SECS[] = {

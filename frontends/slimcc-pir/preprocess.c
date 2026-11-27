@@ -437,6 +437,20 @@ static Token *exec_pragma_op(Token *tok) {
   return tok;
 }
 
+static bool try_expand_nonroot(Token **tokp) {
+  Token *tok = *tokp;
+  if (tok->kind != TK_IDENT || tok->dont_expand)
+    return false;
+  Macro *m = hashmap_get2(&macros, tok->loc, tok->len);
+  if (!m)
+    return false;
+  if (m->handler == &pragma_macro) {
+    *tokp = exec_pragma_op(tok);
+    return true;
+  }
+  return expand_macro(tokp, tok, m, false);
+}
+
 static Token *read_pp_const_expr(Token *tok) {
   Token head = {0};
   Token *cur = &head;
@@ -447,15 +461,8 @@ static Token *read_pp_const_expr(Token *tok) {
       tok = handle_incl_end(tok);
       continue;
     }
-    if (tok->kind == TK_IDENT && !tok->dont_expand) {
-      Macro *m = hashmap_get2(&macros, tok->loc, tok->len);
-      if (m && m->handler == &pragma_macro) {
-        tok = exec_pragma_op(tok);
-        continue;
-      }
-      if (m && expand_macro(&tok, tok, m, false))
-        continue;
-    }
+    if (try_expand_nonroot(&tok))
+      continue;
 
     switch (tok->kind) {
     case TK_IDENT:
@@ -840,15 +847,8 @@ static Token *expand_tok(Token *tok) {
       tok = handle_incl_end(tok);
       continue;
     }
-    if (tok->kind == TK_IDENT && !tok->dont_expand) {
-      Macro *m = hashmap_get2(&macros, tok->loc, tok->len);
-      if (m && m->handler == &pragma_macro) {
-        tok = exec_pragma_op(tok);
-        continue;
-      }
-      if (m && expand_macro(&tok, tok, m, false))
-        continue;
-    }
+    if (try_expand_nonroot(&tok))
+      continue;
 
     cur = cur->next = copy_token(tok);
     tok = tok->next;
@@ -2078,15 +2078,8 @@ static Token *pragma_macro(Token *start) {
 
     pop_macro_lock(tok);
 
-    if (tok->kind == TK_IDENT && !tok->dont_expand) {
-      Macro *m = hashmap_get2(&macros, tok->loc, tok->len);
-      if (m && m->handler == &pragma_macro) {
-        tok = exec_pragma_op(tok);
-        continue;
-      }
-      if (m && expand_macro(&tok, tok, m, false))
-        continue;
-    }
+    if (try_expand_nonroot(&tok))
+      continue;
 
     switch (progress++) {
     case 0: {

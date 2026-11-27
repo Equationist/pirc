@@ -137,6 +137,115 @@ bool pir_target_apply_caps(PirTargetSpec *spec, const char *profile) {
     return false;
 }
 
+const char *pir_target_elf_builtin_section_dir(const char *name) {
+    if (!name) return NULL;
+    static const struct { const char *name; const char *dir; } BUILTIN_SECS[] = {
+        { ".text",           "\t.text\n" },
+        { ".data",           "\t.data\n" },
+        { ".rodata",         "\t.section .rodata,\"a\",@progbits\n" },
+        { ".data.rel.ro",    "\t.section .data.rel.ro,\"aw\",@progbits\n" },
+        { ".tdata",          "\t.section .tdata,\"awT\",@progbits\n" },
+        { ".bss",            "\t.bss\n" },
+        { ".tbss",           "\t.section .tbss,\"awT\",@nobits\n" },
+        { ".eh_frame",       "\t.section .eh_frame,\"a\",@progbits\n" },
+        { ".note.GNU-stack", "\t.section .note.GNU-stack,\"\",@progbits\n" },
+    };
+    for (size_t i = 0u; i < sizeof(BUILTIN_SECS) / sizeof(BUILTIN_SECS[0]); ++i) {
+        if (strcmp(name, BUILTIN_SECS[i].name) == 0) {
+            return BUILTIN_SECS[i].dir;
+        }
+    }
+    return NULL;
+}
+
+static bool target_is_macho_ident_char(unsigned char c, bool allow_plus) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-' ||
+           (allow_plus && c == '+');
+}
+
+static bool target_is_macho_section_type(const char *s, size_t len) {
+    static const char *const TYPES[] = {
+        "regular", "zerofill", "cstring_literals", "4byte_literals",
+        "8byte_literals", "16byte_literals", "literal_pointers",
+        "non_lazy_symbol_pointers", "lazy_symbol_pointers", "symbol_stubs",
+        "mod_init_funcs", "mod_term_funcs", "coalesced", "gb_zerofill",
+        "interposing", "dtrace_dof", "lazy_dylib_symbol_pointers",
+        "thread_local_regular", "thread_local_zerofill", "thread_local_variables",
+        "thread_local_variable_pointers", "thread_local_init_function_pointers",
+        "init_func_offsets"
+    };
+    for (size_t i = 0u; i < sizeof(TYPES) / sizeof(TYPES[0]); ++i) {
+        if (strlen(TYPES[i]) == len && memcmp(s, TYPES[i], len) == 0) return true;
+    }
+    return false;
+}
+
+bool pir_target_section_is_nobits(const PirTargetSpec *target, const char *sec) {
+    if (!target || !sec) return false;
+    if (target->os == PIR_OS_MACOS) {
+        const char *c1 = strchr(sec, ',');
+        if (!c1) return false;
+        size_t l0 = (size_t)(c1 - sec);
+        const char *p1 = c1 + 1;
+        const char *c2 = strchr(p1, ',');
+        size_t l1 = c2 ? (size_t)(c2 - p1) : strlen(p1);
+        if (l0 == 6u && memcmp(sec, "__DATA", 6u) == 0 &&
+            l1 == 5u && memcmp(p1, "__bss", 5u) == 0) {
+            return true;
+        }
+        if (c2) {
+            const char *p2 = c2 + 1;
+            const char *c3 = strchr(p2, ',');
+            size_t l2 = c3 ? (size_t)(c3 - p2) : strlen(p2);
+            if ((l2 == 8u && memcmp(p2, "zerofill", 8u) == 0) ||
+                (l2 == 11u && memcmp(p2, "gb_zerofill", 11u) == 0) ||
+                (l2 == 21u && memcmp(p2, "thread_local_zerofill", 21u) == 0)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (target->os == PIR_OS_WINDOWS) return false;
+    return strcmp(sec, ".bss") == 0 || strcmp(sec, ".tbss") == 0;
+}
+
+const char *pir_target_validate_section(const PirTargetSpec *target, const char *sec) {
+    if (!target || !sec) return NULL;
+    if (target->os == PIR_OS_MACOS) {
+        if (strchr(sec, ';') != NULL) return "invalid Mach-O section name";
+        if (strchr(sec, ',') == NULL) return NULL;
+        const char *f[4] = { NULL, NULL, NULL, NULL };
+        size_t      fl[4] = { 0u, 0u, 0u, 0u };
+        uint32_t    nf = 0u;
+        const char *p = sec;
+        for (;;) {
+            if (nf >= 4u) return "Mach-O section has too many comma-separated fields";
+            const char *c = strchr(p, ',');
+            size_t len = c ? (size_t)(c - p) : strlen(p);
+            if (len == 0u) return "Mach-O section has empty field";
+            for (size_t k = 0u; k < len; ++k) {
+                if (!target_is_macho_ident_char((unsigned char)p[k], nf == 3u)) {
+                    return "Mach-O section contains invalid character";
+                }
+            }
+            f[nf]  = p;
+            fl[nf] = len;
+            nf++;
+            if (!c) break;
+            p = c + 1;
+        }
+        if (fl[0] > 16u || fl[1] > 16u) return "Mach-O segment/section name exceeds 16 characters";
+        if (nf >= 3u && !target_is_macho_section_type(f[2], fl[2])) return "unknown Mach-O section type";
+        return NULL;
+    }
+    if (target->os == PIR_OS_WINDOWS) return NULL;
+    for (const char *p = sec; *p; ++p) {
+        if (*p == '\\' || *p == '"') return "ELF section name cannot contain backslash or quote";
+    }
+    return NULL;
+}
+
 bool pir_abi_is_pad_only_agg(const PirModule *mod, PirType ty) {
     return pir_agg_is_pad_only(mod, ty);
 }

@@ -10,7 +10,10 @@
 
 #include "ir/ir.h"
 
-bool pir_target_from_triple(const char *triple, PirTargetSpec *out);
-bool pir_target_apply_caps(PirTargetSpec *spec, const char *profile);
+bool        pir_target_from_triple(const char *triple, PirTargetSpec *out);
+bool        pir_target_apply_caps(PirTargetSpec *spec, const char *profile);
+const char *pir_target_elf_builtin_section_dir(const char *name);
+bool        pir_target_section_is_nobits(const PirTargetSpec *target, const char *sec);
+const char *pir_target_validate_section(const PirTargetSpec *target, const char *sec);
 
 #endif /* PIR_TARGET_TARGET_H */
