@@ -103,9 +103,9 @@ static void emit_mem_at_base_off(MInstVec *out, bool is_load, MPReg reg,
 }
 
 static void emit_sp_adjust(MInstVec *out, bool is_sub, uint64_t bytes,
-                           bool need_chkstk, uint32_t loc) {
+                           int probe_mode, uint32_t loc) {
     if (bytes == 0u) return;
-    if (is_sub && need_chkstk) {
+    if (is_sub && probe_mode == 1) {
         /* Darwin ARM64 stack probe: size in x9, call ___chkstk_darwin, then sub sp, sp, x9. */
         emit_mov_u64(out, A64_GP(9u), bytes, loc);
         MInst bl = minst_make(MI_A64_BL, 8u, loc);
@@ -118,6 +118,15 @@ static void emit_sp_adjust(MInstVec *out, bool is_sub, uint64_t bytes,
         sub.ops[1] = mop_preg_use(A64_SP);
         sub.ops[2] = mop_preg_use(A64_GP(9u));
         PIR_VEC_PUSH(out, sub);
+        return;
+    }
+    if (is_sub && probe_mode == 2) {
+        /* Linux/generic static frame inline 4KB stack probe. */
+        MInst pr = minst_make(MI_A64_MOV_SP, 8u, loc);
+        pr.aux_id   = 3u;
+        pr.op_count = 1u;
+        pr.ops[0]   = mop_imm((int64_t)bytes);
+        PIR_VEC_PUSH(out, pr);
         return;
     }
     if (bytes <= 4095u) {
@@ -248,7 +257,7 @@ static void emit_arm64_prologue(MInstVec *out, const MFunc *mf,
                                 const int64_t *cs_gp_off, uint32_t n_gp_pairs,
                                 const MPReg *cs_fp, uint32_t n_cs_fp,
                                 const int64_t *cs_fp_off, uint32_t n_fp_pairs,
-                                bool need_chkstk, bool is_linux_va, uint32_t ploc) {
+                                int probe_mode, bool is_linux_va, uint32_t ploc) {
     /* Always maintain Darwin/AAPCS64 x29/x30 frame pointer chain:
      *   stp x29, x30, [sp, #-16]!
      *   mov x29, sp
@@ -268,8 +277,8 @@ static void emit_arm64_prologue(MInstVec *out, const MFunc *mf,
     set_fp.ops[0]   = mop_preg_def(A64_FP_REG);
     PIR_VEC_PUSH(out, set_fp);
 
-    /* Allocate local frame (with ___chkstk_darwin if >= 16KB on macOS). */
-    emit_sp_adjust(out, true, mf->local_frame_size, need_chkstk, ploc);
+    /* Allocate local frame (with stack probing on macOS/Linux). */
+    emit_sp_adjust(out, true, mf->local_frame_size, probe_mode, ploc);
 
     /* Save callee-saved GP pairs right below x29 (always within stp range!). */
     for (uint32_t i = 0u; i < n_gp_pairs; ++i) {
@@ -379,9 +388,9 @@ static bool try_arm64_shrink_wrap(MFunc *mf,
                                   const int64_t *cs_gp_off, uint32_t n_gp_pairs,
                                   const MPReg *cs_fp, uint32_t n_cs_fp,
                                   const int64_t *cs_fp_off, uint32_t n_fp_pairs,
-                                  bool need_chkstk, bool is_linux_va,
+                                  int probe_mode, bool is_linux_va,
                                   uint32_t *out_prol_bid, bool *out_prol_inlined) {
-    if (mf->blocks.len < 2u || mf->is_variadic || is_linux_va || need_chkstk || mf->has_alloca_dyn) {
+    if (mf->blocks.len < 2u || mf->is_variadic || is_linux_va || probe_mode != 0 || mf->has_alloca_dyn) {
         return false;
     }
     if (a64_count_block_refs(mf, 0u, MBLOCK_NONE, MBLOCK_NONE) != 0u) return false;
@@ -512,7 +521,7 @@ static bool try_arm64_shrink_wrap(MFunc *mf,
         /* Prepend prologue + deferred copies directly to slow_target (zero extra branch!). */
         MInstVec pvec = {0};
         emit_arm64_prologue(&pvec, mf, cs_gp, n_cs_gp, cs_gp_off, n_gp_pairs,
-                            cs_fp, n_cs_fp, cs_fp_off, n_fp_pairs, need_chkstk, is_linux_va, ploc);
+                            cs_fp, n_cs_fp, cs_fp_off, n_fp_pairs, probe_mode, is_linux_va, ploc);
         for (uint32_t i = 0u; i < n_deferred; ++i) {
             PIR_VEC_PUSH(&pvec, deferred[i]);
         }
@@ -530,7 +539,7 @@ static bool try_arm64_shrink_wrap(MFunc *mf,
         memset(&prol_blk, 0, sizeof(prol_blk));
         prol_blk.id = prol_bid;
         emit_arm64_prologue(&prol_blk.insts, mf, cs_gp, n_cs_gp, cs_gp_off, n_gp_pairs,
-                            cs_fp, n_cs_fp, cs_fp_off, n_fp_pairs, need_chkstk, is_linux_va, ploc);
+                            cs_fp, n_cs_fp, cs_fp_off, n_fp_pairs, probe_mode, is_linux_va, ploc);
         for (uint32_t i = 0u; i < n_deferred; ++i) {
             PIR_VEC_PUSH(&prol_blk.insts, deferred[i]);
         }
@@ -642,14 +651,15 @@ bool pir_arm64_frame_lower(MFunc *mf, PirDiag *diag) {
     }
 
     mf->local_frame_size = align_up_u64(cur, 16u);
-    bool need_chkstk = is_darwin && (mf->local_frame_size >= 16384u);
+    int probe_mode = is_darwin ? ((mf->local_frame_size >= 16384u) ? 1 : 0)
+                               : ((mf->local_frame_size >= 4096u) ? 2 : 0);
 
     /* Attempt shrink-wrapping so base-case / fast-path returns skip the frame prologue & epilogue. */
     uint32_t sw_prol_bid = MBLOCK_NONE;
     bool sw_prol_inlined = false;
     bool shrink_wrapped = try_arm64_shrink_wrap(mf, cs_gp, n_cs_gp, cs_gp_off, n_gp_pairs,
                                                 cs_fp, n_cs_fp, cs_fp_off, n_fp_pairs,
-                                                need_chkstk, is_linux_va,
+                                                probe_mode, is_linux_va,
                                                 &sw_prol_bid, &sw_prol_inlined);
 
     /* 3. Rewrite every block: prepend prologue in block 0 (unless shrink-wrapped), expand pseudo-ops, expand epilogue before RET. */
@@ -662,7 +672,7 @@ bool pir_arm64_frame_lower(MFunc *mf, PirDiag *diag) {
             uint32_t ploc = (blk->insts.len > 0u) ? blk->insts.data[0].loc_idx : 0u;
             emit_arm64_prologue(&out, mf, cs_gp, n_cs_gp, cs_gp_off, n_gp_pairs,
                                 cs_fp, n_cs_fp, cs_fp_off, n_fp_pairs,
-                                need_chkstk, is_linux_va, ploc);
+                                probe_mode, is_linux_va, ploc);
         }
 
         for (uint32_t j = 0u; j < blk->insts.len; ++j) {
@@ -728,14 +738,14 @@ bool pir_arm64_frame_lower(MFunc *mf, PirDiag *diag) {
             if (ins.op == MI_CALL_ADJ_DOWN) {
                 if (mf->has_alloca_dyn) {
                     uint64_t bytes = align_up_u64((uint64_t)ins.ops[0].u.imm, 16u);
-                    emit_sp_adjust(&out, true, bytes, false, loc);
+                    emit_sp_adjust(&out, true, bytes, 0, loc);
                 }
                 continue;
             }
             if (ins.op == MI_CALL_ADJ_UP) {
                 if (mf->has_alloca_dyn) {
                     uint64_t bytes = align_up_u64((uint64_t)ins.ops[0].u.imm, 16u);
-                    emit_sp_adjust(&out, false, bytes, false, loc);
+                    emit_sp_adjust(&out, false, bytes, 0, loc);
                 }
                 continue;
             }

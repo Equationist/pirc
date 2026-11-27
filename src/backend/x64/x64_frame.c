@@ -70,9 +70,9 @@ static void emit_x64_mem(MInstVec *out, bool is_load, MPReg reg, MPReg base, int
 }
 
 static void emit_x64_sp_adjust(MInstVec *out, bool is_sub, uint64_t bytes,
-                               bool need_chkstk, uint32_t loc) {
+                               int probe_mode, uint32_t loc) {
     if (bytes == 0u) return;
-    if (is_sub && need_chkstk) {
+    if (is_sub && probe_mode == 1) {
         /* Darwin x86-64 stack probe: size in rax, call ____chkstk_darwin, then sub rsp, rax.
          * ____chkstk_darwin preserves rax and all SysV argument registers (rdi..r9, xmm0..xmm7). */
         MInst mi = minst_make(MI_X64_MOV_RI, 8u, loc);
@@ -85,6 +85,15 @@ static void emit_x64_sp_adjust(MInstVec *out, bool is_sub, uint64_t bytes,
         MInst sub = minst_make(MI_X64_SUB_RR, 8u, loc);
         sub.op_count = 2u; sub.ops[0] = mop_preg_defuse(X64_RSP); sub.ops[1] = mop_preg_use(X64_RAX);
         PIR_VEC_PUSH(out, sub);
+        return;
+    }
+    if (is_sub && probe_mode == 2) {
+        /* Linux/generic static frame inline 4KB stack probe. */
+        MInst pr = minst_make(MI_X64_MOV_RSP, 8u, loc);
+        pr.aux_id   = 3u;
+        pr.op_count = 1u;
+        pr.ops[0]   = mop_imm((int64_t)bytes);
+        PIR_VEC_PUSH(out, pr);
         return;
     }
     if (bytes <= (uint64_t)INT32_MAX) {
@@ -167,7 +176,8 @@ bool pir_x64_frame_lower(MFunc *mf, PirDiag *diag) {
     }
 
     mf->local_frame_size = align_up_u64(cur, 16u);
-    bool need_chkstk = is_darwin && (mf->local_frame_size >= 4096u);
+    int probe_mode = is_darwin ? ((mf->local_frame_size >= 4096u) ? 1 : 0)
+                               : ((mf->local_frame_size >= 4096u) ? 2 : 0);
 
     /* 3. Rewrite every block: prepend prologue in block 0, expand pseudo-ops, expand epilogue before RET. */
     for (uint32_t b = 0u; b < mf->blocks.len; ++b) {
@@ -187,8 +197,8 @@ bool pir_x64_frame_lower(MFunc *mf, PirDiag *diag) {
             set_fp.op_count = 1u; set_fp.ops[0] = mop_preg_def(X64_RBP);
             PIR_VEC_PUSH(&out, set_fp);
 
-            /* Allocate local frame (with ____chkstk_darwin on macOS if >= 4KB) */
-            emit_x64_sp_adjust(&out, true, mf->local_frame_size, need_chkstk, ploc);
+            /* Allocate local frame (with stack probing on macOS/Linux) */
+            emit_x64_sp_adjust(&out, true, mf->local_frame_size, probe_mode, ploc);
             if (!mf->has_alloca_dyn && mf->max_out_args_align > 16u) {
                 /* Realign RSP down for >16B-aligned outgoing SysV stack arguments (e.g. _Alignas(32)). */
                 MInst al_sp = minst_make(MI_X64_AND_RI, 8u, ploc);
@@ -312,7 +322,7 @@ bool pir_x64_frame_lower(MFunc *mf, PirDiag *diag) {
                         PIR_VEC_PUSH(&out, gsp);
                         emit_x64_mem(&out, false, X64_SCRATCH_GP0, X64_RBP, vla_out_sp_off,
                                      8u, false, X64_SCRATCH_GP1, loc);
-                        emit_x64_sp_adjust(&out, true, bytes, false, loc);
+                        emit_x64_sp_adjust(&out, true, bytes, 0, loc);
                         MInst al_sp = minst_make(MI_X64_AND_RI, 8u, loc);
                         al_sp.op_count = 2u;
                         al_sp.ops[0]   = mop_preg_defuse(X64_RSP);
@@ -320,7 +330,7 @@ bool pir_x64_frame_lower(MFunc *mf, PirDiag *diag) {
                         PIR_VEC_PUSH(&out, al_sp);
                     } else {
                         uint64_t bytes = align_up_u64((uint64_t)ins.ops[0].u.imm, 16u);
-                        emit_x64_sp_adjust(&out, true, bytes, false, loc);
+                        emit_x64_sp_adjust(&out, true, bytes, 0, loc);
                     }
                 }
                 continue;
@@ -335,7 +345,7 @@ bool pir_x64_frame_lower(MFunc *mf, PirDiag *diag) {
                         PIR_VEC_PUSH(&out, ssp);
                     } else {
                         uint64_t bytes = align_up_u64((uint64_t)ins.ops[0].u.imm, 16u);
-                        emit_x64_sp_adjust(&out, false, bytes, false, loc);
+                        emit_x64_sp_adjust(&out, false, bytes, 0, loc);
                     }
                 }
                 continue;

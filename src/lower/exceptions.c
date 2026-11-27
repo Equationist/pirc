@@ -148,9 +148,9 @@ static bool lower_exceptions_shadow_stack(PirModule *mod, const PirTargetSpec *t
 
         PirValueId exc_frame = PIR_INVALID_ID;
         if (fn_needs_frame) {
-            /* Prepend one frame slot { prev: ptr, exn: ptr, jmp_buf: 256B } to blocks[0]. */
+            /* Prepend one frame slot { prev: ptr, exn: ptr, jmp_buf: 384B } to blocks[0]. */
             PirInst al = pir_make_inst(PIR_OP_ALLOCA_PTR, tptr, fn->src_line, 0u);
-            al.imm_u64    = 2u * pb + 256u;
+            al.imm_u64    = 2u * pb + 384u;
             al.align      = 16u;
             al.results[0] = pir_fn_new_val(mod, fn, "exc_fr", tptr, 0u, PIR_INVALID_ID, 0u);
             PirInstId aid = pir_fn_append_inst(fn, NULL, al);

@@ -21,6 +21,8 @@ typedef struct PirExcFrame {
     jmp_buf             jb;
 } PirExcFrame;
 
+typedef char pir_exc_frame_jmpbuf_check[(sizeof(jmp_buf) <= 384u) ? 1 : -1];
+
 /* Shared TLS shadow-stack head (weak so PIR modules can also emit a weak zeroinit definition). */
 #if defined(__APPLE__) || defined(__GNUC__) || defined(__clang__)
 __attribute__((weak)) __thread PirExcFrame *__pir_exc_head = NULL;
