@@ -133,6 +133,20 @@ static bool assemble_to_obj(const char *asm_path, const char *obj_path,
             execlp("cc", "cc", "-arch", "x86_64", "-x", "assembler", "-c", asm_path, "-o", obj_path, (char *)NULL);
         } else if (target && target->os == PIR_OS_MACOS && target->arch == PIR_ARCH_ARM64) {
             execlp("cc", "cc", "-arch", "arm64", "-x", "assembler", "-c", asm_path, "-o", obj_path, (char *)NULL);
+        } else if (target && target->arch == PIR_ARCH_RV32) {
+            const char *rv_cc = getenv("PIRC_RV32_CC");
+            if (!rv_cc || !rv_cc[0]) {
+                if (access("/opt/homebrew/opt/llvm/bin/clang", X_OK) == 0)
+                    rv_cc = "/opt/homebrew/opt/llvm/bin/clang";
+                else if (access("/usr/local/opt/llvm/bin/clang", X_OK) == 0)
+                    rv_cc = "/usr/local/opt/llvm/bin/clang";
+                else
+                    rv_cc = "clang";
+            }
+            char target_flag[128];
+            snprintf(target_flag, sizeof(target_flag), "--target=%s", target->triple);
+            execlp(rv_cc, rv_cc, target_flag, "-march=rv32imafd", "-mabi=ilp32d",
+                   "-x", "assembler", "-c", asm_path, "-o", obj_path, (char *)NULL);
         } else if (target && target->triple) {
             char target_flag[128];
             snprintf(target_flag, sizeof(target_flag), "--target=%s", target->triple);

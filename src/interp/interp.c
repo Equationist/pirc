@@ -1605,6 +1605,12 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                                 if (al > 8u) {
                                     off = (off + al - 1u) & ~(al - 1u);
                                 }
+                            } else if (it->target && it->target->arch == PIR_ARCH_RV32) {
+                                size_t al = (vsz >= 8u) ? 8u : 4u;
+                                if (mt && mt->stack_align > al) al = mt->stack_align;
+                                if (al > 4u) {
+                                    off = (off + al - 1u) & ~(al - 1u);
+                                }
                             }
                             PirPtr dst = { va_aid, (int64_t)off };
                             if (is_f32) {

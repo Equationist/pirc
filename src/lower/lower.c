@@ -459,6 +459,11 @@ bool pir_lower_module(PirModule *mod, const PirTargetSpec *target, PirDiag *diag
 
     if (!pir_legalize_optional_ops(mod, target, diag)) return false;
 #ifdef PIR_VERIFY_ALL
+    if (!maybe_verify_hir(mod, target, diag))          return false;
+#endif
+
+    if (!pir_legalize_i64(mod, target, diag))          return false;
+#ifdef PIR_VERIFY_ALL
     if (!pir_verify_module(mod, PIR_VERIFY_LIR, target, diag)) return false;
 #endif
 

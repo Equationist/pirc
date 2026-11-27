@@ -218,15 +218,27 @@ static bool shim_printf(PirInterp *it, const PirVal *args, uint32_t arg_count, i
             return false;
         }
         const PirVal *av = &args[ai++];
+        bool long_is_64 = (it->ptr_bytes >= 8u && (!it->target || it->target->os != PIR_OS_WINDOWS));
         bool is_64 = (lmod == LEN_LL || lmod == LEN_J ||
-                      ((lmod == LEN_L || lmod == LEN_Z || lmod == LEN_T) && it->ptr_bytes >= 8u));
+                      (lmod == LEN_L && long_is_64) ||
+                      ((lmod == LEN_Z || lmod == LEN_T) && it->ptr_bytes >= 8u));
+        bool split_64 = (is_64 && it->target && it->target->caps.max_int_bits == 32u &&
+                         av->ty.kind == PIR_TYPE_SCALAR && av->ty.u.scalar == PIR_SCALAR_I32 &&
+                         ai < arg_count &&
+                         args[ai].ty.kind == PIR_TYPE_SCALAR && args[ai].ty.u.scalar == PIR_SCALAR_I32);
+        uint64_t split_64_val = 0u;
+        if (split_64) {
+            uint64_t lo32 = (uint32_t)pir_val_get_u64(av);
+            uint64_t hi32 = (uint32_t)pir_val_get_u64(&args[ai++]);
+            split_64_val  = lo32 | (hi32 << 32u);
+        }
         char fbuf[48];
         size_t fl = 0u;
         fbuf[fl++] = '%';
         switch (spec) {
             case 'd': case 'i': {
                 int64_t sv = 0;
-                uint64_t raw = pir_val_get_u64(av);
+                uint64_t raw = split_64 ? split_64_val : pir_val_get_u64(av);
                 if (lmod == LEN_HH)     sv = (int64_t)(int8_t)raw;
                 else if (lmod == LEN_H) sv = (int64_t)(int16_t)raw;
                 else if (is_64)         sv = (int64_t)raw;
@@ -242,7 +254,7 @@ static bool shim_printf(PirInterp *it, const PirVal *args, uint32_t arg_count, i
                 break;
             }
             case 'u': case 'o': case 'x': case 'X': {
-                uint64_t uv = pir_val_get_u64(av);
+                uint64_t uv = split_64 ? split_64_val : pir_val_get_u64(av);
                 if (lmod == LEN_HH)     uv = (uint8_t)uv;
                 else if (lmod == LEN_H) uv = (uint16_t)uv;
                 else if (!is_64)        uv = (uint32_t)uv;
@@ -350,17 +362,61 @@ static void i128_neg(uint64_t *lo, uint64_t *hi) {
     *hi = ~(*hi) + carry;
 }
 
-/* 128-bit div/rem helper shim: expects (out_ptr, a_lo, a_hi, b_lo, b_hi) writing 16B result. */
-static bool shim_ti3(PirInterp *it, const char *name, const PirVal *args, uint32_t arg_count) {
+/* 64-bit div/rem helper shim (32-bit targets): expects (out_ptr, a_lo, a_hi, b_lo, b_hi). */
+static bool shim_di3(PirInterp *it, const char *name, const PirVal *args, uint32_t arg_count) {
     if (arg_count != 5u) {
         pir_interp_fail(it, PIR_INTERP_ERR, "%s expects 5 args (out_ptr, a_lo, a_hi, b_lo, b_hi)", name);
         return false;
     }
+    PirPtr out_p = args[0].ptr;
+    uint64_t a = (uint64_t)(uint32_t)pir_val_get_u64(&args[1]) |
+                 ((uint64_t)(uint32_t)pir_val_get_u64(&args[2]) << 32u);
+    uint64_t b = (uint64_t)(uint32_t)pir_val_get_u64(&args[3]) |
+                 ((uint64_t)(uint32_t)pir_val_get_u64(&args[4]) << 32u);
+    if (b == 0u) {
+        pir_interp_fail(it, PIR_INTERP_TRAP, "64-bit division by zero in %s", name);
+        return false;
+    }
+    uint64_t res = 0u;
+    if (strcmp(name, "__divdi3") == 0) {
+        if ((int64_t)a == INT64_MIN && (int64_t)b == -1) res = (uint64_t)INT64_MIN;
+        else res = (uint64_t)((int64_t)a / (int64_t)b);
+    } else if (strcmp(name, "__moddi3") == 0) {
+        if ((int64_t)a == INT64_MIN && (int64_t)b == -1) res = 0u;
+        else res = (uint64_t)((int64_t)a % (int64_t)b);
+    } else if (strcmp(name, "__udivdi3") == 0) {
+        res = a / b;
+    } else {
+        res = a % b;
+    }
+    uint8_t buf[8];
+    memcpy(buf, &res, 8u);
+    return pir_interp_mem_write(it, out_p, buf, 8u, 4u);
+}
+
+/* 128-bit div/rem helper shim: expects (out_ptr, a_lo, a_hi, b_lo, b_hi) writing 16B result. */
+static bool shim_ti3(PirInterp *it, const char *name, const PirVal *args, uint32_t arg_count) {
+    if (arg_count != 5u && arg_count != 9u) {
+        pir_interp_fail(it, PIR_INTERP_ERR, "%s expects 5 or 9 args", name);
+        return false;
+    }
     PirPtr out_p  = args[0].ptr;
-    uint64_t a_lo = pir_val_get_u64(&args[1]);
-    uint64_t a_hi = pir_val_get_u64(&args[2]);
-    uint64_t b_lo = pir_val_get_u64(&args[3]);
-    uint64_t b_hi = pir_val_get_u64(&args[4]);
+    uint64_t a_lo = 0u, a_hi = 0u, b_lo = 0u, b_hi = 0u;
+    if (arg_count == 5u) {
+        a_lo = pir_val_get_u64(&args[1]);
+        a_hi = pir_val_get_u64(&args[2]);
+        b_lo = pir_val_get_u64(&args[3]);
+        b_hi = pir_val_get_u64(&args[4]);
+    } else {
+        a_lo = (uint64_t)(uint32_t)pir_val_get_u64(&args[1]) |
+               ((uint64_t)(uint32_t)pir_val_get_u64(&args[2]) << 32u);
+        a_hi = (uint64_t)(uint32_t)pir_val_get_u64(&args[3]) |
+               ((uint64_t)(uint32_t)pir_val_get_u64(&args[4]) << 32u);
+        b_lo = (uint64_t)(uint32_t)pir_val_get_u64(&args[5]) |
+               ((uint64_t)(uint32_t)pir_val_get_u64(&args[6]) << 32u);
+        b_hi = (uint64_t)(uint32_t)pir_val_get_u64(&args[7]) |
+               ((uint64_t)(uint32_t)pir_val_get_u64(&args[8]) << 32u);
+    }
     if (b_lo == 0u && b_hi == 0u) {
         pir_interp_fail(it, PIR_INTERP_TRAP, "128-bit division by zero in %s", name);
         return false;
@@ -392,8 +448,11 @@ bool pir_interp_try_shim(PirInterp *it, const char *name,
     out_ret->ty = ret_ty;
 
     if (strcmp(name, "malloc") == 0) {
-        if (arg_count != 1u) { pir_interp_fail(it, PIR_INTERP_UB, "malloc arity"); return true; }
-        uint64_t sz = pir_val_get_u64(&args[0]);
+        bool sp64 = (arg_count == 2u && it->target && it->target->caps.max_int_bits == 32u);
+        if (arg_count != 1u && !sp64) { pir_interp_fail(it, PIR_INTERP_UB, "malloc arity"); return true; }
+        uint64_t sz = sp64 ? ((uint64_t)(uint32_t)pir_val_get_u64(&args[0]) |
+                              ((uint64_t)(uint32_t)pir_val_get_u64(&args[1]) << 32u))
+                           : pir_val_get_u64(&args[0]);
         if (sz > (UINT64_C(1) << 30)) {
             out_ret->ptr.alloc_id = 0u;
             out_ret->ptr.offset   = 0;
@@ -405,9 +464,14 @@ bool pir_interp_try_shim(PirInterp *it, const char *name,
         return true;
     }
     if (strcmp(name, "calloc") == 0) {
-        if (arg_count != 2u) { pir_interp_fail(it, PIR_INTERP_UB, "calloc arity"); return true; }
-        uint64_t n = pir_val_get_u64(&args[0]);
-        uint64_t s = pir_val_get_u64(&args[1]);
+        bool sp64 = (arg_count == 4u && it->target && it->target->caps.max_int_bits == 32u);
+        if (arg_count != 2u && !sp64) { pir_interp_fail(it, PIR_INTERP_UB, "calloc arity"); return true; }
+        uint64_t n = sp64 ? ((uint64_t)(uint32_t)pir_val_get_u64(&args[0]) |
+                             ((uint64_t)(uint32_t)pir_val_get_u64(&args[1]) << 32u))
+                          : pir_val_get_u64(&args[0]);
+        uint64_t s = sp64 ? ((uint64_t)(uint32_t)pir_val_get_u64(&args[2]) |
+                             ((uint64_t)(uint32_t)pir_val_get_u64(&args[3]) << 32u))
+                          : pir_val_get_u64(&args[1]);
         if (n != 0u && s > (UINT64_C(1) << 30) / n) {
             out_ret->ptr.alloc_id = 0u;
             out_ret->ptr.offset   = 0;
@@ -440,9 +504,12 @@ bool pir_interp_try_shim(PirInterp *it, const char *name,
         return true;
     }
     if (strcmp(name, "realloc") == 0) {
-        if (arg_count != 2u) { pir_interp_fail(it, PIR_INTERP_UB, "realloc arity"); return true; }
+        bool sp64 = (arg_count == 3u && it->target && it->target->caps.max_int_bits == 32u);
+        if (arg_count != 2u && !sp64) { pir_interp_fail(it, PIR_INTERP_UB, "realloc arity"); return true; }
         PirPtr p = args[0].ptr;
-        uint64_t new_sz_u64 = pir_val_get_u64(&args[1]);
+        uint64_t new_sz_u64 = sp64 ? ((uint64_t)(uint32_t)pir_val_get_u64(&args[1]) |
+                                      ((uint64_t)(uint32_t)pir_val_get_u64(&args[2]) << 32u))
+                                   : pir_val_get_u64(&args[1]);
         if (pir_ptr_is_null(p)) {
             if (new_sz_u64 > (UINT64_C(1) << 30)) {
                 out_ret->ptr.alloc_id = 0u;
@@ -486,17 +553,23 @@ bool pir_interp_try_shim(PirInterp *it, const char *name,
         return true;
     }
     if (strcmp(name, "memcpy") == 0 || strcmp(name, "memmove") == 0) {
-        if (arg_count != 3u) { pir_interp_fail(it, PIR_INTERP_UB, "memcpy/memmove arity"); return true; }
-        size_t len = (size_t)pir_val_get_u64(&args[2]);
+        bool sp64 = (arg_count == 4u && it->target && it->target->caps.max_int_bits == 32u);
+        if (arg_count != 3u && !sp64) { pir_interp_fail(it, PIR_INTERP_UB, "memcpy/memmove arity"); return true; }
+        size_t len = (size_t)(sp64 ? ((uint64_t)(uint32_t)pir_val_get_u64(&args[2]) |
+                                      ((uint64_t)(uint32_t)pir_val_get_u64(&args[3]) << 32u))
+                                   : pir_val_get_u64(&args[2]));
         pir_interp_mem_copy(it, args[0].ptr, args[1].ptr, len, strcmp(name, "memmove") == 0);
         out_ret->ptr = args[0].ptr;
         return true;
     }
     if (strcmp(name, "memset") == 0) {
-        if (arg_count != 3u) { pir_interp_fail(it, PIR_INTERP_UB, "memset arity"); return true; }
+        bool sp64 = (arg_count == 4u && it->target && it->target->caps.max_int_bits == 32u);
+        if (arg_count != 3u && !sp64) { pir_interp_fail(it, PIR_INTERP_UB, "memset arity"); return true; }
         PirPtr dst = args[0].ptr;
         uint8_t byte = (uint8_t)pir_val_get_u64(&args[1]);
-        size_t len = (size_t)pir_val_get_u64(&args[2]);
+        size_t len = (size_t)(sp64 ? ((uint64_t)(uint32_t)pir_val_get_u64(&args[2]) |
+                                      ((uint64_t)(uint32_t)pir_val_get_u64(&args[3]) << 32u))
+                                   : pir_val_get_u64(&args[2]));
         if (len > 0u && pir_interp_check_access(it, dst, len, 1u, true, false)) {
             PirAlloc *a = &it->allocs.data[dst.alloc_id];
             size_t off = (size_t)dst.offset;
@@ -508,8 +581,11 @@ bool pir_interp_try_shim(PirInterp *it, const char *name,
         return true;
     }
     if (strcmp(name, "memcmp") == 0) {
-        if (arg_count != 3u) { pir_interp_fail(it, PIR_INTERP_UB, "memcmp arity"); return true; }
-        size_t len = (size_t)pir_val_get_u64(&args[2]);
+        bool sp64 = (arg_count == 4u && it->target && it->target->caps.max_int_bits == 32u);
+        if (arg_count != 3u && !sp64) { pir_interp_fail(it, PIR_INTERP_UB, "memcmp arity"); return true; }
+        size_t len = (size_t)(sp64 ? ((uint64_t)(uint32_t)pir_val_get_u64(&args[2]) |
+                                      ((uint64_t)(uint32_t)pir_val_get_u64(&args[3]) << 32u))
+                                   : pir_val_get_u64(&args[2]));
         int res = 0;
         if (len > 0u &&
             pir_interp_check_access(it, args[0].ptr, len, 1u, false, true) &&
@@ -616,6 +692,68 @@ bool pir_interp_try_shim(PirInterp *it, const char *name,
     if (strcmp(name, "__divti3") == 0 || strcmp(name, "__udivti3") == 0 ||
         strcmp(name, "__modti3") == 0 || strcmp(name, "__umodti3") == 0) {
         shim_ti3(it, name, args, arg_count);
+        return true;
+    }
+    if (strcmp(name, "__divdi3") == 0 || strcmp(name, "__udivdi3") == 0 ||
+        strcmp(name, "__moddi3") == 0 || strcmp(name, "__umoddi3") == 0) {
+        shim_di3(it, name, args, arg_count);
+        return true;
+    }
+    if (strcmp(name, "__pir_atomic_load_8") == 0 && arg_count == 2u) {
+        uint8_t buf[8];
+        if (pir_interp_mem_read(it, args[0].ptr, buf, 8u, 8u)) {
+            pir_interp_mem_write(it, args[1].ptr, buf, 8u, 4u);
+        }
+        return true;
+    }
+    if (strcmp(name, "__pir_atomic_store_8") == 0 && arg_count == 3u) {
+        uint64_t v = (uint64_t)(uint32_t)pir_val_get_u64(&args[1]) |
+                     ((uint64_t)(uint32_t)pir_val_get_u64(&args[2]) << 32u);
+        uint8_t buf[8];
+        memcpy(buf, &v, 8u);
+        pir_interp_mem_write(it, args[0].ptr, buf, 8u, 8u);
+        return true;
+    }
+    if (strcmp(name, "__pir_atomic_rmw_8") == 0 && arg_count == 5u) {
+        uint8_t buf[8];
+        if (pir_interp_mem_read(it, args[0].ptr, buf, 8u, 8u)) {
+            uint64_t oldv = 0u;
+            memcpy(&oldv, buf, 8u);
+            pir_interp_mem_write(it, args[1].ptr, buf, 8u, 4u);
+            uint32_t op = (uint32_t)pir_val_get_u64(&args[2]);
+            uint64_t rhs = (uint64_t)(uint32_t)pir_val_get_u64(&args[3]) |
+                           ((uint64_t)(uint32_t)pir_val_get_u64(&args[4]) << 32u);
+            uint64_t nv = oldv;
+            switch ((PirRmwOp)op) {
+                case PIR_RMW_ADD:  nv = oldv + rhs; break;
+                case PIR_RMW_SUB:  nv = oldv - rhs; break;
+                case PIR_RMW_AND:  nv = oldv & rhs; break;
+                case PIR_RMW_OR:   nv = oldv | rhs; break;
+                case PIR_RMW_XOR:  nv = oldv ^ rhs; break;
+                case PIR_RMW_XCHG: nv = rhs;        break;
+            }
+            memcpy(buf, &nv, 8u);
+            pir_interp_mem_write(it, args[0].ptr, buf, 8u, 8u);
+        }
+        return true;
+    }
+    if (strcmp(name, "__pir_atomic_cmpxchg_8") == 0 && arg_count == 6u) {
+        uint8_t buf[8];
+        if (pir_interp_mem_read(it, args[0].ptr, buf, 8u, 8u)) {
+            uint64_t oldv = 0u;
+            memcpy(&oldv, buf, 8u);
+            pir_interp_mem_write(it, args[1].ptr, buf, 8u, 4u);
+            uint64_t expv = (uint64_t)(uint32_t)pir_val_get_u64(&args[2]) |
+                            ((uint64_t)(uint32_t)pir_val_get_u64(&args[3]) << 32u);
+            uint64_t newv = (uint64_t)(uint32_t)pir_val_get_u64(&args[4]) |
+                            ((uint64_t)(uint32_t)pir_val_get_u64(&args[5]) << 32u);
+            bool eq = (oldv == expv);
+            if (eq) {
+                memcpy(buf, &newv, 8u);
+                pir_interp_mem_write(it, args[0].ptr, buf, 8u, 8u);
+            }
+            pir_val_set_u64(out_ret, ret_ty, eq ? 1u : 0u);
+        }
         return true;
     }
     return false;

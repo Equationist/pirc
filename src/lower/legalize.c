@@ -327,7 +327,9 @@ static void emit_switch_node(PirModule *mod, PirFunction *fn, PirBlockId blk_id,
 bool pir_legalize_optional_ops(PirModule *mod, const PirTargetSpec *target, PirDiag *diag) {
     (void)diag;
     const PirBackendCaps *c = &target->caps;
-    if (c->has_mul_wide && c->has_add_carry && c->has_ovf_ops && c->has_bitops && c->has_switch) {
+    bool narrow_i64 = (c->max_int_bits > 0u && c->max_int_bits < 64u);
+    if (!narrow_i64 &&
+        c->has_mul_wide && c->has_add_carry && c->has_ovf_ops && c->has_bitops && c->has_switch) {
         return true;
     }
 
@@ -344,16 +346,17 @@ bool pir_legalize_optional_ops(PirModule *mod, const PirTargetSpec *target, PirD
                 PirInstId iid = fn->blocks.data[b].insts.data[j];
                 PirInst copy  = fn->insts.data[iid];
                 uint32_t ln = copy.src_line, lc = copy.loc_idx;
+                bool is_op_i64 = (copy.ty.kind == PIR_TYPE_SCALAR && copy.ty.u.scalar == PIR_SCALAR_I64);
 
-                if (!c->has_ovf_ops &&
+                if ((!c->has_ovf_ops || (narrow_i64 && is_op_i64)) &&
                     (copy.op == PIR_OP_ADD_OVF_S || copy.op == PIR_OP_ADD_OVF_U ||
                      copy.op == PIR_OP_SUB_OVF_S || copy.op == PIR_OP_SUB_OVF_U ||
                      copy.op == PIR_OP_MUL_OVF_S || copy.op == PIR_OP_MUL_OVF_U)) {
                     expand_ovf_or_carry(mod, fn, b, &new_insts, &copy);
-                } else if ((!c->has_ovf_ops || !c->has_add_carry) &&
+                } else if ((!c->has_ovf_ops || !c->has_add_carry || (narrow_i64 && is_op_i64)) &&
                            (copy.op == PIR_OP_ADD_CARRY || copy.op == PIR_OP_SUB_BORROW)) {
                     expand_ovf_or_carry(mod, fn, b, &new_insts, &copy);
-                } else if (!c->has_mul_wide &&
+                } else if ((!c->has_mul_wide || (narrow_i64 && is_op_i64)) &&
                            (copy.op == PIR_OP_MUL_WIDE_U || copy.op == PIR_OP_MUL_WIDE_S)) {
                     bool is_s = (copy.op == PIR_OP_MUL_WIDE_S);
                     if (copy.ty.u.scalar == PIR_SCALAR_I32) {
@@ -371,11 +374,11 @@ bool pir_legalize_optional_ops(PirModule *mod, const PirTargetSpec *target, PirD
                         expand_mul_wide_64(mod, fn, b, &new_insts, is_s, copy.operands[0], copy.operands[1],
                                            copy.results[0], copy.results[1], ln, lc);
                     }
-                } else if (!c->has_bitops &&
+                } else if ((!c->has_bitops || (narrow_i64 && is_op_i64)) &&
                            (copy.op == PIR_OP_CLZ || copy.op == PIR_OP_CTZ ||
                             copy.op == PIR_OP_POPCNT || copy.op == PIR_OP_BSWAP)) {
                     expand_bitop(mod, fn, b, &new_insts, &copy);
-                } else if (!c->has_switch && copy.op == PIR_OP_SWITCH) {
+                } else if ((!c->has_switch || (narrow_i64 && is_op_i64)) && copy.op == PIR_OP_SWITCH) {
                     uint32_t nc = copy.switch_case_count;
                     SortedCase *sc = nc ? (SortedCase *)malloc(nc * sizeof(SortedCase)) : NULL;
                     if (nc && !sc) abort();

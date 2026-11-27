@@ -51,6 +51,12 @@ bool pir_x64_isel_func(const PirModule *mod, const PirFunction *fn, uint32_t fn_
 bool pir_x64_frame_lower(MFunc *mf, PirDiag *diag);
 void pir_x64_asm_emitter_init(PirCodeEmitter *em, FILE *out, const PirTargetSpec *target);
 
+/* RISC-V 32-bit (RV32IMAFD) backend passes */
+bool pir_rv32_isel_func(const PirModule *mod, const PirFunction *fn, uint32_t fn_index,
+                        const PirTargetSpec *target, MFunc *out_mf, PirDiag *diag);
+bool pir_rv32_frame_lower(MFunc *mf, PirDiag *diag);
+void pir_rv32_asm_emitter_init(PirCodeEmitter *em, FILE *out, const PirTargetSpec *target);
+
 /* Top-level backend driver: lowers every defined function to post-regalloc MFunc
  * and streams through the selected CodeEmitter. */
 bool pir_backend_emit_asm(const PirModule *mod, const PirTargetSpec *target,

@@ -820,6 +820,27 @@ static void emit_inst(X64AsmCtx *ctx, const MFunc *mf, const MInst *ins) {
         case MI_A64_VSCVTF: case MI_A64_VUCVTF: case MI_A64_VFCVTZS: case MI_A64_VFCVTZU:
         case MI_A64_B: case MI_A64_BCOND: case MI_A64_CBZ: case MI_A64_CBNZ:
         case MI_A64_BL: case MI_A64_BLR: case MI_A64_SWITCH_TBL: case MI_A64_RET: case MI_A64_UDF:
+        case MI_RV32_LI: case MI_RV32_MV: case MI_RV32_SYM_ADDR: case MI_RV32_TLS_ADDR:
+        case MI_RV32_LD: case MI_RV32_ST: case MI_RV32_FLD: case MI_RV32_FST: case MI_RV32_MOV_SP:
+        case MI_RV32_ADD: case MI_RV32_ADDI: case MI_RV32_SUB:
+        case MI_RV32_MUL: case MI_RV32_MULH: case MI_RV32_MULHU:
+        case MI_RV32_DIV: case MI_RV32_DIVU: case MI_RV32_REM: case MI_RV32_REMU:
+        case MI_RV32_AND: case MI_RV32_ANDI: case MI_RV32_OR: case MI_RV32_ORI:
+        case MI_RV32_XOR: case MI_RV32_XORI:
+        case MI_RV32_SLL: case MI_RV32_SLLI: case MI_RV32_SRL: case MI_RV32_SRLI:
+        case MI_RV32_SRA: case MI_RV32_SRAI:
+        case MI_RV32_SLT: case MI_RV32_SLTI: case MI_RV32_SLTU: case MI_RV32_SLTIU:
+        case MI_RV32_SEQZ: case MI_RV32_SNEZ:
+        case MI_RV32_FENCE: case MI_RV32_ATOMIC_RMW: case MI_RV32_ATOMIC_CAS:
+        case MI_RV32_FMV_RR: case MI_RV32_FMV_W_X: case MI_RV32_FMV_X_W: case MI_RV32_LOAD_IMM_F64:
+        case MI_RV32_FADD: case MI_RV32_FSUB: case MI_RV32_FMUL: case MI_RV32_FDIV:
+        case MI_RV32_FNEG: case MI_RV32_FABS: case MI_RV32_FSQRT:
+        case MI_RV32_FEQ: case MI_RV32_FLT: case MI_RV32_FLE:
+        case MI_RV32_FCVT_S_D: case MI_RV32_FCVT_D_S:
+        case MI_RV32_FCVT_F_W: case MI_RV32_FCVT_F_WU:
+        case MI_RV32_FCVT_W_F: case MI_RV32_FCVT_WU_F:
+        case MI_RV32_J: case MI_RV32_BCC: case MI_RV32_CALL: case MI_RV32_CALL_IND:
+        case MI_RV32_SWITCH_TBL: case MI_RV32_RET: case MI_RV32_UNIMP:
             fprintf(stderr, "internal error: unexpected MIR op %u in x64_asm\n", (unsigned)ins->op);
             abort();
     }

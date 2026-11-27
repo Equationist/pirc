@@ -400,9 +400,10 @@ static bool rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
                               const PirInst *inst, const CabiPlan *plan,
                               const PirParamDecl *orig_params, bool is_variadic,
                               PirDiag *diag) {
-    PirType tptr   = pir_type_scalar(PIR_SCALAR_PTR);
-    PirType ti64   = pir_type_scalar(PIR_SCALAR_I64);
-    PirType idx_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
+    PirType tptr    = pir_type_scalar(PIR_SCALAR_PTR);
+    PirType ti64    = pir_type_scalar(PIR_SCALAR_I64);
+    PirType gp_pad  = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
+    PirType idx_ty  = gp_pad;
     uint32_t ln = inst->src_line, lc = inst->loc_idx;
 
     PirOperandVec new_ops = {0};
@@ -433,7 +434,7 @@ static bool rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
             }
             const PirAbiArgInfo *info = &plan->param_infos[pi];
             for (uint32_t p = 0u; p < info->pad_gp_before; ++p) {
-                PIR_VEC_PUSH(&new_ops, pir_op_imm_i(0u, false, ti64));
+                PIR_VEC_PUSH(&new_ops, pir_op_imm_i(0u, false, gp_pad));
             }
             for (uint32_t p = 0u; p < info->pad_fp_before; ++p) {
                 PIR_VEC_PUSH(&new_ops, pir_op_imm_f(0u, pir_type_scalar(PIR_SCALAR_F64)));
@@ -510,6 +511,25 @@ static bool rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
                         vinfo.regs[k] = widen_ty;
                     }
                 }
+            } else if (target->arch == PIR_ARCH_RV32 && vinfo.kind == PIR_ABI_DIRECT) {
+                /* RISC-V ILP32D variadic byval: always passed in GP registers/stack (never fa0..fa7),
+                 * packed into 1..2 i32 words (or indirect if > 8B, already classified above). */
+                PirTypeLayout vly = pir_type_layout(mod, target, vpd.abi_type);
+                if (vly.size > 8u) {
+                    memset(&vinfo, 0, sizeof(vinfo));
+                    vinfo.kind    = PIR_ABI_INDIRECT;
+                    vinfo.gp_used = 1u;
+                } else {
+                    uint32_t nw = (vly.size <= 4u) ? 1u : 2u;
+                    vinfo.reg_count       = nw;
+                    vinfo.fp_used         = 0u;
+                    vinfo.gp_used         = nw;
+                    vinfo.has_reg_offsets = false;
+                    for (uint32_t w = 0u; w < nw; ++w) {
+                        vinfo.regs[w] = pir_type_scalar(PIR_SCALAR_I32);
+                    }
+                    if (vly.align >= 8u) vinfo.stack_align = 8u;
+                }
             } else if (target->arch == PIR_ARCH_ARM64 && target->os != PIR_OS_MACOS) {
                 for (uint32_t p = 0u; p < vinfo.pad_gp_before; ++p) {
                     PirOperand pad = pir_op_imm_i(0u, false, ti64);
@@ -580,7 +600,7 @@ static bool rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
                         }
                     } else {
                         for (uint32_t p = 0u; p < vinfo.pad_gp_before; ++p) {
-                            PirOperand pad = pir_op_imm_i(0u, false, ti64);
+                            PirOperand pad = pir_op_imm_i(0u, false, gp_pad);
                             pad.has_explicit_type = true;
                             PIR_VEC_PUSH(&new_ops, pad);
                         }
@@ -686,10 +706,10 @@ static void rewrite_param_decls(PirModule *mod, const PirTargetSpec *target, con
                                 PirFunction *defined_fn) {
     PirParamDecl *old_p = *params_io;
     uint32_t old_n      = *count_io;
-    PirType tptr  = pir_type_scalar(PIR_SCALAR_PTR);
-    PirType ti64  = pir_type_scalar(PIR_SCALAR_I64);
-    PirType tf64  = pir_type_scalar(PIR_SCALAR_F64);
-    PirType tvoid = pir_type_scalar(PIR_SCALAR_VOID);
+    PirType tptr   = pir_type_scalar(PIR_SCALAR_PTR);
+    PirType gp_pad = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
+    PirType tf64   = pir_type_scalar(PIR_SCALAR_F64);
+    PirType tvoid  = pir_type_scalar(PIR_SCALAR_VOID);
 
     populate_cabi_ret(mod, target, plan, cabi_ret_io);
 
@@ -715,11 +735,11 @@ static void rewrite_param_decls(PirModule *mod, const PirTargetSpec *target, con
         for (uint32_t p = 0u; p < info->pad_gp_before; ++p) {
             PirParamDecl pad;
             memset(&pad, 0, sizeof(pad));
-            pad.type     = ti64;
+            pad.type     = gp_pad;
             pad.abi_type = tvoid;
             pad.val_id   = PIR_INVALID_ID;
             if (defined_fn) {
-                pad.val_id = pir_fn_new_val(mod, defined_fn, "abi_pad", ti64,
+                pad.val_id = pir_fn_new_val(mod, defined_fn, "abi_pad", gp_pad,
                                             PIR_INVALID_ID, PIR_INVALID_ID, np.len);
                 pad.name   = defined_fn->values.data[pad.val_id].name;
             }

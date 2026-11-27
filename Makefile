@@ -14,11 +14,11 @@ LDFLAGS   :=
 SAN_FLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g -DPIR_VERIFY_ALL=1
 
 COMMON_SRCS   := src/common/arena.c src/common/diag.c
-TARGET_SRCS   := src/target/target.c src/target/abi_sysv_x64.c src/target/abi_aapcs64.c src/target/abi_win64.c
+TARGET_SRCS   := src/target/target.c src/target/abi_sysv_x64.c src/target/abi_aapcs64.c src/target/abi_win64.c src/target/abi_rv32.c
 ANALYSIS_SRCS := src/analysis/cfg.c src/analysis/dom.c src/analysis/loops.c src/analysis/alias.c
 IR_SRCS       := src/ir/lexer.c src/ir/parser.c src/ir/printer.c src/ir/verify.c
 LOWER_SRCS    := src/lower/lower.c src/lower/exceptions.c src/lower/varargs.c src/lower/cabi.c \
-                 src/lower/aggregates.c src/lower/i128.c src/lower/simd.c src/lower/legalize.c
+                 src/lower/aggregates.c src/lower/i128.c src/lower/i64.c src/lower/simd.c src/lower/legalize.c
 OPT_SRCS      := src/opt/opt.c src/opt/inline.c src/opt/simplify_cfg.c src/opt/mem2reg.c src/opt/gvn.c \
                  src/opt/licm.c src/opt/dse.c src/opt/dce.c src/opt/loop_vec.c
 INTERP_SRCS   := src/interp/interp.c src/interp/runtime_shims.c
@@ -26,7 +26,9 @@ BACKEND_SRCS  := src/backend/mir.c src/backend/regalloc.c src/backend/asm_common
                  src/backend/arm64/arm64_isel.c src/backend/arm64/arm64_frame.c \
                  src/backend/arm64/arm64_asm.c \
                  src/backend/x64/x64_isel.c src/backend/x64/x64_frame.c \
-                 src/backend/x64/x64_asm.c
+                 src/backend/x64/x64_asm.c \
+                 src/backend/rv32/rv32_isel.c src/backend/rv32/rv32_frame.c \
+                 src/backend/rv32/rv32_asm.c
 CORE_SRCS     := $(COMMON_SRCS) $(TARGET_SRCS) $(ANALYSIS_SRCS) $(IR_SRCS) $(LOWER_SRCS) $(OPT_SRCS) $(INTERP_SRCS) $(BACKEND_SRCS)
 HEADERS       := src/common/arena.h src/common/vec.h src/common/diag.h src/common/symset.h \
                  src/target/target.h src/target/abi.h \
@@ -43,7 +45,7 @@ TEST_M0_SAN := $(BUILD_DIR)/test_m0_ir_san
 TEST_M1     := $(BUILD_DIR)/test_m1_cfg_dom
 TEST_M1_SAN := $(BUILD_DIR)/test_m1_cfg_dom_san
 
-.PHONY: all clean test test-m0 test-m1 test-interp test-m3 test-m4 test-m5 test-m6 test-m7 test-m8 test-san test-roundtrip test-verifier-neg bench slimcc-pir bootstrap ada83-pir test-ada83 bench-ada83
+.PHONY: all clean test test-m0 test-m1 test-interp test-m3 test-m4 test-m5 test-m6 test-m7 test-m8 test-rv32 test-san test-roundtrip test-verifier-neg bench slimcc-pir bootstrap ada83-pir test-ada83 bench-ada83
 
 all: $(BIN)
 
@@ -125,7 +127,10 @@ test-m7: $(BIN_SAN)
 test-m8: $(BIN_SAN)
 	sh tests/run_m8_tests.sh ./$(BIN_SAN)
 
-test-san: $(BIN_SAN) $(TEST_M0_SAN) $(TEST_M1_SAN) test-roundtrip test-verifier-neg test-interp test-m3 test-m4 test-m5 test-m6 test-m7 test-m8
+test-rv32: $(BIN_SAN)
+	sh tests/run_rv32_tests.sh ./$(BIN_SAN)
+
+test-san: $(BIN_SAN) $(TEST_M0_SAN) $(TEST_M1_SAN) test-roundtrip test-verifier-neg test-interp test-m3 test-m4 test-m5 test-m6 test-m7 test-m8 test-rv32
 	./$(TEST_M0_SAN)
 	./$(TEST_M1_SAN)
 	./$(BIN_SAN) --version
@@ -156,7 +161,8 @@ test: $(BIN) test-m0 test-m1
 	sh tests/run_m6_tests.sh ./$(BIN)
 	PIRC=./$(BIN) bash tests/c_abi_conformance/run_c_abi.sh
 	sh tests/run_m8_tests.sh ./$(BIN)
-	@echo "ALL M0-M8 TESTS PASSED"
+	sh tests/run_rv32_tests.sh ./$(BIN)
+	@echo "ALL M0-M8 + RV32 TESTS PASSED"
 
 bench: $(BIN)
 	PIRC=./$(BIN) bash tests/benchmarks/run_benchmarks.sh

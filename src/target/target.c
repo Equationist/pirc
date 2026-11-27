@@ -16,6 +16,7 @@ bool pir_target_from_triple(const char *triple, PirTargetSpec *out) {
     }
     memset(out, 0, sizeof(*out));
     out->triple = triple;
+    out->caps.max_int_bits  = 64u;
     out->caps.has_mul_wide  = true;
     out->caps.has_add_carry = true;
     out->caps.has_ovf_ops   = true;
@@ -66,10 +67,27 @@ bool pir_target_from_triple(const char *triple, PirTargetSpec *out) {
         out->caps.max_simd_bits = 128u;
         return true;
     }
+    if (strcmp(triple, "riscv32-unknown-elf") == 0 ||
+        strcmp(triple, "riscv32-unknown-linux-gnu") == 0 ||
+        strcmp(triple, "riscv32-linux-gnu") == 0) {
+        out->arch               = PIR_ARCH_RV32;
+        out->os                 = strstr(triple, "linux") ? PIR_OS_LINUX : PIR_OS_BAREMETAL;
+        out->ptr_bytes          = 4u;
+        out->is_big_endian      = false;
+        out->va_list_size       = 4u;
+        out->va_list_align      = 4u;
+        out->caps.max_simd_bits = 0u;
+        out->caps.max_int_bits  = 32u;
+        out->caps.has_mul_wide  = true;  /* RV32M mul + mulh/mulhu (32x32->64) */
+        out->caps.has_add_carry = false; /* Flagless ISA */
+        out->caps.has_ovf_ops   = false; /* Flagless ISA */
+        out->caps.has_bitops    = false; /* Base RV32IMAFD (no Zbb) */
+        out->caps.has_switch    = true;
+        return true;
+    }
     if (strcmp(triple, "wasm32-unknown-unknown") == 0 ||
         strcmp(triple, "i386-unknown-linux-gnu") == 0 ||
-        strcmp(triple, "i686-unknown-linux-gnu") == 0 ||
-        strcmp(triple, "riscv32-unknown-elf") == 0) {
+        strcmp(triple, "i686-unknown-linux-gnu") == 0) {
         out->arch           = PIR_ARCH_CUSTOM;
         out->os             = PIR_OS_BAREMETAL;
         out->ptr_bytes      = 4u;
@@ -202,6 +220,9 @@ bool pir_abi_classify_param(const PirModule *mod, const PirTargetSpec *target,
     if (target->arch == PIR_ARCH_ARM64) {
         return pir_abi_aapcs64_param(mod, target, pd, st, out);
     }
+    if (target->arch == PIR_ARCH_RV32) {
+        return pir_abi_rv32_param(mod, target, pd, st, out);
+    }
     return false;
 }
 
@@ -216,6 +237,9 @@ bool pir_abi_classify_retbuf(const PirModule *mod, const PirTargetSpec *target,
     }
     if (target->arch == PIR_ARCH_ARM64) {
         return pir_abi_aapcs64_retbuf(mod, target, agg_ty, out);
+    }
+    if (target->arch == PIR_ARCH_RV32) {
+        return pir_abi_rv32_retbuf(mod, target, agg_ty, out);
     }
     return false;
 }
@@ -303,6 +327,9 @@ void pir_abi_plan_va_arg(const PirModule *mod, const PirTargetSpec *target,
         if (stk_al > 8u) out->mem_align = (stk_al > 16u) ? 16u : stk_al;
     } else if (is_darwin_a64 && !out->is_indirect) {
         if (out->align > 8u) out->mem_align = (out->align > 16u) ? 16u : out->align;
+    } else if (target->arch == PIR_ARCH_RV32 && !out->is_indirect) {
+        /* RISC-V ILP32D: 2*XLEN (8B) aligned variadic args align cursor to 8 bytes. */
+        if (out->align >= 8u) out->mem_align = 8u;
     }
 
     out->align_gp16 = (is_aapcs64_lin && !out->is_fp && !out->is_indirect && out->nat_align >= 16u);

@@ -510,9 +510,9 @@ static uint64_t compute_global_bytes(const PirModule *mod, const PirTargetSpec *
     return tot > 0u ? tot : 1u;
 }
 
-static void emit_reloc_quad(FILE *out, const PirTargetSpec *target,
-                            const PirGlobalItem *gi, PirAsmNeedsQuoteFn arch_needs_quote) {
-    fputs("\t.quad ", out);
+static void emit_reloc_ptr(FILE *out, const PirTargetSpec *target,
+                           const PirGlobalItem *gi, PirAsmNeedsQuoteFn arch_needs_quote) {
+    fputs(target->ptr_bytes == 4u ? "\t.long " : "\t.quad ", out);
     pir_asm_emit_sym(out, target, gi->sym_name, NULL, arch_needs_quote);
     if (gi->sym_offset != 0) {
         fprintf(out, " + %" PRId64 "\n", gi->sym_offset);
@@ -546,7 +546,7 @@ static void emit_scalar_gitem(FILE *out, const PirTargetSpec *target, PirScalarT
         if (sz == 4u) fprintf(out, "\t.long %" PRIu64 "\n", gi->float_bits & 0xFFFFFFFFu);
         else          fprintf(out, "\t.quad %" PRIu64 "\n", gi->float_bits);
     } else if (gi->kind == PIR_GITEM_RELOC) {
-        emit_reloc_quad(out, target, gi, arch_needs_quote);
+        emit_reloc_ptr(out, target, gi, arch_needs_quote);
     } else if (gi->kind == PIR_GITEM_ZERO) {
         fprintf(out, "\t.zero %" PRIu64 "\n", gi->len > 0u ? gi->len : sz);
     }
@@ -603,7 +603,7 @@ static void emit_global_data_items(FILE *out, const PirModule *mod, const PirTar
                 fprintf(out, "\t.quad %" PRIu64 "\n", gi->float_bits);
                 break;
             case PIR_GITEM_RELOC:
-                emit_reloc_quad(out, target, gi, arch_needs_quote);
+                emit_reloc_ptr(out, target, gi, arch_needs_quote);
                 break;
         }
     }

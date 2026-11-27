@@ -98,6 +98,52 @@ static inline uint32_t x64_reg_num(MPReg r) {
     return (r >= 32u) ? (uint32_t)(r - 32u) : (uint32_t)r;
 }
 
+/* RISC-V 32-bit (RV32IMAFD) physical register numbering:
+ *   0..31  : x0..x31 (zero, ra, sp, gp, tp, t0..t2, s0/fp, s1, a0..a7, s2..s11, t3..t6)
+ *   32..63 : f0..f31 (ft0..ft7, fs0..fs1, fa0..fa7, fs2..fs11, ft8..ft11)
+ */
+#define RV32_GP(n)   ((MPReg)(n))
+#define RV32_FP(n)   ((MPReg)(32u + (n)))
+#define RV32_ZERO    RV32_GP(0u)
+#define RV32_RA      RV32_GP(1u)
+#define RV32_SP      RV32_GP(2u)
+#define RV32_GP_REG  RV32_GP(3u)
+#define RV32_TP      RV32_GP(4u)
+#define RV32_T0      RV32_GP(5u)
+#define RV32_T1      RV32_GP(6u)
+#define RV32_T2      RV32_GP(7u)
+#define RV32_S0      RV32_GP(8u)   /* Frame pointer fp */
+#define RV32_S1      RV32_GP(9u)
+#define RV32_A0      RV32_GP(10u)
+#define RV32_A1      RV32_GP(11u)
+#define RV32_A2      RV32_GP(12u)
+#define RV32_A3      RV32_GP(13u)
+#define RV32_A4      RV32_GP(14u)
+#define RV32_A5      RV32_GP(15u)
+#define RV32_A6      RV32_GP(16u)
+#define RV32_A7      RV32_GP(17u)
+#define RV32_T3      RV32_GP(28u)
+#define RV32_T4      RV32_GP(29u)
+#define RV32_T5      RV32_GP(30u)
+#define RV32_T6      RV32_GP(31u)
+#define RV32_FA0     RV32_FP(10u)
+
+/* Dedicated RV32 scratch registers (never allocated by regalloc). */
+#define RV32_SCRATCH_GP0 RV32_T4
+#define RV32_SCRATCH_GP1 RV32_T5
+#define RV32_SCRATCH_GP2 RV32_T6
+#define RV32_SCRATCH_FP0 RV32_FP(29u) /* ft9 */
+#define RV32_SCRATCH_FP1 RV32_FP(30u) /* ft10 */
+#define RV32_SCRATCH_FP2 RV32_FP(31u) /* ft11 */
+
+static inline bool rv32_is_fp_preg(MPReg r) {
+    return r >= 32u && r < 64u;
+}
+
+static inline uint32_t rv32_reg_num(MPReg r) {
+    return (r >= 32u) ? (uint32_t)(r - 32u) : (uint32_t)r;
+}
+
 static inline uint32_t mreg_num(MPReg r) {
     return (r >= 32u) ? (uint32_t)(r - 32u) : (uint32_t)r;
 }
@@ -441,7 +487,84 @@ typedef enum {
     MI_X64_CALL_IND,
     MI_X64_SWITCH_TBL,
     MI_X64_RET,
-    MI_X64_UD2
+    MI_X64_UD2,
+
+    /* RISC-V 32-bit (RV32IMAFD) Data Movement, Memory & Addressing */
+    MI_RV32_LI,             /* li dst, imm32 */
+    MI_RV32_MV,             /* mv dst, src */
+    MI_RV32_SYM_ADDR,       /* lla/la dst, sym */
+    MI_RV32_TLS_ADDR,       /* TLS address materialization */
+    MI_RV32_LD,             /* lb/lbu/lh/lhu/lw dst, imm12(base) (width 1/2/4, is_signed) */
+    MI_RV32_ST,             /* sb/sh/sw src, imm12(base) (width 1/2/4) */
+    MI_RV32_FLD,            /* flw/fld dst_fp, imm12(base) (width 4/8) */
+    MI_RV32_FST,            /* fsw/fsd src_fp, imm12(base) (width 4/8) */
+    MI_RV32_MOV_SP,         /* aux_id=0: mv dst, sp; aux_id=1: mv sp, src */
+
+    /* RV32IM Integer ALU (3-address) */
+    MI_RV32_ADD,
+    MI_RV32_ADDI,
+    MI_RV32_SUB,
+    MI_RV32_MUL,
+    MI_RV32_MULH,
+    MI_RV32_MULHU,
+    MI_RV32_DIV,
+    MI_RV32_DIVU,
+    MI_RV32_REM,
+    MI_RV32_REMU,
+    MI_RV32_AND,
+    MI_RV32_ANDI,
+    MI_RV32_OR,
+    MI_RV32_ORI,
+    MI_RV32_XOR,
+    MI_RV32_XORI,
+    MI_RV32_SLL,
+    MI_RV32_SLLI,
+    MI_RV32_SRL,
+    MI_RV32_SRLI,
+    MI_RV32_SRA,
+    MI_RV32_SRAI,
+    MI_RV32_SLT,
+    MI_RV32_SLTI,
+    MI_RV32_SLTU,
+    MI_RV32_SLTIU,
+    MI_RV32_SEQZ,
+    MI_RV32_SNEZ,
+
+    /* RV32A Atomics & Fences */
+    MI_RV32_FENCE,
+    MI_RV32_ATOMIC_RMW,     /* dst_old, ptr, val (width=1/2/4, aux_id=rmw_op, aux_id2=order) */
+    MI_RV32_ATOMIC_CAS,     /* dst_old, dst_ok, ptr, exp, des (width=1/2/4, aux_id=succ, aux_id2=fail) */
+
+    /* RV32FD Floating-Point */
+    MI_RV32_FMV_RR,         /* fmv.s / fmv.d dst, src (width 4/8) */
+    MI_RV32_FMV_W_X,        /* fmv.w.x dst_fp, src_gp */
+    MI_RV32_FMV_X_W,        /* fmv.x.w dst_gp, src_fp */
+    MI_RV32_LOAD_IMM_F64,   /* dst_fp, imm64 (const pool / fcvt.d.w zero) */
+    MI_RV32_FADD,           /* fadd.s / fadd.d */
+    MI_RV32_FSUB,           /* fsub.s / fsub.d */
+    MI_RV32_FMUL,           /* fmul.s / fmul.d */
+    MI_RV32_FDIV,           /* fdiv.s / fdiv.d */
+    MI_RV32_FNEG,           /* fneg.s / fneg.d */
+    MI_RV32_FABS,           /* fabs.s / fabs.d */
+    MI_RV32_FSQRT,          /* fsqrt.s / fsqrt.d */
+    MI_RV32_FEQ,            /* feq.s / feq.d dst_gp, f1, f2 */
+    MI_RV32_FLT,            /* flt.s / flt.d dst_gp, f1, f2 */
+    MI_RV32_FLE,            /* fle.s / fle.d dst_gp, f1, f2 */
+    MI_RV32_FCVT_S_D,       /* fcvt.s.d dst_f32, src_f64 */
+    MI_RV32_FCVT_D_S,       /* fcvt.d.s dst_f64, src_f32 */
+    MI_RV32_FCVT_F_W,       /* fcvt.s.w / fcvt.d.w dst_fp, src_gp */
+    MI_RV32_FCVT_F_WU,      /* fcvt.s.wu / fcvt.d.wu dst_fp, src_gp */
+    MI_RV32_FCVT_W_F,       /* fcvt.w.s / fcvt.w.d dst_gp, src_fp, rtz */
+    MI_RV32_FCVT_WU_F,      /* fcvt.wu.s / fcvt.wu.d dst_gp, src_fp, rtz */
+
+    /* RV32 Control Flow */
+    MI_RV32_J,              /* j target_blk */
+    MI_RV32_BCC,            /* b<cond> rs1, rs2, target_blk */
+    MI_RV32_CALL,           /* call sym */
+    MI_RV32_CALL_IND,       /* jalr ra, 0(rs) */
+    MI_RV32_SWITCH_TBL,     /* PC-relative jump table dispatch */
+    MI_RV32_RET,            /* epilogue marker before frame pass */
+    MI_RV32_UNIMP           /* unimp (deterministic trap) */
 } MOpcode;
 
 /* =========================================================================

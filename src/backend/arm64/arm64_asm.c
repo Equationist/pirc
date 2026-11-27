@@ -919,6 +919,27 @@ static void emit_inst(A64AsmCtx *ctx, const MFunc *mf, const MInst *ins) {
         case MI_X64_CVTDQ2PS: case MI_X64_CVTTPS2DQ:
         case MI_X64_JMP: case MI_X64_JCC: case MI_X64_CALL: case MI_X64_CALL_IND:
         case MI_X64_SWITCH_TBL: case MI_X64_RET: case MI_X64_UD2:
+        case MI_RV32_LI: case MI_RV32_MV: case MI_RV32_SYM_ADDR: case MI_RV32_TLS_ADDR:
+        case MI_RV32_LD: case MI_RV32_ST: case MI_RV32_FLD: case MI_RV32_FST: case MI_RV32_MOV_SP:
+        case MI_RV32_ADD: case MI_RV32_ADDI: case MI_RV32_SUB:
+        case MI_RV32_MUL: case MI_RV32_MULH: case MI_RV32_MULHU:
+        case MI_RV32_DIV: case MI_RV32_DIVU: case MI_RV32_REM: case MI_RV32_REMU:
+        case MI_RV32_AND: case MI_RV32_ANDI: case MI_RV32_OR: case MI_RV32_ORI:
+        case MI_RV32_XOR: case MI_RV32_XORI:
+        case MI_RV32_SLL: case MI_RV32_SLLI: case MI_RV32_SRL: case MI_RV32_SRLI:
+        case MI_RV32_SRA: case MI_RV32_SRAI:
+        case MI_RV32_SLT: case MI_RV32_SLTI: case MI_RV32_SLTU: case MI_RV32_SLTIU:
+        case MI_RV32_SEQZ: case MI_RV32_SNEZ:
+        case MI_RV32_FENCE: case MI_RV32_ATOMIC_RMW: case MI_RV32_ATOMIC_CAS:
+        case MI_RV32_FMV_RR: case MI_RV32_FMV_W_X: case MI_RV32_FMV_X_W: case MI_RV32_LOAD_IMM_F64:
+        case MI_RV32_FADD: case MI_RV32_FSUB: case MI_RV32_FMUL: case MI_RV32_FDIV:
+        case MI_RV32_FNEG: case MI_RV32_FABS: case MI_RV32_FSQRT:
+        case MI_RV32_FEQ: case MI_RV32_FLT: case MI_RV32_FLE:
+        case MI_RV32_FCVT_S_D: case MI_RV32_FCVT_D_S:
+        case MI_RV32_FCVT_F_W: case MI_RV32_FCVT_F_WU:
+        case MI_RV32_FCVT_W_F: case MI_RV32_FCVT_WU_F:
+        case MI_RV32_J: case MI_RV32_BCC: case MI_RV32_CALL: case MI_RV32_CALL_IND:
+        case MI_RV32_SWITCH_TBL: case MI_RV32_RET: case MI_RV32_UNIMP:
             fprintf(stderr, "internal error: unexpected MIR op %u in arm64_asm\n", (unsigned)ins->op);
             abort();
     }
@@ -1058,7 +1079,8 @@ void pir_arm64_asm_emitter_init(PirCodeEmitter *em, FILE *out, const PirTargetSp
 
 bool pir_backend_emit_asm(const PirModule *mod, const PirTargetSpec *target,
                           FILE *out, PirDiag *diag) {
-    if ((target->arch != PIR_ARCH_ARM64 && target->arch != PIR_ARCH_X86_64) ||
+    if ((target->arch != PIR_ARCH_ARM64 && target->arch != PIR_ARCH_X86_64 &&
+         target->arch != PIR_ARCH_RV32) ||
         target->os == PIR_OS_WINDOWS) {
         pir_diag_error(diag, 0u, 0u,
                        "native assembly emission for target '%s' is not supported",
@@ -1069,6 +1091,8 @@ bool pir_backend_emit_asm(const PirModule *mod, const PirTargetSpec *target,
     PirCodeEmitter em;
     if (target->arch == PIR_ARCH_X86_64) {
         pir_x64_asm_emitter_init(&em, out, target);
+    } else if (target->arch == PIR_ARCH_RV32) {
+        pir_rv32_asm_emitter_init(&em, out, target);
     } else {
         pir_arm64_asm_emitter_init(&em, out, target);
     }
@@ -1090,6 +1114,16 @@ bool pir_backend_emit_asm(const PirModule *mod, const PirTargetSpec *target,
             if (ok) ok = pir_mir_verify_post_ra(&mf, diag);
 #endif
             if (ok) ok = pir_x64_frame_lower(&mf, diag);
+        } else if (target->arch == PIR_ARCH_RV32) {
+            ok = pir_rv32_isel_func(mod, fn, fi, target, &mf, diag);
+#ifdef PIR_VERIFY_ALL
+            if (ok) ok = pir_mir_verify_pre_ra(&mf, diag);
+#endif
+            if (ok) ok = pir_regalloc_run(&mf, diag);
+#ifdef PIR_VERIFY_ALL
+            if (ok) ok = pir_mir_verify_post_ra(&mf, diag);
+#endif
+            if (ok) ok = pir_rv32_frame_lower(&mf, diag);
         } else {
             ok = pir_arm64_isel_func(mod, fn, fi, target, &mf, diag);
 #ifdef PIR_VERIFY_ALL

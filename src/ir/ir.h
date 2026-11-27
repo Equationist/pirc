@@ -590,6 +590,7 @@ typedef enum {
     PIR_ARCH_UNKNOWN = 0,
     PIR_ARCH_X86_64,
     PIR_ARCH_ARM64,
+    PIR_ARCH_RV32,
     PIR_ARCH_CUSTOM
 } PirArch;
 
@@ -603,6 +604,7 @@ typedef enum {
 
 typedef struct {
     uint16_t max_simd_bits;   /* 0, 128, or 256 */
+    uint8_t  max_int_bits;    /* 32 or 64 (0 treated as 64) */
     bool     has_mul_wide;
     bool     has_add_carry;
     bool     has_ovf_ops;
