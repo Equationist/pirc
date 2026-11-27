@@ -69,6 +69,66 @@ package body Cg_Stmt.Decls is
       Emit_Label (Ctx.E, L_O);
    end Emit_Saved_Discrete_Subtype_Check;
 
+   -- Shared helper (LRM 3.6.1 & 4.1.4, c35003a/b, c36104a/b, c36105b, c41401a, P3-3.13):
+   -- Elaborate and verify index-constraint discrete ranges on object or type declarations
+   -- without re-evaluating dynamic bounds already saved in Saved_Type_Ranges.
+   procedure Emit_Index_Constraint_Elab_Checks
+     (Ctx              : in out Context;
+      IC_Host          : TREE;
+      Arr_TS           : TREE;
+      Eval_Plain_Range : Boolean)
+   is
+   begin
+      if Is_Void_Tree (IC_Host)
+        or else KIND (IC_Host) not in DN_CONSTRAINED_ARRAY_DEF | DN_SUBTYPE_INDICATION
+        or else Is_Void_Tree (D (AS_CONSTRAINT, IC_Host))
+        or else KIND (D (AS_CONSTRAINT, IC_Host)) /= DN_INDEX_CONSTRAINT
+        or else Is_Void_Tree (D (AS_DISCRETE_RANGE_S, D (AS_CONSTRAINT, IC_Host)))
+      then
+         return;
+      end if;
+      declare
+         DSL   : SEQ_TYPE := LIST (D (AS_DISCRETE_RANGE_S, D (AS_CONSTRAINT, IC_Host)));
+         Idx_L : SEQ_TYPE :=
+           (if not Is_Void_Tree (Arr_TS) and then KIND (Arr_TS) = DN_CONSTRAINED_ARRAY
+              and then not Is_Void_Tree (D (SM_INDEX_SUBTYPE_S, Arr_TS))
+            then LIST (D (SM_INDEX_SUBTYPE_S, Arr_TS)) else MAKE);
+         DSI, Idx_Sub : TREE;
+         PT_U, Lo_U, Hi_U : Unbounded_String;
+         pragma Warnings (Off, PT_U); pragma Warnings (Off, Lo_U); pragma Warnings (Off, Hi_U);
+      begin
+         while not IS_EMPTY (DSL) loop
+            POP (DSL, DSI);
+            if not IS_EMPTY (Idx_L) then
+               POP (Idx_L, Idx_Sub);
+            else
+               Idx_Sub := CONST_VOID;
+            end if;
+            declare
+               SR : Saved_Range_Info;
+               Has_SR : constant Boolean := Try_Lookup_Saved_Range (Ctx, Idx_Sub, SR);
+            begin
+               if Has_SR then
+                  if KIND (DSI) = DN_DISCRETE_SUBTYPE then
+                     declare
+                        Sub_I : constant TREE := D (AS_SUBTYPE_INDICATION, DSI);
+                        Con_I : constant TREE := (if not Is_Void_Tree (Sub_I) then D (AS_CONSTRAINT, Sub_I) else CONST_VOID);
+                        TM_I  : constant TREE := (if not Is_Void_Tree (Sub_I) then Get_Name_Defn (D (AS_NAME, Sub_I)) else CONST_VOID);
+                     begin
+                        if not Is_Void_Tree (Con_I) and then not Is_Void_Tree (TM_I) and then KIND (TM_I) in CLASS_TYPE_NAME then
+                           Emit_Saved_Discrete_Subtype_Check
+                             (Ctx, SR, Idx_Sub, Subst_Tree (Ctx, D (SM_TYPE_SPEC, TM_I)));
+                        end if;
+                     end;
+                  end if;
+               elsif Eval_Plain_Range or else KIND (DSI) in DN_DISCRETE_SUBTYPE | DN_RANGE_ATTRIBUTE then
+                  Emit_Discrete_Range (Ctx, DSI, PT_U, Lo_U, Hi_U);
+               end if;
+            end;
+         end loop;
+      end;
+   end Emit_Index_Constraint_Elab_Checks;
+
    -- =========================================================================
    -- Variable / Constant / Object Declarations
    -- =========================================================================
@@ -179,54 +239,7 @@ package body Cg_Stmt.Decls is
                      end;
                      -- LRM 3.6.1 & 4.1.4 (c35003a/b, c36104a/b, c36105b, c41401a, P3-3.13):
                      -- Check discrete subtype mark compatibility without re-evaluating dynamic index bounds!
-                     if KIND (TD_N) in DN_CONSTRAINED_ARRAY_DEF | DN_SUBTYPE_INDICATION
-                       and then not Is_Void_Tree (D (AS_CONSTRAINT, TD_N))
-                       and then KIND (D (AS_CONSTRAINT, TD_N)) = DN_INDEX_CONSTRAINT
-                       and then not Is_Void_Tree (D (AS_DISCRETE_RANGE_S, D (AS_CONSTRAINT, TD_N)))
-                     then
-                        declare
-                           DRL : SEQ_TYPE := LIST (D (AS_DISCRETE_RANGE_S, D (AS_CONSTRAINT, TD_N)));
-                           DRI : TREE;
-                           RTI_IC : constant Type_Info := (if KIND (RT_O) = DN_CONSTRAINED_ARRAY then Get_Type_Info (Ctx, RT_O) else (others => <>));
-                           Dim_IC : Natural := 0;
-                           PT_U, Lo_U, Hi_U : Unbounded_String;
-                           pragma Warnings (Off, PT_U); pragma Warnings (Off, Lo_U); pragma Warnings (Off, Hi_U);
-                        begin
-                           while not IS_EMPTY (DRL) loop
-                              POP (DRL, DRI);
-                              Dim_IC := Dim_IC + 1;
-                              if KIND (DRI) = DN_DISCRETE_SUBTYPE then
-                                 declare
-                                    Sub_I : constant TREE := D (AS_SUBTYPE_INDICATION, DRI);
-                                    Con_I : constant TREE := (if not Is_Void_Tree (Sub_I) then D (AS_CONSTRAINT, Sub_I) else CONST_VOID);
-                                    TM_I  : constant TREE := (if not Is_Void_Tree (Sub_I) then Get_Name_Defn (D (AS_NAME, Sub_I)) else CONST_VOID);
-                                    Idx_T : constant TREE :=
-                                      (if Dim_IC <= RTI_IC.NDims then Resolve_Type_Spec (Subst_Tree (Ctx, RTI_IC.Dims (Dim_IC).Idx_Type)) else CONST_VOID);
-                                 begin
-                                    if not Is_Void_Tree (Con_I) and then not Is_Void_Tree (TM_I) and then KIND (TM_I) in CLASS_TYPE_NAME
-                                      and then not Is_Void_Tree (Idx_T) and then Ctx.Saved_Type_Ranges.Contains (Tree_Key (Idx_T))
-                                    then
-                                       -- Reuse already-saved bounds from Emit_Type_Elab_Checks to avoid double evaluation!
-                                       Emit_Saved_Discrete_Subtype_Check
-                                         (Ctx, Ctx.Saved_Type_Ranges.Element (Tree_Key (Idx_T)), Idx_T,
-                                          Subst_Tree (Ctx, D (SM_TYPE_SPEC, TM_I)));
-                                    else
-                                       Emit_Discrete_Range (Ctx, DRI, PT_U, Lo_U, Hi_U);
-                                    end if;
-                                 end;
-                              elsif KIND (DRI) = DN_RANGE_ATTRIBUTE then
-                                 declare
-                                    Idx_T : constant TREE :=
-                                      (if Dim_IC <= RTI_IC.NDims then Resolve_Type_Spec (Subst_Tree (Ctx, RTI_IC.Dims (Dim_IC).Idx_Type)) else CONST_VOID);
-                                 begin
-                                    if Is_Void_Tree (Idx_T) or else not Ctx.Saved_Type_Ranges.Contains (Tree_Key (Idx_T)) then
-                                       Emit_Discrete_Range (Ctx, DRI, PT_U, Lo_U, Hi_U);
-                                    end if;
-                                 end;
-                              end if;
-                           end loop;
-                        end;
-                     end if;
+                     Emit_Index_Constraint_Elab_Checks (Ctx, TD_N, RT_O, Eval_Plain_Range => False);
                   end if;
                end;
             end if;
@@ -589,17 +602,20 @@ package body Cg_Stmt.Decls is
                               F32, L32   : Unbounded_String;
                               Uns_I      : Boolean;
                            begin
-                              if not Is_Void_Tree (DR_N) and then KIND (DR_N) = DN_RANGE_ATTRIBUTE
-                                and then not Ctx.Saved_Type_Ranges.Contains (Tree_Key (Idx_T))
-                                and then not Ctx.Saved_Type_Ranges.Contains (Tree_Key (Resolve_Type_Spec (Subst_Tree (Ctx, Idx_T))))
-                              then
-                                 Emit_Discrete_Range (Ctx, DR_N, RT, RL, RH);
-                                 Uns_I := Is_Unsigned_Scalar (Idx_T, To_String (RT));
-                                 F32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RL), To_String (RT), "i64", Is_Unsigned => Uns_I));
-                                 L32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RH), To_String (RT), "i64", Is_Unsigned => Uns_I));
-                              else
-                                 Emit_Index_Bounds (Ctx, Idx_T, F32, L32);
-                              end if;
+                              declare
+                                 Dummy_SR : Saved_Range_Info;
+                              begin
+                                 if not Is_Void_Tree (DR_N) and then KIND (DR_N) = DN_RANGE_ATTRIBUTE
+                                   and then not Try_Lookup_Saved_Range (Ctx, Idx_T, Dummy_SR)
+                                 then
+                                    Emit_Discrete_Range (Ctx, DR_N, RT, RL, RH);
+                                    Uns_I := Is_Unsigned_Scalar (Idx_T, To_String (RT));
+                                    F32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RL), To_String (RT), "i64", Is_Unsigned => Uns_I));
+                                    L32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RH), To_String (RT), "i64", Is_Unsigned => Uns_I));
+                                 else
+                                    Emit_Index_Bounds (Ctx, Idx_T, F32, L32);
+                                 end if;
+                              end;
                               VInfo.First_Regs (Dim) := F32;
                               VInfo.Last_Regs (Dim)  := L32;
                            end;
@@ -807,17 +823,20 @@ package body Cg_Stmt.Decls is
                         F32, L32   : Unbounded_String;
                         Uns_I      : Boolean;
                      begin
-                        if not Is_Void_Tree (DR_N) and then KIND (DR_N) = DN_RANGE_ATTRIBUTE
-                          and then not Ctx.Saved_Type_Ranges.Contains (Tree_Key (Idx_T))
-                          and then not Ctx.Saved_Type_Ranges.Contains (Tree_Key (Resolve_Type_Spec (Subst_Tree (Ctx, Idx_T))))
-                        then
-                           Emit_Discrete_Range (Ctx, DR_N, RT, RL, RH);
-                           Uns_I := Is_Unsigned_Scalar (Idx_T, To_String (RT));
-                           F32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RL), To_String (RT), "i64", Is_Unsigned => Uns_I));
-                           L32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RH), To_String (RT), "i64", Is_Unsigned => Uns_I));
-                        else
-                           Emit_Index_Bounds (Ctx, Idx_T, F32, L32);
-                        end if;
+                        declare
+                           Dummy_SR : Saved_Range_Info;
+                        begin
+                           if not Is_Void_Tree (DR_N) and then KIND (DR_N) = DN_RANGE_ATTRIBUTE
+                             and then not Try_Lookup_Saved_Range (Ctx, Idx_T, Dummy_SR)
+                           then
+                              Emit_Discrete_Range (Ctx, DR_N, RT, RL, RH);
+                              Uns_I := Is_Unsigned_Scalar (Idx_T, To_String (RT));
+                              F32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RL), To_String (RT), "i64", Is_Unsigned => Uns_I));
+                              L32 := To_Unbounded_String (Emit_Int_Convert (Ctx, To_String (RH), To_String (RT), "i64", Is_Unsigned => Uns_I));
+                           else
+                              Emit_Index_Bounds (Ctx, Idx_T, F32, L32);
+                           end if;
+                        end;
                         VInfo.First_Regs (Dim) := F32;
                         VInfo.Last_Regs (Dim)  := L32;
                      end;
@@ -1531,61 +1550,9 @@ package body Cg_Stmt.Decls is
                               elsif not Is_Void_Tree (SI_D) and then KIND (SI_D) = DN_SUBTYPE_INDICATION then
                                  IC_Host := SI_D;
                               end if;
-                              if not Is_Void_Tree (IC_Host)
-                                and then not Is_Void_Tree (D (AS_CONSTRAINT, IC_Host))
-                                and then KIND (D (AS_CONSTRAINT, IC_Host)) = DN_INDEX_CONSTRAINT
-                                and then not Is_Void_Tree (D (AS_DISCRETE_RANGE_S, D (AS_CONSTRAINT, IC_Host)))
-                              then
-                                 declare
-                                    DSL   : SEQ_TYPE := LIST (D (AS_DISCRETE_RANGE_S, D (AS_CONSTRAINT, IC_Host)));
-                                    Idx_L : SEQ_TYPE :=
-                                      (if not Is_Void_Tree (TS) and then KIND (TS) = DN_CONSTRAINED_ARRAY
-                                         and then not Is_Void_Tree (D (SM_INDEX_SUBTYPE_S, TS))
-                                       then LIST (D (SM_INDEX_SUBTYPE_S, TS)) else MAKE);
-                                    DSI, Idx_Sub : TREE;
-                                    PT_U, Lo_U, Hi_U : Unbounded_String;
-                                    pragma Warnings (Off, PT_U); pragma Warnings (Off, Lo_U); pragma Warnings (Off, Hi_U);
-                                 begin
-                                    while not IS_EMPTY (DSL) loop
-                                       POP (DSL, DSI);
-                                       if not IS_EMPTY (Idx_L) then
-                                          POP (Idx_L, Idx_Sub);
-                                       else
-                                          Idx_Sub := CONST_VOID;
-                                       end if;
-                                       declare
-                                          Already_Saved : constant Boolean :=
-                                            not Is_Void_Tree (Idx_Sub)
-                                            and then (Ctx.Saved_Type_Ranges.Contains (Tree_Key (Idx_Sub))
-                                                      or else Ctx.Saved_Type_Ranges.Contains (Tree_Key (Resolve_Type_Spec (Subst_Tree (Ctx, Idx_Sub)))));
-                                       begin
-                                          if Already_Saved then
-                                             -- Still verify discrete subtype mark compatibility (LRM 3.6.1, c35003b) without re-evaluating dynamic bounds!
-                                             if KIND (DSI) = DN_DISCRETE_SUBTYPE then
-                                                declare
-                                                   Sub_I : constant TREE := D (AS_SUBTYPE_INDICATION, DSI);
-                                                   Con_I : constant TREE := (if not Is_Void_Tree (Sub_I) then D (AS_CONSTRAINT, Sub_I) else CONST_VOID);
-                                                   TM_I  : constant TREE := (if not Is_Void_Tree (Sub_I) then Get_Name_Defn (D (AS_NAME, Sub_I)) else CONST_VOID);
-                                                   Idx_K : constant Unsigned_32 :=
-                                                     (if Ctx.Saved_Type_Ranges.Contains (Tree_Key (Idx_Sub))
-                                                      then Tree_Key (Idx_Sub)
-                                                      else Tree_Key (Resolve_Type_Spec (Subst_Tree (Ctx, Idx_Sub))));
-                                                begin
-                                                   if not Is_Void_Tree (Con_I) and then not Is_Void_Tree (TM_I) and then KIND (TM_I) in CLASS_TYPE_NAME then
-                                                      Emit_Saved_Discrete_Subtype_Check
-                                                        (Ctx, Ctx.Saved_Type_Ranges.Element (Idx_K), Idx_Sub,
-                                                         Subst_Tree (Ctx, D (SM_TYPE_SPEC, TM_I)));
-                                                   end if;
-                                                end;
-                                             end if;
-                                          elsif KIND (IC_Host) = DN_CONSTRAINED_ARRAY_DEF
-                                            or else KIND (DSI) in DN_DISCRETE_SUBTYPE | DN_RANGE_ATTRIBUTE
-                                          then
-                                             Emit_Discrete_Range (Ctx, DSI, PT_U, Lo_U, Hi_U);
-                                          end if;
-                                       end;
-                                    end loop;
-                                 end;
+                              if not Is_Void_Tree (IC_Host) then
+                                 Emit_Index_Constraint_Elab_Checks
+                                   (Ctx, IC_Host, TS, Eval_Plain_Range => (KIND (IC_Host) = DN_CONSTRAINED_ARRAY_DEF));
                               end if;
                            end;
                         end if;

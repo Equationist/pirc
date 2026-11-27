@@ -366,6 +366,13 @@ package Cg_Expr is
       Low_Reg  : out Unbounded_String;
       High_Reg : out Unbounded_String);
 
+   -- Look up pre-evaluated dynamic subtype bounds in Saved_Type_Ranges (checking both raw T
+   -- and Subst_Resolve_Type (Ctx, T) and verifying scope ownership).
+   function Try_Lookup_Saved_Range
+     (Ctx : Context;
+      T   : TREE;
+      SR  : out Saved_Range_Info) return Boolean;
+
 private
 
    -- Internal helpers shared with Cg_Expr child packages

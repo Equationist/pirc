@@ -1798,14 +1798,44 @@ package body Cg_State is
          return Info;
 
       elsif Is_Scalar_Type (R) then
-         Info.Kind := TK_Scalar;
-         Info.Pir_Type := To_Unbounded_String (Pir_Scalar_Type (R));
          declare
-            Bits : constant Natural := Scalar_Bits (R);
+            Eff_R : TREE := R;
+            Bits  : Natural;
          begin
-            Info.Byte_Size := Bits / 8;
-            if Info.Byte_Size = 0 then Info.Byte_Size := 1; end if;
-            Info.Align := Info.Byte_Size;
+            -- If R is an anonymous scalar subtype inside a generic whose SM_BASE_TYPE
+            -- is a generic formal (e.g. a for-loop subtype over GPARM), resolve its
+            -- PIR width through the instantiated base type when R lacks explicit size/bounds.
+            if not Ctx.Generic_Subst.Is_Empty
+              and then KIND (R) in DN_INTEGER | DN_FLOAT | DN_FIXED | DN_ENUMERATION
+            then
+               declare
+                  SB : constant TREE := Subst_Base_Type (Ctx, R);
+                  St : Boolean := False;
+                  Lo, Hi : Integer_64 := 0;
+               begin
+                  if not Is_Void_Tree (SB) and then SB /= R
+                    and then (not Has_Static_Val (D (CD_IMPL_SIZE, R)) or else Eval_Int64 (D (CD_IMPL_SIZE, R)) <= 0)
+                  then
+                     if KIND (R) in DN_INTEGER | DN_ENUMERATION then
+                        Get_Discrete_Bounds (R, St, Lo, Hi);
+                        if not St then
+                           Eff_R := SB;
+                        end if;
+                     elsif KIND (R) = DN_FLOAT then
+                        if not Has_Static_Val (D (SM_ACCURACY, R)) then
+                           Eff_R := SB;
+                        end if;
+                     elsif KIND (R) = DN_FIXED then
+                        Eff_R := SB;
+                     end if;
+                  end if;
+               end;
+            end if;
+            Info.Kind      := TK_Scalar;
+            Info.Pir_Type  := To_Unbounded_String (Pir_Scalar_Type (Eff_R));
+            Bits           := Scalar_Bits (Eff_R);
+            Info.Byte_Size := Natural'Max (1, Bits / 8);
+            Info.Align     := Info.Byte_Size;
          end;
          if Ctx.Generic_Subst.Is_Empty then Ctx.Types.Include (Key, Info); end if;
          return Info;

@@ -264,25 +264,23 @@ package body Cg_Expr.Attr is
                               RTS : constant TREE := Subst_Resolve_Type (Ctx, TS);
                               Rng : constant TREE := D (SM_RANGE, RTS);
                            begin
-                              if not Is_Void_Tree (RTS) and then Ctx.Saved_Type_Ranges.Contains (Tree_Key (RTS)) then
-                                 declare
-                                    SR : constant Saved_Range_Info := Ctx.Saved_Type_Ranges.Element (Tree_Key (RTS));
-                                 begin
-                                    if SR.Is_Global or else SR.Owner_Subp = Ctx.Cur_Subp_Key then
-                                       declare
-                                          SlotP : constant String := (if AName = "FIRST" then To_String (SR.Lo_Ptr) else To_String (SR.Hi_Ptr));
-                                          RV0   : constant String := Load_Saved_Slot (Ctx, SlotP, To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
-                                       begin
-                                          Res.Kind := EK_Scalar;
-                                          Res.Reg  := To_Unbounded_String
-                                            (Emit_Scalar_Coerce (Ctx, RV0, To_String (SR.Pir_Type), PT_Str,
-                                               Is_Unsigned => Is_Unsigned_Scalar (TS, To_String (SR.Pir_Type))));
-                                          Res.Pir_Type := To_Unbounded_String (PT_Str); Res.Ada_Type := ET; Res.Align := TI.Align;
-                                          return Res;
-                                       end;
-                                    end if;
-                                 end;
-                              end if;
+                              declare
+                                 SR : Saved_Range_Info;
+                              begin
+                                 if Try_Lookup_Saved_Range (Ctx, RTS, SR) then
+                                    declare
+                                       SlotP : constant String := (if AName = "FIRST" then To_String (SR.Lo_Ptr) else To_String (SR.Hi_Ptr));
+                                       RV0   : constant String := Load_Saved_Slot (Ctx, SlotP, To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
+                                    begin
+                                       Res.Kind := EK_Scalar;
+                                       Res.Reg  := To_Unbounded_String
+                                         (Emit_Scalar_Coerce (Ctx, RV0, To_String (SR.Pir_Type), PT_Str,
+                                            Is_Unsigned => Is_Unsigned_Scalar (TS, To_String (SR.Pir_Type))));
+                                       Res.Pir_Type := To_Unbounded_String (PT_Str); Res.Ada_Type := ET; Res.Align := TI.Align;
+                                       return Res;
+                                    end;
+                                 end if;
+                              end;
                               if not Is_Void_Tree (Rng) and then KIND (Rng) = DN_RANGE then
                                  declare
                                     E_Bound : constant TREE := (if AName = "FIRST" then D (AS_EXP1, Rng) else D (AS_EXP2, Rng));
@@ -330,21 +328,21 @@ package body Cg_Expr.Attr is
                            R   : constant String := Next_Reg (Ctx.E, "rfb");
                         begin
                            -- P3-2.11: load saved dynamic real subtype bounds without re-evaluating side effects!
-                           if Ctx.Saved_Type_Ranges.Contains (Tree_Key (RTS))
-                             and then (Ctx.Saved_Type_Ranges.Element (Tree_Key (RTS)).Is_Global
-                                       or else Ctx.Saved_Type_Ranges.Element (Tree_Key (RTS)).Owner_Subp = Ctx.Cur_Subp_Key)
-                           then
-                              declare
-                                 SR : constant Saved_Range_Info := Ctx.Saved_Type_Ranges.Element (Tree_Key (RTS));
-                                 Ptr_S : constant String := To_String (if AName = "FIRST" then SR.Lo_Ptr else SR.Hi_Ptr);
-                                 SV_R  : constant String := Load_Saved_Slot (Ctx, Ptr_S, To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
-                              begin
-                                 Res.Kind := EK_Scalar;
-                                 Res.Reg  := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, SV_R, To_String (SR.Pir_Type), PT_Str));
-                                 Res.Pir_Type := To_Unbounded_String (PT_Str); Res.Ada_Type := ET; Res.Align := TI.Align;
-                                 return Res;
-                              end;
-                           end if;
+                           declare
+                              SR : Saved_Range_Info;
+                           begin
+                              if Try_Lookup_Saved_Range (Ctx, RTS, SR) then
+                                 declare
+                                    Ptr_S : constant String := To_String (if AName = "FIRST" then SR.Lo_Ptr else SR.Hi_Ptr);
+                                    SV_R  : constant String := Load_Saved_Slot (Ctx, Ptr_S, To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
+                                 begin
+                                    Res.Kind := EK_Scalar;
+                                    Res.Reg  := To_Unbounded_String (Emit_Scalar_Coerce (Ctx, SV_R, To_String (SR.Pir_Type), PT_Str));
+                                    Res.Pir_Type := To_Unbounded_String (PT_Str); Res.Ada_Type := ET; Res.Align := TI.Align;
+                                    return Res;
+                                 end;
+                              end if;
+                           end;
                            if not Is_Void_Tree (Rng) and then KIND (Rng) = DN_RANGE then
                               declare
                                  E_B : constant TREE := (if AName = "FIRST" then D (AS_EXP1, Rng) else D (AS_EXP2, Rng));
@@ -999,19 +997,16 @@ package body Cg_Expr.Attr is
                   declare
                      Has_Dyn_W : Boolean := False;
                      Lo64, Hi64 : Unbounded_String;
+                     SR_W : Saved_Range_Info;
                   begin
-                     if Ctx.Saved_Type_Ranges.Contains (Tree_Key (TS))
-                       and then (Ctx.Saved_Type_Ranges.Element (Tree_Key (TS)).Is_Global
-                                 or else Ctx.Saved_Type_Ranges.Element (Tree_Key (TS)).Owner_Subp = Ctx.Cur_Subp_Key)
-                     then
+                     if Try_Lookup_Saved_Range (Ctx, TS, SR_W) then
                         declare
-                           SR  : constant Saved_Range_Info := Ctx.Saved_Type_Ranges.Element (Tree_Key (TS));
-                           LR0 : constant String := Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
-                           HR0 : constant String := Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
-                           SU  : constant Boolean := Is_Unsigned_Scalar (TS, To_String (SR.Pir_Type));
+                           LR0 : constant String := Load_Saved_Slot (Ctx, To_String (SR_W.Lo_Ptr), To_String (SR_W.Pir_Type), SR_W.Align, SR_W.Is_Global);
+                           HR0 : constant String := Load_Saved_Slot (Ctx, To_String (SR_W.Hi_Ptr), To_String (SR_W.Pir_Type), SR_W.Align, SR_W.Is_Global);
+                           SU  : constant Boolean := Is_Unsigned_Scalar (TS, To_String (SR_W.Pir_Type));
                         begin
-                           Lo64 := To_Unbounded_String (Emit_Int_Convert (Ctx, LR0, To_String (SR.Pir_Type), "i64", Is_Unsigned => SU));
-                           Hi64 := To_Unbounded_String (Emit_Int_Convert (Ctx, HR0, To_String (SR.Pir_Type), "i64", Is_Unsigned => SU));
+                           Lo64 := To_Unbounded_String (Emit_Int_Convert (Ctx, LR0, To_String (SR_W.Pir_Type), "i64", Is_Unsigned => SU));
+                           Hi64 := To_Unbounded_String (Emit_Int_Convert (Ctx, HR0, To_String (SR_W.Pir_Type), "i64", Is_Unsigned => SU));
                            Has_Dyn_W := True;
                         end;
                      elsif not Is_Void_Tree (D (SM_RANGE, TS))
@@ -1124,18 +1119,15 @@ package body Cg_Expr.Attr is
                      BSR  : constant String := Next_Reg (Ctx.E, "fbs");
                      SSR  : constant String := Next_Reg (Ctx.E, "fss");
                      RV   : Unbounded_String;
+                     SR_M : Saved_Range_Info;
                   begin
-                     if Ctx.Saved_Type_Ranges.Contains (Tree_Key (TS))
-                       and then (Ctx.Saved_Type_Ranges.Element (Tree_Key (TS)).Is_Global
-                                 or else Ctx.Saved_Type_Ranges.Element (Tree_Key (TS)).Owner_Subp = Ctx.Cur_Subp_Key)
-                     then
+                     if Try_Lookup_Saved_Range (Ctx, TS, SR_M) then
                         declare
-                           SR : constant Saved_Range_Info := Ctx.Saved_Type_Ranges.Element (Tree_Key (TS));
-                           L0 : constant String := Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
-                           H0 : constant String := Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
+                           L0 : constant String := Load_Saved_Slot (Ctx, To_String (SR_M.Lo_Ptr), To_String (SR_M.Pir_Type), SR_M.Align, SR_M.Is_Global);
+                           H0 : constant String := Load_Saved_Slot (Ctx, To_String (SR_M.Hi_Ptr), To_String (SR_M.Pir_Type), SR_M.Align, SR_M.Is_Global);
                         begin
-                           Lo64 := To_Unbounded_String (Emit_Int_Convert (Ctx, L0, To_String (SR.Pir_Type), "i64"));
-                           Hi64 := To_Unbounded_String (Emit_Int_Convert (Ctx, H0, To_String (SR.Pir_Type), "i64"));
+                           Lo64 := To_Unbounded_String (Emit_Int_Convert (Ctx, L0, To_String (SR_M.Pir_Type), "i64"));
+                           Hi64 := To_Unbounded_String (Emit_Int_Convert (Ctx, H0, To_String (SR_M.Pir_Type), "i64"));
                         end;
                      elsif not Is_Void_Tree (Rng) and then KIND (Rng) = DN_RANGE then
                         Lo64 := To_Unbounded_String (Emit_Fixed_Bound_I64 (D (AS_EXP1, Rng), BT));
@@ -1226,18 +1218,15 @@ package body Cg_Expr.Attr is
                         BSR   : constant String := Next_Reg (Ctx.E, "flbs");
                         SSR   : constant String := Next_Reg (Ctx.E, "flss");
                         Ticks : Unbounded_String;
+                        SR_L  : Saved_Range_Info;
                      begin
-                        if Ctx.Saved_Type_Ranges.Contains (Tree_Key (Use_T))
-                          and then (Ctx.Saved_Type_Ranges.Element (Tree_Key (Use_T)).Is_Global
-                                    or else Ctx.Saved_Type_Ranges.Element (Tree_Key (Use_T)).Owner_Subp = Ctx.Cur_Subp_Key)
-                        then
+                        if Try_Lookup_Saved_Range (Ctx, Use_T, SR_L) then
                            declare
-                              SR : constant Saved_Range_Info := Ctx.Saved_Type_Ranges.Element (Tree_Key (Use_T));
-                              L0 : constant String := Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
-                              H0 : constant String := Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
+                              L0 : constant String := Load_Saved_Slot (Ctx, To_String (SR_L.Lo_Ptr), To_String (SR_L.Pir_Type), SR_L.Align, SR_L.Is_Global);
+                              H0 : constant String := Load_Saved_Slot (Ctx, To_String (SR_L.Hi_Ptr), To_String (SR_L.Pir_Type), SR_L.Align, SR_L.Is_Global);
                            begin
-                              Lo64 := To_Unbounded_String (Emit_Int_Convert (Ctx, L0, To_String (SR.Pir_Type), "i64"));
-                              Hi64 := To_Unbounded_String (Emit_Int_Convert (Ctx, H0, To_String (SR.Pir_Type), "i64"));
+                              Lo64 := To_Unbounded_String (Emit_Int_Convert (Ctx, L0, To_String (SR_L.Pir_Type), "i64"));
+                              Hi64 := To_Unbounded_String (Emit_Int_Convert (Ctx, H0, To_String (SR_L.Pir_Type), "i64"));
                            end;
                         elsif not Is_Void_Tree (Rng) and then KIND (Rng) = DN_RANGE then
                            Lo64 := To_Unbounded_String (Emit_Fixed_Bound_I64 (D (AS_EXP1, Rng), BT));
@@ -1710,19 +1699,16 @@ package body Cg_Expr.Attr is
                      Sm_N, Sm_D : Integer_64;
                      Lo64, Hi64 : Unbounded_String;
                      RV    : Unbounded_String;
+                     SR_F  : Saved_Range_Info;
                   begin
                      Fixed_Small_Rational (BT, Sm_Ok, Sm_N, Sm_D);
-                     if Ctx.Saved_Type_Ranges.Contains (Tree_Key (TS))
-                       and then (Ctx.Saved_Type_Ranges.Element (Tree_Key (TS)).Is_Global
-                                 or else Ctx.Saved_Type_Ranges.Element (Tree_Key (TS)).Owner_Subp = Ctx.Cur_Subp_Key)
-                     then
+                     if Try_Lookup_Saved_Range (Ctx, TS, SR_F) then
                         declare
-                           SR : constant Saved_Range_Info := Ctx.Saved_Type_Ranges.Element (Tree_Key (TS));
-                           L0 : constant String := Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
-                           H0 : constant String := Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
+                           L0 : constant String := Load_Saved_Slot (Ctx, To_String (SR_F.Lo_Ptr), To_String (SR_F.Pir_Type), SR_F.Align, SR_F.Is_Global);
+                           H0 : constant String := Load_Saved_Slot (Ctx, To_String (SR_F.Hi_Ptr), To_String (SR_F.Pir_Type), SR_F.Align, SR_F.Is_Global);
                         begin
-                           Lo64 := To_Unbounded_String (Emit_Int_Convert (Ctx, L0, To_String (SR.Pir_Type), "i64"));
-                           Hi64 := To_Unbounded_String (Emit_Int_Convert (Ctx, H0, To_String (SR.Pir_Type), "i64"));
+                           Lo64 := To_Unbounded_String (Emit_Int_Convert (Ctx, L0, To_String (SR_F.Pir_Type), "i64"));
+                           Hi64 := To_Unbounded_String (Emit_Int_Convert (Ctx, H0, To_String (SR_F.Pir_Type), "i64"));
                         end;
                      elsif not Is_Void_Tree (Rng) and then KIND (Rng) = DN_RANGE then
                         Lo64 := To_Unbounded_String (Emit_Fixed_Bound_I64 (D (AS_EXP1, Rng), BT));

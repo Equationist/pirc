@@ -304,6 +304,42 @@ package body Cg_Expr is
       end if;
    end Save_Scalar_Slot;
 
+   function Try_Lookup_Saved_Range
+     (Ctx : Context;
+      T   : TREE;
+      SR  : out Saved_Range_Info) return Boolean
+   is
+      function Check_Key (K : Unsigned_32) return Boolean is
+      begin
+         if Ctx.Saved_Type_Ranges.Contains (K) then
+            declare
+               Cand : constant Saved_Range_Info := Ctx.Saved_Type_Ranges.Element (K);
+            begin
+               if Cand.Is_Global or else Cand.Owner_Subp = Ctx.Cur_Subp_Key then
+                  SR := Cand;
+                  return True;
+               end if;
+            end;
+         end if;
+         return False;
+      end Check_Key;
+   begin
+      if Is_Void_Tree (T) then
+         return False;
+      end if;
+      if Check_Key (Tree_Key (T)) then
+         return True;
+      end if;
+      declare
+         RT : constant TREE := Subst_Resolve_Type (Ctx, T);
+      begin
+         if not Is_Void_Tree (RT) and then RT /= T then
+            return Check_Key (Tree_Key (RT));
+         end if;
+      end;
+      return False;
+   end Try_Lookup_Saved_Range;
+
    procedure Emit_Range_Check
      (Ctx        : in out Context;
       Val_Reg    : String;
@@ -318,51 +354,49 @@ package body Cg_Expr is
          return;
       end if;
       -- Reuse pre-evaluated dynamic scalar bounds saved at subtype/object elaboration (c32001a, c32107a)
-      if Ctx.Saved_Type_Ranges.Contains (Tree_Key (R)) then
-         declare
-            SR : constant Saved_Range_Info := Ctx.Saved_Type_Ranges.Element (Tree_Key (R));
-         begin
-            if SR.Is_Global or else SR.Owner_Subp = Ctx.Cur_Subp_Key then
-               declare
-                  LR0 : constant String := Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
-                  HR0 : constant String := Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
-                  SR_U : constant Boolean := Is_Unsigned_Scalar (R, To_String (SR.Pir_Type));
-                  C1  : constant String := Next_Reg (Ctx.E, "srlo");
-                  C2  : constant String := Next_Reg (Ctx.E, "srhi");
-                  Bad : constant String := Next_Reg (Ctx.E, "srbad");
-               begin
-                  if Val_Pir_Ty = "f32" or else Val_Pir_Ty = "f64" then
-                     declare
-                        L_R : constant String := Emit_Scalar_Coerce (Ctx, LR0, To_String (SR.Pir_Type), Val_Pir_Ty);
-                        H_R : constant String := Emit_Scalar_Coerce (Ctx, HR0, To_String (SR.Pir_Type), Val_Pir_Ty);
-                        InR : constant String := Next_Reg (Ctx.E, "srin");
-                     begin
-                        Emit_Inst (Ctx.E, C1 & " = fcmp_oge." & Val_Pir_Ty & " " & Val_Reg & ", " & L_R);
-                        Emit_Inst (Ctx.E, C2 & " = fcmp_ole." & Val_Pir_Ty & " " & Val_Reg & ", " & H_R);
-                        Emit_Inst (Ctx.E, InR & " = and.i8 " & C1 & ", " & C2);
-                        Emit_Inst (Ctx.E, Bad & " = xor.i8 " & InR & ", 1");
-                     end;
-                  else
-                     -- Compare discrete saved bounds in canonical signed i64 so wider bounds never truncate
-                     declare
-                        V64 : constant String := Emit_Int_Convert (Ctx, Val_Reg, Val_Pir_Ty, "i64",
-                                                 Is_Unsigned => Is_Unsigned_Scalar (R, Val_Pir_Ty));
-                        L64 : constant String := Emit_Int_Convert (Ctx, LR0, To_String (SR.Pir_Type), "i64",
-                                                 Is_Unsigned => SR_U);
-                        H64 : constant String := Emit_Int_Convert (Ctx, HR0, To_String (SR.Pir_Type), "i64",
-                                                 Is_Unsigned => SR_U);
-                     begin
-                        Emit_Inst (Ctx.E, C1 & " = cmp_lt_s.i64 " & V64 & ", " & L64);
-                        Emit_Inst (Ctx.E, C2 & " = cmp_gt_s.i64 " & V64 & ", " & H64);
-                        Emit_Inst (Ctx.E, Bad & " = or.i8 " & C1 & ", " & C2);
-                     end;
-                  end if;
-                  Emit_Check_Fail_If (Ctx, Bad);
-                  return;
-               end;
-            end if;
-         end;
-      end if;
+      declare
+         SR : Saved_Range_Info;
+      begin
+         if Try_Lookup_Saved_Range (Ctx, R, SR) then
+            declare
+               LR0 : constant String := Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
+               HR0 : constant String := Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
+               SR_U : constant Boolean := Is_Unsigned_Scalar (R, To_String (SR.Pir_Type));
+               C1  : constant String := Next_Reg (Ctx.E, "srlo");
+               C2  : constant String := Next_Reg (Ctx.E, "srhi");
+               Bad : constant String := Next_Reg (Ctx.E, "srbad");
+            begin
+               if Val_Pir_Ty = "f32" or else Val_Pir_Ty = "f64" then
+                  declare
+                     L_R : constant String := Emit_Scalar_Coerce (Ctx, LR0, To_String (SR.Pir_Type), Val_Pir_Ty);
+                     H_R : constant String := Emit_Scalar_Coerce (Ctx, HR0, To_String (SR.Pir_Type), Val_Pir_Ty);
+                     InR : constant String := Next_Reg (Ctx.E, "srin");
+                  begin
+                     Emit_Inst (Ctx.E, C1 & " = fcmp_oge." & Val_Pir_Ty & " " & Val_Reg & ", " & L_R);
+                     Emit_Inst (Ctx.E, C2 & " = fcmp_ole." & Val_Pir_Ty & " " & Val_Reg & ", " & H_R);
+                     Emit_Inst (Ctx.E, InR & " = and.i8 " & C1 & ", " & C2);
+                     Emit_Inst (Ctx.E, Bad & " = xor.i8 " & InR & ", 1");
+                  end;
+               else
+                  -- Compare discrete saved bounds in canonical signed i64 so wider bounds never truncate
+                  declare
+                     V64 : constant String := Emit_Int_Convert (Ctx, Val_Reg, Val_Pir_Ty, "i64",
+                                              Is_Unsigned => Is_Unsigned_Scalar (R, Val_Pir_Ty));
+                     L64 : constant String := Emit_Int_Convert (Ctx, LR0, To_String (SR.Pir_Type), "i64",
+                                              Is_Unsigned => SR_U);
+                     H64 : constant String := Emit_Int_Convert (Ctx, HR0, To_String (SR.Pir_Type), "i64",
+                                              Is_Unsigned => SR_U);
+                  begin
+                     Emit_Inst (Ctx.E, C1 & " = cmp_lt_s.i64 " & V64 & ", " & L64);
+                     Emit_Inst (Ctx.E, C2 & " = cmp_gt_s.i64 " & V64 & ", " & H64);
+                     Emit_Inst (Ctx.E, Bad & " = or.i8 " & C1 & ", " & C2);
+                  end;
+               end if;
+               Emit_Check_Fail_If (Ctx, Bad);
+               return;
+            end;
+         end if;
+      end;
       if KIND (R) = DN_FIXED then
          declare
             Rng : constant TREE := D (SM_RANGE, R);
@@ -769,25 +803,23 @@ package body Cg_Expr is
                   Lo, Hi : Integer_64;
                begin
                   Pir_Ty := TI.Pir_Type;
-                  if not Is_Void_Tree (RTS) and then Ctx.Saved_Type_Ranges.Contains (Tree_Key (RTS)) then
-                     declare
-                        SR : constant Saved_Range_Info := Ctx.Saved_Type_Ranges.Element (Tree_Key (RTS));
-                     begin
-                        if SR.Is_Global or else SR.Owner_Subp = Ctx.Cur_Subp_Key then
-                           declare
-                              SR_U : constant Boolean := Is_Unsigned_Scalar (TS, To_String (SR.Pir_Type));
-                           begin
-                              Low_Reg  := To_Unbounded_String
-                                (Emit_Scalar_Coerce (Ctx, Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global),
-                                                     To_String (SR.Pir_Type), To_String (Pir_Ty), Is_Unsigned => SR_U));
-                              High_Reg := To_Unbounded_String
-                                (Emit_Scalar_Coerce (Ctx, Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global),
-                                                     To_String (SR.Pir_Type), To_String (Pir_Ty), Is_Unsigned => SR_U));
-                           end;
-                           return;
-                        end if;
-                     end;
-                  end if;
+                  declare
+                     SR : Saved_Range_Info;
+                  begin
+                     if Try_Lookup_Saved_Range (Ctx, RTS, SR) then
+                        declare
+                           SR_U : constant Boolean := Is_Unsigned_Scalar (TS, To_String (SR.Pir_Type));
+                        begin
+                           Low_Reg  := To_Unbounded_String
+                             (Emit_Scalar_Coerce (Ctx, Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global),
+                                                  To_String (SR.Pir_Type), To_String (Pir_Ty), Is_Unsigned => SR_U));
+                           High_Reg := To_Unbounded_String
+                             (Emit_Scalar_Coerce (Ctx, Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global),
+                                                  To_String (SR.Pir_Type), To_String (Pir_Ty), Is_Unsigned => SR_U));
+                        end;
+                        return;
+                     end if;
+                  end;
                   Get_Discrete_Bounds (TS, St, Lo, Hi);
                   if St then
                      declare
@@ -813,25 +845,23 @@ package body Cg_Expr is
                   Lo, Hi : Integer_64;
                begin
                   Pir_Ty := TI.Pir_Type;
-                  if not Is_Void_Tree (RTS) and then Ctx.Saved_Type_Ranges.Contains (Tree_Key (RTS)) then
-                     declare
-                        SR : constant Saved_Range_Info := Ctx.Saved_Type_Ranges.Element (Tree_Key (RTS));
-                     begin
-                        if SR.Is_Global or else SR.Owner_Subp = Ctx.Cur_Subp_Key then
-                           declare
-                              SR_U : constant Boolean := Is_Unsigned_Scalar (TS, To_String (SR.Pir_Type));
-                           begin
-                              Low_Reg  := To_Unbounded_String
-                                (Emit_Scalar_Coerce (Ctx, Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global),
-                                                     To_String (SR.Pir_Type), To_String (Pir_Ty), Is_Unsigned => SR_U));
-                              High_Reg := To_Unbounded_String
-                                (Emit_Scalar_Coerce (Ctx, Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global),
-                                                     To_String (SR.Pir_Type), To_String (Pir_Ty), Is_Unsigned => SR_U));
-                           end;
-                           return;
-                        end if;
-                     end;
-                  end if;
+                  declare
+                     SR : Saved_Range_Info;
+                  begin
+                     if Try_Lookup_Saved_Range (Ctx, RTS, SR) then
+                        declare
+                           SR_U : constant Boolean := Is_Unsigned_Scalar (TS, To_String (SR.Pir_Type));
+                        begin
+                           Low_Reg  := To_Unbounded_String
+                             (Emit_Scalar_Coerce (Ctx, Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global),
+                                                  To_String (SR.Pir_Type), To_String (Pir_Ty), Is_Unsigned => SR_U));
+                           High_Reg := To_Unbounded_String
+                             (Emit_Scalar_Coerce (Ctx, Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global),
+                                                  To_String (SR.Pir_Type), To_String (Pir_Ty), Is_Unsigned => SR_U));
+                        end;
+                        return;
+                     end if;
+                  end;
                   Get_Discrete_Bounds (TS, St, Lo, Hi);
                   if St then
                      declare
@@ -936,23 +966,21 @@ package body Cg_Expr is
       St     : Boolean := False;
       Lo, Hi : Integer_64 := 1;
    begin
-      if not Is_Void_Tree (IT) and then Ctx.Saved_Type_Ranges.Contains (Tree_Key (IT)) then
-         declare
-            SR : constant Saved_Range_Info := Ctx.Saved_Type_Ranges.Element (Tree_Key (IT));
-         begin
-            if SR.Is_Global or else SR.Owner_Subp = Ctx.Cur_Subp_Key then
-               declare
-                  LR0  : constant String := Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
-                  HR0  : constant String := Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
-                  Is_U : constant Boolean := Is_Unsigned_Scalar (IT, To_String (SR.Pir_Type));
-               begin
-                  First_R := To_Unbounded_String (Emit_Int_Convert (Ctx, LR0, To_String (SR.Pir_Type), "i64", Is_Unsigned => Is_U));
-                  Last_R  := To_Unbounded_String (Emit_Int_Convert (Ctx, HR0, To_String (SR.Pir_Type), "i64", Is_Unsigned => Is_U));
-                  return;
-               end;
-            end if;
-         end;
-      end if;
+      declare
+         SR : Saved_Range_Info;
+      begin
+         if Try_Lookup_Saved_Range (Ctx, IT, SR) then
+            declare
+               LR0  : constant String := Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
+               HR0  : constant String := Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
+               Is_U : constant Boolean := Is_Unsigned_Scalar (IT, To_String (SR.Pir_Type));
+            begin
+               First_R := To_Unbounded_String (Emit_Int_Convert (Ctx, LR0, To_String (SR.Pir_Type), "i64", Is_Unsigned => Is_U));
+               Last_R  := To_Unbounded_String (Emit_Int_Convert (Ctx, HR0, To_String (SR.Pir_Type), "i64", Is_Unsigned => Is_U));
+               return;
+            end;
+         end if;
+      end;
       if not Is_Void_Tree (IT) then
          Get_Discrete_Bounds (IT, St, Lo, Hi);
       end if;
@@ -1837,19 +1865,18 @@ package body Cg_Expr is
                      Lo := To_Unbounded_String (RL);
                      Hi := To_Unbounded_String (RH);
                   end;
-               elsif Ctx.Saved_Type_Ranges.Contains (Tree_Key (T))
-                 and then (Ctx.Saved_Type_Ranges.Element (Tree_Key (T)).Is_Global
-                           or else Ctx.Saved_Type_Ranges.Element (Tree_Key (T)).Owner_Subp = Ctx.Cur_Subp_Key)
-               then
-                  declare
-                     SR : constant Saved_Range_Info := Ctx.Saved_Type_Ranges.Element (Tree_Key (T));
-                  begin
-                     PT := SR.Pir_Type;
-                     Lo := To_Unbounded_String (Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global));
-                     Hi := To_Unbounded_String (Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global));
-                  end;
                else
-                  Emit_Discrete_Range (Ctx, D (SM_RANGE, T), PT, Lo, Hi);
+                  declare
+                     SR : Saved_Range_Info;
+                  begin
+                     if Try_Lookup_Saved_Range (Ctx, T, SR) then
+                        PT := SR.Pir_Type;
+                        Lo := To_Unbounded_String (Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global));
+                        Hi := To_Unbounded_String (Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global));
+                     else
+                        Emit_Discrete_Range (Ctx, D (SM_RANGE, T), PT, Lo, Hi);
+                     end if;
+                  end;
                end if;
             end Get_Sc_Bounds;
          begin
@@ -2041,20 +2068,14 @@ package body Cg_Expr is
             then
                declare
                   procedure Get_Real_Bounds (T_Node : TREE; R_Node : TREE; VL, VH : out Expr_Val) is
+                     SR : Saved_Range_Info;
                   begin
-                     if Ctx.Saved_Type_Ranges.Contains (Tree_Key (T_Node))
-                       and then (Ctx.Saved_Type_Ranges.Element (Tree_Key (T_Node)).Is_Global
-                                 or else Ctx.Saved_Type_Ranges.Element (Tree_Key (T_Node)).Owner_Subp = Ctx.Cur_Subp_Key)
-                     then
-                        declare
-                           SR : constant Saved_Range_Info := Ctx.Saved_Type_Ranges.Element (Tree_Key (T_Node));
-                        begin
-                           VL.Kind := EK_Scalar; VL.Pir_Type := SR.Pir_Type; VL.Ada_Type := T_Node; VL.Align := SR.Align;
-                           VL.Reg  := To_Unbounded_String (Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global));
-                           VH.Kind := EK_Scalar; VH.Pir_Type := SR.Pir_Type; VH.Ada_Type := T_Node; VH.Align := SR.Align;
-                           VH.Reg  := To_Unbounded_String (Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global));
-                           return;
-                        end;
+                     if Try_Lookup_Saved_Range (Ctx, T_Node, SR) then
+                        VL.Kind := EK_Scalar; VL.Pir_Type := SR.Pir_Type; VL.Ada_Type := T_Node; VL.Align := SR.Align;
+                        VL.Reg  := To_Unbounded_String (Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global));
+                        VH.Kind := EK_Scalar; VH.Pir_Type := SR.Pir_Type; VH.Ada_Type := T_Node; VH.Align := SR.Align;
+                        VH.Reg  := To_Unbounded_String (Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global));
+                        return;
                      end if;
                      VL := Emit_Expr (Ctx, D (AS_EXP1, R_Node), T_Node);
                      VH := Emit_Expr (Ctx, D (AS_EXP2, R_Node), T_Node);
@@ -2328,31 +2349,22 @@ package body Cg_Expr is
          return Res;
       elsif Load_Scalar and then TI.Kind = TK_Scalar then
          declare
-            Addr      : constant String := Emit_Var_Addr (Ctx, V);
-            Is_Shared : constant Boolean :=
-              V.Is_Shared or else (not Is_Void_Tree (Def) and then KIND (Def) = DN_VARIABLE_ID and then DB (SM_IS_SHARED, Def));
+            Tgt : Scalar_Target;
          begin
-            if V.Is_Bitfield then
-               Res.Kind     := EK_Scalar;
-               Res.Reg      := To_Unbounded_String (Emit_Bitfield_Load (Ctx, Addr, V.BF_FE, ATy));
-               Res.Pir_Type := TI.Pir_Type;
-               Res.Align    := TI.Align;
-               return Res;
-            end if;
-            declare
-               R : constant String := Next_Reg (Ctx.E, "ld");
-            begin
-               if Is_Shared then
-                  Emit_Inst (Ctx.E, R & " = load." & To_String (Eff_PT) & " " & Addr & ", align " & Img (Eff_Al) & " [volatile]");
-                  Emit_Inst (Ctx.E, "fence [seq_cst]");
-               else
-                  Emit_Inst (Ctx.E, R & " = load." & To_String (Eff_PT) & " " & Addr & ", align " & Img (Eff_Al));
-               end if;
-               Res.Kind  := EK_Scalar;
-               Res.Reg   := To_Unbounded_String (R);
-               Res.Align := Eff_Al;
-               return Res;
-            end;
+            Tgt.Dst_Ptr   := To_Unbounded_String (Emit_Var_Addr (Ctx, V));
+            Tgt.Inner_T   := ATy;
+            Tgt.Outer_T   := ATy;
+            Tgt.Is_BF     := V.Is_Bitfield;
+            Tgt.BF_FE     := V.BF_FE;
+            Tgt.Inner_Pir := (if V.Is_Bitfield then TI.Pir_Type else Eff_PT);
+            Tgt.Inner_Al  := (if V.Is_Bitfield then TI.Align else Eff_Al);
+            Tgt.Is_Shared :=
+              V.Is_Shared or else (not Is_Void_Tree (Def) and then KIND (Def) = DN_VARIABLE_ID and then DB (SM_IS_SHARED, Def));
+            Res.Kind     := EK_Scalar;
+            Res.Reg      := To_Unbounded_String (Emit_Load_Scalar_Target (Ctx, Tgt));
+            Res.Pir_Type := Tgt.Inner_Pir;
+            Res.Align    := Tgt.Inner_Al;
+            return Res;
          end;
       else
          Res.Kind := EK_Addr;
@@ -4578,24 +4590,26 @@ package body Cg_Expr is
                   end if;
                end;
 
-               -- Fallback: external package global via Emit_LValue
+               -- Fallback: external package global via Emit_LValue + unified Emit_Load_Scalar_Target
                declare
                   LV : constant Expr_Val := Emit_LValue (Ctx, Node);
                   TI : constant Type_Info := Get_Type_Info (Ctx, LV.Ada_Type);
                begin
                   if TI.Kind = TK_Scalar and then LV.Kind = EK_Addr then
                      declare
-                        R         : constant String := Next_Reg (Ctx.E, "gld");
-                        Is_Shared : constant Boolean := Is_Shared_Object (Ctx, Node);
+                        Tgt : Scalar_Target;
                      begin
-                        if Is_Shared then
-                           Emit_Inst (Ctx.E, R & " = load." & To_String (TI.Pir_Type) & " " & To_String (LV.Reg) & ", align " & Img (TI.Align) & " [volatile]");
-                           Emit_Inst (Ctx.E, "fence [seq_cst]");
-                        else
-                           Emit_Inst (Ctx.E, R & " = load." & To_String (TI.Pir_Type) & " " & To_String (LV.Reg) & ", align " & Img (TI.Align));
-                        end if;
-                        Res.Kind := EK_Scalar; Res.Reg := To_Unbounded_String (R);
-                        Res.Pir_Type := TI.Pir_Type; Res.Ada_Type := LV.Ada_Type; Res.Align := TI.Align;
+                        Tgt.Dst_Ptr   := LV.Reg;
+                        Tgt.Inner_T   := LV.Ada_Type;
+                        Tgt.Outer_T   := LV.Ada_Type;
+                        Tgt.Inner_Pir := TI.Pir_Type;
+                        Tgt.Inner_Al  := TI.Align;
+                        Tgt.Is_Shared := Is_Shared_Object (Ctx, Node);
+                        Res.Kind      := EK_Scalar;
+                        Res.Reg       := To_Unbounded_String (Emit_Load_Scalar_Target (Ctx, Tgt));
+                        Res.Pir_Type  := TI.Pir_Type;
+                        Res.Ada_Type  := LV.Ada_Type;
+                        Res.Align     := TI.Align;
                         return Res;
                      end;
                   end if;
@@ -5084,42 +5098,40 @@ package body Cg_Expr is
                St     : Boolean;
                Lo, Hi : Integer_64;
                InR    : constant String := Next_Reg (Ctx.E, "tmin");
+               SR     : Saved_Range_Info;
             begin
                Get_Discrete_Bounds (TS, St, Lo, Hi);
                if not Is_Void_Tree (TS) and then To_String (V.Pir_Type) /= "ptr"
-                 and then not Is_Access_Type (TS) and then Ctx.Saved_Type_Ranges.Contains (Tree_Key (TS))
-                 and then (Ctx.Saved_Type_Ranges.Element (Tree_Key (TS)).Is_Global
-                           or else Ctx.Saved_Type_Ranges.Element (Tree_Key (TS)).Owner_Subp = Ctx.Cur_Subp_Key)
+                 and then not Is_Access_Type (TS) and then Try_Lookup_Saved_Range (Ctx, TS, SR)
                then
-                  declare
-                     SR  : constant Saved_Range_Info := Ctx.Saved_Type_Ranges.Element (Tree_Key (TS));
-                     PT  : constant String := To_String (V.Pir_Type);
-                     LR0 : constant String := Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
-                     HR0 : constant String := Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
-                     C1  : constant String := Next_Reg (Ctx.E, "tm1");
-                     C2  : constant String := Next_Reg (Ctx.E, "tm2");
-                  begin
-                     if PT = "f32" or else PT = "f64" then
-                        declare
-                           L_R : constant String := Emit_Scalar_Coerce (Ctx, LR0, To_String (SR.Pir_Type), PT);
-                           H_R : constant String := Emit_Scalar_Coerce (Ctx, HR0, To_String (SR.Pir_Type), PT);
-                        begin
-                           Emit_Inst (Ctx.E, C1 & " = fcmp_oge." & PT & " " & To_String (V.Reg) & ", " & L_R);
-                           Emit_Inst (Ctx.E, C2 & " = fcmp_ole." & PT & " " & To_String (V.Reg) & ", " & H_R);
-                        end;
-                     else
-                        declare
-                           V64 : constant String := Emit_Widen_To_I64 (Ctx, To_String (V.Reg), PT, V.Ada_Type);
-                           L64 : constant String := Emit_Widen_To_I64 (Ctx, LR0, To_String (SR.Pir_Type), TS);
-                           H64 : constant String := Emit_Widen_To_I64 (Ctx, HR0, To_String (SR.Pir_Type), TS);
-                        begin
-                           Emit_Inst (Ctx.E, C1 & " = cmp_ge_s.i64 " & V64 & ", " & L64);
-                           Emit_Inst (Ctx.E, C2 & " = cmp_le_s.i64 " & V64 & ", " & H64);
-                        end;
-                     end if;
-                     Emit_Inst (Ctx.E, InR & " = and.i8 " & C1 & ", " & C2);
-                  end;
-               elsif St then
+                     declare
+                        PT  : constant String := To_String (V.Pir_Type);
+                        LR0 : constant String := Load_Saved_Slot (Ctx, To_String (SR.Lo_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
+                        HR0 : constant String := Load_Saved_Slot (Ctx, To_String (SR.Hi_Ptr), To_String (SR.Pir_Type), SR.Align, SR.Is_Global);
+                        C1  : constant String := Next_Reg (Ctx.E, "tm1");
+                        C2  : constant String := Next_Reg (Ctx.E, "tm2");
+                     begin
+                        if PT = "f32" or else PT = "f64" then
+                           declare
+                              L_R : constant String := Emit_Scalar_Coerce (Ctx, LR0, To_String (SR.Pir_Type), PT);
+                              H_R : constant String := Emit_Scalar_Coerce (Ctx, HR0, To_String (SR.Pir_Type), PT);
+                           begin
+                              Emit_Inst (Ctx.E, C1 & " = fcmp_oge." & PT & " " & To_String (V.Reg) & ", " & L_R);
+                              Emit_Inst (Ctx.E, C2 & " = fcmp_ole." & PT & " " & To_String (V.Reg) & ", " & H_R);
+                           end;
+                        else
+                           declare
+                              V64 : constant String := Emit_Widen_To_I64 (Ctx, To_String (V.Reg), PT, V.Ada_Type);
+                              L64 : constant String := Emit_Widen_To_I64 (Ctx, LR0, To_String (SR.Pir_Type), TS);
+                              H64 : constant String := Emit_Widen_To_I64 (Ctx, HR0, To_String (SR.Pir_Type), TS);
+                           begin
+                              Emit_Inst (Ctx.E, C1 & " = cmp_ge_s.i64 " & V64 & ", " & L64);
+                              Emit_Inst (Ctx.E, C2 & " = cmp_le_s.i64 " & V64 & ", " & H64);
+                           end;
+                        end if;
+                        Emit_Inst (Ctx.E, InR & " = and.i8 " & C1 & ", " & C2);
+                     end;
+                  elsif St then
                   declare
                      V64 : constant String := Emit_Widen_To_I64 (Ctx, To_String (V.Reg), To_String (V.Pir_Type), V.Ada_Type);
                      C1  : constant String := Next_Reg (Ctx.E, "tm1");

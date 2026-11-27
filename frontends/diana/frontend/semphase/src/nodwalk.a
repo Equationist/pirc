@@ -1347,6 +1347,7 @@ package body NODWALK is
 				    ERROR(D(LX_SRCPOS, NAME), "Cannot rename a literal or named number");
 				end if;
 			    end;
+			    CHECK_OUT_TARGET_SUBEXPRS(NAME);
 			    while CUR /= CONST_VOID loop
 				case KIND(CUR) is
 				when DN_SELECTED =>
@@ -1359,31 +1360,33 @@ package body NODWALK is
 					    DF := D(SM_DEFN, DES);
 					end if;
 					if DF /= CONST_VOID and then KIND(DF) = DN_COMPONENT_ID then
-					    if PFX /= CONST_VOID and then D(SM_EXP_TYPE, PFX) /= CONST_VOID then
-						declare
-						    PT: constant TREE := D(SM_EXP_TYPE, PFX);
-						    PB: constant TREE := GET_BASE_STRUCT(PT);
-						begin
-						    if KIND(PB) = DN_ACCESS then
-							CHECK_NO_OUT_READ(PFX);
-							UNCON_DEP := FALSE;
-							DEP_DISCR := FALSE;
-							exit;
-						    end if;
-						    if COMP_VAR_OR_DEP(PT, DF) then
-							DEP_DISCR := TRUE;
-						    end if;
-						    if DEP_DISCR then
-							if KIND(PT) /= DN_CONSTRAINED_RECORD
-							and then PB /= CONST_VOID and then KIND(PB) = DN_RECORD
-							and then D(SM_DISCRIMINANT_S, PB) /= CONST_VOID
-							and then not IS_EMPTY(LIST(D(SM_DISCRIMINANT_S, PB)))
-							and then D(AS_EXP, HEAD(LIST(D(SM_DISCRIMINANT_S, PB)))) /= CONST_VOID then
-							    UNCON_DEP := TRUE;
+					    declare
+						PT: constant TREE := EXPR_TYPE_OR_VOID(PFX);
+					    begin
+						if PT /= CONST_VOID then
+						    declare
+							PB: constant TREE := GET_BASE_STRUCT(PT);
+						    begin
+							if KIND(PB) = DN_ACCESS then
+							    UNCON_DEP := FALSE;
+							    DEP_DISCR := FALSE;
+							    exit;
 							end if;
-						    end if;
-						end;
-					    end if;
+							if COMP_VAR_OR_DEP(PT, DF) then
+							    DEP_DISCR := TRUE;
+							end if;
+							if DEP_DISCR then
+							    if KIND(PT) /= DN_CONSTRAINED_RECORD
+							    and then PB /= CONST_VOID and then KIND(PB) = DN_RECORD
+							    and then D(SM_DISCRIMINANT_S, PB) /= CONST_VOID
+							    and then not IS_EMPTY(LIST(D(SM_DISCRIMINANT_S, PB)))
+							    and then D(AS_EXP, HEAD(LIST(D(SM_DISCRIMINANT_S, PB)))) /= CONST_VOID then
+								UNCON_DEP := TRUE;
+							    end if;
+							end if;
+						    end;
+						end if;
+					    end;
 					    CUR := PFX;
 					else
 					    CUR := DES;
@@ -1392,35 +1395,10 @@ package body NODWALK is
 				when DN_INDEXED | DN_SLICE =>
 				    declare
 					PFX: constant TREE := D(AS_NAME, CUR);
+					PT: constant TREE := EXPR_TYPE_OR_VOID(PFX);
 				    begin
-					if KIND(CUR) = DN_INDEXED and then D(AS_EXP_S, CUR) /= CONST_VOID then
-					    declare
-						EL: SEQ_TYPE := LIST(D(AS_EXP_S, CUR));
-						EI: TREE;
-					    begin
-						while not IS_EMPTY(EL) loop
-						    POP(EL, EI);
-						    CHECK_NO_OUT_READ(EI);
-						end loop;
-					    end;
-					elsif KIND(CUR) = DN_SLICE then
-					    declare
-						DR: constant TREE := D(AS_DISCRETE_RANGE, CUR);
-					    begin
-						if DR /= CONST_VOID and then KIND(DR) = DN_RANGE then
-						    CHECK_NO_OUT_READ(D(AS_EXP1, DR));
-						    CHECK_NO_OUT_READ(D(AS_EXP2, DR));
-						end if;
-					    end;
-					end if;
-					if PFX /= CONST_VOID
-					and then KIND(PFX) in CLASS_EXP
-					and then KIND(PFX) /= DN_USED_NAME_ID
-					and then KIND(PFX) /= DN_USED_OP
-					and then KIND(PFX) /= DN_USED_CHAR
-					and then D(SM_EXP_TYPE, PFX) /= CONST_VOID
-					and then KIND(GET_BASE_STRUCT(D(SM_EXP_TYPE, PFX))) = DN_ACCESS then
-					    CHECK_NO_OUT_READ(PFX);
+					if PT /= CONST_VOID
+					and then KIND(GET_BASE_STRUCT(PT)) = DN_ACCESS then
 					    UNCON_DEP := FALSE;
 					    DEP_DISCR := FALSE;
 					    exit;
@@ -1434,7 +1412,6 @@ package body NODWALK is
 				    ERROR(D(LX_SRCPOS, NAME), "Cannot rename a subcomponent of a function call value");
 				    exit;
 				when DN_ALL =>
-				    CHECK_NO_OUT_READ(D(AS_NAME, CUR));
 				    UNCON_DEP := FALSE;
 				    DEP_DISCR := FALSE;
 				    exit;

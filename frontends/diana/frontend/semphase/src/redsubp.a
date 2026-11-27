@@ -1543,60 +1543,7 @@ package body REDSUBP is
 		    CHECK_NO_OUT_READ(ACT);
 		elsif KIND(FRM_ID) = DN_OUT_ID then
 		    -- LRM 6.2(5): OUT actual's index/slice/deref prefix subexpressions are read!
-		    declare
-			SUB_N: TREE := ACT;
-		    begin
-			while SUB_N /= CONST_VOID loop
-			    case KIND(SUB_N) is
-			    when DN_CONVERSION =>
-				SUB_N := D(AS_EXP, SUB_N);
-			    when DN_INDEXED =>
-				if D(AS_EXP_S, SUB_N) /= CONST_VOID then
-				    declare
-					EL: SEQ_TYPE := LIST(D(AS_EXP_S, SUB_N));
-					EI: TREE;
-				    begin
-					while not IS_EMPTY(EL) loop
-					    POP(EL, EI);
-					    CHECK_NO_OUT_READ(EI);
-					end loop;
-				    end;
-				end if;
-				SUB_N := D(AS_NAME, SUB_N);
-			    when DN_SLICE =>
-				declare
-				    DR: constant TREE := D(AS_DISCRETE_RANGE, SUB_N);
-				begin
-				    if DR /= CONST_VOID and then KIND(DR) = DN_RANGE then
-					CHECK_NO_OUT_READ(D(AS_EXP1, DR));
-					CHECK_NO_OUT_READ(D(AS_EXP2, DR));
-				    end if;
-				end;
-				SUB_N := D(AS_NAME, SUB_N);
-			    when DN_SELECTED =>
-				declare
-				    PFX: constant TREE := D(AS_NAME, SUB_N);
-				begin
-				    if PFX /= CONST_VOID
-				    and then KIND(PFX) in CLASS_EXP
-				    and then KIND(PFX) /= DN_USED_NAME_ID
-				    and then KIND(PFX) /= DN_USED_OP
-				    and then KIND(PFX) /= DN_USED_CHAR
-				    and then D(SM_EXP_TYPE, PFX) /= CONST_VOID
-				    and then KIND(GET_BASE_STRUCT(D(SM_EXP_TYPE, PFX))) = DN_ACCESS then
-					CHECK_NO_OUT_READ(PFX);
-					exit;
-				    end if;
-				    SUB_N := PFX;
-				end;
-			    when DN_ALL =>
-				CHECK_NO_OUT_READ(D(AS_NAME, SUB_N));
-				exit;
-			    when others =>
-				exit;
-			    end case;
-			end loop;
-		    end;
+		    CHECK_OUT_TARGET_SUBEXPRS(ACT);
 		end if;
 		-- LRM 6.4.1(3): OUT or IN OUT actual must be a variable (or view conversion of a variable)
 		if KIND(FRM_ID) = DN_OUT_ID or else KIND(FRM_ID) = DN_IN_OUT_ID then
@@ -2016,18 +1963,17 @@ package body REDSUBP is
 			    end if;
 			end;
 		    end if;
-		    if PFX /= CONST_VOID and then PFX /= CONST_VIRGIN
-		    and then KIND(PFX) in CLASS_EXP
-		    and then KIND(PFX) /= DN_USED_NAME_ID
-		    and then KIND(PFX) /= DN_USED_OP
-		    and then KIND(PFX) /= DN_USED_CHAR
-		    and then not EXEMPT_ATTR
-		    and then (KIND(PFX) = DN_ALL
-			      or else (D(SM_EXP_TYPE, PFX) /= CONST_VOID
-				       and then D(SM_EXP_TYPE, PFX) /= CONST_VIRGIN
-				       and then KIND(GET_BASE_STRUCT(D(SM_EXP_TYPE, PFX))) = DN_ACCESS)) then
-			WALK_E(PFX, DEPTH + 1);
-		    end if;
+		    declare
+			PT: constant TREE := EXPR_TYPE_OR_VOID(PFX);
+		    begin
+			if PFX /= CONST_VOID and then PFX /= CONST_VIRGIN
+			and then not EXEMPT_ATTR
+			and then (KIND(PFX) = DN_ALL
+				  or else (PT /= CONST_VOID
+					   and then KIND(GET_BASE_STRUCT(PT)) = DN_ACCESS)) then
+			    WALK_E(PFX, DEPTH + 1);
+			end if;
+		    end;
 		    if D(AS_EXP, E) /= CONST_VOID and then D(AS_EXP, E) /= CONST_VIRGIN then
 			WALK_E(D(AS_EXP, E), DEPTH + 1);
 		    end if;
@@ -2086,5 +2032,91 @@ package body REDSUBP is
     begin
 	WALK_E(EXP, 0);
     end CHECK_NO_OUT_READ;
+
+    function EXPR_TYPE_OR_VOID(N: TREE) return TREE is
+    begin
+	if N /= CONST_VOID and then N /= CONST_VIRGIN
+	and then KIND(N) in CLASS_EXP
+	and then KIND(N) /= DN_USED_NAME_ID
+	and then KIND(N) /= DN_USED_OP
+	and then KIND(N) /= DN_USED_CHAR then
+	    declare
+		ET: constant TREE := D(SM_EXP_TYPE, N);
+	    begin
+		if ET /= CONST_VOID and then ET /= CONST_VIRGIN then
+		    return ET;
+		end if;
+	    end;
+	end if;
+	return CONST_VOID;
+    end EXPR_TYPE_OR_VOID;
+
+    procedure CHECK_OUT_TARGET_SUBEXPRS(NAME: TREE) is
+	SUB_N: TREE := NAME;
+    begin
+	while SUB_N /= CONST_VOID loop
+	    case KIND(SUB_N) is
+	    when DN_CONVERSION =>
+		SUB_N := D(AS_EXP, SUB_N);
+	    when DN_INDEXED =>
+		if D(AS_EXP_S, SUB_N) /= CONST_VOID then
+		    declare
+			EL: SEQ_TYPE := LIST(D(AS_EXP_S, SUB_N));
+			EI: TREE;
+		    begin
+			while not IS_EMPTY(EL) loop
+			    POP(EL, EI);
+			    CHECK_NO_OUT_READ(EI);
+			end loop;
+		    end;
+		end if;
+		declare
+		    PFX: constant TREE := D(AS_NAME, SUB_N);
+		    PT: constant TREE := EXPR_TYPE_OR_VOID(PFX);
+		begin
+		    if PT /= CONST_VOID and then KIND(GET_BASE_STRUCT(PT)) = DN_ACCESS then
+			CHECK_NO_OUT_READ(PFX);
+			exit;
+		    end if;
+		    SUB_N := PFX;
+		end;
+	    when DN_SLICE =>
+		declare
+		    DR: constant TREE := D(AS_DISCRETE_RANGE, SUB_N);
+		begin
+		    if DR /= CONST_VOID and then KIND(DR) = DN_RANGE then
+			CHECK_NO_OUT_READ(D(AS_EXP1, DR));
+			CHECK_NO_OUT_READ(D(AS_EXP2, DR));
+		    end if;
+		end;
+		declare
+		    PFX: constant TREE := D(AS_NAME, SUB_N);
+		    PT: constant TREE := EXPR_TYPE_OR_VOID(PFX);
+		begin
+		    if PT /= CONST_VOID and then KIND(GET_BASE_STRUCT(PT)) = DN_ACCESS then
+			CHECK_NO_OUT_READ(PFX);
+			exit;
+		    end if;
+		    SUB_N := PFX;
+		end;
+	    when DN_SELECTED =>
+		declare
+		    PFX: constant TREE := D(AS_NAME, SUB_N);
+		    PT: constant TREE := EXPR_TYPE_OR_VOID(PFX);
+		begin
+		    if PT /= CONST_VOID and then KIND(GET_BASE_STRUCT(PT)) = DN_ACCESS then
+			CHECK_NO_OUT_READ(PFX);
+			exit;
+		    end if;
+		    SUB_N := PFX;
+		end;
+	    when DN_ALL =>
+		CHECK_NO_OUT_READ(D(AS_NAME, SUB_N));
+		exit;
+	    when others =>
+		exit;
+	    end case;
+	end loop;
+    end CHECK_OUT_TARGET_SUBEXPRS;
 
 end REDSUBP;

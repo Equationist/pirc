@@ -32,6 +32,10 @@ package REDSUBP is
 
     function GET_TYPE_OF_DISCRETE_RANGE(DISCRETE_RANGE: TREE) return TREE;
 
+    function EXPR_TYPE_OR_VOID(N: TREE) return TREE;
+
     procedure CHECK_NO_OUT_READ(EXP: TREE);
+
+    procedure CHECK_OUT_TARGET_SUBEXPRS(NAME: TREE);
 
 end REDSUBP;
