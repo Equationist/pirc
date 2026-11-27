@@ -35,6 +35,13 @@ package Cg_Expr is
    -- Emit scalar cast/widening/narrowing between PIR types (int, float, ptr)
    function Int_Bits_Of_Pir (Pir_Ty : String) return Natural;
 
+   -- Emit a verifier-safe integer constant register for Pir_Ty (i8/i16/i32/i64)
+   function Emit_Int_Const
+     (Ctx    : in out Context;
+      Val    : Integer_64;
+      Pir_Ty : String;
+      Prefix : String := "c") return String;
+
    function Emit_Int_Convert
      (Ctx         : in out Context;
       Val_Reg     : String;
@@ -84,14 +91,15 @@ package Cg_Expr is
       Mark_Type           : TREE := CONST_VOID;
       Has_Real_Constraint : Boolean := False);
 
-   -- Scalar conversion with fixed-point scaling & pre-fptosi overflow check (LRM 4.6, 9.5)
+   -- Unified scalar conversion (float/fixed/discrete, signedness, narrowing & optional range check)
    function Emit_Typed_Scalar_Convert
-     (Ctx      : in out Context;
-      Val_Reg  : String;
-      Src_Type : TREE;
-      Src_Pir  : String;
-      Dst_Type : TREE;
-      Dst_Pir  : String) return String;
+     (Ctx         : in out Context;
+      Val_Reg     : String;
+      Src_Type    : TREE;
+      Src_Pir     : String;
+      Dst_Type    : TREE;
+      Dst_Pir     : String;
+      Check_Range : Boolean := False) return String;
 
    -- Compute runtime 'CONSTRAINED i8 value (0 or 1) for an actual record expression
    function Emit_Actual_Constrained (Ctx : in out Context; Act : TREE) return String;
@@ -176,7 +184,52 @@ package Cg_Expr is
       Call_Node : TREE;
       Is_Func  : Boolean) return Expr_Val;
 
-   -- Compute array bounds (First_Reg, Last_Reg as i32) for a given array Expr_Val & dimension (1-based)
+   -- Normalized view of any array value (EK_Slice or constrained EK_Addr), with 64-bit bounds
+   type Array_View is record
+      Data_Ptr   : Unbounded_String;
+      Ada_Type   : TREE := (0, 0, 0);
+      Elem_Type  : TREE := (0, 0, 0);
+      Elem_Size  : Natural := 1;
+      Elem_Align : Natural := 1;
+      NDims      : Natural := 1;
+      Firsts     : Str_Array_4; -- i64 bound registers
+      Lasts      : Str_Array_4; -- i64 bound registers
+   end record;
+
+   function Resolve_Array_View (Ctx : in out Context; V : Expr_Val) return Array_View;
+
+   -- Populate / unpack a @__ada_arr_desc (or @__ada_arr_desc_<ND>) struct with ptr + i64 bounds
+   procedure Emit_Store_Arr_Desc
+     (Ctx      : in out Context;
+      Desc_Ptr : String;
+      Data_Ptr : String;
+      Firsts   : Str_Array_4;
+      Lasts    : Str_Array_4;
+      ND       : Natural;
+      Desc_Ty  : String := "@__ada_arr_desc");
+
+   procedure Emit_Unpack_Arr_Desc
+     (Ctx      : in out Context;
+      Desc_Ptr : String;
+      Des_T    : TREE;
+      Out_Val  : out Expr_Val;
+      Desc_Ty  : String := "@__ada_arr_desc");
+
+   -- Check exact i64 First/Last bounds equality across dims 1..NDims (raises Constraint_Error on mismatch)
+   procedure Emit_Exact_Bounds_Check
+     (Ctx    : in out Context;
+      F1, L1 : Str_Array_4;
+      F2, L2 : Str_Array_4;
+      NDims  : Natural);
+
+   -- Check that non-null i64 bounds [First_64 .. Last_64] belong to discrete subtype Idx_Type
+   procedure Emit_Non_Null_Index_Check
+     (Ctx      : in out Context;
+      First_64 : String;
+      Last_64  : String;
+      Idx_Type : TREE);
+
+   -- Compute array bounds (First_Reg, Last_Reg as i64) for a given array Expr_Val & dimension (1-based)
    procedure Get_Array_Dim_Bounds
      (Ctx       : in out Context;
       Arr       : Expr_Val;
@@ -184,18 +237,18 @@ package Cg_Expr is
       First_Reg : out Unbounded_String;
       Last_Reg  : out Unbounded_String);
 
-   -- Emit discrete index subtype bounds (First_R, Last_R as i32) for static or dynamic discrete type
+   -- Emit discrete index subtype bounds (First_R, Last_R as i64) for static or dynamic discrete type
    procedure Emit_Index_Bounds
      (Ctx      : in out Context;
       Idx_Type : TREE;
       First_R  : out Unbounded_String;
       Last_R   : out Unbounded_String);
 
-   -- Compute 64-bit overflow-free dimension length: (Last >= First ? (i64(Last) - i64(First) + 1) : 0)
+   -- Compute 64-bit overflow-free dimension length: (Last >= First ? (Last - First + 1) : 0)
    function Emit_Dim_Len_I64
      (Ctx      : in out Context;
-      First_32 : String;
-      Last_32  : String) return String;
+      First_64 : String;
+      Last_64  : String) return String;
 
    -- Compute super-null-safe, overflow-checked total element count & byte size (raises STORAGE_ERROR on overflow)
    procedure Emit_Array_Byte_Size_I64
@@ -221,5 +274,94 @@ package Cg_Expr is
       Pir_Ty   : out Unbounded_String;
       Low_Reg  : out Unbounded_String;
       High_Reg : out Unbounded_String);
+
+private
+
+   -- Internal helpers shared with Cg_Expr child packages
+   function Format_Int_Imm_For_Pir (Val : Integer_64; Pir_Ty : String) return String;
+   function Min_Signed_For_Pir (Pir_Ty : String) return Long_Long_Integer;
+
+   function Emit_F64_To_Fixed_Ticks
+     (Ctx     : in out Context;
+      F_Reg   : String;
+      F_Pir   : String;
+      Fixed_T : TREE;
+      Dst_Pir : String) return String;
+
+   function Is_Access_To_Uncon_Array (T : TREE) return Boolean;
+   function Expr_Has_Unbound_Discr (Ctx : Context; Node : TREE; Depth : Natural := 0) return Boolean;
+
+   procedure Emit_Subtypes_Match_Check
+     (Ctx   : in out Context;
+      Src_T : TREE;
+      Dst_T : TREE;
+      Depth : Natural := 0);
+
+   procedure Ensure_Enum_Tables_Pkg
+     (Ctx       : in out Context;
+      Base_Enum : TREE;
+      Ptrs_Sym  : out Unbounded_String;
+      Count     : out Natural);
+
+   function Find_Enum_Rep_Type (Ctx : Context; T : TREE) return TREE;
+   function Enum_Rep_Has_Negative (BT : TREE) return Boolean;
+   function Emit_Enum_Rep_Table (Ctx : in out Context; BT : TREE; Count : out Natural) return String;
+   function Emit_Enum_Pos_To_Rep_I64
+     (Ctx    : in out Context;
+      BT     : TREE;
+      Val_R  : String;
+      Pir_Ty : String) return String;
+   function Emit_Enum_Rep_I64_To_Pos
+     (Ctx     : in out Context;
+      BT      : TREE;
+      Rep_I64 : String) return String;
+
+   function Emit_Field_Addr
+     (Ctx     : in out Context;
+      Rec_Ptr : String;
+      Rec_Pir : String;
+      FE      : Field_Entry;
+      Prefix  : String := "fp") return String;
+
+   function Emit_Load_Field_Scalar
+     (Ctx       : in out Context;
+      Rec_Ptr   : String;
+      Rec_Pir   : String;
+      FE        : Field_Entry;
+      Comp_Type : TREE;
+      Comp_TI   : Type_Info;
+      Prefix    : String := "fv") return String;
+
+   procedure Emit_Store_Field_Scalar
+     (Ctx       : in out Context;
+      Rec_Ptr   : String;
+      Rec_Pir   : String;
+      FE        : Field_Entry;
+      Val_Reg   : String;
+      Comp_Type : TREE;
+      Comp_TI   : Type_Info);
+
+   function Emit_Load_Field_I64
+     (Ctx       : in out Context;
+      Rec_Ptr   : String;
+      Rec_Pir   : String;
+      FE        : Field_Entry;
+      Comp_Type : TREE;
+      Comp_TI   : Type_Info) return String;
+
+   function Emit_Variant_Choice_Match
+     (Ctx       : in out Context;
+      DV64      : String;
+      Disc_Type : TREE;
+      Choice_S  : TREE;
+      Is_Others : out Boolean) return String;
+
+   procedure Emit_Record_Rep_Copy_Into
+     (Ctx        : in out Context;
+      Dst_Ptr    : String;
+      Dst_T      : TREE;
+      Src_Ptr    : String;
+      Src_T      : TREE;
+      Discs_Only : Boolean := False);
 
 end Cg_Expr;

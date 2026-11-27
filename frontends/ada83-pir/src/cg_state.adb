@@ -117,7 +117,25 @@ package body Cg_State is
       return Cur;
    end Subst_Resolve_Type;
 
-   function Subst_Base_Type (Ctx : Context; T : TREE) return TREE is
+   function Base_Of_Type (Ctx : Context; T : TREE) return TREE is
+      Cur : TREE := Subst_Resolve_Type (Ctx, T);
+      B   : TREE;
+   begin
+      if Is_Void_Tree (Cur) then
+         return CONST_VOID;
+      end if;
+      for Step in 1 .. 16 loop
+         B := Base_Type_Spec (Cur);
+         if not Is_Void_Tree (B) then
+            B := Subst_Resolve_Type (Ctx, B);
+         end if;
+         exit when Is_Void_Tree (B) or else B = Cur;
+         Cur := B;
+      end loop;
+      return Cur;
+   end Base_Of_Type;
+
+   function Root_Base_Type (Ctx : Context; T : TREE) return TREE is
       Cur : TREE := Subst_Resolve_Type (Ctx, T);
       B   : TREE;
    begin
@@ -149,7 +167,113 @@ package body Cg_State is
          <<Next_Step>>
       end loop;
       return Cur;
+   end Root_Base_Type;
+
+   function Subst_Base_Type (Ctx : Context; T : TREE) return TREE is
+   begin
+      return Root_Base_Type (Ctx, T);
    end Subst_Base_Type;
+
+   procedure Bind_Temp_Var
+     (Ctx   : in out Context;
+      Scope : in out Temp_Var_Scope;
+      Key   : Unsigned_32;
+      Val   : Var_Info)
+   is
+      Entry_S : Saved_Var_Entry;
+   begin
+      Entry_S.Key := Key;
+      if Ctx.Vars.Contains (Key) then
+         Entry_S.Had_Prev := True;
+         Entry_S.Prev_Var := Ctx.Vars.Element (Key);
+      end if;
+      Ctx.Vars.Include (Key, Val);
+      Scope.Append (Entry_S);
+   end Bind_Temp_Var;
+
+   procedure Restore_Temp_Vars
+     (Ctx   : in out Context;
+      Scope : in out Temp_Var_Scope)
+   is
+   begin
+      for I in reverse 0 .. Integer (Scope.Length) - 1 loop
+         declare
+            SB : constant Saved_Var_Entry := Scope.Element (I);
+         begin
+            if SB.Had_Prev then
+               Ctx.Vars.Include (SB.Key, SB.Prev_Var);
+            elsif Ctx.Vars.Contains (SB.Key) then
+               Ctx.Vars.Delete (SB.Key);
+            end if;
+         end;
+      end loop;
+      Scope.Clear;
+   end Restore_Temp_Vars;
+
+   function Save_Subp_State (Ctx : Context) return Subp_State_Snapshot is
+   begin
+      return
+        (Cur_Subp_Key                => Ctx.Cur_Subp_Key,
+         Cur_Subp_Node               => Ctx.Cur_Subp_Node,
+         Cur_Ret_Type                => Ctx.Cur_Ret_Type,
+         Cur_Ret_Comp                => Ctx.Cur_Ret_Comp,
+         Cur_Ret_Uncon               => Ctx.Cur_Ret_Uncon,
+         Cur_Ret_Ptr                 => Ctx.Cur_Ret_Ptr,
+         Cur_Frame_Reg               => Ctx.Cur_Frame_Reg,
+         Cur_SL_Reg                  => Ctx.Cur_SL_Reg,
+         Cur_Master_Reg              => Ctx.Cur_Master_Reg,
+         Cur_Task_Reg                => Ctx.Cur_Task_Reg,
+         Cur_Task_Exit_Lbl           => Ctx.Cur_Task_Exit_Lbl,
+         Cur_Task_Base_Cleanup_Depth => Ctx.Cur_Task_Base_Cleanup_Depth,
+         Cur_Is_Func                 => Ctx.Cur_Is_Func,
+         Loops                       => Ctx.Loops,
+         Handlers                    => Ctx.Handlers,
+         Copy_Outs                   => Ctx.Copy_Outs,
+         Cleanups                    => Ctx.Cleanups,
+         Accept_Frames               => Ctx.Accept_Frames,
+         Label_Cleanup_Depths        => Ctx.Label_Cleanup_Depths,
+         Uplevel_Cache               => Ctx.Uplevel_Cache);
+   end Save_Subp_State;
+
+   procedure Reset_Subp_State (Ctx : in out Context) is
+   begin
+      Ctx.Cur_Frame_Reg               := Null_Unbounded_String;
+      Ctx.Cur_Master_Reg              := Null_Unbounded_String;
+      Ctx.Cur_Task_Reg                := Null_Unbounded_String;
+      Ctx.Cur_Task_Exit_Lbl           := Null_Unbounded_String;
+      Ctx.Cur_Task_Base_Cleanup_Depth := 0;
+      Ctx.Loops.Clear;
+      Ctx.Handlers.Clear;
+      Ctx.Copy_Outs.Clear;
+      Ctx.Cleanups.Clear;
+      Ctx.Accept_Frames.Clear;
+      Ctx.Label_Cleanup_Depths.Clear;
+      Ctx.Uplevel_Cache.Clear;
+   end Reset_Subp_State;
+
+   procedure Restore_Subp_State (Ctx : in out Context; Snap : Subp_State_Snapshot) is
+   begin
+      Ctx.Cur_Subp_Key                := Snap.Cur_Subp_Key;
+      Ctx.Cur_Subp_Node               := Snap.Cur_Subp_Node;
+      Ctx.Cur_Ret_Type                := Snap.Cur_Ret_Type;
+      Ctx.Cur_Ret_Comp                := Snap.Cur_Ret_Comp;
+      Ctx.Cur_Ret_Uncon               := Snap.Cur_Ret_Uncon;
+      Ctx.Cur_Ret_Ptr                 := Snap.Cur_Ret_Ptr;
+      Ctx.Cur_Frame_Reg               := Snap.Cur_Frame_Reg;
+      Ctx.Cur_SL_Reg                  := Snap.Cur_SL_Reg;
+      Ctx.Cur_Master_Reg              := Snap.Cur_Master_Reg;
+      Ctx.Cur_Task_Reg                := Snap.Cur_Task_Reg;
+      Ctx.Cur_Task_Exit_Lbl           := Snap.Cur_Task_Exit_Lbl;
+      Ctx.Cur_Task_Base_Cleanup_Depth := Snap.Cur_Task_Base_Cleanup_Depth;
+      Ctx.Cur_Is_Func                 := Snap.Cur_Is_Func;
+      Ctx.Loops                       := Snap.Loops;
+      Ctx.Handlers                    := Snap.Handlers;
+      Ctx.Copy_Outs                   := Snap.Copy_Outs;
+      Ctx.Cleanups                    := Snap.Cleanups;
+      Ctx.Accept_Frames               := Snap.Accept_Frames;
+      Ctx.Label_Cleanup_Depths        := Snap.Label_Cleanup_Depths;
+      Ctx.Uplevel_Cache               := Snap.Uplevel_Cache;
+   end Restore_Subp_State;
 
    function Emit_Elem_Ptr
      (Ctx      : in out Context;
@@ -180,7 +304,7 @@ package body Cg_State is
       Arr_Desc_Decl : Unbounded_String := To_Unbounded_String ("type @__ada_arr_desc = { ptr");
    begin
       for D in 1 .. Max_Array_Dims loop
-         Append (Arr_Desc_Decl, ", i32, i32");
+         Append (Arr_Desc_Decl, ", i64, i64");
       end loop;
       Append (Arr_Desc_Decl, " }");
       Add_Type_Decl (Ctx.E, To_String (Arr_Desc_Decl));
@@ -731,7 +855,7 @@ package body Cg_State is
                                           then
                                              Append (Fields, "ptr");
                                              for D_I in 1 .. Natural'Max (1, Natural'Min (PTI.NDims, Max_Array_Dims)) loop
-                                                Append (Fields, ", i32, i32");
+                                                Append (Fields, ", i64, i64");
                                              end loop;
                                           elsif PTI.Kind /= TK_Scalar then
                                              Append (Fields, "ptr");
@@ -836,7 +960,7 @@ package body Cg_State is
       Decl : Unbounded_String := To_Unbounded_String ("type " & Name & " = { ptr");
    begin
       for I in 1 .. ND loop
-         Append (Decl, ", i32, i32");
+         Append (Decl, ", i64, i64");
       end loop;
       Append (Decl, " }");
       Add_Type_Decl (Ctx.E, To_String (Decl));
@@ -2051,8 +2175,8 @@ package body Cg_State is
                               Add_P (PN & "_ptr", "ptr");
                               if not Is_C_Interface then
                                  for D_Idx in 1 .. TI.NDims loop
-                                    Add_P (PN & "_f" & Img (D_Idx), "i32");
-                                    Add_P (PN & "_l" & Img (D_Idx), "i32");
+                                    Add_P (PN & "_f" & Img (D_Idx), "i64");
+                                    Add_P (PN & "_l" & Img (D_Idx), "i64");
                                  end loop;
                               end if;
                            elsif TI.Kind = TK_Record or else TI.Kind = TK_Constrained_Array then
@@ -2275,5 +2399,96 @@ package body Cg_State is
       end if;
       return "0";
    end Emit_Captured_Slot_Ptr;
+
+   function Cleanup_Depth (Ctx : Context) return Natural is
+   begin
+      return Natural (Ctx.Cleanups.Length);
+   end Cleanup_Depth;
+
+   procedure Push_Cleanup (Ctx : in out Context; Kind : Cleanup_Kind; Reg : String) is
+   begin
+      Ctx.Cleanups.Append ((Kind => Kind, Reg => To_Unbounded_String (Reg)));
+   end Push_Cleanup;
+
+   procedure Pop_Cleanup (Ctx : in out Context; Expected : Cleanup_Kind) is
+   begin
+      if Ctx.Cleanups.Is_Empty or else Ctx.Cleanups.Last_Element.Kind /= Expected then
+         raise Program_Error with "Cg_State.Pop_Cleanup: mismatched cleanup stack";
+      end if;
+      Ctx.Cleanups.Delete_Last;
+   end Pop_Cleanup;
+
+   function Latest_Cleanup_Reg (Ctx : Context; Kind : Cleanup_Kind) return Unbounded_String is
+   begin
+      if not Ctx.Cleanups.Is_Empty then
+         for I in reverse 0 .. Natural (Ctx.Cleanups.Length) - 1 loop
+            if Ctx.Cleanups.Element (I).Kind = Kind then
+               return Ctx.Cleanups.Element (I).Reg;
+            end if;
+         end loop;
+      end if;
+      return Null_Unbounded_String;
+   end Latest_Cleanup_Reg;
+
+   function Needs_Unwind_To
+     (Ctx           : Context;
+      Target_Depth  : Natural;
+      Leave_Masters : Boolean := True;
+      Release_SS    : Boolean := True;
+      Restore_SP    : Boolean := True) return Boolean
+   is
+   begin
+      if Natural (Ctx.Cleanups.Length) <= Target_Depth then
+         return False;
+      end if;
+      for I in Target_Depth .. Natural (Ctx.Cleanups.Length) - 1 loop
+         case Ctx.Cleanups.Element (I).Kind is
+            when CK_Master  => if Leave_Masters then return True; end if;
+            when CK_SS_Mark => if Release_SS    then return True; end if;
+            when CK_SP_Mark => if Restore_SP    then return True; end if;
+         end case;
+      end loop;
+      return False;
+   end Needs_Unwind_To;
+
+   procedure Emit_Unwind_To
+     (Ctx           : in out Context;
+      Target_Depth  : Natural;
+      Leave_Masters : Boolean := True;
+      Release_SS    : Boolean := True;
+      Restore_SP    : Boolean := True)
+   is
+      SS_Reg : Unbounded_String := Null_Unbounded_String;
+      SP_Reg : Unbounded_String := Null_Unbounded_String;
+      Dummy  : Unbounded_String;
+   begin
+      if Natural (Ctx.Cleanups.Length) <= Target_Depth then
+         return;
+      end if;
+      -- Leave masters strictly innermost-to-outermost BEFORE releasing SS or restoring SP
+      -- so dependent tasks completing in __ada_master_leave can still access enclosing storage.
+      for I in reverse Target_Depth .. Natural (Ctx.Cleanups.Length) - 1 loop
+         declare
+            CE : constant Cleanup_Entry := Ctx.Cleanups.Element (I);
+         begin
+            case CE.Kind is
+               when CK_Master =>
+                  if Leave_Masters then
+                     Emit_Call_Or_Invoke (Ctx, "@__ada_master_leave", To_String (CE.Reg), "", Dummy, Nounwind => True);
+                  end if;
+               when CK_SS_Mark =>
+                  SS_Reg := CE.Reg;
+               when CK_SP_Mark =>
+                  SP_Reg := CE.Reg;
+            end case;
+         end;
+      end loop;
+      if Release_SS and then Length (SS_Reg) > 0 then
+         Emit_Call_Or_Invoke (Ctx, "@__ada_ss_release", To_String (SS_Reg), "", Dummy, Nounwind => True);
+      end if;
+      if Restore_SP and then Length (SP_Reg) > 0 then
+         Emit_Inst (Ctx.E, "stackrestore " & To_String (SP_Reg));
+      end if;
+   end Emit_Unwind_To;
 
 end Cg_State;

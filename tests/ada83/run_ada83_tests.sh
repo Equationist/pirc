@@ -279,6 +279,7 @@ run_case "21_p3s7"    "$TDIR/21_pass3_stage7_frontend_valid.ada"
 run_case "23_p4_rt"   "$TDIR/23_pass4_rt_task_io_core.ada"
 run_case "24_p4_expr" "$TDIR/24_pass4_expr_checks_rep.ada"
 run_case "25_p4_stmt" "$TDIR/25_pass4_stmt_task.ada"
+run_case "26_64bit"   "$TDIR/26_refactor_64bit_bounds.ada"
 run_multi_sep_case
 run_c_iface_case
 run_p4_driver_case

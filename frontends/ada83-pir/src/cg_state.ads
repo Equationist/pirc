@@ -31,7 +31,7 @@ package Cg_State is
    end record;
 
    Max_Array_Dims : constant Natural := 8;
-   Arr_Desc_Size  : constant Natural := 8 + 2 * Max_Array_Dims * 4; -- 72 bytes
+   Arr_Desc_Size  : constant Natural := 8 + 2 * Max_Array_Dims * 8; -- 136 bytes
 
    type Dim_Array is array (1 .. Max_Array_Dims) of Dim_Bound;
 
@@ -159,14 +159,22 @@ package Cg_State is
 
    -- Loop exit label stack
    type Loop_Entry is record
-      Label_Key    : Unsigned_32 := 0; -- 0 if unnamed
-      Exit_Label   : Unbounded_String;
-      SS_Depth     : Natural := 0;
-      Master_Depth : Natural := 0;
-      SP_Depth     : Natural := 0;
+      Label_Key     : Unsigned_32 := 0; -- 0 if unnamed
+      Exit_Label    : Unbounded_String;
+      Cleanup_Depth : Natural := 0;
    end record;
 
    package Loop_Vecs is new Ada.Containers.Vectors (Natural, Loop_Entry);
+
+   -- Unified LIFO scope cleanup stack (masters, secondary-stack marks, dynamic stack saves)
+   type Cleanup_Kind is (CK_Master, CK_SS_Mark, CK_SP_Mark);
+
+   type Cleanup_Entry is record
+      Kind : Cleanup_Kind := CK_Master;
+      Reg  : Unbounded_String;
+   end record;
+
+   package Cleanup_Vecs is new Ada.Containers.Vectors (Natural, Cleanup_Entry);
 
    -- Exception handler stack
    type Handler_Entry is record
@@ -394,10 +402,8 @@ package Cg_State is
       Equivalent_Keys => "=");
 
    type Accept_Frame is record
-      End_Label : Unbounded_String;
-      Mst_Depth : Natural := 0;
-      SS_Depth  : Natural := 0;
-      SP_Depth  : Natural := 0;
+      End_Label     : Unbounded_String;
+      Cleanup_Depth : Natural := 0;
    end record;
 
    package Accept_Vecs is new Ada.Containers.Vectors (Natural, Accept_Frame);
@@ -445,10 +451,10 @@ package Cg_State is
       Cur_Frame_Reg     : Unbounded_String;
       Cur_SL_Reg        : Unbounded_String;
       Cur_Master_Reg    : Unbounded_String;
-      Cur_Task_Reg            : Unbounded_String;
-      Cur_Task_Exit_Lbl       : Unbounded_String;
-      Cur_Task_Base_Mst_Depth : Natural := 0;
-      Cur_Is_Func             : Boolean := False;
+      Cur_Task_Reg                : Unbounded_String;
+      Cur_Task_Exit_Lbl           : Unbounded_String;
+      Cur_Task_Base_Cleanup_Depth : Natural := 0;
+      Cur_Is_Func                 : Boolean := False;
       Uplevel_Cache     : U64_Str_Maps.Map; -- (Owner_Subp << 32 | Slot) -> entry-block uplevel var addr reg
       Pkg_Task_Groups   : I64_Maps.Map;  -- local package task group IDs (PID key -> group_id)
       Cur_Task_Group_Id : Integer_64 := 0;
@@ -461,16 +467,12 @@ package Cg_State is
       Saved_Expr_Vals   : Saved_Expr_Maps.Map;  -- record comp constraint expr key -> pre-evaluated alloca/global
       Gen_Local_Exc_Tags : U32_Str_Maps.Map;    -- generic-local exception key -> tagged @__ada_exc_... sym
 
-      Loops             : Loop_Vecs.Vector;
-      Handlers          : Handler_Vecs.Vector;
-      Copy_Outs         : Copy_Out_Vecs.Vector;
-      SS_Marks          : Str_Vecs.Vector;
-      SP_Marks          : Str_Vecs.Vector;
-      Master_Stack      : Str_Vecs.Vector;
-      Accept_Frames     : Accept_Vecs.Vector;
-      Label_Mst_Depths  : I64_Maps.Map;
-      Label_SS_Depths   : I64_Maps.Map;
-      Label_SP_Depths   : I64_Maps.Map;
+      Loops                : Loop_Vecs.Vector;
+      Handlers             : Handler_Vecs.Vector;
+      Copy_Outs            : Copy_Out_Vecs.Vector;
+      Cleanups             : Cleanup_Vecs.Vector;
+      Accept_Frames        : Accept_Vecs.Vector;
+      Label_Cleanup_Depths : I64_Maps.Map;
    end record;
 
    procedure Init_Context
@@ -479,10 +481,65 @@ package Cg_State is
       Enable_Checks : Boolean;
       Emit_Main     : Boolean);
 
-   -- Apply active generic substitution (if any) to a DIANA type or definition node
+   -- Scoped temporary Var_Maps binding guard (restores shadowed outer bindings in LIFO order)
+   type Saved_Var_Entry is record
+      Key      : Unsigned_32 := 0;
+      Had_Prev : Boolean := False;
+      Prev_Var : Var_Info;
+   end record;
+
+   package Temp_Var_Vecs is new Ada.Containers.Vectors (Natural, Saved_Var_Entry);
+   subtype Temp_Var_Scope is Temp_Var_Vecs.Vector;
+
+   -- Snapshot of all per-subprogram / per-task emission state on Context
+   type Subp_State_Snapshot is record
+      Cur_Subp_Key                : Unsigned_32 := 0;
+      Cur_Subp_Node               : TREE := (0, 0, 0);
+      Cur_Ret_Type                : TREE := (0, 0, 0);
+      Cur_Ret_Comp                : Boolean := False;
+      Cur_Ret_Uncon               : Boolean := False;
+      Cur_Ret_Ptr                 : Unbounded_String;
+      Cur_Frame_Reg               : Unbounded_String;
+      Cur_SL_Reg                  : Unbounded_String;
+      Cur_Master_Reg              : Unbounded_String;
+      Cur_Task_Reg                : Unbounded_String;
+      Cur_Task_Exit_Lbl           : Unbounded_String;
+      Cur_Task_Base_Cleanup_Depth : Natural := 0;
+      Cur_Is_Func                 : Boolean := False;
+      Loops                       : Loop_Vecs.Vector;
+      Handlers                    : Handler_Vecs.Vector;
+      Copy_Outs                   : Copy_Out_Vecs.Vector;
+      Cleanups                    : Cleanup_Vecs.Vector;
+      Accept_Frames               : Accept_Vecs.Vector;
+      Label_Cleanup_Depths        : I64_Maps.Map;
+      Uplevel_Cache               : U64_Str_Maps.Map;
+   end record;
+
+   -- Apply active generic substitution (if any) to a DIANA type or definition node.
+   -- Type resolution hierarchy:
+   --   Subst_Resolve_Type : apply generic map + private/incomplete views (keeps subtype constraints)
+   --   Base_Of_Type       : strip subtype constraints (SM_BASE_TYPE) ONLY; stops at derived types!
+   --   Root_Base_Type / Subst_Base_Type : strip subtypes AND follow SM_DERIVED on enums/privates to root
    function Subst_Tree (Ctx : Context; T : TREE) return TREE;
    function Subst_Resolve_Type (Ctx : Context; T : TREE) return TREE;
+   function Base_Of_Type (Ctx : Context; T : TREE) return TREE;
+   function Root_Base_Type (Ctx : Context; T : TREE) return TREE;
    function Subst_Base_Type (Ctx : Context; T : TREE) return TREE;
+
+   -- Scoped temporary variable/discriminant binding helpers
+   procedure Bind_Temp_Var
+     (Ctx   : in out Context;
+      Scope : in out Temp_Var_Scope;
+      Key   : Unsigned_32;
+      Val   : Var_Info);
+   procedure Restore_Temp_Vars
+     (Ctx   : in out Context;
+      Scope : in out Temp_Var_Scope);
+
+   -- Save / reset / restore per-subprogram & per-task Context state cleanly
+   function Save_Subp_State (Ctx : Context) return Subp_State_Snapshot;
+   procedure Reset_Subp_State (Ctx : in out Context);
+   procedure Restore_Subp_State (Ctx : in out Context; Snap : Subp_State_Snapshot);
 
    -- Emit element pointer for array of ETI (handles array-of-arrays via ptr_add byte stride!)
    function Emit_Elem_Ptr
@@ -568,6 +625,24 @@ package Cg_State is
 
    -- Get (and register) PIR descriptor struct type for N-dim returned unconstrained array
    function Get_Arr_Desc_Type (Ctx : in out Context; NDims : Natural) return String;
+
+   -- Unified scope cleanup stack operations (masters, secondary stack, stacksave)
+   function Cleanup_Depth (Ctx : Context) return Natural;
+   procedure Push_Cleanup (Ctx : in out Context; Kind : Cleanup_Kind; Reg : String);
+   procedure Pop_Cleanup (Ctx : in out Context; Expected : Cleanup_Kind);
+   function Latest_Cleanup_Reg (Ctx : Context; Kind : Cleanup_Kind) return Unbounded_String;
+   function Needs_Unwind_To
+     (Ctx           : Context;
+      Target_Depth  : Natural;
+      Leave_Masters : Boolean := True;
+      Release_SS    : Boolean := True;
+      Restore_SP    : Boolean := True) return Boolean;
+   procedure Emit_Unwind_To
+     (Ctx           : in out Context;
+      Target_Depth  : Natural;
+      Leave_Masters : Boolean := True;
+      Release_SS    : Boolean := True;
+      Restore_SP    : Boolean := True);
 
    -- Storage byte size / alignment of an element stored inside an array or record
    -- (dynamic constrained arrays are stored inline as Arr_Desc_Size-byte @__ada_arr_desc structs).
