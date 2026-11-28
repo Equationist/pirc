@@ -63,10 +63,10 @@ static bool build_plan(const PirModule *mod, const PirTargetSpec *target,
             st.gp_used += 1u;
         }
     } else if ((target->arch == PIR_ARCH_RV32 || target->arch == PIR_ARCH_PPC32 ||
-                target->arch == PIR_ARCH_AVR) &&
+                target->arch == PIR_ARCH_AVR || target->arch == PIR_ARCH_THUMB2) &&
                ((ret_type.kind == PIR_TYPE_SCALAR && ret_type.u.scalar == PIR_SCALAR_I128) ||
                 ret_type.kind == PIR_TYPE_VECTOR)) {
-        /* Match i128.c & simd.c: RV32/PPC32/AVR i128 and vector returns prepend a hidden sret ptr. */
+        /* Match i128.c & simd.c: 32-bit/16-bit targets prepend a hidden sret ptr for i128/vectors. */
         st.gp_used += 1u;
     }
 
@@ -595,35 +595,38 @@ static bool rewrite_call_site(PirModule *mod, const PirTargetSpec *target,
                         }
                     }
                 }
-            } else if (target->arch == PIR_ARCH_RV32 && vinfo.kind == PIR_ABI_DIRECT &&
-                       vinfo.reg_count > 0u) {
-                /* RISC-V ILP32D variadic byval: always passed in GP registers/stack (never fa0..fa7),
-                 * packed into 1..2 i32 words (or indirect if > 8B). Restore va_st first so FP regs
-                 * are not falsely consumed when overriding a hardware-FP struct. */
+            } else if ((target->arch == PIR_ARCH_RV32 || target->arch == PIR_ARCH_THUMB2) &&
+                       vinfo.kind == PIR_ABI_DIRECT && vinfo.reg_count > 0u) {
+                /* RV32 / AAPCS32 variadic byval: always passed in GP registers/stack (never FP regs).
+                 * Restore va_st first so FP regs are not falsely consumed. */
                 va_st = saved_va_st;
                 PirTypeLayout vly = pir_type_layout(mod, target, vpd.abi_type);
-                if (vly.size > 8u) {
+                uint64_t max_direct = (target->arch == PIR_ARCH_THUMB2) ? 16u : 8u;
+                uint32_t max_gp     = (target->arch == PIR_ARCH_THUMB2) ? 4u : 8u;
+                if (vly.size > max_direct) {
                     memset(&vinfo, 0, sizeof(vinfo));
                     vinfo.kind    = PIR_ABI_INDIRECT;
                     vinfo.gp_used = 1u;
-                    if (va_st.gp_used < 8u) va_st.gp_used++;
+                    if (va_st.gp_used < max_gp) va_st.gp_used++;
                 } else {
-                    uint32_t nw = (vly.size <= 4u) ? 1u : 2u;
+                    uint32_t nw = (uint32_t)((vly.size + 3u) / 4u);
+                    if (nw == 0u) nw = 1u;
                     vinfo.reg_count       = nw;
                     vinfo.fp_used         = 0u;
                     vinfo.gp_used         = nw;
+                    vinfo.force_stack     = false;
                     vinfo.has_reg_offsets = false;
                     for (uint32_t w = 0u; w < nw; ++w) {
                         vinfo.regs[w] = pir_type_scalar(PIR_SCALAR_I32);
                     }
                     if (vly.align >= 8u) {
-                        if (va_st.gp_used < 8u && (va_st.gp_used & 1u) != 0u) {
+                        if (va_st.gp_used < max_gp && (va_st.gp_used & 1u) != 0u) {
                             va_st.gp_used++;
                         }
                         vinfo.stack_align = 8u;
                     }
                     va_st.gp_used += nw;
-                    if (va_st.gp_used > 8u) va_st.gp_used = 8u;
+                    if (va_st.gp_used > max_gp) va_st.gp_used = max_gp;
                 }
             } else if (target->arch == PIR_ARCH_ARM64 && target->os != PIR_OS_MACOS) {
                 emit_va_reg_pads(&new_ops, &vinfo, ti64);

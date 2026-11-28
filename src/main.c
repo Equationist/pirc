@@ -173,6 +173,25 @@ static bool assemble_to_obj(const char *asm_path, const char *obj_path,
             }
             execlp(avr_cc, avr_cc, "--target=avr", "-mmcu=atmega1280",
                    "-x", "assembler", "-c", asm_path, "-o", obj_path, (char *)NULL);
+        } else if (target && target->arch == PIR_ARCH_THUMB2) {
+            const char *t2_cc = getenv("PIRC_THUMB2_CC");
+            if (!t2_cc || !t2_cc[0]) {
+                if (access("/opt/homebrew/opt/llvm/bin/clang", X_OK) == 0)
+                    t2_cc = "/opt/homebrew/opt/llvm/bin/clang";
+                else if (access("/usr/local/opt/llvm/bin/clang", X_OK) == 0)
+                    t2_cc = "/usr/local/opt/llvm/bin/clang";
+                else
+                    t2_cc = "clang";
+            }
+            char target_flag[128];
+            snprintf(target_flag, sizeof(target_flag), "--target=%s", target->triple);
+            if (target->caps.has_hw_fp) {
+                execlp(t2_cc, t2_cc, target_flag, "-mcpu=cortex-m7", "-mfpu=fpv5-d16",
+                       "-mfloat-abi=hard", "-x", "assembler", "-c", asm_path, "-o", obj_path, (char *)NULL);
+            } else {
+                execlp(t2_cc, t2_cc, target_flag, "-mcpu=cortex-m3", "-mfloat-abi=soft",
+                       "-x", "assembler", "-c", asm_path, "-o", obj_path, (char *)NULL);
+            }
         } else if (target && target->triple) {
             char target_flag[128];
             snprintf(target_flag, sizeof(target_flag), "--target=%s", target->triple);

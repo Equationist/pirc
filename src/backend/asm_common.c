@@ -207,7 +207,10 @@ static void emit_elf_section_directive(FILE *out, const PirModule *mod,
                                        const PirTargetSpec *target,
                                        const char *custom_sec, PirGlobalSeg seg,
                                        bool has_reloc, bool is_zero, bool is_func) {
-    bool no_elf_tls = (target && target->arch == PIR_ARCH_AVR);
+    bool is_arm = (target && target->arch == PIR_ARCH_THUMB2);
+    const char *tp = is_arm ? "%" : "@";
+    bool no_elf_tls = (target && (target->arch == PIR_ARCH_AVR ||
+                                  (target->arch == PIR_ARCH_THUMB2 && target->os == PIR_OS_BAREMETAL)));
     if (!custom_sec || custom_sec[0] == '\0') {
         if (is_func) {
             fputs("\t.text\n", out);
@@ -215,8 +218,8 @@ static void emit_elf_section_directive(FILE *out, const PirModule *mod,
         }
         switch (seg) {
             case PIR_GSEG_RODATA:
-                fputs(has_reloc ? "\t.section .data.rel.ro,\"aw\",@progbits\n"
-                                : "\t.section .rodata\n", out);
+                if (has_reloc) fprintf(out, "\t.section .data.rel.ro,\"aw\",%sprogbits\n", tp);
+                else           fputs("\t.section .rodata\n", out);
                 break;
             case PIR_GSEG_DATA:
                 fputs(is_zero ? "\t.bss\n" : "\t.data\n", out);
@@ -225,8 +228,8 @@ static void emit_elf_section_directive(FILE *out, const PirModule *mod,
                 if (no_elf_tls) {
                     fputs(is_zero ? "\t.bss\n" : "\t.data\n", out);
                 } else {
-                    fputs(is_zero ? "\t.section .tbss,\"awT\",@nobits\n"
-                                  : "\t.section .tdata,\"awT\",@progbits\n", out);
+                    fprintf(out, is_zero ? "\t.section .tbss,\"awT\",%snobits\n"
+                                         : "\t.section .tdata,\"awT\",%sprogbits\n", tp);
                 }
                 break;
         }
@@ -241,15 +244,15 @@ static void emit_elf_section_directive(FILE *out, const PirModule *mod,
         }
 
         static const struct { const char *pfx; const char *type; } ARRAY_SECS[] = {
-            { ".init_array",    "@init_array" },
-            { ".fini_array",    "@fini_array" },
-            { ".preinit_array", "@preinit_array" },
+            { ".init_array",    "init_array" },
+            { ".fini_array",    "fini_array" },
+            { ".preinit_array", "preinit_array" },
         };
         for (size_t i = 0u; i < sizeof(ARRAY_SECS) / sizeof(ARRAY_SECS[0]); ++i) {
             if (elf_sec_is_prefix(custom_sec, ARRAY_SECS[i].pfx)) {
                 fputs("\t.section ", out);
                 emit_elf_section_name(out, custom_sec);
-                fprintf(out, ",\"aw\",%s\n", ARRAY_SECS[i].type);
+                fprintf(out, ",\"aw\",%s%s\n", tp, ARRAY_SECS[i].type);
                 return;
             }
         }
@@ -288,7 +291,7 @@ static void emit_elf_section_directive(FILE *out, const PirModule *mod,
     flags[fl] = '\0';
     fputs("\t.section ", out);
     emit_elf_section_name(out, custom_sec);
-    fprintf(out, ",\"%s\",%s\n", flags, eff_zero ? "@nobits" : "@progbits");
+    fprintf(out, ",\"%s\",%s%s\n", flags, tp, eff_zero ? "nobits" : "progbits");
 }
 
 static void emit_macho_section_directive(FILE *out, const char *custom_sec, PirGlobalSeg seg,
@@ -766,6 +769,8 @@ bool pir_asm_emit_module_footer(FILE *out, const PirModule *mod, const PirTarget
 
     if (pir_asm_is_macho(target)) {
         fprintf(out, ".subsections_via_symbols\n");
+    } else if (target->arch == PIR_ARCH_THUMB2) {
+        fprintf(out, "\t.section .note.GNU-stack,\"\",%%progbits\n");
     } else {
         fprintf(out, "\t.section .note.GNU-stack,\"\",@progbits\n");
     }

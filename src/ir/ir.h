@@ -597,6 +597,7 @@ typedef enum {
     PIR_ARCH_RV32,
     PIR_ARCH_PPC32,
     PIR_ARCH_AVR,
+    PIR_ARCH_THUMB2,
     PIR_ARCH_CUSTOM
 } PirArch;
 

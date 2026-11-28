@@ -397,7 +397,8 @@ static bool legalize_i64_func(PirModule *mod, const PirTargetSpec *target, PirFu
                 PirParamDecl p1 = fn->params[i];
                 p0.type = t32;
                 p1.type = t32;
-                if (target->arch == PIR_ARCH_PPC32 && fn->cc == PIR_CC_C && p0.abi_stack_align < 8u) {
+                if ((target->arch == PIR_ARCH_PPC32 || target->arch == PIR_ARCH_THUMB2) &&
+                    fn->cc == PIR_CC_C && p0.abi_stack_align < 8u) {
                     p0.abi_stack_align = 8u;
                 }
                 if (target->arch == PIR_ARCH_AVR && fn->cc == PIR_CC_C) {
@@ -513,7 +514,8 @@ static bool legalize_i64_func(PirModule *mod, const PirTargetSpec *target, PirFu
                             second.call_stack_align = 0u;
                             first.call_force_stack  = copy.operands[k].call_force_stack;
                             second.call_force_stack = copy.operands[k].call_force_stack;
-                            if (target->arch == PIR_ARCH_PPC32 && call_is_c && first.call_stack_align < 8u) {
+                            if ((target->arch == PIR_ARCH_PPC32 || target->arch == PIR_ARCH_THUMB2) &&
+                                call_is_c && first.call_stack_align < 8u) {
                                 first.call_stack_align = 8u;
                             }
                             if (target->arch == PIR_ARCH_AVR && call_is_c) {
@@ -523,7 +525,8 @@ static bool legalize_i64_func(PirModule *mod, const PirTargetSpec *target, PirFu
                             if (call_is_var && (k - 1u) >= fixed_n) {
                                 first.has_explicit_type  = true;
                                 second.has_explicit_type = true;
-                                if ((target->arch == PIR_ARCH_RV32 || target->arch == PIR_ARCH_PPC32) &&
+                                if ((target->arch == PIR_ARCH_RV32 || target->arch == PIR_ARCH_PPC32 ||
+                                     target->arch == PIR_ARCH_THUMB2) &&
                                     first.call_stack_align < 8u) {
                                     first.call_stack_align = 8u;
                                 }
@@ -1469,7 +1472,8 @@ static void split_i64_decl(PirModule *mod, const PirTargetSpec *target, PirCalli
             PirParamDecl p0 = old_p[i];
             PirParamDecl p1 = old_p[i];
             p0.type = t32; p1.type = t32;
-            if (target->arch == PIR_ARCH_PPC32 && cc == PIR_CC_C && p0.abi_stack_align < 8u) {
+            if ((target->arch == PIR_ARCH_PPC32 || target->arch == PIR_ARCH_THUMB2) &&
+                cc == PIR_CC_C && p0.abi_stack_align < 8u) {
                 p0.abi_stack_align = 8u;
             }
             if (target->arch == PIR_ARCH_AVR && cc == PIR_CC_C) {

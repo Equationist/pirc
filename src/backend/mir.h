@@ -224,6 +224,60 @@ static inline uint32_t avr_hi_reg(MPReg p) {
     return (uint32_t)p * 2u + 1u;
 }
 
+/* ARM Thumb-2 (ARMv7E-M, Cortex-M7 FPv5-D16) physical register numbering:
+ *   0..15  : GP r0..r15
+ *            r0..r3   caller-saved args/rets
+ *            r4..r6, r8..r9 callee-saved allocatable
+ *            r7       frame pointer (FP)
+ *            r10, r11 callee-saved scratches (GP2, GP1)
+ *            r12 (ip) caller-saved scratch (GP0)
+ *            r13 (sp), r14 (lr), r15 (pc)
+ *   32..47 : VFP d0..d15 (f32 lives in low single lane s(2*k), f64 in d(k))
+ *            d0..d7   caller-saved args/rets (overlay s0..s15)
+ *            d8..d12  callee-saved allocatable
+ *            d13..d15 callee-saved scratches (FP0, FP1, FP2)
+ */
+#define T2_GP(n)        ((MPReg)(n))
+#define T2_D(n)         ((MPReg)(32u + (n)))
+#define T2_R0           T2_GP(0u)
+#define T2_R1           T2_GP(1u)
+#define T2_R2           T2_GP(2u)
+#define T2_R3           T2_GP(3u)
+#define T2_R4           T2_GP(4u)
+#define T2_R5           T2_GP(5u)
+#define T2_R6           T2_GP(6u)
+#define T2_FP_REG       T2_GP(7u)
+#define T2_R8           T2_GP(8u)
+#define T2_R9           T2_GP(9u)
+#define T2_R10          T2_GP(10u)
+#define T2_R11          T2_GP(11u)
+#define T2_R12          T2_GP(12u)
+#define T2_SP           T2_GP(13u)
+#define T2_LR           T2_GP(14u)
+#define T2_PC           T2_GP(15u)
+#define T2_SCRATCH_GP0  T2_R12
+#define T2_SCRATCH_GP1  T2_R11
+#define T2_SCRATCH_GP2  T2_R10
+#define T2_SCRATCH_FP0  T2_D(13u)
+#define T2_SCRATCH_FP1  T2_D(14u)
+#define T2_SCRATCH_FP2  T2_D(15u)
+
+static inline bool t2_is_fp_preg(MPReg r) {
+    return r >= 32u && r < 48u;
+}
+
+static inline uint32_t t2_reg_num(MPReg r) {
+    return (r >= 32u) ? (uint32_t)(r - 32u) : (uint32_t)r;
+}
+
+static inline uint32_t t2_s_lo(MPReg d) {
+    return t2_reg_num(d) * 2u;
+}
+
+static inline uint32_t t2_s_hi(MPReg d) {
+    return t2_reg_num(d) * 2u + 1u;
+}
+
 static inline uint32_t mreg_num(MPReg r) {
     return (r >= 32u) ? (uint32_t)(r - 32u) : (uint32_t)r;
 }
@@ -767,7 +821,85 @@ typedef enum {
     MI_AVR_ICALL,           /* movw Z, fn; icall */
     MI_AVR_SWITCH_TBL,      /* Flash jump table dispatch */
     MI_AVR_RET,             /* ret (epilogue marker before frame pass) */
-    MI_AVR_TRAP             /* call __pir_avr_trap (exits with code 132) */
+    MI_AVR_TRAP,            /* call __pir_avr_trap (exits with code 132) */
+
+    /* ARM Thumb-2 (ARMv7E-M + VFPv5-D16) Data Movement, Memory & Stack */
+    MI_T2_LI,               /* dst = imm32 (mov/mvn/movw+movt) */
+    MI_T2_MOV,              /* dst = src */
+    MI_T2_SYM_ADDR,         /* dst = sym (+ offset) via movw :lower16: / movt :upper16: */
+    MI_T2_LD,               /* dst = *(T*)(base + disp) (width=1/2/4, is_signed) */
+    MI_T2_ST,               /* *(T*)(base + disp) = src (width=1/2/4) */
+    MI_T2_PUSH,             /* push.w {regmask} */
+    MI_T2_POP,              /* pop.w  {regmask} */
+    MI_T2_VPUSH,            /* vpush  {d_first .. d_first+cnt-1} */
+    MI_T2_VPOP,             /* vpop   {d_first .. d_first+cnt-1} */
+    MI_T2_ADJ_SP,           /* sp += signed imm32 */
+
+    /* ARM Thumb-2 Integer ALU & Bitops */
+    MI_T2_ADD,
+    MI_T2_ADDI,
+    MI_T2_SUB,
+    MI_T2_MUL,
+    MI_T2_MUL_WIDE,         /* dst_lo, dst_hi, lhs, rhs (is_signed: smull/umull) */
+    MI_T2_DIV,              /* dst, lhs, rhs (is_signed: sdiv/udiv) */
+    MI_T2_AND,
+    MI_T2_ANDI,
+    MI_T2_OR,
+    MI_T2_ORI,
+    MI_T2_XOR,
+    MI_T2_XORI,
+    MI_T2_SHL,
+    MI_T2_SHLI,
+    MI_T2_LSR,
+    MI_T2_LSRI,
+    MI_T2_ASR,
+    MI_T2_ASRI,
+    MI_T2_EXT,              /* sxtb/uxtb/sxth/uxth (width=1/2, is_signed) */
+    MI_T2_BITOP,            /* aux_id: 0=clz, 1=ctz, 2=bswap, 3=bitrev, 4=ctpop */
+    MI_T2_CMP_SET,          /* dst = (lhs <cond> rhs) ? 1 : 0 via IT predication */
+    MI_T2_SELECT,           /* dst = (cond != 0) ? tv : fv via ITE */
+
+    /* ARM Thumb-2 VFPv5-D16 Floating-Point */
+    MI_T2_VLD,              /* vldr.32 / vldr.64 */
+    MI_T2_VST,              /* vstr.32 / vstr.64 */
+    MI_T2_VMOV_F,           /* vmov.f32 / vmov.f64 */
+    MI_T2_LOAD_IMM_FP,      /* materialize f32/f64 imm64 bits into d-reg */
+    MI_T2_VMOV_G2S,         /* vmov s(2d), r */
+    MI_T2_VMOV_S2G,         /* vmov r, s(2d) */
+    MI_T2_VMOV_G2D,         /* vmov d, rlo, rhi */
+    MI_T2_VMOV_D2G,         /* vmov rlo, rhi, d */
+    MI_T2_PACK_S2,          /* pack lo=s(2*a), hi=s(2*b) into d-reg s(2*d), s(2*d+1) */
+    MI_T2_UNPACK_S,         /* extract s(2*src + aux_width) into s(2*dst) */
+    MI_T2_FADD,
+    MI_T2_FSUB,
+    MI_T2_FMUL,
+    MI_T2_FDIV,
+    MI_T2_FNEG,
+    MI_T2_FABS,
+    MI_T2_FSQRT,
+    MI_T2_FCVT_F2F,         /* width=4->8 (vcvt.f64.f32) or 8->4 (vcvt.f32.f64) */
+    MI_T2_FCVT_I2F,         /* GP i32/u32 -> f32/f64 (is_signed, width=4/8) */
+    MI_T2_FCVT_F2I,         /* f32/f64 -> GP i32/u32 (is_signed, width=4/8, aux_id=sat) */
+    MI_T2_FCMP_SET,         /* vcmp + vmrs APSR_nzcv, FPSCR + IT (aux_id=unord_true) */
+    MI_T2_FSELECT,          /* cmp cond, #0 + ite ne + vmovne/vmoveq */
+
+    /* ARM Thumb-2 Hardware LL/SC Atomics */
+    MI_T2_DMB,              /* dmb ish */
+    MI_T2_ATOMIC_LD,        /* ldr* + dmb ish */
+    MI_T2_ATOMIC_ST,        /* dmb ish + str* + dmb ish */
+    MI_T2_ATOMIC_RMW,       /* ldrex+op+strex loop (width=1/2/4, aux_id=PirRmwOp) */
+    MI_T2_ATOMIC_CAS,       /* ldrex+cmp+strex loop (width=1/2/4) */
+
+    /* ARM Thumb-2 Control Flow */
+    MI_T2_B,                /* b.w target_blk */
+    MI_T2_BC,               /* cmp lhs, rhs; b<cc>.w target_blk */
+    MI_T2_BR_NZ,            /* cmp reg, #0; bne.w target_blk */
+    MI_T2_BR_Z,             /* cmp reg, #0; beq.w target_blk */
+    MI_T2_CALL,             /* bl sym */
+    MI_T2_CALL_IND,         /* blx reg */
+    MI_T2_SWITCH_TBL,       /* PC-relative jump table dispatch */
+    MI_T2_RET,              /* epilogue marker before frame pass */
+    MI_T2_TRAP              /* bl __pir_t2_trap (exits with code 132) */
 } MOpcode;
 
 /* =========================================================================

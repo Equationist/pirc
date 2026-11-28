@@ -111,4 +111,9 @@ bool pir_abi_avr_param(const PirModule *mod, const PirTargetSpec *target,
 bool pir_abi_avr_retbuf(const PirModule *mod, const PirTargetSpec *target,
                         PirType agg_ty, PirAbiArgInfo *out);
 
+bool pir_abi_arm32_param(const PirModule *mod, const PirTargetSpec *target,
+                         const PirParamDecl *pd, PirAbiRegState *st, PirAbiArgInfo *out);
+bool pir_abi_arm32_retbuf(const PirModule *mod, const PirTargetSpec *target,
+                          PirType agg_ty, PirAbiArgInfo *out);
+
 #endif /* PIR_TARGET_ABI_H */

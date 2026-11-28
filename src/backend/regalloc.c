@@ -118,6 +118,22 @@ static const MPReg AVR_GP_REGS[] = {
 };
 #define NUM_AVR_GP_REGS ((uint32_t)(sizeof(AVR_GP_REGS) / sizeof(AVR_GP_REGS[0])))
 
+static const MPReg T2_GP_REGS[] = {
+    /* Caller-saved first: r0..r3 (r12=scratch0) */
+    T2_R0, T2_R1, T2_R2, T2_R3,
+    /* Callee-saved: r4..r6, r8..r9 (r7=FP, r10=scratch2, r11=scratch1) */
+    T2_R4, T2_R5, T2_R6, T2_R8, T2_R9
+};
+#define NUM_T2_GP_REGS ((uint32_t)(sizeof(T2_GP_REGS) / sizeof(T2_GP_REGS[0])))
+
+static const MPReg T2_FP_REGS[] = {
+    /* Caller-saved first: d0..d7 (overlay s0..s15) */
+    T2_D(0), T2_D(1), T2_D(2), T2_D(3), T2_D(4), T2_D(5), T2_D(6), T2_D(7),
+    /* Callee-saved: d8..d12 (d13..d15 reserved scratch) */
+    T2_D(8), T2_D(9), T2_D(10), T2_D(11), T2_D(12)
+};
+#define NUM_T2_FP_REGS ((uint32_t)(sizeof(T2_FP_REGS) / sizeof(T2_FP_REGS[0])))
+
 static bool is_callee_saved_gp(PirArch arch, MPReg p) {
     if (arch == PIR_ARCH_X86_64) {
         return p == X64_RBX || p == X64_R12 || p == X64_R13 || p == X64_R14 || p == X64_R15;
@@ -130,6 +146,9 @@ static bool is_callee_saved_gp(PirArch arch, MPReg p) {
     }
     if (arch == PIR_ARCH_AVR) {
         return p >= AVR_PAIR(1) && p <= AVR_PAIR(8);
+    }
+    if (arch == PIR_ARCH_THUMB2) {
+        return (p >= T2_R4 && p <= T2_R6) || (p >= T2_R8 && p <= T2_R11);
     }
     return p >= A64_GP(19) && p <= A64_GP(28);
 }
@@ -144,6 +163,9 @@ static bool is_callee_saved_fp(PirArch arch, MPReg p) {
     }
     if (arch == PIR_ARCH_PPC32) {
         return p >= PPC_FP(14) && p <= PPC_FP(31);
+    }
+    if (arch == PIR_ARCH_THUMB2) {
+        return p >= T2_D(8) && p <= T2_D(15);
     }
     return p >= A64_FP(8) && p <= A64_FP(15);
 }
@@ -161,6 +183,9 @@ static void get_reg_pool(PirArch arch, MRegClass rc, const MPReg **out_pool, uin
     } else if (arch == PIR_ARCH_AVR) {
         *out_pool = (rc == MREG_CLASS_GP) ? AVR_GP_REGS : NULL;
         *out_len  = (rc == MREG_CLASS_GP) ? NUM_AVR_GP_REGS : 0u;
+    } else if (arch == PIR_ARCH_THUMB2) {
+        *out_pool = (rc == MREG_CLASS_GP) ? T2_GP_REGS : T2_FP_REGS;
+        *out_len  = (rc == MREG_CLASS_GP) ? NUM_T2_GP_REGS : NUM_T2_FP_REGS;
     } else {
         *out_pool = (rc == MREG_CLASS_GP) ? A64_GP_REGS : A64_FP_REGS;
         *out_len  = (rc == MREG_CLASS_GP) ? NUM_A64_GP_REGS : NUM_A64_FP_REGS;
@@ -531,6 +556,30 @@ static void compute_intervals(const MFunc *mf, LiveInterval *v_ivs,
                             iv_add_range(&fixed_ivs[p], pos, pos + 1u);
                         }
                     }
+                } else if (mf->target->arch == PIR_ARCH_THUMB2) {
+                    static const MPReg T2_CALL_CLOB_GP[] = {
+                        T2_R0, T2_R1, T2_R2, T2_R3, T2_R12
+                    };
+                    for (uint32_t ci = 0u; ci < sizeof(T2_CALL_CLOB_GP) / sizeof(T2_CALL_CLOB_GP[0]); ++ci) {
+                        MPReg p = T2_CALL_CLOB_GP[ci];
+                        if ((preg_live & (UINT64_C(1) << p)) != 0u) {
+                            uint32_t end_p = preg_use_end[p] > pos ? preg_use_end[p] : (pos + 1u);
+                            iv_add_range(&fixed_ivs[p], pos, end_p);
+                            preg_live &= ~(UINT64_C(1) << p);
+                        } else {
+                            iv_add_range(&fixed_ivs[p], pos, pos + 1u);
+                        }
+                    }
+                    for (uint32_t r = 0u; r <= 7u; ++r) {
+                        MPReg p = T2_D(r);
+                        if ((preg_live & (UINT64_C(1) << p)) != 0u) {
+                            uint32_t end_p = preg_use_end[p] > pos ? preg_use_end[p] : (pos + 1u);
+                            iv_add_range(&fixed_ivs[p], pos, end_p);
+                            preg_live &= ~(UINT64_C(1) << p);
+                        } else {
+                            iv_add_range(&fixed_ivs[p], pos, pos + 1u);
+                        }
+                    }
                 } else {
                     for (uint32_t r = 0u; r <= 15u; ++r) {
                         MPReg p = A64_GP(r);
@@ -874,8 +923,10 @@ static void emit_mov_imm64(PirArch arch, MInstVec *out, MPReg dst, uint64_t val,
         PIR_VEC_PUSH(out, m);
         return;
     }
-    if (arch == PIR_ARCH_RV32 || arch == PIR_ARCH_PPC32) {
-        MInst m = minst_make(arch == PIR_ARCH_PPC32 ? MI_PPC_LI : MI_RV32_LI, 4u, loc);
+    if (arch == PIR_ARCH_RV32 || arch == PIR_ARCH_PPC32 || arch == PIR_ARCH_THUMB2) {
+        MOpcode op = (arch == PIR_ARCH_PPC32)  ? MI_PPC_LI
+                   : (arch == PIR_ARCH_THUMB2) ? MI_T2_LI : MI_RV32_LI;
+        MInst m = minst_make(op, 4u, loc);
         m.op_count = 2u;
         m.ops[0]   = mop_preg_def(dst);
         m.ops[1]   = mop_imm((int64_t)(int32_t)(uint32_t)(val & 0xFFFFFFFFu));
@@ -1001,17 +1052,21 @@ static void lower_pcopy_bundle(const MFunc *mf, const MPCopyBundle *pc,
     MPReg cyc_gp  = (arch == PIR_ARCH_X86_64) ? X64_SCRATCH_GP1
                   : (arch == PIR_ARCH_RV32)   ? RV32_SCRATCH_GP0
                   : (arch == PIR_ARCH_PPC32)  ? PPC_SCRATCH_GP0
-                  : (arch == PIR_ARCH_AVR)    ? AVR_SCRATCH_GP0 : A64_SCRATCH_GP0;
+                  : (arch == PIR_ARCH_AVR)    ? AVR_SCRATCH_GP0
+                  : (arch == PIR_ARCH_THUMB2) ? T2_SCRATCH_GP0 : A64_SCRATCH_GP0;
     MPReg slot_gp = (arch == PIR_ARCH_X86_64) ? X64_SCRATCH_GP0
                   : (arch == PIR_ARCH_RV32)   ? RV32_SCRATCH_GP2
                   : (arch == PIR_ARCH_PPC32)  ? PPC_SCRATCH_GP1
-                  : (arch == PIR_ARCH_AVR)    ? AVR_SCRATCH_GP1 : A64_SCRATCH_GP2;
+                  : (arch == PIR_ARCH_AVR)    ? AVR_SCRATCH_GP1
+                  : (arch == PIR_ARCH_THUMB2) ? T2_SCRATCH_GP1 : A64_SCRATCH_GP2;
     MPReg cyc_fp  = (arch == PIR_ARCH_X86_64) ? X64_SCRATCH_FP2
                   : (arch == PIR_ARCH_RV32)   ? RV32_SCRATCH_FP2
-                  : (arch == PIR_ARCH_PPC32)  ? PPC_SCRATCH_FP2 : A64_SCRATCH_FP2;
+                  : (arch == PIR_ARCH_PPC32)  ? PPC_SCRATCH_FP2
+                  : (arch == PIR_ARCH_THUMB2) ? T2_SCRATCH_FP2 : A64_SCRATCH_FP2;
     MPReg slot_fp = (arch == PIR_ARCH_X86_64) ? X64_SCRATCH_FP1
                   : (arch == PIR_ARCH_RV32)   ? RV32_SCRATCH_FP1
-                  : (arch == PIR_ARCH_PPC32)  ? PPC_SCRATCH_FP1 : A64_SCRATCH_FP1;
+                  : (arch == PIR_ARCH_PPC32)  ? PPC_SCRATCH_FP1
+                  : (arch == PIR_ARCH_THUMB2) ? T2_SCRATCH_FP1 : A64_SCRATCH_FP1;
 
     PendingCopy *copies = (PendingCopy *)calloc(pc->count, sizeof(PendingCopy));
     if (!copies) abort();
@@ -1086,8 +1141,9 @@ static void lower_pcopy_bundle(const MFunc *mf, const MPCopyBundle *pc,
         } else {
             /* Float scalar immediate (f32 or f64) */
             MPReg fp_t = (d.kind == PC_LOC_REG) ? d.preg : cyc_fp;
-            if (arch == PIR_ARCH_PPC32) {
-                MInst lf = minst_make(MI_PPC_LOAD_IMM_FP, d.byte_size, loc);
+            if (arch == PIR_ARCH_PPC32 || arch == PIR_ARCH_THUMB2) {
+                MInst lf = minst_make(arch == PIR_ARCH_THUMB2 ? MI_T2_LOAD_IMM_FP : MI_PPC_LOAD_IMM_FP,
+                                      d.byte_size, loc);
                 lf.op_count = 2u; lf.ops[0] = mop_preg_def(fp_t); lf.ops[1] = mop_imm((int64_t)bits);
                 PIR_VEC_PUSH(out, lf);
             } else if (arch == PIR_ARCH_RV32 && d.byte_size == 8u) {
@@ -1126,21 +1182,27 @@ static bool rewrite_blocks(MFunc *mf, PirDiag *diag) {
     static const MPReg PPC_GP_SCRATCH[3]  = { PPC_SCRATCH_GP0,  PPC_SCRATCH_GP1,  PPC_SCRATCH_GP2  };
     static const MPReg PPC_FP_SCRATCH[3]  = { PPC_SCRATCH_FP0,  PPC_SCRATCH_FP1,  PPC_SCRATCH_FP2  };
     static const MPReg AVR_GP_SCRATCH[3]  = { AVR_SCRATCH_GP0,  AVR_SCRATCH_GP1,  AVR_SCRATCH_GP2  };
+    static const MPReg T2_GP_SCRATCH[3]   = { T2_SCRATCH_GP0,   T2_SCRATCH_GP1,   T2_SCRATCH_GP2   };
+    static const MPReg T2_FP_SCRATCH[3]   = { T2_SCRATCH_FP0,   T2_SCRATCH_FP1,   T2_SCRATCH_FP2   };
     bool is_x64   = (mf->target->arch == PIR_ARCH_X86_64);
     bool is_rv32  = (mf->target->arch == PIR_ARCH_RV32);
     bool is_ppc32 = (mf->target->arch == PIR_ARCH_PPC32);
     bool is_avr   = (mf->target->arch == PIR_ARCH_AVR);
+    bool is_t2    = (mf->target->arch == PIR_ARCH_THUMB2);
     const MPReg *GP_SCRATCH = is_x64 ? X64_GP_SCRATCH
                             : is_rv32 ? RV32_GP_SCRATCH
                             : is_ppc32 ? PPC_GP_SCRATCH
-                            : is_avr ? AVR_GP_SCRATCH : A64_GP_SCRATCH;
+                            : is_avr ? AVR_GP_SCRATCH
+                            : is_t2 ? T2_GP_SCRATCH : A64_GP_SCRATCH;
     const MPReg *FP_SCRATCH = is_x64 ? X64_FP_SCRATCH
                             : is_rv32 ? RV32_FP_SCRATCH
-                            : is_ppc32 ? PPC_FP_SCRATCH : A64_FP_SCRATCH;
+                            : is_ppc32 ? PPC_FP_SCRATCH
+                            : is_t2 ? T2_FP_SCRATCH : A64_FP_SCRATCH;
     MPReg addr_tmp_gp = is_x64 ? X64_SCRATCH_GP1
                       : is_rv32 ? RV32_SCRATCH_GP1
                       : is_ppc32 ? PPC_SCRATCH_GP1
-                      : is_avr ? AVR_SCRATCH_GP1 : A64_SCRATCH_GP1;
+                      : is_avr ? AVR_SCRATCH_GP1
+                      : is_t2 ? T2_SCRATCH_GP1 : A64_SCRATCH_GP1;
 
     for (uint32_t b = 0u; b < mf->blocks.len; ++b) {
         MBlock *blk = &mf->blocks.data[b];
@@ -1393,7 +1455,8 @@ static bool verify_mir_common(const MFunc *mf, bool post_ra, PirDiag *diag) {
                         break;
                     case MOP_PREG:
                         if (op->u.preg >= 64u ||
-                            (mf->target && mf->target->arch == PIR_ARCH_X86_64 &&
+                            (mf->target && (mf->target->arch == PIR_ARCH_X86_64 ||
+                                            mf->target->arch == PIR_ARCH_THUMB2) &&
                              ((op->u.preg >= 16u && op->u.preg < 32u) || op->u.preg >= 48u)) ||
                             (mf->target && mf->target->arch == PIR_ARCH_AVR && op->u.preg >= 16u)) {
                             pir_diag_error(diag, 0u, 0u, "MIR verifier: preg %u out of range", (unsigned)op->u.preg);
@@ -1499,17 +1562,22 @@ bool pir_regalloc_run(MFunc *mf, PirDiag *diag) {
 
     bool ok = rewrite_blocks(mf, diag);
 
-    /* Ensure any explicit callee-saved physical register defs (e.g. AVR call args in r8..r17)
-     * are recorded in used_callee_gp_mask so the frame pass preserves them. */
-    if (ok && is_avr_arch) {
+    /* Ensure any explicit callee-saved physical register defs (AVR call args in r8..r17,
+     * Thumb-2 callee-saved scratch regs r10/r11/d13..d15) are recorded so the frame pass saves them. */
+    bool is_t2_arch = (mf->target && mf->target->arch == PIR_ARCH_THUMB2);
+    if (ok && (is_avr_arch || is_t2_arch)) {
         for (uint32_t b = 0u; b < mf->blocks.len; ++b) {
             const MBlock *blk = &mf->blocks.data[b];
             for (uint32_t j = 0u; j < blk->insts.len; ++j) {
                 const MInst *ins = &blk->insts.data[j];
                 for (uint8_t k = 0u; k < ins->op_count; ++k) {
-                    if (ins->ops[k].kind == MOP_PREG && ins->ops[k].is_def &&
-                        is_callee_saved_gp(PIR_ARCH_AVR, ins->ops[k].u.preg)) {
-                        mf->used_callee_gp_mask |= (1u << mreg_num(ins->ops[k].u.preg));
+                    if (ins->ops[k].kind == MOP_PREG && ins->ops[k].is_def) {
+                        MPReg p = ins->ops[k].u.preg;
+                        if (is_callee_saved_gp(mf->target->arch, p)) {
+                            mf->used_callee_gp_mask |= (1u << mreg_num(p));
+                        } else if (is_callee_saved_fp(mf->target->arch, p)) {
+                            mf->used_callee_fp_mask |= (1u << mreg_num(p));
+                        }
                     }
                 }
             }

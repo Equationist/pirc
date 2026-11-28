@@ -814,6 +814,28 @@ static void emit_inst(AvrAsmCtx *ctx, const MFunc *mf, const MInst *ins) {
         case MI_PPC_FRSP: case MI_PPC_FCMPU: case MI_PPC_FCTIWZ:
         case MI_PPC_B: case MI_PPC_BC: case MI_PPC_CALL: case MI_PPC_CALL_IND:
         case MI_PPC_SWITCH_TBL: case MI_PPC_RET: case MI_PPC_TRAP:
+        case MI_T2_LI: case MI_T2_MOV: case MI_T2_SYM_ADDR:
+        case MI_T2_LD: case MI_T2_ST: case MI_T2_PUSH: case MI_T2_POP:
+        case MI_T2_VPUSH: case MI_T2_VPOP: case MI_T2_ADJ_SP:
+        case MI_T2_ADD: case MI_T2_ADDI: case MI_T2_SUB: case MI_T2_MUL:
+        case MI_T2_MUL_WIDE: case MI_T2_DIV:
+        case MI_T2_AND: case MI_T2_ANDI: case MI_T2_OR: case MI_T2_ORI:
+        case MI_T2_XOR: case MI_T2_XORI:
+        case MI_T2_SHL: case MI_T2_SHLI: case MI_T2_LSR: case MI_T2_LSRI:
+        case MI_T2_ASR: case MI_T2_ASRI: case MI_T2_EXT: case MI_T2_BITOP:
+        case MI_T2_CMP_SET: case MI_T2_SELECT:
+        case MI_T2_VLD: case MI_T2_VST: case MI_T2_VMOV_F: case MI_T2_LOAD_IMM_FP:
+        case MI_T2_VMOV_G2S: case MI_T2_VMOV_S2G: case MI_T2_VMOV_G2D: case MI_T2_VMOV_D2G:
+        case MI_T2_PACK_S2: case MI_T2_UNPACK_S:
+        case MI_T2_FADD: case MI_T2_FSUB: case MI_T2_FMUL: case MI_T2_FDIV:
+        case MI_T2_FNEG: case MI_T2_FABS: case MI_T2_FSQRT:
+        case MI_T2_FCVT_F2F: case MI_T2_FCVT_I2F: case MI_T2_FCVT_F2I:
+        case MI_T2_FCMP_SET: case MI_T2_FSELECT:
+        case MI_T2_DMB: case MI_T2_ATOMIC_LD: case MI_T2_ATOMIC_ST:
+        case MI_T2_ATOMIC_RMW: case MI_T2_ATOMIC_CAS:
+        case MI_T2_B: case MI_T2_BC: case MI_T2_BR_NZ: case MI_T2_BR_Z:
+        case MI_T2_CALL: case MI_T2_CALL_IND: case MI_T2_SWITCH_TBL:
+        case MI_T2_RET: case MI_T2_TRAP:
             fprintf(stderr, "pirc: AVR asm emitter encountered non-AVR opcode %u\n", (unsigned)ins->op);
             abort();
     }

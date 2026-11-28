@@ -69,6 +69,12 @@ bool pir_avr_isel_func(const PirModule *mod, const PirFunction *fn, uint32_t fn_
 bool pir_avr_frame_lower(MFunc *mf, PirDiag *diag);
 void pir_avr_asm_emitter_init(PirCodeEmitter *em, FILE *out, const PirTargetSpec *target);
 
+/* ARM Thumb-2 (ARMv7E-M, Cortex-M7 FPv5-D16) backend passes */
+bool pir_thumb2_isel_func(const PirModule *mod, const PirFunction *fn, uint32_t fn_index,
+                          const PirTargetSpec *target, MFunc *out_mf, PirDiag *diag);
+bool pir_thumb2_frame_lower(MFunc *mf, PirDiag *diag);
+void pir_thumb2_asm_emitter_init(PirCodeEmitter *em, FILE *out, const PirTargetSpec *target);
+
 /* Top-level backend driver: lowers every defined function to post-regalloc MFunc
  * and streams through the selected CodeEmitter. */
 bool pir_backend_emit_asm(const PirModule *mod, const PirTargetSpec *target,
