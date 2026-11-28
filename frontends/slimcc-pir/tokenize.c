@@ -1461,7 +1461,8 @@ Token *tokenize(File *file, SlashDelta *delta, Token **end) {
       continue;
     }
 
-    error_at(p, "invalid token");
+    cur = cur->next = new_token(TK_INVALID, p, p + 1);
+    p++;
   }
 
   if (end && cur != &head)
@@ -1593,6 +1594,9 @@ Token *tokenize_file_ex(const char *path, Token *tok, Token **end, bool is_syshd
 
   File *f = new_file(path, buf);
   f->is_syshdr = is_syshdr;
+  size_t plen = strlen(path);
+  if (plen >= 2 && path[plen - 2] == '.' && path[plen - 1] == 'i')
+    f->is_preprocessed = true;
   return tokenize(f, &dlt, end);
 }
 

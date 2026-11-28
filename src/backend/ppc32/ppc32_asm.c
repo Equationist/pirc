@@ -39,19 +39,23 @@ static unsigned fp_num(MPReg p) {
 }
 
 static bool ppc32_needs_sym_quote(const char *s) {
+    /* PowerPC ELF uses bare numeric registers (0..31), so register-like names
+     * (r0..r31, f0..f31, cr0..cr7, sp, lr, ctr, xer) are valid bare symbols. */
+    (void)s;
+    return false;
+}
+
+static bool ppc32_sym_requires_alias(const char *s) {
     if (!s || !s[0]) return true;
-    if (strcmp(s, "sp") == 0 || strcmp(s, "lr") == 0 ||
-        strcmp(s, "ctr") == 0 || strcmp(s, "xer") == 0) {
+    unsigned char c0 = (unsigned char)s[0];
+    if (!((c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z') || c0 == '_')) {
         return true;
     }
-    if (s[0] == 'c' && s[1] == 'r' && s[2] >= '0' && s[2] <= '7' && s[3] == '\0') {
-        return true;
-    }
-    if ((s[0] == 'r' || s[0] == 'f') && s[1] >= '0' && s[1] <= '9') {
-        if (s[2] == '\0') return true;
-        if (s[2] >= '0' && s[2] <= '9' && s[3] == '\0') {
-            uint32_t v = (uint32_t)(s[1] - '0') * 10u + (uint32_t)(s[2] - '0');
-            return v <= 31u && s[1] != '0';
+    for (const char *p = s; *p; ++p) {
+        unsigned char c = (unsigned char)*p;
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '.')) {
+            return true;
         }
     }
     return false;
@@ -59,6 +63,22 @@ static bool ppc32_needs_sym_quote(const char *s) {
 
 static void ppc32_emit_sym(FILE *out, const PirTargetSpec *target, const char *name) {
     pir_asm_emit_sym(out, target, name, NULL, ppc32_needs_sym_quote);
+}
+
+/* LLVM-MC's PowerPC parser rejects quoted string symbols inside instruction
+ * operands (lis @ha / addi @l / addis @tprel@ha / bl). For any non-bare symbol
+ * name, emit a local .set alias right before the instruction and reference it. */
+static void ppc32_prepare_op_sym(PpcAsmCtx *ctx, const char *name, char *alias_buf, size_t alias_sz) {
+    if (!ppc32_sym_requires_alias(name)) {
+        alias_buf[0] = '\0';
+        return;
+    }
+    uint32_t seq = ctx->local_seq++;
+    const char *lp = pir_asm_lbl_pfx(ctx->target);
+    snprintf(alias_buf, alias_sz, "%sPS%u", lp, seq);
+    fprintf(ctx->out, "\t.set %s, ", alias_buf);
+    ppc32_emit_sym(ctx->out, ctx->target, name);
+    fputc('\n', ctx->out);
 }
 
 static uint32_t add_f32_const(PpcAsmCtx *ctx, uint32_t bits) {
@@ -168,22 +188,30 @@ static void emit_inst(PpcAsmCtx *ctx, const MFunc *mf, const MInst *ins) {
 
         case MI_PPC_SYM_ADDR: {
             unsigned rd = gp_num(ins->ops[0].u.preg);
+            char abuf[64];
+            ppc32_prepare_op_sym(ctx, ins->ops[1].u.sym.name, abuf, sizeof(abuf));
             fprintf(out, "\tlis %u, ", rd);
-            ppc32_emit_sym(out, target, ins->ops[1].u.sym.name);
+            if (abuf[0]) fputs(abuf, out);
+            else ppc32_emit_sym(out, target, ins->ops[1].u.sym.name);
             fputs("@ha\n", out);
             fprintf(out, "\taddi %u, %u, ", rd, rd);
-            ppc32_emit_sym(out, target, ins->ops[1].u.sym.name);
+            if (abuf[0]) fputs(abuf, out);
+            else ppc32_emit_sym(out, target, ins->ops[1].u.sym.name);
             fputs("@l\n", out);
             return;
         }
 
         case MI_PPC_TLS_ADDR: {
             unsigned rd = gp_num(ins->ops[0].u.preg);
+            char abuf[64];
+            ppc32_prepare_op_sym(ctx, ins->ops[1].u.sym.name, abuf, sizeof(abuf));
             fprintf(out, "\taddis %u, 2, ", rd);
-            ppc32_emit_sym(out, target, ins->ops[1].u.sym.name);
+            if (abuf[0]) fputs(abuf, out);
+            else ppc32_emit_sym(out, target, ins->ops[1].u.sym.name);
             fputs("@tprel@ha\n", out);
             fprintf(out, "\taddi %u, %u, ", rd, rd);
-            ppc32_emit_sym(out, target, ins->ops[1].u.sym.name);
+            if (abuf[0]) fputs(abuf, out);
+            else ppc32_emit_sym(out, target, ins->ops[1].u.sym.name);
             fputs("@tprel@l\n", out);
             return;
         }
@@ -310,7 +338,7 @@ static void emit_inst(PpcAsmCtx *ctx, const MFunc *mf, const MInst *ins) {
                 case PIR_ORDER_RELAXED:
                     break;
                 case PIR_ORDER_ACQUIRE:
-                    fputs("\tisync\n", out);
+                    fputs("\tlwsync\n", out);
                     break;
                 case PIR_ORDER_RELEASE:
                 case PIR_ORDER_ACQ_REL:
@@ -498,16 +526,22 @@ static void emit_inst(PpcAsmCtx *ctx, const MFunc *mf, const MInst *ins) {
             emit_bc(ctx, mf, ins->ops[0].u.cond, redir_blk(ctx, ins->ops[1].u.block_id));
             return;
 
-        case MI_PPC_CALL:
-            if (ins->aux_id != 0u) fputs("\tcreqv 6, 6, 6\n", out);
+        case MI_PPC_CALL: {
+            char abuf[64];
+            ppc32_prepare_op_sym(ctx, ins->ops[0].u.sym.name, abuf, sizeof(abuf));
+            if (ins->aux_id == 1u) fputs("\tcrxor 6, 6, 6\n", out);
+            else if (ins->aux_id >= 2u) fputs("\tcreqv 6, 6, 6\n", out);
             fputs("\tbl ", out);
-            ppc32_emit_sym(out, target, ins->ops[0].u.sym.name);
+            if (abuf[0]) fputs(abuf, out);
+            else ppc32_emit_sym(out, target, ins->ops[0].u.sym.name);
             fputc('\n', out);
             return;
+        }
 
         case MI_PPC_CALL_IND:
             fprintf(out, "\tmtctr %u\n", gp_num(ins->ops[0].u.preg));
-            if (ins->aux_id != 0u) fputs("\tcreqv 6, 6, 6\n", out);
+            if (ins->aux_id == 1u) fputs("\tcrxor 6, 6, 6\n", out);
+            else if (ins->aux_id >= 2u) fputs("\tcreqv 6, 6, 6\n", out);
             fputs("\tbctrl\n", out);
             return;
 
@@ -664,6 +698,19 @@ static void emit_inst(PpcAsmCtx *ctx, const MFunc *mf, const MInst *ins) {
     }
 }
 
+static uint32_t ppc32_max_inst_words(const MInst *ins) {
+    if (ins->op == MI_PPC_ATOMIC_CAS) return 26u;
+    if (ins->op == MI_PPC_ATOMIC_RMW) return 24u;
+    if (ins->op == MI_PPC_SWITCH_TBL) return 14u;
+    if (ins->op == MI_PPC_SETCC || ins->op == MI_PPC_CALL_IND) return 3u;
+    if (ins->op == MI_PPC_LI || ins->op == MI_PPC_SYM_ADDR ||
+        ins->op == MI_PPC_TLS_ADDR || ins->op == MI_PPC_LOAD_IMM_FP ||
+        ins->op == MI_PPC_LD || ins->op == MI_PPC_CALL || ins->op == MI_PPC_BC) {
+        return 2u;
+    }
+    return 1u;
+}
+
 static bool ppc32_emit_function(PirCodeEmitter *em, const PirModule *mod, const MFunc *mf) {
     PpcAsmCtx *ctx = (PpcAsmCtx *)em->ctx;
     FILE *out = ctx->out;
@@ -673,12 +720,15 @@ static bool ppc32_emit_function(PirCodeEmitter *em, const PirModule *mod, const 
     ctx->f32_pool.len = 0u;
     ctx->f64_pool.len = 0u;
 
-    uint32_t total_insts = 0u;
+    uint32_t total_words = 0u;
     for (uint32_t b = 0u; b < mf->blocks.len; ++b) {
-        total_insts += mf->blocks.data[b].insts.len;
+        const MBlock *blk = &mf->blocks.data[b];
+        for (uint32_t j = 0u; j < blk->insts.len; ++j) {
+            total_words += ppc32_max_inst_words(&blk->insts.data[j]);
+        }
     }
-    /* PowerPC conditional branch displacement is +-32 KiB (~8192 insns); relax above 4000. */
-    ctx->need_branch_relax = (total_insts > 4000u);
+    /* PowerPC conditional branch displacement is +-32 KiB (+-8192 words); relax above 6000. */
+    ctx->need_branch_relax = (total_words > 6000u);
 
     uint32_t *blk_redir = NULL;
     bool     *blk_skip  = NULL;

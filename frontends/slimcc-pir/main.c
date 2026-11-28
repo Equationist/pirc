@@ -968,14 +968,23 @@ static void print_tokens(Token *tok, FILE *out) {
   if (opt_P) {
     tok->at_bol = false;
     Token *prev = NULL;
-    for (; tok->kind != TK_EOF; prev = tok, tok = tok->next) {
-      if (tok->at_bol) {
-        fputc('\n', out);
+    bool pending_bol = false;
+    for (; tok->kind != TK_EOF; tok = tok->next) {
+      if (tok->kind == TK_PMARK) {
+        if (tok->at_bol)
+          pending_bol = true;
+        continue;
+      }
+      if (tok->at_bol || pending_bol) {
+        if (prev)
+          fputc('\n', out);
         prev = NULL;
+        pending_bol = false;
       }
       if (tok->has_space || needs_space_between(prev, tok))
         fputc(' ', out);
       fprintf(out, "%.*s", tok->len, tok->loc);
+      prev = tok;
     }
     fputc('\n', out);
     return;
@@ -986,8 +995,15 @@ static void print_tokens(Token *tok, FILE *out) {
   bool after_tok = false;
   Token *prev = NULL;
   for (; tok->kind != TK_EOF; tok = tok->next) {
-    if (tok->kind == TK_PMARK)
+    if (tok->kind == TK_PMARK) {
+      if (tok->at_bol && after_tok) {
+        fputc('\n', out);
+        line++;
+        after_tok = false;
+        prev = NULL;
+      }
       continue;
+    }
     if (tok->kind == TK_FMARK) {
       if (tok->display_file_no == tok->next->display_file_no && tok->next->kind != TK_EOF)
         continue;
@@ -995,6 +1011,7 @@ static void print_tokens(Token *tok, FILE *out) {
         fputc('\n', out);
       print_linemarker(out, tok);
       file_no = tok->display_file_no;
+      line = tok->display_line_no;
       after_tok = false;
       prev = NULL;
       continue;

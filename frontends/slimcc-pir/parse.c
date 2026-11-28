@@ -147,8 +147,14 @@ struct JumpContext {
   Node *node;
 } *jump_ctx;
 
+typedef struct {
+  int32_t val;
+  const char *id;
+  int id_len;
+} PackEntry;
+
 struct {
-  int32_t *data;
+  PackEntry *data;
   int32_t capacity;
   int32_t cnt;
 } pack_stk;
@@ -174,6 +180,7 @@ static bool *eval_recover;
 static bool eval_strict;
 static int parse_depth = 0;
 int uneval_depth = 0;
+int void_deref_ok_depth = 0;
 static bool is_lvalue_expr(Node *n);
 static void strip_proto_vla_exprs(Type *ty);
 
@@ -807,22 +814,35 @@ static bool braced_list(Token **rest, Token **tok_rest, bool skip_comma) {
   return true;
 }
 
-static void pragma_pack_push(void) {
+static void pragma_pack_push(const char *id, int id_len) {
   bool init = !pack_stk.cnt;
 
   if (pack_stk.cnt == pack_stk.capacity)
     GrowArr(pack_stk.data, &pack_stk.capacity);
 
   int idx = pack_stk.cnt++;
-  pack_stk.data[idx] = idx ? pack_stk.data[idx - 1] : 0;
+  pack_stk.data[idx].val = idx ? pack_stk.data[idx - 1].val : 0;
+  pack_stk.data[idx].id = idx ? id : NULL;
+  pack_stk.data[idx].id_len = idx ? id_len : 0;
 
   if (init)
-    pragma_pack_push();
+    pragma_pack_push(id, id_len);
 }
 
-static void pragma_pack_pop(Token *tok) {
+static void pragma_pack_pop(Token *tok, Token *id_tok) {
   if (pack_stk.cnt <= 1) {
     warn_tok(tok, "#pragma pack() stack empty");
+    return;
+  }
+  if (id_tok) {
+    for (int i = pack_stk.cnt - 1; i >= 1; i--) {
+      if (pack_stk.data[i].id && pack_stk.data[i].id_len == id_tok->len &&
+          memcmp(pack_stk.data[i].id, id_tok->loc, (size_t)id_tok->len) == 0) {
+        pack_stk.cnt = i;
+        return;
+      }
+    }
+    warn_tok(id_tok, "#pragma pack(pop, %.*s) identifier not found", id_tok->len, id_tok->loc);
     return;
   }
   pack_stk.cnt--;
@@ -830,26 +850,59 @@ static void pragma_pack_pop(Token *tok) {
 
 static void pragma_pack_set(int val) {
   if (!pack_stk.cnt) {
-    pragma_pack_push();
+    pragma_pack_push(NULL, 0);
     pack_stk.cnt = 1;
   }
-  pack_stk.data[pack_stk.cnt - 1] = val;
+  pack_stk.data[pack_stk.cnt - 1].val = val;
 }
 
 static void pragma_pack(Token **rest, Token *tok) {
   if (consume(&tok, tok, "pack")) {
     tok = skip_tk(tok, TK_LPAREN);
     if (equal(tok, "pop")) {
-      pragma_pack_pop(tok);
-      *rest = skip_tk(tok->next, TK_RPAREN);
+      Token *pop_tok = tok;
+      tok = tok->next;
+      if (consume_tk(rest, tok, TK_RPAREN)) {
+        pragma_pack_pop(pop_tok, NULL);
+        return;
+      }
+      tok = skip_tk(tok, TK_COMMA);
+      Token *id_tok = NULL;
+      if (tok->kind == TK_IDENT) {
+        id_tok = tok;
+        tok = tok->next;
+        pragma_pack_pop(pop_tok, id_tok);
+        if (consume_tk(rest, tok, TK_RPAREN))
+          return;
+        tok = skip_tk(tok, TK_COMMA);
+        pragma_pack_set(align_expr(&tok, tok));
+        *rest = skip_tk(tok, TK_RPAREN);
+        return;
+      }
+      pragma_pack_pop(pop_tok, NULL);
+      pragma_pack_set(align_expr(&tok, tok));
+      *rest = skip_tk(tok, TK_RPAREN);
       return;
     }
     if (equal(tok, "push")) {
-      pragma_pack_push();
-      if (consume_tk(rest, tok->next, TK_RPAREN))
+      tok = tok->next;
+      if (consume_tk(rest, tok, TK_RPAREN)) {
+        pragma_pack_push(NULL, 0);
         return;
-
-      tok = skip_tk(tok->next, TK_COMMA);
+      }
+      tok = skip_tk(tok, TK_COMMA);
+      if (tok->kind == TK_IDENT) {
+        Token *id_tok = tok;
+        tok = tok->next;
+        pragma_pack_push(id_tok->loc, id_tok->len);
+        if (consume_tk(rest, tok, TK_RPAREN))
+          return;
+        tok = skip_tk(tok, TK_COMMA);
+        pragma_pack_set(align_expr(&tok, tok));
+        *rest = skip_tk(tok, TK_RPAREN);
+        return;
+      }
+      pragma_pack_push(NULL, 0);
     }
     pragma_pack_set(tok->kind == TK_RPAREN ? 0 : align_expr(&tok, tok));
     *rest = skip_tk(tok, TK_RPAREN);
@@ -1453,6 +1506,7 @@ static void func_params(Token *tok, Type *fn_ty, bool is_def) {
 
       cur = cur->param_next = new_param(NULL, param_ty);
       cur->is_register = !!(attr.strg & SC_REGISTER);
+      aligned_attr(name, tok, &attr, &cur->alt_align);
       if (name)
         push_var_name(name, cur);
     }
@@ -6088,13 +6142,17 @@ static Type *struct_union_decl(Token **rest, Token *tok, TypeKind kind) {
       ty->is_constructing = true;
   }
 
+  /* Snapshot #pragma pack state BEFORE parsing body so directives inside the
+   * struct/union definition do not retroactively alter this type's layout. */
+  int cur_pack_align = pack_stk.cnt ? pack_stk.data[pack_stk.cnt - 1].val : 0;
+
   struct_members(&tok, tok, ty);
 
   attr_aligned(tok, TK_ATTR, &alt_align);
   bool_attr(tok, TK_ATTR, "packed", &is_packed);
   *rest = tok;
 
-  int pack_align = is_packed ? 1 : pack_stk.cnt ? pack_stk.data[pack_stk.cnt - 1] : 0;
+  int pack_align = is_packed ? 1 : cur_pack_align;
 
   if (kind == TY_STRUCT)
     ty = struct_decl(ty, alt_align, pack_align);
@@ -6352,8 +6410,8 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
       if (arg->ty->kind == TY_VOID || (arg->ty->size < 0 && !is_array(arg->ty)))
         error_tok(arg->tok, "invalid argument of void or incomplete type");
 
-      if (is_integer(arg->ty) && arg->ty->size < ty_int->size)
-        arg = new_cast(arg, ty_int);
+      if (is_integer(arg->ty))
+        int_promotion(&arg);
       else if (arg->ty->kind == TY_FLOAT)
         arg = new_cast(arg, ty_double);
       else
@@ -6409,8 +6467,10 @@ static Node *generic_selection(Token **rest, Token *tok) {
     t1 = typename(&tok, tok);
   } else {
     uneval_depth++;
+    void_deref_ok_depth++;
     Node *ctrl = assign(&tok, tok);
     add_type(ctrl);
+    void_deref_ok_depth--;
     uneval_depth--;
     chk_not_register_array(ctrl);
     t1 = unqual(ptr_decay(ctrl->ty));
@@ -6650,11 +6710,28 @@ static Node *builtin_functions(Token **rest, Token *tok) {
 
   if (equal(tok, "__builtin_offsetof")) {
     tok = skip_tk(tok->next, TK_LPAREN);
+    Token *ty_start = tok;
     Type *ty = typename(&tok, tok);
+    if (is_iso_std && opt_std < STD_C23 && !ty_start->file->is_syshdr &&
+        has_lcurly_before(ty_start, tok))
+      error_tok(ty_start, "defining a type within 'offsetof' is a C23 extension");
     Node *node = new_unary(ND_DEREF, new_cast(new_num(0, tok), pointer_to(ty)), tok);
     tok = skip_tk(tok, TK_COMMA);
-    Token dot = {.kind = TK_DOT, .loc = ".", .len = 1, .next = tok, .origin = tok, .file = tok->file};
-    node = postfix(node, &tok, &dot);
+    node = struct_ref(node, ident_tok(&tok, tok));
+    for (;;) {
+      if (tok->kind == TK_DOT) {
+        node = struct_ref(node, ident_tok(&tok, tok->next));
+        continue;
+      }
+      if (tok->kind == TK_LBRACK) {
+        Token *start = tok;
+        Node *idx = expression(&tok, tok->next);
+        tok = skip_tk(tok, TK_RBRACK);
+        node = new_unary(ND_DEREF, new_add(node, idx, start), start);
+        continue;
+      }
+      break;
+    }
     add_type(node);
     if (is_bitfield(node))
       error_tok(tok, "cannot apply offsetof to bit-field");
@@ -7139,11 +7216,13 @@ static Node *func_old_style_param(Token **rest, Token *tok, Type *prot_ty, Type 
       if (!promoted) {
         var->ty = ty;
         var->is_register = !!(attr.strg & SC_REGISTER);
+        aligned_attr(name, tok, &attr, &var->alt_align);
         push_var_name(name, var);
       } else {
         var->ty = (ty->qual & Q_ATOMIC) ? promoted : unqual(promoted);
         Node *lhs = new_var_node(new_lvar2(ty, decl_scope()), name);
         lhs->m.var->is_register = !!(attr.strg & SC_REGISTER);
+        aligned_attr(name, tok, &attr, &lhs->m.var->alt_align);
         push_var_name(name, lhs->m.var);
 
         Node *rhs = new_var_node(var, name);

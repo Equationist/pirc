@@ -401,6 +401,7 @@ struct File {
   InclIdx incl_idx;
   bool is_syshdr;
   bool is_placeholder;
+  bool is_preprocessed;
 };
 
 typedef struct Token Token;
@@ -1079,6 +1080,7 @@ extern bool opt_dM;
 extern bool opt_P;
 extern bool opt_reuse_stack;
 extern int uneval_depth;
+extern int void_deref_ok_depth;
 extern bool opt_g;
 extern bool opt_werror;
 extern StdVer opt_std;

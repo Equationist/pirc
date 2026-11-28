@@ -1631,6 +1631,13 @@ static bool parse_instruction(Parser *p, PirFuncId func_idx, PirBlockId blk_idx,
                     } else if (inst.ty.u.scalar == PIR_SCALAR_I64) {
                         expected = pir_type_scalar(PIR_SCALAR_F64);
                     }
+                } else if (inst.op == PIR_OP_BITCAST && ops.data[k].kind == PIR_OPER_IMM_INT &&
+                           inst.ty.kind == PIR_TYPE_SCALAR) {
+                    if (inst.ty.u.scalar == PIR_SCALAR_F32) {
+                        expected = pir_type_scalar(PIR_SCALAR_I32);
+                    } else if (inst.ty.u.scalar == PIR_SCALAR_F64) {
+                        expected = pir_type_scalar(PIR_SCALAR_I64);
+                    }
                 }
                 assign_literal_type(&ops.data[k], expected);
             }

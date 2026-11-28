@@ -61,10 +61,6 @@ static void walk_rv32_fp_struct(const PirModule *mod, const PirTargetSpec *targe
             return;
         }
         PirTypeLayout ly = pir_type_layout(mod, target, ty);
-        if (ly.align > 1u && (base_off % ly.align) != 0u) {
-            w->valid = false;
-            return;
-        }
         if (ty.u.scalar == PIR_SCALAR_F32 || ty.u.scalar == PIR_SCALAR_F64) {
             w->tys[w->count]  = ty;
             w->offs[w->count] = base_off;
@@ -99,21 +95,29 @@ static void walk_rv32_fp_struct(const PirModule *mod, const PirTargetSpec *targe
     if (agg->kind == PIR_AGG_PAD) {
         return;
     }
-    if (agg->kind == PIR_AGG_UNION || agg->kind == PIR_AGG_PACKED_STRUCT) {
+    if (agg->kind == PIR_AGG_UNION) {
         w->valid = false;
         return;
     }
     if (agg->kind == PIR_AGG_ARRAY) {
-        /* RISC-V psABI: arrays are NOT flattened for the hardware-FP calling convention
-         * (only struct members are flattened). */
-        w->valid = false;
+        if (agg->array_len == 0u) return;
+        PirTypeLayout el = pir_type_layout(mod, target, agg->elem_type);
+        if (el.size == 0u || pir_abi_is_pad_only_agg(mod, agg->elem_type)) return;
+        if (agg->array_len > 2u) {
+            w->valid = false;
+            return;
+        }
+        for (uint64_t i = 0u; i < agg->array_len && w->valid; ++i) {
+            walk_rv32_fp_struct(mod, target, agg->elem_type, base_off + i * el.size, w);
+        }
         return;
     }
-    /* PIR_AGG_STRUCT */
+    /* PIR_AGG_STRUCT or PIR_AGG_PACKED_STRUCT */
+    bool is_packed = (agg->kind == PIR_AGG_PACKED_STRUCT);
     uint64_t pos = 0u;
     for (uint32_t i = 0u; i < agg->field_count && w->valid; ++i) {
         PirTypeLayout fl = pir_type_layout(mod, target, agg->fields[i]);
-        uint64_t foff = rv32_align_up(pos, fl.align);
+        uint64_t foff = is_packed ? pos : rv32_align_up(pos, fl.align);
         walk_rv32_fp_struct(mod, target, agg->fields[i], base_off + foff, w);
         pos = foff + fl.size;
     }
@@ -130,15 +134,6 @@ static bool try_rv32_fp_struct(const PirModule *mod, const PirTargetSpec *target
         return false;
     }
     if (w.fp_cnt > avail_fp || w.gp_cnt > avail_gp) {
-        return false;
-    }
-    PirTypeLayout agg_ly = pir_type_layout(mod, target, agg_ty);
-    uint64_t reg_cap = 0u;
-    for (uint32_t i = 0u; i < w.count; ++i) {
-        PirTypeLayout fl = pir_type_layout(mod, target, w.tys[i]);
-        reg_cap += (fl.size < 4u) ? 4u : fl.size;
-    }
-    if (agg_ly.size > reg_cap) {
         return false;
     }
     out->kind            = PIR_ABI_DIRECT;

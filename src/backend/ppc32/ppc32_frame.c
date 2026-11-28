@@ -86,6 +86,18 @@ bool pir_ppc32_frame_lower(MFunc *mf, PirDiag *diag) {
     (void)diag;
     if (mf->blocks.len == 0u) return true;
 
+    /* If a large stack frame (>32 KiB) may require an address scratch during
+     * MI_STORE_SLOT / MI_STORE_OUTARG while src == PPC_SCRATCH_GP1 (r12),
+     * reserve PPC_SCRATCH_GP2 (r30) so we never clobber PPC_SCRATCH_GP0 (r11,
+     * which holds the live cycle-breaker value in parallel-copy cycles). */
+    uint64_t est_slots = 512u;
+    for (uint32_t s = 0u; s < mf->slots.len; ++s) {
+        est_slots += mf->slots.data[s].size + 16u;
+    }
+    if (est_slots > 32768u || mf->max_out_args_bytes + 16u > 32768u) {
+        mf->used_callee_gp_mask |= (1u << 30u);
+    }
+
     /* Collect callee-saved GP (r14..r30) and FP (f14..f31) registers used. */
     MPReg cs_gp[20];
     uint32_t n_cs_gp = 0u;
@@ -238,7 +250,7 @@ bool pir_ppc32_frame_lower(MFunc *mf, PirDiag *diag) {
             if (ins.op == MI_STORE_SLOT) {
                 MPReg src = ins.ops[0].u.preg;
                 int64_t off = mf->slots.data[ins.ops[1].u.slot_id].fp_offset;
-                MPReg atmp = (src == PPC_SCRATCH_GP1) ? PPC_SCRATCH_GP0 : PPC_SCRATCH_GP1;
+                MPReg atmp = (src == PPC_SCRATCH_GP1) ? PPC_SCRATCH_GP2 : PPC_SCRATCH_GP1;
                 emit_mem_at_off(&out, false, src, PPC_FP_REG, off, ins.width, atmp, loc);
                 continue;
             }
@@ -253,7 +265,7 @@ bool pir_ppc32_frame_lower(MFunc *mf, PirDiag *diag) {
             if (ins.op == MI_STORE_OUTARG) {
                 MPReg src = ins.ops[0].u.preg;
                 int64_t off = 8 + ins.ops[1].u.imm;
-                MPReg atmp = (src == PPC_SCRATCH_GP1) ? PPC_SCRATCH_GP0 : PPC_SCRATCH_GP1;
+                MPReg atmp = (src == PPC_SCRATCH_GP1) ? PPC_SCRATCH_GP2 : PPC_SCRATCH_GP1;
                 emit_mem_at_off(&out, false, src, PPC_SP, off, ins.width, atmp, loc);
                 continue;
             }

@@ -141,6 +141,26 @@ static bool rv32_emit_header(PirCodeEmitter *em, const PirModule *mod,
     return true;
 }
 
+static void emit_mask_subword(FILE *out, const char *dst, const char *src, uint32_t wmask) {
+    if (wmask == 0xFFu) {
+        fprintf(out, "\tandi %s, %s, 255\n", dst, src);
+    } else {
+        fprintf(out, "\tslli %s, %s, 16\n\tsrli %s, %s, 16\n", dst, src, dst, dst);
+    }
+}
+
+static uint32_t rv32_max_inst_words(const MInst *ins) {
+    if (ins->op == MI_RV32_ATOMIC_CAS) return 24u;
+    if (ins->op == MI_RV32_ATOMIC_RMW) return 20u;
+    if (ins->op == MI_RV32_SWITCH_TBL) return 10u;
+    if (ins->op == MI_RV32_LI || ins->op == MI_RV32_SYM_ADDR ||
+        ins->op == MI_RV32_TLS_ADDR || ins->op == MI_RV32_LOAD_IMM_F64 ||
+        ins->op == MI_RV32_CALL || ins->op == MI_RV32_BCC) {
+        return 3u;
+    }
+    return 1u;
+}
+
 static void emit_inst(Rv32AsmCtx *ctx, const MFunc *mf, const MInst *ins) {
     FILE *out = ctx->out;
     const PirTargetSpec *target = ctx->target;
@@ -315,33 +335,18 @@ static void emit_inst(Rv32AsmCtx *ctx, const MFunc *mf, const MInst *ins) {
                     case PIR_RMW_XOR:  fprintf(out, "\txor t4, t4, %s\n", val); break;
                     case PIR_RMW_XCHG: fprintf(out, "\tmv t4, %s\n", val);      break;
                 }
-                if (wmask == 0xFFu) {
-                    fprintf(out, "\tandi t4, t4, 255\n");
-                } else {
-                    fprintf(out, "\tslli t4, t4, 16\n\tsrli t4, t4, 16\n");
-                }
+                emit_mask_subword(out, "t4", "t4", wmask);
                 fprintf(out, "\tsll t4, t4, t6\n");
-                /* Clear lane bits in word using stack-free sequence: build mask in sp-safe way via rd?
-                 * Wait: we have rd (old word) and t4 (shifted new lane). Use xori/and/or! */
+                /* Clear lane bits in word using stack-free sequence: (t4 >> t6) & wmask << t6 */
                 fprintf(out, "\txor t4, t4, %s\n", rd);
-                /* Mask t4 to lane bits only: shift right then left via a temp? Wait:
-                 * (t4 >> t6) & wmask << t6! */
                 fprintf(out, "\tsrl t4, t4, t6\n");
-                if (wmask == 0xFFu) {
-                    fprintf(out, "\tandi t4, t4, 255\n");
-                } else {
-                    fprintf(out, "\tslli t4, t4, 16\n\tsrli t4, t4, 16\n");
-                }
+                emit_mask_subword(out, "t4", "t4", wmask);
                 fprintf(out, "\tsll t4, t4, t6\n");
                 fprintf(out, "\txor t4, t4, %s\n", rd);
                 fprintf(out, "\tsc.w.aqrl t4, t4, (t5)\n");
                 fprintf(out, "\tbnez t4, %sARM_%u\n", lp, seq);
                 fprintf(out, "\tsrl %s, %s, t6\n", rd, rd);
-                if (wmask == 0xFFu) {
-                    fprintf(out, "\tandi %s, %s, 255\n", rd, rd);
-                } else {
-                    fprintf(out, "\tslli %s, %s, 16\n\tsrli %s, %s, 16\n", rd, rd, rd, rd);
-                }
+                emit_mask_subword(out, rd, rd, wmask);
             }
             return;
         }
@@ -372,30 +377,17 @@ static void emit_inst(Rv32AsmCtx *ctx, const MFunc *mf, const MInst *ins) {
                 fprintf(out, "%sCAS_%u:\n", lp, seq);
                 fprintf(out, "\tlr.w.aqrl %s, (t5)\n", r_old);
                 fprintf(out, "\tsrl t4, %s, t6\n", r_old);
-                if (wmask == 0xFFu) {
-                    fprintf(out, "\tandi t4, t4, 255\n");
-                    fprintf(out, "\tandi %s, %s, 255\n", r_ok, exp);
-                } else {
-                    fprintf(out, "\tslli t4, t4, 16\n\tsrli t4, t4, 16\n");
-                    fprintf(out, "\tslli %s, %s, 16\n\tsrli %s, %s, 16\n", r_ok, exp, r_ok, r_ok);
-                }
+                emit_mask_subword(out, "t4", "t4", wmask);
+                emit_mask_subword(out, r_ok, exp, wmask);
                 fprintf(out, "\tbne t4, %s, %sCASF_%u\n", r_ok, lp, seq);
                 fprintf(out, "\txor t4, t4, %s\n", des);
-                if (wmask == 0xFFu) {
-                    fprintf(out, "\tandi t4, t4, 255\n");
-                } else {
-                    fprintf(out, "\tslli t4, t4, 16\n\tsrli t4, t4, 16\n");
-                }
+                emit_mask_subword(out, "t4", "t4", wmask);
                 fprintf(out, "\tsll t4, t4, t6\n");
                 fprintf(out, "\txor t4, t4, %s\n", r_old);
                 fprintf(out, "\tsc.w.aqrl t4, t4, (t5)\n");
                 fprintf(out, "\tbnez t4, %sCAS_%u\n", lp, seq);
                 fprintf(out, "\tsrl %s, %s, t6\n", r_old, r_old);
-                if (wmask == 0xFFu) {
-                    fprintf(out, "\tandi %s, %s, 255\n", r_old, r_old);
-                } else {
-                    fprintf(out, "\tslli %s, %s, 16\n\tsrli %s, %s, 16\n", r_old, r_old, r_old, r_old);
-                }
+                emit_mask_subword(out, r_old, r_old, wmask);
                 fprintf(out, "\tli %s, 1\n", r_ok);
                 fprintf(out, "\tj %sCASD_%u\n", lp, seq);
                 fprintf(out, "%sCASF_%u:\n", lp, seq);
@@ -671,11 +663,14 @@ static bool rv32_emit_function(PirCodeEmitter *em, const PirModule *mod, const M
 
     ctx->f64_pool.len = 0u;
 
-    uint32_t total_insts = 0u;
+    uint32_t total_words = 0u;
     for (uint32_t b = 0u; b < mf->blocks.len; ++b) {
-        total_insts += mf->blocks.data[b].insts.len;
+        const MBlock *blk = &mf->blocks.data[b];
+        for (uint32_t j = 0u; j < blk->insts.len; ++j) {
+            total_words += rv32_max_inst_words(&blk->insts.data[j]);
+        }
     }
-    ctx->need_branch_relax = (total_insts > 700u);
+    ctx->need_branch_relax = (total_words > 750u);
 
     uint32_t *blk_redir = NULL;
     bool     *blk_skip  = NULL;

@@ -387,6 +387,91 @@ static void emit_fctiwz_to_gp(PpcISelCtx *c, MVReg dst_gp, MVReg src_fp, uint32_
     emit(c, ld);
 }
 
+static void ppc32_assign_arg_slot(bool is_fp, uint8_t w, bool force_stack, uint32_t stack_align,
+                                  uint32_t *gp_i, uint32_t *fp_i, uint64_t *stk_off,
+                                  MPReg *out_preg, int64_t *out_soff) {
+    *out_preg = MREG_NONE;
+    *out_soff = -1;
+    if (is_fp) {
+        if (!force_stack && *fp_i < 8u) {
+            *out_preg = PPC_FP(1u + *fp_i);
+            (*fp_i)++;
+        } else {
+            uint64_t al = (w >= 8u || stack_align >= 8u) ? 8u : 4u;
+            *stk_off = (*stk_off + al - 1u) & ~(al - 1u);
+            *out_soff = (int64_t)*stk_off;
+            *stk_off += w;
+        }
+        return;
+    }
+    bool need_al8 = (stack_align >= 8u);
+    if (force_stack) {
+        /* SysV PPC32 SVR4: forcing an i64/arg onto stack (e.g. at gp_i == 7 / r10)
+         * exhausts remaining GP arg registers so trailing GP args cannot backfill r10. */
+        *gp_i = 8u;
+    } else {
+        if (need_al8 && (*gp_i & 1u) != 0u && *gp_i < 8u) {
+            (*gp_i)++;
+        }
+        if (need_al8 && *gp_i + 2u > 8u) {
+            *gp_i = 8u;
+        }
+    }
+    if (!force_stack && *gp_i < 8u) {
+        *out_preg = PPC_GP(3u + *gp_i);
+        (*gp_i)++;
+    } else {
+        uint64_t al = need_al8 ? 8u : 4u;
+        *stk_off = (*stk_off + al - 1u) & ~(al - 1u);
+        *out_soff = (int64_t)*stk_off;
+        *stk_off += 4u;
+    }
+}
+
+static void emit_fptoui32_split(PpcISelCtx *c, MVReg dst, MVReg src, uint32_t done_b, uint32_t loc) {
+    uint32_t big_b = mfunc_new_block(c->mf, "fu_big");
+    uint32_t sml_b = mfunc_new_block(c->mf, "fu_sml");
+    MVReg f231 = new_fp(c, 8u);
+    emit_imm_fp(c, f231, UINT64_C(0x41e0000000000000), 8u, loc); /* 2147483648.0 */
+    MInst cu = minst_make(MI_PPC_FCMPU, 8u, loc);
+    cu.op_count = 2u; cu.ops[0] = mop_vreg_use(src); cu.ops[1] = mop_vreg_use(f231);
+    emit(c, cu);
+    MInst bu = minst_make(MI_PPC_BC, 4u, loc);
+    bu.op_count = 2u; bu.ops[0] = mop_cond(MCOND_GE); bu.ops[1] = mop_block(big_b);
+    emit(c, bu);
+    MInst js = minst_make(MI_PPC_B, 4u, loc);
+    js.op_count = 1u; js.ops[0] = mop_block(sml_b);
+    emit(c, js);
+    mfunc_add_edge(c->mf, c->cur_mblk, big_b);
+    mfunc_add_edge(c->mf, c->cur_mblk, sml_b);
+
+    c->cur_mblk = sml_b;
+    emit_fctiwz_to_gp(c, dst, src, loc);
+    MInst jds = minst_make(MI_PPC_B, 4u, loc);
+    jds.op_count = 1u; jds.ops[0] = mop_block(done_b);
+    emit(c, jds);
+    mfunc_add_edge(c->mf, sml_b, done_b);
+
+    c->cur_mblk = big_b;
+    MVReg fadj = new_fp(c, 8u);
+    MInst fsb = minst_make(MI_PPC_FSUB, 8u, loc);
+    fsb.op_count = 3u; fsb.ops[0] = mop_vreg_def(fadj);
+    fsb.ops[1] = mop_vreg_use(src); fsb.ops[2] = mop_vreg_use(f231);
+    emit(c, fsb);
+    MVReg tmp_i = new_gp(c);
+    emit_fctiwz_to_gp(c, tmp_i, fadj, loc);
+    MVReg hi_bit = new_gp(c);
+    emit_li(c, hi_bit, (int32_t)0x80000000u, loc);
+    MInst xr = minst_make(MI_PPC_XOR, 4u, loc);
+    xr.op_count = 3u; xr.ops[0] = mop_vreg_def(dst);
+    xr.ops[1] = mop_vreg_use(tmp_i); xr.ops[2] = mop_vreg_use(hi_bit);
+    emit(c, xr);
+    MInst jdb = minst_make(MI_PPC_B, 4u, loc);
+    jdb.op_count = 1u; jdb.ops[0] = mop_block(done_b);
+    emit(c, jdb);
+    mfunc_add_edge(c->mf, big_b, done_b);
+}
+
 /* =========================================================================
  * Call Lowering (SysV PowerPC 32-bit SVR4 ABI)
  * ========================================================================= */
@@ -463,41 +548,8 @@ static void isel_call(PpcISelCtx *c, const PirInst *inst, uint32_t loc) {
 
     for (uint32_t i = 0u; i < nargs; ++i) {
         const PirOperand *aop = &inst->operands[first_arg + i];
-        arg_preg[i] = MREG_NONE;
-        arg_soff[i] = -1;
-
-        if (is_fp[i]) {
-            if (!aop->call_force_stack && fp_i < 8u) {
-                arg_preg[i] = PPC_FP(1u + fp_i);
-                fp_i++;
-            } else {
-                uint64_t al = (arg_w[i] >= 8u || aop->call_stack_align >= 8u) ? 8u : 4u;
-                stk_off = (stk_off + al - 1u) & ~(al - 1u);
-                arg_soff[i] = (int64_t)stk_off;
-                stk_off += arg_w[i];
-            }
-        } else {
-            bool need_al8 = (aop->call_stack_align >= 8u);
-            if (!aop->call_force_stack) {
-                if (need_al8 && (gp_i & 1u) != 0u && gp_i < 8u) {
-                    gp_i++;
-                }
-                /* If this is the first half of an 8B-aligned pair and only 1 reg (r10) remains,
-                 * SysV PPC32 pushes BOTH halves onto 8B-aligned stack. */
-                if (need_al8 && gp_i + 2u > 8u) {
-                    gp_i = 8u;
-                }
-            }
-            if (!aop->call_force_stack && gp_i < 8u) {
-                arg_preg[i] = PPC_GP(3u + gp_i);
-                gp_i++;
-            } else {
-                uint64_t al = need_al8 ? 8u : 4u;
-                stk_off = (stk_off + al - 1u) & ~(al - 1u);
-                arg_soff[i] = (int64_t)stk_off;
-                stk_off += 4u;
-            }
-        }
+        ppc32_assign_arg_slot(is_fp[i], arg_w[i], aop->call_force_stack, aop->call_stack_align,
+                              &gp_i, &fp_i, &stk_off, &arg_preg[i], &arg_soff[i]);
     }
 
     uint64_t out_bytes = (stk_off + 15u) & ~UINT64_C(15);
@@ -539,17 +591,18 @@ static void isel_call(PpcISelCtx *c, const PirInst *inst, uint32_t loc) {
         emit(c, cp);
     }
 
+    uint32_t va_cr6_mode = !is_variadic ? 0u : (fp_i > 0u ? 2u : 1u);
     if (is_ind) {
         MInst ci = minst_make(MI_PPC_CALL_IND, 4u, loc);
         ci.is_call  = true;
-        ci.aux_id   = (is_variadic && fp_i > 0u) ? 1u : 0u;
+        ci.aux_id   = va_cr6_mode;
         ci.op_count = 1u;
         ci.ops[0]   = mop_vreg_use(ind_v);
         emit(c, ci);
     } else {
         MInst cl = minst_make(MI_PPC_CALL, 4u, loc);
         cl.is_call  = true;
-        cl.aux_id   = (is_variadic && fp_i > 0u) ? 1u : 0u;
+        cl.aux_id   = va_cr6_mode;
         cl.op_count = 1u;
         cl.ops[0]   = mop_sym(inst->operands[0].u.sym.name, 0, true, false, false);
         emit(c, cl);
@@ -581,28 +634,43 @@ static void isel_call(PpcISelCtx *c, const PirInst *inst, uint32_t loc) {
             emit(c, cp);
         }
         uint64_t agg_sz = cabi_ret.agg_size > 0u ? cabi_ret.agg_size : ((uint64_t)nregs * 4u);
-        for (uint32_t k = 0u; k < nregs && k < 2u; ++k) {
-            uint64_t off = (uint64_t)k * 4u;
-            uint64_t rem = (agg_sz > off) ? (agg_sz - off) : 0u;
-            if (rem == 0u) continue;
-            if (rem < 4u) {
-                /* Big-endian partial trailing word: byte 0 is MSB (bits 24..31), etc. */
-                for (uint64_t b = 0u; b < rem; ++b) {
-                    MVReg bv = saved_v[k];
-                    uint32_t sh = (uint32_t)((3u - b) * 8u);
-                    if (sh > 0u) {
-                        bv = new_gp(c);
-                        MInst sr = minst_make(MI_PPC_SRWI, 4u, loc);
-                        sr.op_count = 3u; sr.ops[0] = mop_vreg_def(bv);
-                        sr.ops[1] = mop_vreg_use(saved_v[k]); sr.ops[2] = mop_imm((int64_t)sh);
-                        emit(c, sr);
-                    }
-                    MInst sb = minst_make(MI_PPC_ST, 1u, loc);
-                    sb.op_count = 3u; sb.ops[0] = mop_vreg_use(bv);
-                    sb.ops[1] = mop_vreg_use(hidden_out_v); sb.ops[2] = mop_imm((int64_t)(off + b));
-                    emit(c, sb);
+        if (nregs == 2u && agg_sz > 4u && agg_sz < 8u) {
+            /* SysV PPC32 SVR4: 5/6/7-byte aggregate returns are right-justified across r3:r4:
+             * r3 low (agg_sz - 4) bytes hold bytes[0 .. hi_bytes-1], r4 holds bytes[hi_bytes .. agg_sz-1]. */
+            uint64_t hi_bytes = agg_sz - 4u;
+            for (uint64_t b = 0u; b < hi_bytes; ++b) {
+                MVReg bv = saved_v[0];
+                uint32_t sh = (uint32_t)((hi_bytes - 1u - b) * 8u);
+                if (sh > 0u) {
+                    bv = new_gp(c);
+                    MInst sr = minst_make(MI_PPC_SRWI, 4u, loc);
+                    sr.op_count = 3u; sr.ops[0] = mop_vreg_def(bv);
+                    sr.ops[1] = mop_vreg_use(saved_v[0]); sr.ops[2] = mop_imm((int64_t)sh);
+                    emit(c, sr);
                 }
-            } else {
+                MInst sb = minst_make(MI_PPC_ST, 1u, loc);
+                sb.op_count = 3u; sb.ops[0] = mop_vreg_use(bv);
+                sb.ops[1] = mop_vreg_use(hidden_out_v); sb.ops[2] = mop_imm((int64_t)b);
+                emit(c, sb);
+            }
+            for (uint64_t b = 0u; b < 4u; ++b) {
+                MVReg bv = saved_v[1];
+                uint32_t sh = (uint32_t)((3u - b) * 8u);
+                if (sh > 0u) {
+                    bv = new_gp(c);
+                    MInst sr = minst_make(MI_PPC_SRWI, 4u, loc);
+                    sr.op_count = 3u; sr.ops[0] = mop_vreg_def(bv);
+                    sr.ops[1] = mop_vreg_use(saved_v[1]); sr.ops[2] = mop_imm((int64_t)sh);
+                    emit(c, sr);
+                }
+                MInst sb = minst_make(MI_PPC_ST, 1u, loc);
+                sb.op_count = 3u; sb.ops[0] = mop_vreg_use(bv);
+                sb.ops[1] = mop_vreg_use(hidden_out_v); sb.ops[2] = mop_imm((int64_t)(hi_bytes + b));
+                emit(c, sb);
+            }
+        } else {
+            for (uint32_t k = 0u; k < nregs && k < 2u; ++k) {
+                uint64_t off = (uint64_t)k * 4u;
                 MInst st = minst_make(MI_PPC_ST, 4u, loc);
                 st.op_count = 3u;
                 st.ops[0] = mop_vreg_use(saved_v[k]);
@@ -1085,9 +1153,16 @@ static void isel_inst(PpcISelCtx *c, const PirInst *inst) {
 
         case PIR_OP_BITCAST: {
             MVReg dst = c->val_vreg[inst->results[0]];
-            MVReg src = mat_op(c, &inst->operands[0], loc);
             MRegClass drc = ppc_rclass(inst->ty);
-            MRegClass src_rc = ppc_rclass(inst->operands[0].type);
+            if (inst->operands[0].kind == PIR_OPER_IMM_INT && drc == MREG_CLASS_FP) {
+                uint64_t raw = inst->operands[0].u.imm_int.is_negative
+                               ? (UINT64_C(0) - inst->operands[0].u.imm_int.lo)
+                               : inst->operands[0].u.imm_int.lo;
+                emit_imm_fp(c, dst, raw, ppc_vreg_bytes(inst->ty), loc);
+                return;
+            }
+            MVReg src = mat_op(c, &inst->operands[0], loc);
+            MRegClass src_rc = c->mf->vregs.data[src].rclass;
             if (drc == src_rc) {
                 MInst cp = minst_make(MI_COPY, ppc_vreg_bytes(inst->ty), loc);
                 cp.op_count = 2u; cp.ops[0] = mop_vreg_def(dst); cp.ops[1] = mop_vreg_use(src);
@@ -1180,34 +1255,37 @@ static void isel_inst(PpcISelCtx *c, const PirInst *inst) {
             MVReg dst = c->val_vreg[inst->results[0]];
             MVReg src = mat_op(c, &inst->operands[0], loc);
             bool is_s = (inst->op == PIR_OP_FPTOSI);
-            bool is_sat = (inst->flags & PIR_FLAG_SAT) != 0u;
             bool is_trap = (inst->flags & PIR_FLAG_TRAP) != 0u;
+            /* PIR default for flagless fptosi/fptoui is saturating ([sat]). */
+            bool is_sat = !is_trap && (inst->flags & PIR_FLAG_UNSAFE) == 0u;
             PirScalarType dsc = inst->ty.u.scalar;
 
             int64_t  imin = is_s ? ((dsc == PIR_SCALAR_I8) ? -128 : (dsc == PIR_SCALAR_I16) ? -32768 : INT32_MIN) : 0;
             uint64_t imax = is_s ? ((dsc == PIR_SCALAR_I8) ? 127u : (dsc == PIR_SCALAR_I16) ? 32767u : (uint64_t)INT32_MAX)
                                  : ((dsc == PIR_SCALAR_I8) ? 255u : (dsc == PIR_SCALAR_I16) ? 65535u : UINT32_MAX);
             double dmin = (double)imin;
+            double dmin_trap_excl = (double)imin - 1.0;
             double dmax_excl = is_s
                 ? ((dsc == PIR_SCALAR_I8) ? 128.0 : (dsc == PIR_SCALAR_I16) ? 32768.0 : 2147483648.0)
                 : ((dsc == PIR_SCALAR_I8) ? 256.0 : (dsc == PIR_SCALAR_I16) ? 65536.0 : 4294967296.0);
-            uint64_t bmin = 0u, bmax = 0u;
+            uint64_t bmin = 0u, bmin_trap = 0u, bmax = 0u;
             memcpy(&bmin, &dmin, 8u);
+            memcpy(&bmin_trap, &dmin_trap_excl, 8u);
             memcpy(&bmax, &dmax_excl, 8u);
 
             if (is_trap) {
-                /* Trap on NaN, < dmin, or >= dmax_excl */
+                /* Trap on NaN, trunc(src) < imin (i.e. src <= imin - 1.0), or >= dmax_excl */
                 MInst cn = minst_make(MI_PPC_FCMPU, 8u, loc);
                 cn.op_count = 2u; cn.ops[0] = mop_vreg_use(src); cn.ops[1] = mop_vreg_use(src);
                 emit(c, cn);
                 emit_bc_trap(c, MCOND_VS, loc); /* unordered = NaN */
 
                 MVReg fmin = new_fp(c, 8u);
-                emit_imm_fp(c, fmin, bmin, 8u, loc);
+                emit_imm_fp(c, fmin, bmin_trap, 8u, loc);
                 MInst cl = minst_make(MI_PPC_FCMPU, 8u, loc);
                 cl.op_count = 2u; cl.ops[0] = mop_vreg_use(src); cl.ops[1] = mop_vreg_use(fmin);
                 emit(c, cl);
-                emit_bc_trap(c, MCOND_LT, loc);
+                emit_bc_trap(c, MCOND_LE, loc);
 
                 MVReg fmax = new_fp(c, 8u);
                 emit_imm_fp(c, fmax, bmax, 8u, loc);
@@ -1292,48 +1370,7 @@ static void isel_inst(PpcISelCtx *c, const PirInst *inst) {
 
                 c->cur_mblk = conv_b;
                 if (!is_s && dsc == PIR_SCALAR_I32) {
-                    /* Unsigned 32-bit in [0, 2^32): split at 2^31 */
-                    uint32_t big_b = mfunc_new_block(c->mf, "fu_big");
-                    uint32_t sml_b = mfunc_new_block(c->mf, "fu_sml");
-                    MVReg f231 = new_fp(c, 8u);
-                    emit_imm_fp(c, f231, UINT64_C(0x41e0000000000000), 8u, loc); /* 2147483648.0 */
-                    MInst cu = minst_make(MI_PPC_FCMPU, 8u, loc);
-                    cu.op_count = 2u; cu.ops[0] = mop_vreg_use(src); cu.ops[1] = mop_vreg_use(f231);
-                    emit(c, cu);
-                    MInst bu = minst_make(MI_PPC_BC, 4u, loc);
-                    bu.op_count = 2u; bu.ops[0] = mop_cond(MCOND_GE); bu.ops[1] = mop_block(big_b);
-                    emit(c, bu);
-                    MInst js = minst_make(MI_PPC_B, 4u, loc);
-                    js.op_count = 1u; js.ops[0] = mop_block(sml_b);
-                    emit(c, js);
-                    mfunc_add_edge(c->mf, conv_b, big_b);
-                    mfunc_add_edge(c->mf, conv_b, sml_b);
-
-                    c->cur_mblk = sml_b;
-                    emit_fctiwz_to_gp(c, dst, src, loc);
-                    MInst jds = minst_make(MI_PPC_B, 4u, loc);
-                    jds.op_count = 1u; jds.ops[0] = mop_block(done_b);
-                    emit(c, jds);
-                    mfunc_add_edge(c->mf, sml_b, done_b);
-
-                    c->cur_mblk = big_b;
-                    MVReg fadj = new_fp(c, 8u);
-                    MInst fsb = minst_make(MI_PPC_FSUB, 8u, loc);
-                    fsb.op_count = 3u; fsb.ops[0] = mop_vreg_def(fadj);
-                    fsb.ops[1] = mop_vreg_use(src); fsb.ops[2] = mop_vreg_use(f231);
-                    emit(c, fsb);
-                    MVReg tmp_i = new_gp(c);
-                    emit_fctiwz_to_gp(c, tmp_i, fadj, loc);
-                    MVReg hi_bit = new_gp(c);
-                    emit_li(c, hi_bit, (int32_t)0x80000000u, loc);
-                    MInst xr = minst_make(MI_PPC_XOR, 4u, loc);
-                    xr.op_count = 3u; xr.ops[0] = mop_vreg_def(dst);
-                    xr.ops[1] = mop_vreg_use(tmp_i); xr.ops[2] = mop_vreg_use(hi_bit);
-                    emit(c, xr);
-                    MInst jdb = minst_make(MI_PPC_B, 4u, loc);
-                    jdb.op_count = 1u; jdb.ops[0] = mop_block(done_b);
-                    emit(c, jdb);
-                    mfunc_add_edge(c->mf, big_b, done_b);
+                    emit_fptoui32_split(c, dst, src, done_b, loc);
                 } else {
                     emit_fctiwz_to_gp(c, dst, src, loc);
                     MInst jdc = minst_make(MI_PPC_B, 4u, loc);
@@ -1347,49 +1384,8 @@ static void isel_inst(PpcISelCtx *c, const PirInst *inst) {
 
             /* Non-sat path (already trapped if is_trap) */
             if (!is_s && dsc == PIR_SCALAR_I32) {
-                uint32_t big_b  = mfunc_new_block(c->mf, "fu_big");
-                uint32_t sml_b  = mfunc_new_block(c->mf, "fu_sml");
                 uint32_t done_b = mfunc_new_block(c->mf, "fu_dn");
-                MVReg f231 = new_fp(c, 8u);
-                emit_imm_fp(c, f231, UINT64_C(0x41e0000000000000), 8u, loc);
-                MInst cu = minst_make(MI_PPC_FCMPU, 8u, loc);
-                cu.op_count = 2u; cu.ops[0] = mop_vreg_use(src); cu.ops[1] = mop_vreg_use(f231);
-                emit(c, cu);
-                MInst bu = minst_make(MI_PPC_BC, 4u, loc);
-                bu.op_count = 2u; bu.ops[0] = mop_cond(MCOND_GE); bu.ops[1] = mop_block(big_b);
-                emit(c, bu);
-                MInst js = minst_make(MI_PPC_B, 4u, loc);
-                js.op_count = 1u; js.ops[0] = mop_block(sml_b);
-                emit(c, js);
-                mfunc_add_edge(c->mf, c->cur_mblk, big_b);
-                mfunc_add_edge(c->mf, c->cur_mblk, sml_b);
-
-                c->cur_mblk = sml_b;
-                emit_fctiwz_to_gp(c, dst, src, loc);
-                MInst j1 = minst_make(MI_PPC_B, 4u, loc);
-                j1.op_count = 1u; j1.ops[0] = mop_block(done_b);
-                emit(c, j1);
-                mfunc_add_edge(c->mf, sml_b, done_b);
-
-                c->cur_mblk = big_b;
-                MVReg fadj = new_fp(c, 8u);
-                MInst fsb = minst_make(MI_PPC_FSUB, 8u, loc);
-                fsb.op_count = 3u; fsb.ops[0] = mop_vreg_def(fadj);
-                fsb.ops[1] = mop_vreg_use(src); fsb.ops[2] = mop_vreg_use(f231);
-                emit(c, fsb);
-                MVReg tmp_i = new_gp(c);
-                emit_fctiwz_to_gp(c, tmp_i, fadj, loc);
-                MVReg hi_bit = new_gp(c);
-                emit_li(c, hi_bit, (int32_t)0x80000000u, loc);
-                MInst xr = minst_make(MI_PPC_XOR, 4u, loc);
-                xr.op_count = 3u; xr.ops[0] = mop_vreg_def(dst);
-                xr.ops[1] = mop_vreg_use(tmp_i); xr.ops[2] = mop_vreg_use(hi_bit);
-                emit(c, xr);
-                MInst j2 = minst_make(MI_PPC_B, 4u, loc);
-                j2.op_count = 1u; j2.ops[0] = mop_block(done_b);
-                emit(c, j2);
-                mfunc_add_edge(c->mf, big_b, done_b);
-
+                emit_fptoui32_split(c, dst, src, done_b, loc);
                 c->cur_mblk = done_b;
             } else {
                 emit_fctiwz_to_gp(c, dst, src, loc);
@@ -1467,11 +1463,11 @@ static void isel_inst(PpcISelCtx *c, const PirInst *inst) {
             lbc.ops[1] = mop_vreg_use(cur_sp); lbc.ops[2] = mop_imm(0);
             emit(c, lbc);
 
-            /* sz_pad = (sz + 31) & ~15 (adds 16B header room) */
-            MInst a31 = minst_make(MI_PPC_ADDI, 4u, loc);
-            a31.op_count = 3u; a31.ops[0] = mop_vreg_def(sz_pad);
-            a31.ops[1] = mop_vreg_use(sz); a31.ops[2] = mop_imm(31);
-            emit(c, a31);
+            /* sz_al = (sz + 15) & ~15 */
+            MInst a15 = minst_make(MI_PPC_ADDI, 4u, loc);
+            a15.op_count = 3u; a15.ops[0] = mop_vreg_def(sz_pad);
+            a15.ops[1] = mop_vreg_use(sz); a15.ops[2] = mop_imm(15);
+            emit(c, a15);
 
             MVReg m16 = new_gp(c), sz_al = new_gp(c);
             emit_li(c, m16, -16, loc);
@@ -1480,22 +1476,29 @@ static void isel_inst(PpcISelCtx *c, const PirInst *inst) {
             an.ops[1] = mop_vreg_use(sz_pad); an.ops[2] = mop_vreg_use(m16);
             emit(c, an);
 
+            /* raw_dst = cur_sp - sz_al; align down to al so dst % al == 0, then nsp = dst - 16. */
+            MVReg raw_dst = (al > 16u) ? new_gp(c) : dst;
             MInst sb = minst_make(MI_PPC_SUB, 4u, loc);
-            sb.op_count = 3u; sb.ops[0] = mop_vreg_def(nsp);
+            sb.op_count = 3u; sb.ops[0] = mop_vreg_def(raw_dst);
             sb.ops[1] = mop_vreg_use(cur_sp); sb.ops[2] = mop_vreg_use(sz_al);
             emit(c, sb);
 
             if (al > 16u) {
-                MVReg mal = new_gp(c), nsp2 = new_gp(c);
+                MVReg mal = new_gp(c);
                 emit_li(c, mal, -(int32_t)al, loc);
                 MInst aa = minst_make(MI_PPC_AND, 4u, loc);
-                aa.op_count = 3u; aa.ops[0] = mop_vreg_def(nsp2);
-                aa.ops[1] = mop_vreg_use(nsp); aa.ops[2] = mop_vreg_use(mal);
+                aa.op_count = 3u; aa.ops[0] = mop_vreg_def(dst);
+                aa.ops[1] = mop_vreg_use(raw_dst); aa.ops[2] = mop_vreg_use(mal);
                 emit(c, aa);
-                nsp = nsp2;
             }
 
-            /* Store backchain at 0(nsp), update sp = nsp, return nsp + 16 */
+            /* Reserve 16B header below dst (nsp is guaranteed 16B-aligned since al >= 16). */
+            MInst sub16 = minst_make(MI_PPC_ADDI, 4u, loc);
+            sub16.op_count = 3u; sub16.ops[0] = mop_vreg_def(nsp);
+            sub16.ops[1] = mop_vreg_use(dst); sub16.ops[2] = mop_imm(-16);
+            emit(c, sub16);
+
+            /* Store backchain at 0(nsp), update sp = nsp, return dst */
             MInst sbc = minst_make(MI_PPC_ST, 4u, loc);
             sbc.op_count = 3u; sbc.ops[0] = mop_vreg_use(bc);
             sbc.ops[1] = mop_vreg_use(nsp); sbc.ops[2] = mop_imm(0);
@@ -1504,11 +1507,6 @@ static void isel_inst(PpcISelCtx *c, const PirInst *inst) {
             MInst ssp = minst_make(MI_PPC_MOV_SP, 4u, loc);
             ssp.aux_id = 1u; ssp.op_count = 1u; ssp.ops[0] = mop_vreg_use(nsp);
             emit(c, ssp);
-
-            MInst retp = minst_make(MI_PPC_ADDI, 4u, loc);
-            retp.op_count = 3u; retp.ops[0] = mop_vreg_def(dst);
-            retp.ops[1] = mop_vreg_use(nsp); retp.ops[2] = mop_imm(16);
-            emit(c, retp);
             return;
         }
 
@@ -1859,39 +1857,63 @@ static void isel_inst(PpcISelCtx *c, const PirInst *inst) {
                 uint32_t nregs = c->fn->cabi_ret.reg_count;
                 uint64_t agg_sz = c->fn->cabi_ret.agg_size > 0u ? c->fn->cabi_ret.agg_size : ((uint64_t)nregs * 4u);
                 MVReg vals[2] = { MVREG_NONE, MVREG_NONE };
-                for (uint32_t k = 0u; k < nregs && k < 2u; ++k) {
-                    uint64_t off = (uint64_t)k * 4u;
-                    uint64_t rem = (agg_sz > off) ? (agg_sz - off) : 0u;
-                    vals[k] = new_gp(c);
-                    if (rem == 0u) {
-                        emit_li(c, vals[k], 0, loc);
-                    } else if (rem < 4u) {
-                        /* Big-endian partial trailing word: byte 0 at MSB (bits 24..31), etc. */
-                        MVReg acc = new_gp(c);
-                        emit_li(c, acc, 0, loc);
-                        for (uint64_t b = 0u; b < rem; ++b) {
-                            MVReg bv = new_gp(c);
-                            MInst lb = minst_make(MI_PPC_LD, 1u, loc);
-                            lb.op_count = 3u; lb.ops[0] = mop_vreg_def(bv);
-                            lb.ops[1] = mop_vreg_use(c->multi_ret_vreg); lb.ops[2] = mop_imm((int64_t)(off + b));
-                            emit(c, lb);
-                            uint32_t sh = (uint32_t)((3u - b) * 8u);
-                            if (sh > 0u) {
-                                MVReg bs = new_gp(c);
-                                MInst sl = minst_make(MI_PPC_SLWI, 4u, loc);
-                                sl.op_count = 3u; sl.ops[0] = mop_vreg_def(bs);
-                                sl.ops[1] = mop_vreg_use(bv); sl.ops[2] = mop_imm((int64_t)sh);
-                                emit(c, sl);
-                                bv = bs;
-                            }
-                            MVReg nx = (b + 1u == rem) ? vals[k] : new_gp(c);
-                            MInst oi = minst_make(MI_PPC_OR, 4u, loc);
-                            oi.op_count = 3u; oi.ops[0] = mop_vreg_def(nx);
-                            oi.ops[1] = mop_vreg_use(acc); oi.ops[2] = mop_vreg_use(bv);
-                            emit(c, oi);
-                            acc = nx;
+                if (nregs == 2u && agg_sz > 4u && agg_sz < 8u) {
+                    /* SysV PPC32 SVR4: right-justify 5/6/7-byte aggregate across r3:r4. */
+                    uint64_t hi_bytes = agg_sz - 4u;
+                    vals[0] = new_gp(c);
+                    vals[1] = new_gp(c);
+                    MVReg acc0 = new_gp(c);
+                    emit_li(c, acc0, 0, loc);
+                    for (uint64_t b = 0u; b < hi_bytes; ++b) {
+                        MVReg bv = new_gp(c);
+                        MInst lb = minst_make(MI_PPC_LD, 1u, loc);
+                        lb.op_count = 3u; lb.ops[0] = mop_vreg_def(bv);
+                        lb.ops[1] = mop_vreg_use(c->multi_ret_vreg); lb.ops[2] = mop_imm((int64_t)b);
+                        emit(c, lb);
+                        uint32_t sh = (uint32_t)((hi_bytes - 1u - b) * 8u);
+                        if (sh > 0u) {
+                            MVReg bs = new_gp(c);
+                            MInst sl = minst_make(MI_PPC_SLWI, 4u, loc);
+                            sl.op_count = 3u; sl.ops[0] = mop_vreg_def(bs);
+                            sl.ops[1] = mop_vreg_use(bv); sl.ops[2] = mop_imm((int64_t)sh);
+                            emit(c, sl);
+                            bv = bs;
                         }
-                    } else {
+                        MVReg nx = (b + 1u == hi_bytes) ? vals[0] : new_gp(c);
+                        MInst oi = minst_make(MI_PPC_OR, 4u, loc);
+                        oi.op_count = 3u; oi.ops[0] = mop_vreg_def(nx);
+                        oi.ops[1] = mop_vreg_use(acc0); oi.ops[2] = mop_vreg_use(bv);
+                        emit(c, oi);
+                        acc0 = nx;
+                    }
+                    MVReg acc1 = new_gp(c);
+                    emit_li(c, acc1, 0, loc);
+                    for (uint64_t b = 0u; b < 4u; ++b) {
+                        MVReg bv = new_gp(c);
+                        MInst lb = minst_make(MI_PPC_LD, 1u, loc);
+                        lb.op_count = 3u; lb.ops[0] = mop_vreg_def(bv);
+                        lb.ops[1] = mop_vreg_use(c->multi_ret_vreg); lb.ops[2] = mop_imm((int64_t)(hi_bytes + b));
+                        emit(c, lb);
+                        uint32_t sh = (uint32_t)((3u - b) * 8u);
+                        if (sh > 0u) {
+                            MVReg bs = new_gp(c);
+                            MInst sl = minst_make(MI_PPC_SLWI, 4u, loc);
+                            sl.op_count = 3u; sl.ops[0] = mop_vreg_def(bs);
+                            sl.ops[1] = mop_vreg_use(bv); sl.ops[2] = mop_imm((int64_t)sh);
+                            emit(c, sl);
+                            bv = bs;
+                        }
+                        MVReg nx = (b + 1u == 4u) ? vals[1] : new_gp(c);
+                        MInst oi = minst_make(MI_PPC_OR, 4u, loc);
+                        oi.op_count = 3u; oi.ops[0] = mop_vreg_def(nx);
+                        oi.ops[1] = mop_vreg_use(acc1); oi.ops[2] = mop_vreg_use(bv);
+                        emit(c, oi);
+                        acc1 = nx;
+                    }
+                } else {
+                    for (uint32_t k = 0u; k < nregs && k < 2u; ++k) {
+                        uint64_t off = (uint64_t)k * 4u;
+                        vals[k] = new_gp(c);
                         MInst ld = minst_make(MI_PPC_LD, 4u, loc);
                         ld.op_count = 3u; ld.ops[0] = mop_vreg_def(vals[k]);
                         ld.ops[1] = mop_vreg_use(c->multi_ret_vreg); ld.ops[2] = mop_imm((int64_t)off);
@@ -2033,56 +2055,21 @@ bool pir_ppc32_isel_func(const PirModule *mod, const PirFunction *fn, uint32_t f
         MVReg dst = (pd->val_id != PIR_INVALID_ID) ? ctx.val_vreg[pd->val_id] : MVREG_NONE;
         bool fp = (ppc_rclass(pd->type) == MREG_CLASS_FP);
         uint8_t w = ppc_vreg_bytes(pd->type);
-
-        if (fp) {
-            if (!pd->abi_force_stack && fp_i < 8u) {
-                if (dst != MVREG_NONE) {
-                    MInst cp = minst_make(MI_COPY, w, 0u);
-                    cp.op_count = 2u; cp.ops[0] = mop_vreg_def(dst);
-                    cp.ops[1] = mop_preg_use(PPC_FP(1u + fp_i));
-                    emit(&ctx, cp);
-                }
-                fp_i++;
-            } else {
-                uint64_t al = (w >= 8u || pd->abi_stack_align >= 8u) ? 8u : 4u;
-                stk_off = (stk_off + al - 1u) & ~(al - 1u);
-                if (dst != MVREG_NONE) {
-                    MInst li = minst_make(MI_LOAD_INARG, w, 0u);
-                    li.op_count = 2u; li.ops[0] = mop_vreg_def(dst);
-                    li.ops[1] = mop_imm((int64_t)stk_off);
-                    emit(&ctx, li);
-                }
-                stk_off += w;
-            }
+        MPReg preg = MREG_NONE;
+        int64_t soff = -1;
+        ppc32_assign_arg_slot(fp, w, pd->abi_force_stack, pd->abi_stack_align,
+                              &gp_i, &fp_i, &stk_off, &preg, &soff);
+        if (dst == MVREG_NONE) continue;
+        if (preg != MREG_NONE) {
+            MInst cp = minst_make(MI_COPY, fp ? w : 4u, 0u);
+            cp.op_count = 2u; cp.ops[0] = mop_vreg_def(dst);
+            cp.ops[1] = mop_preg_use(preg);
+            emit(&ctx, cp);
         } else {
-            bool need_al8 = (pd->abi_stack_align >= 8u);
-            if (!pd->abi_force_stack) {
-                if (need_al8 && (gp_i & 1u) != 0u && gp_i < 8u) {
-                    gp_i++;
-                }
-                if (need_al8 && gp_i + 2u > 8u) {
-                    gp_i = 8u;
-                }
-            }
-            if (!pd->abi_force_stack && gp_i < 8u) {
-                if (dst != MVREG_NONE) {
-                    MInst cp = minst_make(MI_COPY, 4u, 0u);
-                    cp.op_count = 2u; cp.ops[0] = mop_vreg_def(dst);
-                    cp.ops[1] = mop_preg_use(PPC_GP(3u + gp_i));
-                    emit(&ctx, cp);
-                }
-                gp_i++;
-            } else {
-                uint64_t al = need_al8 ? 8u : 4u;
-                stk_off = (stk_off + al - 1u) & ~(al - 1u);
-                if (dst != MVREG_NONE) {
-                    MInst li = minst_make(MI_LOAD_INARG, 4u, 0u);
-                    li.op_count = 2u; li.ops[0] = mop_vreg_def(dst);
-                    li.ops[1] = mop_imm((int64_t)stk_off);
-                    emit(&ctx, li);
-                }
-                stk_off += 4u;
-            }
+            MInst li = minst_make(MI_LOAD_INARG, fp ? w : 4u, 0u);
+            li.op_count = 2u; li.ops[0] = mop_vreg_def(dst);
+            li.ops[1] = mop_imm(soff);
+            emit(&ctx, li);
         }
     }
 

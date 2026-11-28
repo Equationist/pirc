@@ -714,9 +714,13 @@ Type *composite_type(Type *t1, Type *t2) {
   if (is_array(t1) && is_array(t2)) {
     Type *base = composite_type(t1->base, t2->base);
     if (t1->kind == TY_ARRAY && t1->size >= 0)
-      return array_of(base, t1->array_len);
+      return base->kind == TY_VLA ? vla_of(base, NULL, t1->array_len) : array_of(base, t1->array_len);
     if (t2->kind == TY_ARRAY && t2->size >= 0)
-      return array_of(base, t2->array_len);
+      return base->kind == TY_VLA ? vla_of(base, NULL, t2->array_len) : array_of(base, t2->array_len);
+    int64_t *l1 = get_arr_len(t1);
+    int64_t *l2 = get_arr_len(t2);
+    if (l1 || l2)
+      return vla_of(base, NULL, l1 ? *l1 : *l2);
     if (t1->kind == TY_VLA || t2->kind == TY_VLA) {
       Type *src = (t2->kind == TY_VLA && (t2->vla_len_val || t2->vla_len_expr)) ? t2
                 : (t1->kind == TY_VLA && (t1->vla_len_val || t1->vla_len_expr)) ? t1
@@ -994,10 +998,12 @@ static Type *cond_ptr_conv2(Type *ty1, Type *ty2, Node **cond, Obj **cond_var) {
     Type *base = cond_ptr_conv2(ty1->base, ty2->base, cond, cond_var);
     if ((ty1->kind == TY_ARRAY && ty1->size >= 0) || (ty2->kind == TY_ARRAY && ty2->size >= 0)) {
       int64_t alen = (ty1->kind == TY_ARRAY && ty1->size >= 0) ? ty1->array_len : ty2->array_len;
-      if (base->kind == TY_VLA)
-        return vla_of(base, NULL, alen);
-      return array_of(base, alen);
+      return base->kind == TY_VLA ? vla_of(base, NULL, alen) : array_of(base, alen);
     }
+    int64_t *l1 = get_arr_len(ty1);
+    int64_t *l2 = get_arr_len(ty2);
+    if (l1 || l2)
+      return vla_of(base, NULL, l1 ? *l1 : *l2);
     if (ty1->vla_len_expr || ty2->vla_len_expr)
       return vla_cond_result_len(ty1, ty2, base, cond, cond_var);
     if (ty1->kind == TY_VLA || ty2->kind == TY_VLA) {
@@ -1315,7 +1321,7 @@ void _add_type(Node *node) {
     add_type(node->m.lhs);
     if (!node->m.lhs->ty->base)
       error_tok(node->tok, "invalid pointer dereference");
-    if (is_iso_std && !uneval_depth && node->m.lhs->ty->base->kind == TY_VOID &&
+    if (is_iso_std && !void_deref_ok_depth && node->m.lhs->ty->base->kind == TY_VOID &&
         (!node->tok || !node->tok->file || !node->tok->file->is_syshdr))
       error_tok(node->tok, "dereferencing 'void *' pointer");
 

@@ -555,7 +555,7 @@ static const char *register_pir_type_def(const char *def_str) {
 
   if (pir_type_cnt == pir_type_cap) {
     pir_type_cap = pir_type_cap ? pir_type_cap * 2 : 32;
-    pir_types = realloc(pir_types, (size_t)pir_type_cap * sizeof(PirTypeEntry));
+    pir_types = pir_xrealloc(pir_types, (size_t)pir_type_cap * sizeof(PirTypeEntry));
   }
   int id = pir_type_cnt++;
   char *name = arena_format(&cc1_arena, "T_%d", id);
@@ -873,7 +873,7 @@ static const char *register_pir_sig(const char *def_str) {
 
   if (pir_sig_cnt == pir_sig_cap) {
     pir_sig_cap = pir_sig_cap ? pir_sig_cap * 2 : 32;
-    pir_sigs = realloc(pir_sigs, (size_t)pir_sig_cap * sizeof(PirSigEntry));
+    pir_sigs = pir_xrealloc(pir_sigs, (size_t)pir_sig_cap * sizeof(PirSigEntry));
   }
   int id = pir_sig_cnt++;
   char *name = arena_format(&cc1_arena, "S_%d", id);
@@ -966,6 +966,7 @@ typedef struct {
   int slot_id;       /* %loc_<slot_id> or %p_<slot_id> */
   int vla_save_slot; /* %loc_<vla_save_slot> for stacksave before VLA alloca_dyn, or -1 */
   bool is_byval_param;
+  bool is_overaligned_byval; /* byval(@T) copied into over-aligned %loc_<slot_id> in entry */
   const char *pir_ty;
   int64_t size;
   int32_t align;
@@ -1138,7 +1139,7 @@ static LocalInfo *register_local(Obj *var, bool is_param) {
 
   if (fc->local_cnt == fc->local_cap) {
     fc->local_cap = fc->local_cap ? fc->local_cap * 2 : 64;
-    fc->locals = realloc(fc->locals, (size_t)fc->local_cap * sizeof(LocalInfo));
+    fc->locals = pir_xrealloc(fc->locals, (size_t)fc->local_cap * sizeof(LocalInfo));
   }
   LocalInfo *li = &fc->locals[fc->local_cnt++];
   memset(li, 0, sizeof(*li));
@@ -1149,6 +1150,13 @@ static LocalInfo *register_local(Obj *var, bool is_param) {
   li->size = var->ty->size > 0 ? var->ty->size : 1;
 
   if (is_param && is_mem_val_ty(var->ty) && var->ty->size > 0) {
+    if (var->alt_align > var->ty->align) {
+      li->is_overaligned_byval = true;
+      li->align = al;
+      li->slot_id = emit_entry_alloca(li->size, al);
+      li->pir_ty = "ptr";
+      return li;
+    }
     li->is_byval_param = true;
     li->slot_id = fc->next_loc_id++;
     li->pir_ty = "ptr";
@@ -1251,6 +1259,8 @@ static PirVal emit_const_float(Type *ty, FPVal *fval) {
 }
 
 static PirVal emit_to_bool_i8(PirVal v, Type *from_ty) {
+  if (is_bitint_mem(from_ty))
+    error("unsupported wide _BitInt boolean conversion");
   ensure_open_block();
   int r = new_tid();
   if (is_flonum(from_ty)) {
@@ -1730,6 +1740,10 @@ static int32_t effective_lval_align(Node *n) {
     return 1;
   int32_t al = n->ty->align > 0 ? n->ty->align : 1;
   switch (n->kind) {
+  case ND_VAR:
+    if (n->m.var && n->m.var->alt_align > 0 && n->m.var->alt_align < al)
+      al = n->m.var->alt_align;
+    return align_floor_pow2(al);
   case ND_MEMBER: {
     Member *m = n->m.member;
     if (m->is_packed)
@@ -2201,8 +2215,8 @@ static PirVal gen_funcall(Node *node) {
     if (d_retbuf != c_retbuf) {
       use_direct = false;
     } else if (d_retbuf) {
-      if (strcmp(get_pir_agg_type_name(direct->ty->return_ty),
-                 get_pir_agg_type_name(fnty->return_ty)) != 0)
+      if (strcmp(get_pir_agg_type_name(unqual(direct->ty->return_ty)),
+                 get_pir_agg_type_name(unqual(fnty->return_ty))) != 0)
         use_direct = false;
     } else {
       if (strcmp(pir_ret_ty_name(direct->ty->return_ty),
@@ -3741,6 +3755,11 @@ void emit_text(Obj *fn) {
     first_p = false;
     if (li->is_byval_param) {
       sb_printf(&hdr, "%%p_%d: byval(@%s)", li->slot_id, get_pir_agg_type_name(p->ty));
+    } else if (li->is_overaligned_byval) {
+      sb_printf(&hdr, "%%p_%d: byval(@%s)", li->slot_id, get_pir_agg_type_name(p->ty));
+      int32_t src_al = align_floor_pow2(p->ty->align > 0 ? p->ty->align : 1);
+      sb_printf(&ctx.entry_sb, "    memcpy %%loc_%d, %%p_%d, %" PRId64 ", align %d\n",
+                li->slot_id, li->slot_id, li->size, src_al);
     } else {
       const char *abi_ty = pir_abi_scalar_ty_name(p->ty);
       sb_printf(&hdr, "%%p_%d: %s%s", li->slot_id, abi_ty, pir_int_ext_attr(p->ty));

@@ -128,17 +128,24 @@ bool pir_abi_ppc32_param(const PirModule *mod, const PirTargetSpec *target,
 
     /* Vectors (max_simd_bits == 0 on base PPC32 -> scalarized). */
     PirTypeLayout ly = pir_type_layout(mod, target, ty);
+    if (ly.size > 8u) {
+        out->kind      = PIR_ABI_INDIRECT;
+        out->reg_count = 0u;
+        out->gp_used   = 1u;
+        if (st->gp_used < 8u) st->gp_used++;
+        return true;
+    }
     out->kind      = PIR_ABI_DIRECT;
     out->reg_count = 1u;
     out->regs[0]   = ty;
-    if (ly.size > 8u) {
-        out->kind    = PIR_ABI_INDIRECT;
-        out->gp_used = 1u;
-        if (st->gp_used < 8u) st->gp_used++;
-    } else if (st->gp_used < 8u) {
-        out->gp_used = 1u;
-        st->gp_used++;
-    }
+    uint32_t vgp = 0u, vfp = 0u;
+    pir_abi_vec_param_regs(target, ty.u.vec, &vgp, &vfp);
+    out->gp_used = vgp;
+    out->fp_used = vfp;
+    st->gp_used += vgp;
+    if (st->gp_used > 8u) st->gp_used = 8u;
+    st->fp_used += vfp;
+    if (st->fp_used > 8u) st->fp_used = 8u;
     return true;
 }
 

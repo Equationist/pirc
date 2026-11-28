@@ -1661,7 +1661,13 @@ static Token *embed_file(Token *cont, Token *tok, const char *path, Token *start
 // Read #line arguments
 static void read_line_marker(Token **rest, Token *tok, bool is_line_dir) {
   Token *start = tok;
-  tok = expand_tok(split_line(rest, tok));
+  Token *raw = split_line(rest, tok);
+  Token *last = start;
+  for (Token *t = raw; t->kind != TK_EOF; t = t->next) {
+    if (t->file == start->file)
+      last = t;
+  }
+  tok = expand_tok(raw);
 
   int64_t line_no = 0;
   if (tok->kind != TK_PP_NUM)
@@ -1674,9 +1680,8 @@ static void read_line_marker(Token **rest, Token *tok, bool is_line_dir) {
   if (is_iso_std && is_line_dir && (line_no <= 0 || line_no > 2147483647) && !start->file->is_syshdr)
     error_tok(tok, "invalid line marker");
 
-  int64_t next_phys = (*rest && (*rest)->file == start->file)
-                          ? ((int64_t)(*rest)->line_no + (int64_t)(*rest)->display_line_no)
-                          : ((int64_t)start->line_no + (int64_t)start->display_line_no + 1);
+  /* Physical line immediately following the #line directive itself (C17 6.10.4p2). */
+  int64_t next_phys = (int64_t)last->line_no + (int64_t)last->display_line_no + 1;
   start->file->line_delta = line_no - next_phys;
 
   tok = tok->next;
@@ -1933,7 +1938,7 @@ static Token *directives(Token **cur, Token *start, bool is_root) {
   }
 
   if (tok->kind == TK_PP_NUM) {
-    if (is_iso_std && !start->file->is_syshdr)
+    if (is_iso_std && !start->file->is_syshdr && !start->file->is_preprocessed)
       error_tok(tok, "GNU linemarker directive is not allowed in ISO C");
     read_line_marker(&tok, tok, false);
     return tok;
