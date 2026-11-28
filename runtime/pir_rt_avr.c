@@ -958,6 +958,7 @@ void  free(void *p);
 void *malloc(size_t sz) {
     if (!heap_cur) heap_cur = __heap_start;
     if (sz == 0u) sz = 1u;
+    if (sz > (size_t)UINT16_MAX - 2u || heap_cur >= __heap_end) return NULL;
     size_t total = sz + 2u;
     if ((size_t)(__heap_end - heap_cur) < total) return NULL;
     uint16_t *hdr = (uint16_t *)heap_cur;
@@ -968,6 +969,7 @@ void *malloc(size_t sz) {
 }
 
 void *calloc(size_t n, size_t sz) {
+    if (n != 0u && sz > (size_t)UINT16_MAX / n) return NULL;
     size_t tot = n * sz;
     void *p = malloc(tot);
     if (p) memset(p, 0, tot);
@@ -1041,15 +1043,15 @@ static int32_t print_double_bits(uint64_t bits, int16_t prec) {
     if (prec > 9) prec = 9;
     uint32_t iscale = 1u;
     for (int16_t i = 0; i < prec; ++i) iscale = __mulsi3(iscale, 10u);
-    uint32_t ipart = __fixunsdfsi(bits);
-    uint64_t frac  = __subdf3(bits, __floatunsidf(ipart));
+    uint64_t ipart = __fixunsdfdi(bits);
+    uint64_t frac  = __subdf3(bits, __floatundidf(ipart));
     uint64_t scaled = __adddf3(__muldf3(frac, __floatunsidf(iscale)), UINT64_C(0x3FE0000000000000)); /* +0.5 */
     uint32_t fpart = __fixunsdfsi(scaled);
     if (fpart >= iscale) {
         fpart -= iscale;
         ipart++;
     }
-    n += print_uint((uint64_t)ipart, 10u, 0u);
+    n += print_uint(ipart, 10u, 0u);
     if (prec > 0) {
         _pir_avr_putc('.');
         n++;

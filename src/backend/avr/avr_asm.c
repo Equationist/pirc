@@ -30,20 +30,10 @@ typedef struct {
 } AvrAsmCtx;
 
 static bool avr_needs_sym_quote(const char *name) {
-    if (!name || !name[0]) return true;
-    if ((name[0] == 'r' || name[0] == 'R') && name[1] >= '0' && name[1] <= '9') {
-        char *end = NULL;
-        long n = strtol(name + 1, &end, 10);
-        if (end && *end == '\0' && n >= 0 && n <= 31) return true;
-    }
-    static const char *const RESERVED[] = {
-        "x", "y", "z", "X", "Y", "Z", "sp", "SP", "spl", "SPL", "sph", "SPH",
-        "sreg", "SREG", "rampz", "RAMPZ", "pc", "PC"
-    };
-    for (size_t i = 0u; i < sizeof(RESERVED) / sizeof(RESERVED[0]); ++i) {
-        if (strcmp(name, RESERVED[i]) == 0) return true;
-    }
-    return false;
+    /* LLVM-MC AVR accepts bare register/SFR identifier names unquoted in labels,
+     * call, lo8/hi8/pm_lo8/pm_hi8, and .short pm(...); quoting them breaks call
+     * and R_AVR_16_PM relocations. pir_asm_emit_sym still quotes non-bare names. */
+    return !name || !name[0];
 }
 
 static uint32_t redir_blk(const AvrAsmCtx *ctx, uint32_t b) {
@@ -230,11 +220,17 @@ static void emit_inst(AvrAsmCtx *ctx, const MFunc *mf, const MInst *ins) {
                 if (w == 1u) fprintf(out, "\tst Z, r%u\n", avr_lo_reg(s));
                 else         fprintf(out, "\tst Z+, r%u\n\tst Z, r%u\n", avr_lo_reg(s), avr_hi_reg(s));
             } else {
-                /* s == Z (r30:r31): use X (r26:r27) as pointer register! */
-                if (base != AVR_X) fprintf(out, "\tmovw r26, r%u\n", avr_lo_reg(base));
-                if (disp != 0) emit_add_imm_high_inplace(out, AVR_X, (uint16_t)disp, 2u);
-                if (w == 1u) fprintf(out, "\tst X, r30\n");
-                else         fprintf(out, "\tst X+, r30\n\tst X, r31\n");
+                /* s == Z (r30:r31): stage Z via stack/r0 so X (cyc_gp / GP0) is never clobbered. */
+                if (w == 2u) fprintf(out, "\tpush r31\n");
+                fprintf(out, "\tpush r30\n");
+                if (base != AVR_Z) fprintf(out, "\tmovw r30, r%u\n", avr_lo_reg(base));
+                if (disp != 0) emit_add_imm_high_inplace(out, AVR_Z, (uint16_t)disp, 2u);
+                fprintf(out, "\tpop r0\n");
+                if (w == 1u) {
+                    fprintf(out, "\tst Z, r0\n");
+                } else {
+                    fprintf(out, "\tst Z+, r0\n\tpop r0\n\tst Z, r0\n");
+                }
             }
             return;
         }
@@ -395,15 +391,18 @@ static void emit_inst(AvrAsmCtx *ctx, const MFunc *mf, const MInst *ins) {
                 /* AVR has no eori: load immediate bytes into free high reg + eor. */
                 MPReg t = pick_high_tmp(d, s, MREG_NONE);
                 bool push_t = (t == MREG_NONE);
-                if (push_t) { t = AVR_Z; fprintf(out, "\tpush r30\n\tpush r31\n"); }
                 if (d != s) fprintf(out, "\tmovw r%u, r%u\n", avr_lo_reg(d), avr_lo_reg(s));
+                if (push_t) {
+                    t = (d == AVR_Z) ? AVR_X : AVR_Z;
+                    fprintf(out, "\tpush r%u\n", avr_lo_reg(t));
+                }
                 if (blo != 0u) fprintf(out, "\tldi r%u, %u\n\teor r%u, r%u\n",
                                        avr_lo_reg(t), (unsigned)blo, avr_lo_reg(d), avr_lo_reg(t));
                 if (ins->width == 2u && bhi != 0u) {
                     fprintf(out, "\tldi r%u, %u\n\teor r%u, r%u\n",
                             avr_lo_reg(t), (unsigned)bhi, avr_hi_reg(d), avr_lo_reg(t));
                 }
-                if (push_t) fprintf(out, "\tpop r31\n\tpop r30\n");
+                if (push_t) fprintf(out, "\tpop r%u\n", avr_lo_reg(t));
                 return;
             }
             const char *mn = (ins->op == MI_AVR_ANDI) ? "andi" : "ori";

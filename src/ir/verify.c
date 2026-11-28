@@ -1490,11 +1490,14 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
             if (!align_valid_u32(inst->align)) {
                 pir_diag_error(v->diag, inst->src_line, 0u,
                                "alignment %u is not a valid power of two", inst->align);
-            } else if (inst->op == PIR_OP_ALLOCA_PTR && inst->align > 16u &&
-                       inst->imm_u64 > max_obj_bytes(v->target) - (uint64_t)(inst->align - 16u)) {
-                pir_diag_error(v->diag, inst->src_line, 0u,
-                               "overaligned alloca.ptr size %" PRIu64 " (align %u) exceeds maximum",
-                               inst->imm_u64, inst->align);
+            } else if (inst->op == PIR_OP_ALLOCA_PTR && inst->align > 16u) {
+                uint64_t max_b = max_obj_bytes(v->target);
+                uint64_t pad   = (uint64_t)(inst->align - 16u);
+                if (pad >= max_b || inst->imm_u64 > max_b - pad) {
+                    pir_diag_error(v->diag, inst->src_line, 0u,
+                                   "overaligned alloca.ptr size %" PRIu64 " (align %u) exceeds maximum",
+                                   inst->imm_u64, inst->align);
+                }
             }
             break;
 
@@ -1622,11 +1625,14 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
             if (!align_valid_u32(inst->align)) {
                 pir_diag_error(v->diag, inst->src_line, 0u,
                                "alignment %u is not a valid power of two", inst->align);
-            } else if (inst->op == PIR_OP_ALLOCA_PTR && inst->align > 16u &&
-                       inst->imm_u64 > max_obj_bytes(v->target) - (uint64_t)(inst->align - 16u)) {
-                pir_diag_error(v->diag, inst->src_line, 0u,
-                               "overaligned alloca.ptr size %" PRIu64 " (align %u) exceeds maximum",
-                               inst->imm_u64, inst->align);
+            } else if (inst->op == PIR_OP_ALLOCA_PTR && inst->align > 16u) {
+                uint64_t max_b = max_obj_bytes(v->target);
+                uint64_t pad   = (uint64_t)(inst->align - 16u);
+                if (pad >= max_b || inst->imm_u64 > max_b - pad) {
+                    pir_diag_error(v->diag, inst->src_line, 0u,
+                                   "overaligned alloca.ptr size %" PRIu64 " (align %u) exceeds maximum",
+                                   inst->imm_u64, inst->align);
+                }
             }
             break;
 
@@ -1654,11 +1660,14 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
             if (!align_valid_u32(inst->align)) {
                 pir_diag_error(v->diag, inst->src_line, 0u,
                                "alignment %u is not a valid power of two", inst->align);
-            } else if (inst->op == PIR_OP_ALLOCA_PTR && inst->align > 16u &&
-                       inst->imm_u64 > max_obj_bytes(v->target) - (uint64_t)(inst->align - 16u)) {
-                pir_diag_error(v->diag, inst->src_line, 0u,
-                               "overaligned alloca.ptr size %" PRIu64 " (align %u) exceeds maximum",
-                               inst->imm_u64, inst->align);
+            } else if (inst->op == PIR_OP_ALLOCA_PTR && inst->align > 16u) {
+                uint64_t max_b = max_obj_bytes(v->target);
+                uint64_t pad   = (uint64_t)(inst->align - 16u);
+                if (pad >= max_b || inst->imm_u64 > max_b - pad) {
+                    pir_diag_error(v->diag, inst->src_line, 0u,
+                                   "overaligned alloca.ptr size %" PRIu64 " (align %u) exceeds maximum",
+                                   inst->imm_u64, inst->align);
+                }
             }
             break;
 
@@ -2824,6 +2833,15 @@ bool pir_verify_module(const PirModule *mod, PirVerifyMode mode,
                     pir_diag_error(diag, g->src_line, 0u,
                                    "global '@%s' cannot take static address of tls global '@%s'",
                                    g->name, rname);
+                } else if (v.target && v.target->arch == PIR_ARCH_AVR && g->items[k].sym_offset != 0) {
+                    for (uint32_t fi = 0u; fi < mod->funcs.len; ++fi) {
+                        if (mod->funcs.data[fi].name && strcmp(mod->funcs.data[fi].name, rname) == 0) {
+                            pir_diag_error(diag, g->src_line, 0u,
+                                           "global '@%s': AVR function pointer relocation '@%s' cannot have nonzero offset",
+                                           g->name, rname);
+                            break;
+                        }
+                    }
                 }
             }
         }

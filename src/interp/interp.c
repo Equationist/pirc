@@ -652,7 +652,9 @@ static PirVal eval_operand(PirInterp *it, const CallFrame *fr, const PirOperand 
             return v;
         case PIR_OPER_SYM: {
             const PirModule *mod = it->mod;
-            int64_t sym_off = (it->ptr_bytes == 4u)
+            int64_t sym_off = (it->ptr_bytes == 2u)
+                              ? (int64_t)(int16_t)(uint16_t)op->u.sym.offset
+                              : (it->ptr_bytes == 4u)
                               ? (int64_t)(int32_t)(uint32_t)op->u.sym.offset
                               : op->u.sym.offset;
             for (uint32_t i = 0u; i < mod->globals.len; ++i) {
@@ -2288,7 +2290,11 @@ PirInterpStatus pir_interp_run(const PirModule *mod, const PirTargetSpec *target
                                 mfn->params[0].type.kind == PIR_TYPE_SCALAR &&
                                 mfn->params[0].type.u.scalar == PIR_SCALAR_PTR);
         if (main_hidden_ret) {
-            uint32_t rbuf_aid = pir_interp_alloc_new(&it, 8u, 2u, false, false, false, true);
+            uint64_t rbuf_sz = 16u;
+            if (mfn->cabi_ret.agg_size > rbuf_sz) rbuf_sz = mfn->cabi_ret.agg_size;
+            uint32_t rbuf_al = (target && target->ptr_bytes == 2u) ? 2u : 16u;
+            if (mfn->cabi_ret.agg_align > rbuf_al) rbuf_al = mfn->cabi_ret.agg_align;
+            uint32_t rbuf_aid = pir_interp_alloc_new(&it, rbuf_sz, rbuf_al, false, false, false, false);
             PirVal arg0;
             memset(&arg0, 0, sizeof(arg0));
             arg0.ty = pir_type_scalar(PIR_SCALAR_PTR);
@@ -2300,7 +2306,18 @@ PirInterpStatus pir_interp_run(const PirModule *mod, const PirTargetSpec *target
             }
             if (it.status == PIR_INTERP_OK && !it.exited) {
                 uint32_t ec32 = 0u;
-                PirPtr rp = { rbuf_aid, 0 };
+                int64_t read_off = 0;
+                if (target && target->is_big_endian) {
+                    /* On big-endian targets, find the highest initialized byte in the hidden return buffer
+                     * so i64 (8B) reads low 32 bits at offset 4 and i128 (16B) reads low 32 bits at offset 12. */
+                    const PirAlloc *ra = &it.allocs.data[rbuf_aid];
+                    size_t written = 0u;
+                    for (size_t k = ra->size; k > 0u; --k) {
+                        if (ra->init_bits[k - 1u]) { written = k; break; }
+                    }
+                    if (written >= 4u) read_off = (int64_t)(written - 4u);
+                }
+                PirPtr rp = { rbuf_aid, read_off };
                 pir_interp_mem_read(&it, rp, &ec32, 4u, 1u);
                 if (target && target->is_big_endian) bswap_inplace((uint8_t *)&ec32, 4u);
                 it.exit_code = (int)(int32_t)ec32;

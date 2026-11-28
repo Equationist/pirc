@@ -993,6 +993,7 @@ static void print_tokens(Token *tok, FILE *out) {
   int64_t line = 0;
   int file_no = -1;
   bool after_tok = false;
+  bool pending_bol = false;
   Token *prev = NULL;
   for (; tok->kind != TK_EOF; tok = tok->next) {
     if (tok->kind == TK_PMARK) {
@@ -1000,6 +1001,7 @@ static void print_tokens(Token *tok, FILE *out) {
         fputc('\n', out);
         line++;
         after_tok = false;
+        pending_bol = true;
         prev = NULL;
       }
       continue;
@@ -1013,6 +1015,7 @@ static void print_tokens(Token *tok, FILE *out) {
       file_no = tok->display_file_no;
       line = tok->display_line_no;
       after_tok = false;
+      pending_bol = false;
       prev = NULL;
       continue;
     }
@@ -1023,9 +1026,10 @@ static void print_tokens(Token *tok, FILE *out) {
       print_linemarker(out, tok);
       file_no = tok->display_file_no;
       line = tok->display_line_no;
+      pending_bol = false;
       prev = NULL;
 
-    } else if (tok->at_bol) {
+    } else if (tok->at_bol || pending_bol) {
       if (after_tok) {
         fputc('\n', out);
         line++;
@@ -1039,6 +1043,7 @@ static void print_tokens(Token *tok, FILE *out) {
 
         line = tok->display_line_no;
       }
+      pending_bol = false;
       prev = NULL;
     }
 

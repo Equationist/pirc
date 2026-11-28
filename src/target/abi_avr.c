@@ -49,7 +49,8 @@ static void pack_avr_words(uint64_t size, PirAbiArgInfo *out) {
     out->reg_count = nw;
     out->gp_used   = nw;
     for (uint32_t k = 0u; k < nw; ++k) {
-        out->regs[k] = pir_type_scalar(PIR_SCALAR_I16);
+        bool last_odd = (k + 1u == nw) && ((size & 1u) != 0u);
+        out->regs[k] = pir_type_scalar(last_odd ? PIR_SCALAR_I8 : PIR_SCALAR_I16);
     }
 }
 

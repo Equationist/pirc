@@ -512,7 +512,7 @@ static void check_hfa_walk_rec(Type *ty, int64_t base_off, HfaCheck *hc, int dep
         hc->valid = false;
         return;
       }
-      if (m->ty->size <= 0 || is_unnamed_bf_only_agg(m->ty))
+      if ((m->ty->kind == TY_STRUCT || m->ty->kind == TY_UNION) && m->ty->size == 0)
         continue;
       HfaCheck mc = {.valid = true, .elem_kind = TY_VOID, .count = 0};
       check_hfa_walk_rec(m->ty, base_off + m->offset, &mc, depth + 1);
@@ -668,12 +668,26 @@ static void walk_sysv_x64_agg_rec(Type *ty, int64_t base_off, SysvX64Walk *w, in
     w->cls[eb] = sysv_merge_cls(w->cls[eb], 2);
 }
 
+static Type *abi_ret_type(Type *rty) {
+  return (rty && (rty->qual & Q_ATOMIC)) ? rty : unqual(rty);
+}
+
+static int32_t abi_agg_align(Type *ty) {
+  Type *u = unqual(ty);
+  int32_t al = (u->align > 0) ? u->align : 1;
+  if ((ty->qual & Q_ATOMIC) &&
+      (ty->size == 2 || ty->size == 4 || ty->size == 8 || ty->size == 16) &&
+      al < (int32_t)ty->size)
+    al = (int32_t)ty->size;
+  return al;
+}
+
 /* Build a PIR structural type `@T_N` whose size, alignment, and target C ABI
  * classification (AAPCS64 HFA or SysV AMD64 eightbytes) match C's `Type *ty`. */
 static const char *get_pir_agg_type_name(Type *ty) {
   int64_t csz = agg_copy_size(ty);
   int64_t sz = csz > 0 ? csz : 1;
-  int32_t al = ty->align > 0 ? ty->align : 1;
+  int32_t al = abi_agg_align(ty);
 
   /* 0. On SysV AMD64, <=16B aggregates with any SSE or NO_CLASS eightbyte
    *    (including mixed [INTEGER, SSE], [SSE, INTEGER], [NO_CLASS, SSE],
@@ -899,7 +913,7 @@ static const char *get_pir_sig_for_call(Type *fnty, Obj *call_args) {
   sb_printf(&sb, "(");
   bool first = true;
 
-  Type *rty = unqual(fnty->return_ty);
+  Type *rty = abi_ret_type(fnty->return_ty);
   bool has_retbuf = is_mem_val_ty(rty) && rty->size > 0;
   if (has_retbuf) {
     sb_printf(&sb, "retbuf(@%s)", get_pir_agg_type_name(rty));
@@ -1150,7 +1164,7 @@ static LocalInfo *register_local(Obj *var, bool is_param) {
   li->size = var->ty->size > 0 ? var->ty->size : 1;
 
   if (is_param && is_mem_val_ty(var->ty) && var->ty->size > 0) {
-    if (var->alt_align > var->ty->align) {
+    if (al > abi_agg_align(var->ty)) {
       li->is_overaligned_byval = true;
       li->align = al;
       li->slot_id = emit_entry_alloca(li->size, al);
@@ -2215,8 +2229,8 @@ static PirVal gen_funcall(Node *node) {
     if (d_retbuf != c_retbuf) {
       use_direct = false;
     } else if (d_retbuf) {
-      if (strcmp(get_pir_agg_type_name(unqual(direct->ty->return_ty)),
-                 get_pir_agg_type_name(unqual(fnty->return_ty))) != 0)
+      if (strcmp(get_pir_agg_type_name(abi_ret_type(direct->ty->return_ty)),
+                 get_pir_agg_type_name(abi_ret_type(fnty->return_ty))) != 0)
         use_direct = false;
     } else {
       if (strcmp(pir_ret_ty_name(direct->ty->return_ty),
@@ -3664,8 +3678,8 @@ static void gen_stmt(Node *node) {
     }
     PirVal rv = gen_expr(node->m.lhs);
     if (fc->has_retbuf) {
-      Type *urty = unqual(rty);
-      int32_t dst_al = align_floor_pow2(urty->align > 0 ? urty->align : 1);
+      Type *urty = abi_ret_type(rty);
+      int32_t dst_al = align_floor_pow2(abi_agg_align(urty));
       int32_t src_al = effective_lval_align(node->m.lhs);
       int32_t p2 = dst_al < src_al ? dst_al : src_al;
       int64_t rsz = is_agg_ty(urty) ? agg_copy_size(urty) : urty->size;
@@ -3724,7 +3738,7 @@ void emit_text(Obj *fn) {
   ctx.vla_sp_slot = -1;
   fc = &ctx;
 
-  Type *rty = unqual(fn->ty->return_ty);
+  Type *rty = abi_ret_type(fn->ty->return_ty);
   ctx.has_retbuf = is_mem_val_ty(rty) && rty->size > 0;
   ctx.ret_pir_ty = ctx.has_retbuf ? "void" : pir_ret_ty_name(rty);
 
@@ -3757,7 +3771,7 @@ void emit_text(Obj *fn) {
       sb_printf(&hdr, "%%p_%d: byval(@%s)", li->slot_id, get_pir_agg_type_name(p->ty));
     } else if (li->is_overaligned_byval) {
       sb_printf(&hdr, "%%p_%d: byval(@%s)", li->slot_id, get_pir_agg_type_name(p->ty));
-      int32_t src_al = align_floor_pow2(p->ty->align > 0 ? p->ty->align : 1);
+      int32_t src_al = align_floor_pow2(abi_agg_align(p->ty));
       sb_printf(&ctx.entry_sb, "    memcpy %%loc_%d, %%p_%d, %" PRId64 ", align %d\n",
                 li->slot_id, li->slot_id, li->size, src_al);
     } else {
@@ -3949,7 +3963,7 @@ static void emit_extern_decl(SBuf *sb, Obj *var) {
     sb_emit_sym(sb, pir_sym_name(var));
     sb_printf(sb, "(");
     bool first = true;
-    Type *rty = unqual(var->ty->return_ty);
+    Type *rty = abi_ret_type(var->ty->return_ty);
     bool has_rb = is_mem_val_ty(rty) && rty->size > 0;
     if (has_rb) {
       sb_printf(sb, "retbuf(@%s)", get_pir_agg_type_name(rty));

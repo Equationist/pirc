@@ -60,11 +60,17 @@ static PirOperand map_fp_operand(PirOperand op) {
         r.has_explicit_type   = op.has_explicit_type;
         r.call_stack_align    = op.call_stack_align;
         r.call_force_stack    = op.call_force_stack;
-        r.call_no_f32_promote = op.call_no_f32_promote;
+        r.call_no_f32_promote = false;
         r.call_group_words    = op.call_group_words;
         return r;
     }
-    op.type = map_fp_type(op.type);
+    if (is_fp(op.type)) {
+        op.type = map_fp_type(op.type);
+        op.call_no_f32_promote = false;
+    } else if (op.call_no_f32_promote) {
+        /* Value was already rewritten from f32 -> i32 in the value table. */
+        op.call_no_f32_promote = false;
+    }
     return op;
 }
 
@@ -310,8 +316,10 @@ bool pir_legalize_soft_float(PirModule *mod, const PirTargetSpec *target, PirDia
                         bool va_prom = is_var && (k - 1u) >= fixed_n && orig_is_f32 && !a.call_no_f32_promote;
                         PirOperand ma = map_fp_operand(a);
                         if (va_prom) {
+                            PirOperand ext_arg = ma;
+                            pir_op_strip_call_meta(&ext_arg);
                             PirValueId ext64 = emit_call1(mod, fi, b, &new_insts, "__extendsfdf2",
-                                                          t32, t64, ma, ln, lc, PIR_INVALID_ID, diag);
+                                                          t32, t64, ext_arg, ln, lc, PIR_INVALID_ID, diag);
                             if (ext64 == PIR_INVALID_ID) {
                                 PIR_VEC_FREE(&new_insts); PIR_VEC_FREE(&aliases); free(val_fp_kind);
                                 return false;
@@ -551,8 +559,8 @@ bool pir_legalize_soft_float(PirModule *mod, const PirTargetSpec *target, PirDia
 
                 if (copy.op == PIR_OP_FPTOSI || copy.op == PIR_OP_FPTOUI) {
                     bool is_s   = (copy.op == PIR_OP_FPTOSI);
-                    bool is_sat = (copy.flags & PIR_FLAG_SAT) != 0u;
                     bool is_trp = (copy.flags & PIR_FLAG_TRAP) != 0u;
+                    bool is_sat = (copy.flags & (PIR_FLAG_TRAP | PIR_FLAG_UNSAFE)) == 0u;
                     bool s32    = is_f32(copy.operands[0].type) ||
                                   (copy.operands[0].kind == PIR_OPER_VAL &&
                                    copy.operands[0].u.val < orig_vals &&
@@ -563,7 +571,9 @@ bool pir_legalize_soft_float(PirModule *mod, const PirTargetSpec *target, PirDia
                     bool d64 = (dsc == PIR_SCALAR_I64);
                     PirType wty = d64 ? t64 : t32;
 
-                    /* Exact IEEE-754 bounds for [min, max_excl) */
+                    /* Exact IEEE-754 bounds for [min, max_excl). For [trap], float-to-int truncates
+                     * toward zero before checking range, so values in (dmin - 1.0, dmin) are valid
+                     * whenever dmin - 1.0 is strictly less than dmin in the source float format. */
                     double dmin = 0.0, dmax_excl = 0.0;
                     uint64_t imin_u = 0u, imax_u = 0u;
                     if (is_s) {
@@ -578,14 +588,18 @@ bool pir_legalize_soft_float(PirModule *mod, const PirTargetSpec *target, PirDia
                         else if (dsc == PIR_SCALAR_I32) { dmax_excl = 4294967296.0; imax_u = UINT32_MAX; }
                         else                            { dmax_excl = 18446744073709551616.0; imax_u = UINT64_MAX; }
                     }
+                    double dmin_m1 = dmin - 1.0;
+                    bool trap_use_le = is_trp && (s32 ? ((float)dmin_m1 < (float)dmin)
+                                                      : (dmin_m1 < dmin));
+                    double dlo_cmp = trap_use_le ? dmin_m1 : dmin;
                     uint64_t bmin = 0u, bmax = 0u;
                     if (s32) {
-                        float fmin = (float)dmin, fmax = (float)dmax_excl;
+                        float fmin = (float)dlo_cmp, fmax = (float)dmax_excl;
                         uint32_t umin = 0u, umax = 0u;
                         memcpy(&umin, &fmin, 4u); memcpy(&umax, &fmax, 4u);
                         bmin = (uint64_t)umin; bmax = (uint64_t)umax;
                     } else {
-                        memcpy(&bmin, &dmin, 8u); memcpy(&bmax, &dmax_excl, 8u);
+                        memcpy(&bmin, &dlo_cmp, 8u); memcpy(&bmax, &dmax_excl, 8u);
                     }
 
                     const char *cmp_fn = s32 ? "__pir_fcmp_sf" : "__pir_fcmp_df";
@@ -605,8 +619,13 @@ bool pir_legalize_soft_float(PirModule *mod, const PirTargetSpec *target, PirDia
                         PirFunction *fn = &mod->funcs.data[fi];
                         is_nan = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_EQ, t8, 0u,
                                           pir_op_val(cn, t8), pir_op_imm_i(2u, false, t8), ln, lc, PIR_INVALID_ID);
-                        too_lo = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_EQ, t8, 0u,
-                                          pir_op_val(cl, t8), pir_op_imm_i(0xFFu, false, t8), ln, lc, PIR_INVALID_ID);
+                        if (trap_use_le) {
+                            too_lo = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_LE_S, t8, 0u,
+                                              pir_op_val(cl, t8), pir_op_imm_i(0u, false, t8), ln, lc, PIR_INVALID_ID);
+                        } else {
+                            too_lo = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_EQ, t8, 0u,
+                                              pir_op_val(cl, t8), pir_op_imm_i(0xFFu, false, t8), ln, lc, PIR_INVALID_ID);
+                        }
                         PirValueId ch_ge0 = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_GE_S, t8, 0u,
                                                      pir_op_val(ch, t8), pir_op_imm_i(0u, false, t8), ln, lc, PIR_INVALID_ID);
                         PirValueId ch_ord = emit_bin(mod, fn, b, &new_insts, PIR_OP_CMP_NE, t8, 0u,

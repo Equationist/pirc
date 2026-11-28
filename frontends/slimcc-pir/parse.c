@@ -182,6 +182,7 @@ static int parse_depth = 0;
 int uneval_depth = 0;
 int void_deref_ok_depth = 0;
 static bool is_lvalue_expr(Node *n);
+static bool is_ice_expr_syntax(Node *n);
 static void strip_proto_vla_exprs(Type *ty);
 
 static bool is_type_kw(TokenKind kind);
@@ -856,6 +857,17 @@ static void pragma_pack_set(int val) {
   pack_stk.data[pack_stk.cnt - 1].val = val;
 }
 
+static bool pragma_pack_val(Token **rest, Token *tok, int *out_val) {
+  Token *vtok = tok;
+  int64_t val = const_expr(rest, tok);
+  if (val == 0 || val == 1 || val == 2 || val == 4 || val == 8 || val == 16) {
+    *out_val = (int)val;
+    return true;
+  }
+  warn_tok(vtok, "expected #pragma pack parameter to be '1', '2', '4', '8', or '16'");
+  return false;
+}
+
 static void pragma_pack(Token **rest, Token *tok) {
   if (consume(&tok, tok, "pack")) {
     tok = skip_tk(tok, TK_LPAREN);
@@ -875,12 +887,16 @@ static void pragma_pack(Token **rest, Token *tok) {
         if (consume_tk(rest, tok, TK_RPAREN))
           return;
         tok = skip_tk(tok, TK_COMMA);
-        pragma_pack_set(align_expr(&tok, tok));
+        int pv = 0;
+        if (pragma_pack_val(&tok, tok, &pv))
+          pragma_pack_set(pv);
         *rest = skip_tk(tok, TK_RPAREN);
         return;
       }
       pragma_pack_pop(pop_tok, NULL);
-      pragma_pack_set(align_expr(&tok, tok));
+      int pv = 0;
+      if (pragma_pack_val(&tok, tok, &pv))
+        pragma_pack_set(pv);
       *rest = skip_tk(tok, TK_RPAREN);
       return;
     }
@@ -898,13 +914,21 @@ static void pragma_pack(Token **rest, Token *tok) {
         if (consume_tk(rest, tok, TK_RPAREN))
           return;
         tok = skip_tk(tok, TK_COMMA);
-        pragma_pack_set(align_expr(&tok, tok));
+        int pv = 0;
+        if (pragma_pack_val(&tok, tok, &pv))
+          pragma_pack_set(pv);
         *rest = skip_tk(tok, TK_RPAREN);
         return;
       }
       pragma_pack_push(NULL, 0);
     }
-    pragma_pack_set(tok->kind == TK_RPAREN ? 0 : align_expr(&tok, tok));
+    if (tok->kind == TK_RPAREN) {
+      pragma_pack_set(0);
+    } else {
+      int pv = 0;
+      if (pragma_pack_val(&tok, tok, &pv))
+        pragma_pack_set(pv);
+    }
     *rest = skip_tk(tok, TK_RPAREN);
     return;
   }
@@ -1585,6 +1609,8 @@ static void array_dimension2(Type *ty, Token *tok, Node *expr) {
     array_setty(ty, basety, array_len);
     return;
   }
+  if (is_iso_std && !expr->tok->file->is_syshdr && is_ice_expr_syntax(expr))
+    error_tok(expr->tok, "invalid constant expression for array size");
   vla_setty(ty, expr, 0);
   return;
 }
@@ -2134,7 +2160,7 @@ static Node *declaration2(Token **rest, Token *tok, Type *basety, VarAttr *attr,
     if (ty->kind == TY_VLA)
       error_tok(tok, "variable length arrays cannot be 'static'");
     if (is_iso_std && fnctx && fnctx->fn->is_ext_inline && !fnctx->fn->is_static &&
-        !(eff_qual(ty) & Q_CONST) && !tok->file->is_syshdr)
+        !fnctx->fn->export_fn && !(eff_qual(ty) & Q_CONST) && !tok->file->is_syshdr)
       error_tok(name, "non-const static local variable in external inline function");
 
     Obj *var = new_static_lvar(ty);
@@ -2459,7 +2485,8 @@ static void designation(Token **rest, Token *tok, Initializer *init, bool post_b
         init->list.data[mem->idx] = (Initializer){.ty = mem->ty};
         init->list.union_idx = mem->idx;
       }
-      init->list.base_expr = NULL;
+      if (tok->kind == TK_EQ)
+        init->list.base_expr = NULL;
       designation(rest, tok, &init->list.data[mem->idx], false, ctx);
     } else {
       designation(&tok, tok, &init->list.data[mem->idx], false, ctx);
@@ -2651,7 +2678,8 @@ static void initializer3(Token **rest, Token *tok, Initializer *init, Node *expr
       }
     }
 
-    if (is_integer(init->ty->base) && init->ty->base->kind != TY_BOOL) {
+    if (is_integer(init->ty->base) && init->ty->base->kind != TY_BOOL &&
+        !(init->ty->base->qual & Q_ATOMIC)) {
       if (!expr &&
           !(tok->kind == TK_LBRACK || tok->kind == TK_DOT || tok->kind == TK_LCURLY))
         expr = assign(&tok, tok);
@@ -3842,8 +3870,9 @@ static Node *compound_stmt2(Token **rest, Token *tok, NodeKind kind) {
     node->blk.result = result;
     add_type(result);
     Type *ty = result->m.lhs->ty;
-    if (ty->kind == TY_STRUCT || ty->kind == TY_UNION) {
-      Obj *var = new_lvar(ty);
+    if (ty->kind == TY_STRUCT || ty->kind == TY_UNION ||
+        (ty->kind == TY_BITINT && bitint_rtn_need_copy(ty->bit_cnt))) {
+      Obj *var = new_lvar((ty->qual & Q_ATOMIC) ? ty : unqual(ty));
       Node *n = new_binary(ND_ASSIGN, new_var_node(var, tok), result->m.lhs, tok);
       result->m.lhs = new_binary(ND_COMMA, n, new_var_node(var, tok), tok);
     }
@@ -6199,22 +6228,27 @@ static int64_t checked_align_to(int64_t n, int64_t align) {
   return align_to(n, align);
 }
 
+static int64_t member_alt_align(Member *mem, int pack_align) {
+  int64_t alt = mem->alt_align;
+  if (pack_align > 0 && alt > pack_align)
+    alt = pack_align;
+  return alt;
+}
+
 static Type *struct_decl(Type *ty, int align, int pack_align) {
   int64_t bits = 0;
 
   for (Member *mem = ty->members; mem; mem = mem->next) {
     int64_t mem_align = member_align(mem, pack_align);
+    int64_t eff_alt = member_alt_align(mem, pack_align);
+    int64_t eff_align = MAX(mem_align, eff_alt);
 
-    if (!mem->is_bitfield || mem->name) {
-      align = MAX(align, mem_align);
-      align = MAX(align, mem->alt_align);
-    }
-    if (mem->alt_align)
-      if (mem->alt_align > mem->ty->align ||
-          (mem->ty->kind != TY_STRUCT && mem->ty->kind != TY_UNION))
-        bits = checked_align_to(bits, (int64_t)mem->alt_align * 8);
+    if (!mem->is_bitfield || mem->name)
+      align = MAX(align, eff_align);
 
     if (mem->is_bitfield) {
+      if (eff_alt > 0)
+        bits = checked_align_to(bits, eff_alt * 8);
       if (mem->bit_width == 0) {
         bits = checked_align_to(bits, mem->ty->size * 8);
         continue;
@@ -6249,7 +6283,7 @@ static Type *struct_decl(Type *ty, int align, int pack_align) {
       bits += mem->bit_width;
       continue;
     }
-    bits = checked_align_to(bits, mem_align * 8);
+    bits = checked_align_to(bits, eff_align * 8);
     mem->offset = bits / 8;
 
     if (mem->ty->size < 0) {
@@ -6276,11 +6310,11 @@ static Type *struct_decl(Type *ty, int align, int pack_align) {
 static Type *union_decl(Type *ty, int align, int pack_align) {
   for (Member *mem = ty->members; mem; mem = mem->next) {
     int64_t mem_align = member_align(mem, pack_align);
+    int64_t eff_alt = member_alt_align(mem, pack_align);
+    int64_t eff_align = MAX(mem_align, eff_alt);
 
-    if (!mem->is_bitfield || mem->name) {
-      align = MAX(align, mem_align);
-      align = MAX(align, mem->alt_align);
-    }
+    if (!mem->is_bitfield || mem->name)
+      align = MAX(align, eff_align);
     if (mem->ty->is_flexible)
       ty->is_flexible = true;
     int64_t sz;
@@ -6436,7 +6470,7 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
   if (node->ty->kind == TY_STRUCT ||
       node->ty->kind == TY_UNION ||
       (node->ty->kind == TY_BITINT && bitint_rtn_need_copy(node->ty->bit_cnt)))
-    node->call.rtn_buf = new_lvar(node->ty);
+    node->call.rtn_buf = new_lvar((ty->return_ty->qual & Q_ATOMIC) ? ty->return_ty : node->ty);
   return node;
 }
 
@@ -7290,7 +7324,8 @@ static void func_definition(Token **rest, Token *tok, Obj *fn, Type *ty) {
     if (vis_ty && !vis_ty->is_oldstyle)
       ty->is_oldstyle = false;
   }
-  fn->ty = ty;
+  bool keep_vis_in_body = (!ty->is_oldstyle && vis_ty && vis_ty != ty);
+  fn->ty = keep_vis_in_body ? vis_ty : ty;
 
   fnctx = &(FuncContext){.fn = fn};
 
@@ -7332,9 +7367,10 @@ static void func_definition(Token **rest, Token *tok, Obj *fn, Type *ty) {
   if (fnctx->gotos)
     resolve_gotos(fn->body);
 
+  fn->ty = ty;
   emit_text(fn);
 
-  if (!ty->is_oldstyle && vis_ty && vis_ty != ty)
+  if (keep_vis_in_body)
     fn->ty = vis_ty;
 
   fnctx = NULL;
@@ -7500,8 +7536,7 @@ static void global_declaration(Token **rest, Token *tok, Type *basety, VarAttr *
         strip_proto_vla_exprs(ty);
       Obj *fn = func_prototype(tok, name, ty, attr, is_fndef);
       func_exportness(fn, attr, is_fndef);
-      if (is_fndef && (attr->strg & SC_INLINE) && !fn->is_static &&
-          !fn->export_fn && !fn->is_gnu_inline)
+      if (is_fndef && (attr->strg & SC_INLINE) && !fn->is_static && !fn->is_gnu_inline)
         fn->is_ext_inline = true;
 
       if (is_fndef) {

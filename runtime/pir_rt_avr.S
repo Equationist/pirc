@@ -36,14 +36,6 @@ _start:
     cpc r27, r23
     brsh 2f
     elpm r0, Z+
-    ; If Z wrapped to 0x0000, increment RAMPZ
-    mov r25, r30
-    or  r25, r31
-    brne 3f
-    in  r25, 0x3b
-    inc r25
-    out 0x3b, r25
-3:
     st  X+, r0
     rjmp 1b
 2:

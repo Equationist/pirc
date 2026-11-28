@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+static uint32_t shim_pair_u32(const PirInterp *it, const PirVal *a, const PirVal *b);
+
 static bool read_cstr_n(PirInterp *it, PirPtr p, bool has_max, size_t max_n,
                         char **out_buf, size_t *out_len) {
     if (p.alloc_id == 0u || p.alloc_id >= it->allocs.len) {
@@ -130,7 +132,16 @@ static bool shim_printf(PirInterp *it, const PirVal *args, uint32_t arg_count, i
                 pir_interp_fail(it, PIR_INTERP_UB, "printf missing dynamic width argument");
                 return false;
             }
-            int32_t wv = (int32_t)pir_val_get_u64(&args[ai++]);
+            int32_t wv = 0;
+            if (it->target && it->target->caps.max_int_bits == 16u &&
+                ai + 1u < arg_count &&
+                args[ai].ty.kind == PIR_TYPE_SCALAR && args[ai].ty.u.scalar == PIR_SCALAR_I16 &&
+                args[ai + 1u].ty.kind == PIR_TYPE_SCALAR && args[ai + 1u].ty.u.scalar == PIR_SCALAR_I16) {
+                wv = (int32_t)shim_pair_u32(it, &args[ai], &args[ai + 1u]);
+                ai += 2u;
+            } else {
+                wv = (int32_t)pir_val_get_u64(&args[ai++]);
+            }
             if (wv < 0) {
                 flag_minus = true;
                 uint64_t mag = (uint64_t)(-(int64_t)wv);
@@ -172,7 +183,16 @@ static bool shim_printf(PirInterp *it, const PirVal *args, uint32_t arg_count, i
                     pir_interp_fail(it, PIR_INTERP_UB, "printf missing dynamic precision argument");
                     return false;
                 }
-                int32_t pv = (int32_t)pir_val_get_u64(&args[ai++]);
+                int32_t pv = 0;
+                if (it->target && it->target->caps.max_int_bits == 16u &&
+                    ai + 1u < arg_count &&
+                    args[ai].ty.kind == PIR_TYPE_SCALAR && args[ai].ty.u.scalar == PIR_SCALAR_I16 &&
+                    args[ai + 1u].ty.kind == PIR_TYPE_SCALAR && args[ai + 1u].ty.u.scalar == PIR_SCALAR_I16) {
+                    pv = (int32_t)shim_pair_u32(it, &args[ai], &args[ai + 1u]);
+                    ai += 2u;
+                } else {
+                    pv = (int32_t)pir_val_get_u64(&args[ai++]);
+                }
                 if (pv >= 0) {
                     if ((uint32_t)pv > 65536u) {
                         free(fmt);
@@ -1084,6 +1104,9 @@ bool pir_interp_try_shim(PirInterp *it, const char *name,
         } else if (arg_count == 5u && mib == 16u) {
             byte = (uint8_t)shim_pair_u32(it, &args[1], &args[2]);
             len = (size_t)shim_pair_u32(it, &args[3], &args[4]);
+        } else if (arg_count == 6u && mib == 16u) {
+            byte = (uint8_t)pir_val_get_u64(&args[1]);
+            len = (size_t)shim_quad16_u64(it, &args[2]);
         } else if (arg_count == 7u && mib == 16u) {
             byte = (uint8_t)shim_pair_u32(it, &args[1], &args[2]);
             len = (size_t)shim_quad16_u64(it, &args[3]);

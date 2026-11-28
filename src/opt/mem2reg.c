@@ -326,8 +326,9 @@ typedef struct {
 static int64_t sroa_imm_to_i64(const PirOperand *c) {
     uint64_t v = c->u.imm_int.is_negative ? (UINT64_C(0) - c->u.imm_int.lo)
                                           : c->u.imm_int.lo;
-    if (c->type.kind == PIR_TYPE_SCALAR && c->type.u.scalar == PIR_SCALAR_I32) {
-        return (int64_t)(int32_t)(uint32_t)v;
+    if (c->type.kind == PIR_TYPE_SCALAR) {
+        if (c->type.u.scalar == PIR_SCALAR_I16) return (int64_t)(int16_t)(uint16_t)v;
+        if (c->type.u.scalar == PIR_SCALAR_I32) return (int64_t)(int32_t)(uint32_t)v;
     }
     return (int64_t)v;
 }
@@ -646,7 +647,14 @@ void pir_opt_mem2reg(PirModule *mod, PirFunction *fn, const PirTargetSpec *targe
                 ins->operands[1].kind == PIR_OPER_IMM_INT &&
                 ins->operands[1].u.imm_int.lo == 0u && ins->operands[1].u.imm_int.hi == 0u) {
                 PirValueId base = ins->operands[0].u.val;
-                if (base != ins->results[0]) {
+                bool base_ok = (ptr_bytes == 8u);
+                if (!base_ok && base < nvals) {
+                    PirInstId bdef = fn->values.data[base].def_inst;
+                    if (bdef != PIR_INVALID_ID && fn->insts.data[bdef].op == PIR_OP_ALLOCA_PTR) {
+                        base_ok = true;
+                    }
+                }
+                if (base_ok && base != ins->results[0]) {
                     zero_alias[ins->results[0]] = base;
                     has_zero_pa = true;
                 }

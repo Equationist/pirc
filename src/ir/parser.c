@@ -1922,14 +1922,36 @@ static bool parse_fn_cc_and_attrs(Parser *p, PirCallingConv *cc_out,
             if (!expect_tok(p, TOK_LPAREN, "'('")) return false;
             cabi_ret_out->kind = PIR_CABI_RET_MULTI_REG;
             cabi_ret_out->reg_count = 0u;
+            cabi_ret_out->has_reg_offsets = false;
+            uint32_t n_explicit_offs = 0u;
             for (;;) {
                 if (cabi_ret_out->reg_count >= 4u) {
                     pir_diag_error(p->diag, p->cur.line, p->cur.col, "too many registers in multi_ret");
                     return false;
                 }
-                if (!parse_type(p, &cabi_ret_out->regs[cabi_ret_out->reg_count++])) return false;
+                uint32_t ridx = cabi_ret_out->reg_count++;
+                if (!parse_type(p, &cabi_ret_out->regs[ridx])) return false;
+                if (is_ident(p, "offset")) {
+                    advance_tok(p);
+                    if (p->cur.kind != TOK_INT || p->cur.int_neg || p->cur.int_hi != 0u) {
+                        pir_diag_error(p->diag, p->cur.line, p->cur.col,
+                                       "expected non-negative integer offset in multi_ret");
+                        return false;
+                    }
+                    cabi_ret_out->reg_offsets[ridx] = p->cur.int_lo;
+                    advance_tok(p);
+                    n_explicit_offs++;
+                }
                 if (!expect_tok(p, TOK_COMMA, "','")) return false;
                 if (is_ident(p, "size")) break;
+            }
+            if (n_explicit_offs > 0u) {
+                if (n_explicit_offs != cabi_ret_out->reg_count) {
+                    pir_diag_error(p->diag, p->cur.line, p->cur.col,
+                                   "multi_ret must specify offset on all registers or none");
+                    return false;
+                }
+                cabi_ret_out->has_reg_offsets = true;
             }
             if (cabi_ret_out->reg_count < 2u) {
                 pir_diag_error(p->diag, p->cur.line, p->cur.col, "multi_ret requires at least 2 register types");

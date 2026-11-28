@@ -618,7 +618,7 @@ static void isel_call(Rv32ISelCtx *c, const PirInst *inst, uint32_t loc) {
                                  ? callee_params[i].attrs : 0u;
                 if ((pattr & PIR_PATTR_SIGNEXT) != 0u) {
                     v = emit_normalize_subword(c, v, aty, true, loc);
-                } else if ((pattr & PIR_PATTR_ZEROEXT) != 0u) {
+                } else if ((pattr & PIR_PATTR_ZEROEXT) != 0u || is_va_arg) {
                     v = emit_normalize_subword(c, v, aty, false, loc);
                 }
             }

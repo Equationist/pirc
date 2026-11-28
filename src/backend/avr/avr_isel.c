@@ -208,15 +208,16 @@ typedef struct {
 } AvrArgLoc;
 
 static uint64_t avr_plan_args(uint32_t n, bool is_variadic,
+                              const uint8_t *arg_w,
                               const uint8_t *group_words, const bool *force_stack,
                               AvrArgLoc *locs) {
     uint64_t stk_off = 0u;
     if (is_variadic) {
-        /* AVR C ABI: ALL arguments (fixed + variadic) pass on stack in 2-byte slots. */
+        /* AVR C ABI: ALL arguments (fixed + variadic) pass on stack (1-byte stack align). */
         for (uint32_t i = 0u; i < n; ++i) {
             locs[i].preg = MREG_NONE;
             locs[i].soff = (int64_t)stk_off;
-            stk_off += 2u;
+            stk_off += (arg_w && arg_w[i] > 0u) ? (uint64_t)arg_w[i] : 2u;
         }
         return stk_off;
     }
@@ -238,7 +239,7 @@ static uint64_t avr_plan_args(uint32_t n, bool is_variadic,
             for (uint32_t k = 0u; k < gw; ++k) {
                 locs[i + k].preg = MREG_NONE;
                 locs[i + k].soff = (int64_t)stk_off;
-                stk_off += 2u;
+                stk_off += (arg_w && arg_w[i + k] > 0u) ? (uint64_t)arg_w[i + k] : 2u;
             }
         }
         i += gw;
@@ -353,19 +354,17 @@ static void isel_call(AvrISelCtx *c, const PirInst *inst, uint32_t loc) {
         arg_fs[i] = aop->call_force_stack ||
                     (callee_params && pi < callee_param_count && callee_params[pi].abi_force_stack);
 
-        /* On AVR variadic stack, widen i8 to 16-bit (C default int promotion). */
-        if (is_variadic && arg_w[i] == 1u) {
+        /* On AVR variadic stack, widen ONLY variadic (non-fixed) i8 args to 16-bit
+         * (C default int promotion); fixed i8 params occupy 1 byte on the stack. */
+        if (is_variadic && pi >= callee_param_count && arg_w[i] == 1u) {
             MVReg wv = new_gp(c);
-            bool sext = (callee_params && pi < callee_param_count &&
-                         (callee_params[pi].attrs & PIR_PATTR_SIGNEXT) != 0u);
-            if (sext) emit_sext8(c, wv, arg_v[i], loc);
-            else      emit_zext8(c, wv, arg_v[i], loc);
+            emit_zext8(c, wv, arg_v[i], loc);
             arg_v[i] = wv;
             arg_w[i] = 2u;
         }
     }
 
-    uint64_t out_bytes = avr_plan_args(nargs, is_variadic, arg_gw, arg_fs, locs);
+    uint64_t out_bytes = avr_plan_args(nargs, is_variadic, arg_w, arg_gw, arg_fs, locs);
     if (out_bytes > c->mf->max_out_args_bytes) c->mf->max_out_args_bytes = out_bytes;
 
     if (out_bytes > 0u) {
@@ -377,7 +376,7 @@ static void isel_call(AvrISelCtx *c, const PirInst *inst, uint32_t loc) {
     /* Emit outgoing stack arg stores first. */
     for (uint32_t i = 0u; i < nargs; ++i) {
         if (locs[i].soff < 0) continue;
-        MInst st = minst_make(MI_STORE_OUTARG, 2u, loc);
+        MInst st = minst_make(MI_STORE_OUTARG, arg_w[i], loc);
         st.op_count = 2u;
         st.ops[0]   = mop_vreg_use(arg_v[i]);
         st.ops[1]   = mop_imm(locs[i].soff);
@@ -446,7 +445,9 @@ static void isel_call(AvrISelCtx *c, const PirInst *inst, uint32_t loc) {
     if (cabi_ret.kind == PIR_CABI_RET_MULTI_REG) {
         uint32_t nregs = cabi_ret.reg_count;
         if (nregs > 4u) nregs = 4u;
-        uint32_t base_pair = 13u - nregs;
+        /* AVR-GCC / Clang rounds multi-reg return sizes up to powers of 2:
+         * 1..2B -> r24.. (pair 12), 3..4B -> r22.. (pair 11), 5..8B -> r18.. (pair 9). */
+        uint32_t base_pair = (nregs >= 3u) ? 9u : (13u - nregs);
         MVReg saved[4] = { MVREG_NONE, MVREG_NONE, MVREG_NONE, MVREG_NONE };
         for (uint32_t k = 0u; k < nregs; ++k) {
             saved[k] = new_gp(c);
@@ -590,6 +591,35 @@ static MCond pir_cmp_to_mcond(PirOpcode op) {
     if (op == PIR_OP_CMP_GT_U) return MCOND_HI;
     if (op == PIR_OP_CMP_GE_U) return MCOND_CS;
     return MCOND_EQ;
+}
+
+static void emit_mul_wide_pinned(AvrISelCtx *c, MVReg rlo, MVReg rhi,
+                                 MVReg lhs, MVReg rhs, bool is_signed, uint32_t loc) {
+    /* Pin all 4 operands to distinct fixed GP pairs so regalloc never needs 4 GP scratches
+     * when both early-clobber outputs and both inputs are spilled simultaneously. */
+    MVReg p_lhs = new_gp(c); c->mf->vregs.data[p_lhs].fixed_preg = AVR_R24R25;
+    MVReg p_rhs = new_gp(c); c->mf->vregs.data[p_rhs].fixed_preg = AVR_R22R23;
+    MVReg p_rlo = new_gp(c); c->mf->vregs.data[p_rlo].fixed_preg = AVR_R20R21;
+    MVReg p_rhi = new_gp(c); c->mf->vregs.data[p_rhi].fixed_preg = AVR_R18R19;
+    MPCopyEntry ents[2];
+    ents[0].dst = p_lhs; ents[0].src_is_imm = false; ents[0].src = lhs; ents[0].rclass = MREG_CLASS_GP; ents[0].byte_size = 2u;
+    ents[1].dst = p_rhs; ents[1].src_is_imm = false; ents[1].src = rhs; ents[1].rclass = MREG_CLASS_GP; ents[1].byte_size = 2u;
+    uint32_t pid = mfunc_add_pcopy(c->mf, ents, 2u);
+    MInst pc = minst_make(MI_PCOPY, 2u, loc);
+    pc.aux_id = pid;
+    emit(c, pc);
+
+    MInst mw = minst_make(MI_AVR_MUL_WIDE, 2u, loc);
+    mw.is_signed = is_signed;
+    mw.op_count  = 4u;
+    mw.ops[0]    = mop_vreg_def_ec(p_rlo);
+    mw.ops[1]    = mop_vreg_def_ec(p_rhi);
+    mw.ops[2]    = mop_vreg_use(p_lhs);
+    mw.ops[3]    = mop_vreg_use(p_rhs);
+    emit(c, mw);
+
+    emit_copy(c, rlo, p_rlo, loc);
+    emit_copy(c, rhi, p_rhi, loc);
 }
 
 static void isel_inst(AvrISelCtx *c, PirInstId iid, const PirInst *inst) {
@@ -771,14 +801,7 @@ static void isel_inst(AvrISelCtx *c, PirInstId iid, const PirInst *inst) {
                 bool is_s = (inst->flags & PIR_FLAG_TRAP_S) != 0u;
                 if (w == 2u) {
                     MVReg hi = new_gp(c);
-                    MInst mw = minst_make(MI_AVR_MUL_WIDE, 2u, loc);
-                    mw.is_signed = is_s;
-                    mw.op_count = 4u;
-                    mw.ops[0] = mop_vreg_def_ec(dst);
-                    mw.ops[1] = mop_vreg_def_ec(hi);
-                    mw.ops[2] = mop_vreg_use(lhs);
-                    mw.ops[3] = mop_vreg_use(rhs);
-                    emit(c, mw);
+                    emit_mul_wide_pinned(c, dst, hi, lhs, rhs, is_s, loc);
                     if (is_s) {
                         MVReg sgn = new_gp(c);
                         MInst sr = minst_make(MI_AVR_SARI, 2u, loc);
@@ -820,14 +843,7 @@ static void isel_inst(AvrISelCtx *c, PirInstId iid, const PirInst *inst) {
             MVReg rhi = c->val_vreg[inst->results[1]];
             MVReg lhs = mat_op(c, &inst->operands[0], loc);
             MVReg rhs = mat_op(c, &inst->operands[1], loc);
-            MInst mw = minst_make(MI_AVR_MUL_WIDE, 2u, loc);
-            mw.is_signed = (inst->op == PIR_OP_MUL_WIDE_S);
-            mw.op_count  = 4u;
-            mw.ops[0]    = mop_vreg_def_ec(rlo);
-            mw.ops[1]    = mop_vreg_def_ec(rhi);
-            mw.ops[2]    = mop_vreg_use(lhs);
-            mw.ops[3]    = mop_vreg_use(rhs);
-            emit(c, mw);
+            emit_mul_wide_pinned(c, rlo, rhi, lhs, rhs, (inst->op == PIR_OP_MUL_WIDE_S), loc);
             return;
         }
 
@@ -1178,7 +1194,7 @@ static void isel_inst(AvrISelCtx *c, PirInstId iid, const PirInst *inst) {
             if (c->fn->cabi_ret.kind == PIR_CABI_RET_MULTI_REG) {
                 uint32_t nregs = c->fn->cabi_ret.reg_count;
                 if (nregs > 4u) nregs = 4u;
-                uint32_t base_pair = 13u - nregs;
+                uint32_t base_pair = (nregs >= 3u) ? 9u : (13u - nregs);
                 MVReg loaded[4] = { MVREG_NONE, MVREG_NONE, MVREG_NONE, MVREG_NONE };
                 for (uint32_t k = 0u; k < nregs; ++k) {
                     uint64_t byte_off = (uint64_t)k * 2u;
@@ -1298,15 +1314,17 @@ bool pir_avr_isel_func(const PirModule *mod, const PirFunction *fn, uint32_t fn_
 
     uint32_t np = (fn->param_count > start_p) ? (fn->param_count - start_p) : 0u;
     if (np > 0u) {
+        uint8_t   *pw   = (uint8_t *)calloc(np, sizeof(uint8_t));
         uint8_t   *pgw  = (uint8_t *)calloc(np, sizeof(uint8_t));
         bool      *pfs  = (bool *)calloc(np, sizeof(bool));
         AvrArgLoc *locs = (AvrArgLoc *)calloc(np, sizeof(AvrArgLoc));
-        if (!pgw || !pfs || !locs) abort();
+        if (!pw || !pgw || !pfs || !locs) abort();
         for (uint32_t i = 0u; i < np; ++i) {
+            pw[i]  = avr_val_width(fn->params[start_p + i].type);
             pgw[i] = fn->params[start_p + i].abi_group_words;
             pfs[i] = fn->params[start_p + i].abi_force_stack;
         }
-        uint64_t fixed_stk = avr_plan_args(np, fn->is_variadic, pgw, pfs, locs);
+        uint64_t fixed_stk = avr_plan_args(np, fn->is_variadic, pw, pgw, pfs, locs);
         out_mf->va_fixed_stack_bytes = fixed_stk;
 
         /* Copy register arguments first while incoming ABI regs are untouched. */
@@ -1323,12 +1341,13 @@ bool pir_avr_isel_func(const PirModule *mod, const PirFunction *fn, uint32_t fn_
         for (uint32_t i = 0u; i < np; ++i) {
             if (locs[i].soff < 0) continue;
             MVReg dst = c.val_vreg[fn->params[start_p + i].val_id];
-            MInst ld = minst_make(MI_LOAD_INARG, 2u, 0u);
+            MInst ld = minst_make(MI_LOAD_INARG, pw[i], 0u);
             ld.op_count = 2u;
             ld.ops[0] = mop_vreg_def(dst);
             ld.ops[1] = mop_imm(locs[i].soff);
             emit(&c, ld);
         }
+        free(pw);
         free(pgw);
         free(pfs);
         free(locs);

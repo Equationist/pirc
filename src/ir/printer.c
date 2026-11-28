@@ -501,6 +501,9 @@ static void print_fn_cc_attrs(const PirModule *mod, PirCallingConv cc, uint32_t 
                 for (uint32_t r = 0u; r < cabi_ret->reg_count && r < 4u; ++r) {
                     if (r > 0u) fputs(", ", out);
                     pir_print_type(mod, cabi_ret->regs[r], out);
+                    if (cabi_ret->has_reg_offsets) {
+                        fprintf(out, " offset %" PRIu64, cabi_ret->reg_offsets[r]);
+                    }
                 }
                 fprintf(out, ", size %" PRIu64 ", align %u)",
                         cabi_ret->agg_size, cabi_ret->agg_align);

@@ -291,11 +291,38 @@ static PirFuncId ensure_si3_helper(PirModule *mod, const char *name,
                                    uint32_t ln, PirDiag *diag) {
     PirType tptr  = pir_type_scalar(PIR_SCALAR_PTR);
     PirType t16   = pir_type_scalar(PIR_SCALAR_I16);
+    PirType t32   = pir_type_scalar(PIR_SCALAR_I32);
     PirType tvoid = pir_type_scalar(PIR_SCALAR_VOID);
     PirType ptys[5] = { tptr, t16, t16, t16, t16 };
 
     for (uint32_t i = 0u; i < mod->funcs.len; ++i) {
         if (strcmp(mod->funcs.data[i].name, name) == 0) {
+            const PirFunction *f = &mod->funcs.data[i];
+            bool ok_base = (f->cc == PIR_CC_C &&
+                            !f->is_variadic &&
+                            f->linkage != PIR_LINK_INTERNAL);
+            bool ok_post = ok_base &&
+                           f->param_count == 5u &&
+                           pir_type_eq(f->ret_type, tvoid) &&
+                           f->cabi_ret.kind == PIR_CABI_RET_MULTI_REG &&
+                           f->cabi_ret.reg_count == 2u &&
+                           pir_type_eq(f->cabi_ret.regs[0], t16) &&
+                           pir_type_eq(f->cabi_ret.regs[1], t16) &&
+                           pir_type_eq(f->params[0].type, tptr);
+            for (uint32_t k = 1u; ok_post && k < 5u; ++k) {
+                if (!pir_type_eq(f->params[k].type, t16)) ok_post = false;
+            }
+            bool ok_pre = ok_base &&
+                          f->param_count == 2u &&
+                          pir_type_eq(f->ret_type, t32) &&
+                          pir_type_eq(f->params[0].type, t32) &&
+                          pir_type_eq(f->params[1].type, t32);
+            if (!ok_post && !ok_pre) {
+                pir_diag_error(diag, ln, 0u,
+                               "incompatible predeclaration of '%s' required by i32 division legalization",
+                               name);
+                return PIR_INVALID_ID;
+            }
             return i;
         }
     }
@@ -1276,6 +1303,21 @@ static bool legalize_i32_func(PirModule *mod, const PirTargetSpec *target, PirFu
                 l1.operands[0] = pir_op_val(pa.results[0], tptr);
                 l1.results[0]  = target->is_big_endian ? rlo : rhi;
                 pir_fn_append_inst(fn, &new_insts, l1);
+            } else if (copy.op == PIR_OP_BITCAST) {
+                PirOperand slo, shi;
+                operand_to_pair16(&copy.operands[0], map, &slo, &shi);
+                if (slo.kind == PIR_OPER_VAL) {
+                    I32Alias a0 = { rlo, slo.u.val };
+                    PIR_VEC_PUSH(&aliases, a0);
+                } else {
+                    emit_un(mod, fn, b, &new_insts, PIR_OP_CONST, t16, slo, ln, lc, rlo);
+                }
+                if (shi.kind == PIR_OPER_VAL) {
+                    I32Alias a1 = { rhi, shi.u.val };
+                    PIR_VEC_PUSH(&aliases, a1);
+                } else {
+                    emit_un(mod, fn, b, &new_insts, PIR_OP_CONST, t16, shi, ln, lc, rhi);
+                }
             } else {
                 PIR_VEC_PUSH(&new_insts, iid);
             }

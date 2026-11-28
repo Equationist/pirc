@@ -19,8 +19,9 @@ static uint64_t gcd_u64(uint64_t a, uint64_t b) {
 static int64_t imm_to_i64(const PirOperand *c) {
     uint64_t v = c->u.imm_int.is_negative ? (UINT64_C(0) - c->u.imm_int.lo)
                                           : c->u.imm_int.lo;
-    if (c->type.kind == PIR_TYPE_SCALAR && c->type.u.scalar == PIR_SCALAR_I32) {
-        return (int64_t)(int32_t)(uint32_t)v;
+    if (c->type.kind == PIR_TYPE_SCALAR) {
+        if (c->type.u.scalar == PIR_SCALAR_I16) return (int64_t)(int16_t)(uint16_t)v;
+        if (c->type.u.scalar == PIR_SCALAR_I32) return (int64_t)(int32_t)(uint32_t)v;
     }
     return (int64_t)v;
 }
@@ -64,8 +65,14 @@ static uint64_t extract_var_stride(const PirFunction *fn, PirOperand off_op, boo
         }
     } else if (ins->op == PIR_OP_SHL && ins->operand_count == 2u) {
         int64_t sh = 0;
-        if (get_const_i64(fn, ins->operands[1], &sh) && sh >= 1 && sh <= 16) {
-            return (uint64_t)1u << (uint32_t)sh;
+        uint32_t bits = pir_type_bits(ins->ty, 8u);
+        if (bits > 0u && get_const_i64(fn, ins->operands[1], &sh)) {
+            if ((ins->flags & (PIR_FLAG_TRAP | PIR_FLAG_UNSAFE)) == 0u) {
+                sh = (int64_t)((uint64_t)sh & (uint64_t)(bits - 1u));
+            }
+            if (sh >= 1 && (uint64_t)sh < (uint64_t)bits && sh <= 16) {
+                return (uint64_t)1u << (uint32_t)sh;
+            }
         }
     }
     return 1u;

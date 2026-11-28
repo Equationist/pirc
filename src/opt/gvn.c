@@ -622,10 +622,10 @@ static bool try_simplify_identity(GvnCtx *ctx, PirInst *ins) {
     }
 
     /* ptr_add p, 0 -> p (only without [inbounds], since ptr_add [inbounds] null, 0 is UB;
-     * and only on 64-bit targets, since 32-bit ptr_add wraps non-canonical 64-bit sym offsets). */
+     * and only on 64-bit targets, since 16/32-bit ptr_add wraps non-canonical 64-bit sym offsets). */
     if (ins->op == PIR_OP_PTR_ADD && ins->operand_count == 2u &&
         (ins->flags & PIR_FLAG_INBOUNDS) == 0u &&
-        ctx->target->ptr_bytes != 4u) {
+        ctx->target->ptr_bytes == 8u) {
         uint32_t pbits = scalar_int_bits(ins->ty);
         if (pbits == 0u) pbits = (uint32_t)ctx->target->ptr_bytes * 8u;
         uint64_t off = 0u;
