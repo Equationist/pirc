@@ -248,6 +248,25 @@ static PirFuncId ensure_di3_helper(PirModule *mod, const char *name,
 
     for (uint32_t i = 0u; i < mod->funcs.len; ++i) {
         if (strcmp(mod->funcs.data[i].name, name) == 0) {
+            const PirFunction *f = &mod->funcs.data[i];
+            bool ok_sig = (f->cc == PIR_CC_C &&
+                           !f->is_variadic &&
+                           f->param_count == 5u &&
+                           pir_type_eq(f->ret_type, tvoid) &&
+                           f->cabi_ret.kind == PIR_CABI_RET_MULTI_REG &&
+                           f->cabi_ret.reg_count == 2u &&
+                           pir_type_eq(f->cabi_ret.regs[0], t32) &&
+                           pir_type_eq(f->cabi_ret.regs[1], t32) &&
+                           pir_type_eq(f->params[0].type, tptr));
+            for (uint32_t k = 1u; ok_sig && k < 5u; ++k) {
+                if (!pir_type_eq(f->params[k].type, t32)) ok_sig = false;
+            }
+            if (!ok_sig) {
+                pir_diag_error(diag, ln, 0u,
+                               "incompatible predeclaration of '%s' required by i64 division legalization",
+                               name);
+                return PIR_INVALID_ID;
+            }
             return i;
         }
     }
@@ -255,6 +274,8 @@ static PirFuncId ensure_di3_helper(PirModule *mod, const char *name,
                                                    ln, "i64 division legalization", diag);
     if (id == PIR_INVALID_ID) return PIR_INVALID_ID;
     PirFunction *h = &mod->funcs.data[id];
+    h->params[1].abi_group_words = 2u;
+    h->params[3].abi_group_words = 2u;
     h->cabi_ret.kind      = PIR_CABI_RET_MULTI_REG;
     h->cabi_ret.reg_count = 2u;
     h->cabi_ret.regs[0]   = t32;
@@ -379,6 +400,10 @@ static bool legalize_i64_func(PirModule *mod, const PirTargetSpec *target, PirFu
                 if (target->arch == PIR_ARCH_PPC32 && fn->cc == PIR_CC_C && p0.abi_stack_align < 8u) {
                     p0.abi_stack_align = 8u;
                 }
+                if (target->arch == PIR_ARCH_AVR && fn->cc == PIR_CC_C) {
+                    p0.abi_group_words = 2u;
+                    p1.abi_group_words = 0u;
+                }
                 p1.abi_stack_align = 0u;
                 p0.val_id = target->is_big_endian ? hi_id : lo_id;
                 p0.name   = fn->values.data[p0.val_id].name;
@@ -490,6 +515,10 @@ static bool legalize_i64_func(PirModule *mod, const PirTargetSpec *target, PirFu
                             second.call_force_stack = copy.operands[k].call_force_stack;
                             if (target->arch == PIR_ARCH_PPC32 && call_is_c && first.call_stack_align < 8u) {
                                 first.call_stack_align = 8u;
+                            }
+                            if (target->arch == PIR_ARCH_AVR && call_is_c) {
+                                first.call_group_words  = 2u;
+                                second.call_group_words = 0u;
                             }
                             if (call_is_var && (k - 1u) >= fixed_n) {
                                 first.has_explicit_type  = true;
@@ -608,7 +637,7 @@ static bool legalize_i64_func(PirModule *mod, const PirTargetSpec *target, PirFu
                 continue;
             }
             if (copy.op == PIR_OP_BITCAST && copy.operand_count == 1u &&
-                is_i64(copy.operands[0].type) &&
+                (is_i64(copy.operands[0].type) || copy.operands[0].kind == PIR_OPER_IMM_INT) &&
                 copy.ty.kind == PIR_TYPE_SCALAR && copy.ty.u.scalar == PIR_SCALAR_F64) {
                 PirOperand xlo, xhi;
                 operand_to_pair32(&copy.operands[0], map, &xlo, &xhi);
@@ -962,6 +991,10 @@ static bool legalize_i64_func(PirModule *mod, const PirTargetSpec *target, PirFu
                 hc.operands[3] = target->is_big_endian ? alo : ahi;
                 hc.operands[4] = target->is_big_endian ? call_bhi : call_blo;
                 hc.operands[5] = target->is_big_endian ? call_blo : call_bhi;
+                if (target->arch == PIR_ARCH_AVR) {
+                    hc.operands[2].call_group_words = 2u;
+                    hc.operands[4].call_group_words = 2u;
+                }
                 pir_fn_append_inst(fn, &new_insts, hc);
 
                 bool wrap_sel = (is_s && (copy.flags & PIR_FLAG_WRAP) && is_min_m1 != PIR_INVALID_ID);
@@ -1139,32 +1172,50 @@ static bool legalize_i64_func(PirModule *mod, const PirTargetSpec *target, PirFu
                 emit_un(mod, fn, b, &new_insts, PIR_OP_PTRTOINT, t32, copy.operands[0], ln, lc, rlo);
                 emit_un(mod, fn, b, &new_insts, PIR_OP_CONST, t32, pir_op_imm_i(0u, false, t32), ln, lc, rhi);
             } else if (copy.op == PIR_OP_BITCAST) {
-                /* bitcast.i64 %f64 -> store f64 to 8B slot, load lo/hi i32. */
-                PirValueId slot = pir_fn_emit_entry_alloca(mod, fn, "bc64i", 8u, 8u, ln, lc, &entry_allocas);
-                PirInst st = pir_make_inst(PIR_OP_STORE, tf64, ln, lc);
-                st.align = 8u; st.operand_count = 2u; st.operands = pir_alloc_ops(mod, 2u);
-                st.operands[0] = copy.operands[0];
-                st.operands[1] = pir_op_val(slot, tptr);
-                pir_fn_append_inst(fn, &new_insts, st);
+                if (is_i64(copy.operands[0].type) || copy.operands[0].kind == PIR_OPER_IMM_INT) {
+                    /* Same-type bitcast.i64 %x or bitcast.i64 <imm_int> -> copy/const split. */
+                    PirOperand xlo, xhi;
+                    operand_to_pair32(&copy.operands[0], map, &xlo, &xhi);
+                    if (xlo.kind == PIR_OPER_VAL) {
+                        I64Alias al = { rlo, xlo.u.val };
+                        PIR_VEC_PUSH(&aliases, al);
+                    } else {
+                        emit_un(mod, fn, b, &new_insts, PIR_OP_CONST, t32, xlo, ln, lc, rlo);
+                    }
+                    if (xhi.kind == PIR_OPER_VAL) {
+                        I64Alias al = { rhi, xhi.u.val };
+                        PIR_VEC_PUSH(&aliases, al);
+                    } else {
+                        emit_un(mod, fn, b, &new_insts, PIR_OP_CONST, t32, xhi, ln, lc, rhi);
+                    }
+                } else {
+                    /* bitcast.i64 %f64 -> store f64 to 8B slot, load lo/hi i32. */
+                    PirValueId slot = pir_fn_emit_entry_alloca(mod, fn, "bc64i", 8u, 8u, ln, lc, &entry_allocas);
+                    PirInst st = pir_make_inst(PIR_OP_STORE, tf64, ln, lc);
+                    st.align = 8u; st.operand_count = 2u; st.operands = pir_alloc_ops(mod, 2u);
+                    st.operands[0] = copy.operands[0];
+                    st.operands[1] = pir_op_val(slot, tptr);
+                    pir_fn_append_inst(fn, &new_insts, st);
 
-                PirInst l0 = pir_make_inst(PIR_OP_LOAD, t32, ln, lc);
-                l0.align = 4u; l0.operand_count = 1u; l0.operands = pir_alloc_ops(mod, 1u);
-                l0.operands[0] = pir_op_val(slot, tptr);
-                l0.results[0]  = target->is_big_endian ? rhi : rlo;
-                pir_fn_append_inst(fn, &new_insts, l0);
+                    PirInst l0 = pir_make_inst(PIR_OP_LOAD, t32, ln, lc);
+                    l0.align = 4u; l0.operand_count = 1u; l0.operands = pir_alloc_ops(mod, 1u);
+                    l0.operands[0] = pir_op_val(slot, tptr);
+                    l0.results[0]  = target->is_big_endian ? rhi : rlo;
+                    pir_fn_append_inst(fn, &new_insts, l0);
 
-                PirInst pa = pir_make_inst(PIR_OP_PTR_ADD, t32, ln, lc);
-                pa.flags = PIR_FLAG_INBOUNDS; pa.operand_count = 2u; pa.operands = pir_alloc_ops(mod, 2u);
-                pa.operands[0] = pir_op_val(slot, tptr);
-                pa.operands[1] = pir_op_imm_i(4u, false, t32);
-                pa.results[0]  = pir_fn_new_val(mod, fn, "bcip", tptr, b, PIR_INVALID_ID, 0u);
-                pir_fn_append_inst(fn, &new_insts, pa);
+                    PirInst pa = pir_make_inst(PIR_OP_PTR_ADD, t32, ln, lc);
+                    pa.flags = PIR_FLAG_INBOUNDS; pa.operand_count = 2u; pa.operands = pir_alloc_ops(mod, 2u);
+                    pa.operands[0] = pir_op_val(slot, tptr);
+                    pa.operands[1] = pir_op_imm_i(4u, false, t32);
+                    pa.results[0]  = pir_fn_new_val(mod, fn, "bcip", tptr, b, PIR_INVALID_ID, 0u);
+                    pir_fn_append_inst(fn, &new_insts, pa);
 
-                PirInst l1 = pir_make_inst(PIR_OP_LOAD, t32, ln, lc);
-                l1.align = 4u; l1.operand_count = 1u; l1.operands = pir_alloc_ops(mod, 1u);
-                l1.operands[0] = pir_op_val(pa.results[0], tptr);
-                l1.results[0]  = target->is_big_endian ? rlo : rhi;
-                pir_fn_append_inst(fn, &new_insts, l1);
+                    PirInst l1 = pir_make_inst(PIR_OP_LOAD, t32, ln, lc);
+                    l1.align = 4u; l1.operand_count = 1u; l1.operands = pir_alloc_ops(mod, 1u);
+                    l1.operands[0] = pir_op_val(pa.results[0], tptr);
+                    l1.results[0]  = target->is_big_endian ? rlo : rhi;
+                    pir_fn_append_inst(fn, &new_insts, l1);
+                }
             } else if (copy.op == PIR_OP_FPTOSI || copy.op == PIR_OP_FPTOUI) {
                 PirOperand x = copy.operands[0];
                 if (x.type.kind == PIR_TYPE_SCALAR && x.type.u.scalar == PIR_SCALAR_F32) {
@@ -1420,6 +1471,10 @@ static void split_i64_decl(PirModule *mod, const PirTargetSpec *target, PirCalli
             p0.type = t32; p1.type = t32;
             if (target->arch == PIR_ARCH_PPC32 && cc == PIR_CC_C && p0.abi_stack_align < 8u) {
                 p0.abi_stack_align = 8u;
+            }
+            if (target->arch == PIR_ARCH_AVR && cc == PIR_CC_C) {
+                p0.abi_group_words = 2u;
+                p1.abi_group_words = 0u;
             }
             p1.abi_stack_align = 0u;
             p1.name = NULL; p1.val_id = PIR_INVALID_ID;

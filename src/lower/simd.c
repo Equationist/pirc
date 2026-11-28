@@ -158,7 +158,7 @@ static bool legalize_simd_func(PirModule *mod, const PirTargetSpec *target, PirF
     PirType t8     = pir_type_scalar(PIR_SCALAR_I8);
     PirType tptr   = pir_type_scalar(PIR_SCALAR_PTR);
     PirType tvoid  = pir_type_scalar(PIR_SCALAR_VOID);
-    PirType idx_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
+    PirType idx_ty = pir_type_scalar(pir_ptr_int_scalar(target->ptr_bytes));
     PirValueId ret_out_val = PIR_INVALID_ID;
 
     uint32_t orig_vals = fn->values.len;

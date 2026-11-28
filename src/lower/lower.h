@@ -28,7 +28,9 @@ bool pir_lower_varargs(PirModule *mod, const PirTargetSpec *target, PirDiag *dia
 bool pir_lower_cabi(PirModule *mod, const PirTargetSpec *target, PirDiag *diag);
 bool pir_lower_aggregates(PirModule *mod, const PirTargetSpec *target, PirDiag *diag);
 bool pir_legalize_i128(PirModule *mod, const PirTargetSpec *target, PirDiag *diag);
+bool pir_legalize_soft_float(PirModule *mod, const PirTargetSpec *target, PirDiag *diag);
 bool pir_legalize_i64(PirModule *mod, const PirTargetSpec *target, PirDiag *diag);
+bool pir_legalize_i32(PirModule *mod, const PirTargetSpec *target, PirDiag *diag);
 bool pir_legalize_simd(PirModule *mod, const PirTargetSpec *target, PirDiag *diag);
 bool pir_legalize_optional_ops(PirModule *mod, const PirTargetSpec *target, PirDiag *diag);
 

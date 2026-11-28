@@ -253,7 +253,7 @@ static bool legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
     PirType t8  = pir_type_scalar(PIR_SCALAR_I8);
     PirType tptr = pir_type_scalar(PIR_SCALAR_PTR);
     PirType tvoid = pir_type_scalar(PIR_SCALAR_VOID);
-    PirType idx_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
+    PirType idx_ty = pir_type_scalar(pir_ptr_int_scalar(target->ptr_bytes));
 
     uint32_t orig_vals = fn->values.len;
     I128Pair *map = (I128Pair *)malloc((orig_vals + 1u) * sizeof(I128Pair));
@@ -414,7 +414,7 @@ static bool legalize_i128_func(PirModule *mod, const PirTargetSpec *target, PirF
                     PirValueId rbuf = PIR_INVALID_ID;
                     if (call_ret_i128) {
                         rbuf = pir_fn_emit_entry_alloca(mod, fn, "c128_out",
-                                                        16u, 8u, ln, lc, &entry_allocas);
+                                                        16u, 16u, ln, lc, &entry_allocas);
                     }
                     PIR_VEC(PirOperand) nargs = {0};
                     PIR_VEC_PUSH(&nargs, copy.operands[0]);

@@ -42,14 +42,18 @@ uint32_t pir_interp_alloc_new(PirInterp *it, size_t size, uint32_t align,
         return 0u;
     }
     if (align == 0u) align = 1u;
-    uint64_t a_align = align < 16u ? 16u : (uint64_t)align;
+    uint64_t a_align = (it->ptr_bytes == 2u)
+                       ? (align < 2u ? 2u : (uint64_t)align)
+                       : (align < 16u ? 16u : (uint64_t)align);
     if (it->next_addr > UINT64_MAX - a_align) {
         pir_interp_fail(it, PIR_INTERP_ERR, "interpreter virtual address space exhausted");
         return 0u;
     }
     uint64_t base = align_up_u64(it->next_addr, a_align);
-    uint64_t span = (uint64_t)size + 4096u;
+    uint64_t guard = (it->ptr_bytes == 2u) ? 16u : 4096u;
+    uint64_t span = (uint64_t)size + guard;
     if (span < (uint64_t)size || base > UINT64_MAX - span ||
+        (it->ptr_bytes == 2u && base + span > UINT16_MAX) ||
         (it->ptr_bytes == 4u && base + span > UINT32_MAX)) {
         pir_interp_fail(it, PIR_INTERP_ERR, "interpreter virtual address space exhausted");
         return 0u;
@@ -116,13 +120,16 @@ PirPtr pir_interp_int_to_ptr(PirInterp *it, uint64_t addr) {
     }
     /* Fallback: recover provenance for wrapping OOB pointers within the 2048B half-guard window
      * (e.g. `ptr_add %arr, -8` round-tripped through byval/retbuf integer register packing). */
+    int64_t half_guard = (it->ptr_bytes == 2u) ? 8 : 2048;
     for (uint32_t i = 1u; i < it->allocs.len; ++i) {
         const PirAlloc *a = &it->allocs.data[i];
         uint64_t base = a->base_addr & pmask;
-        int64_t rel = (it->ptr_bytes == 4u)
+        int64_t rel = (it->ptr_bytes == 2u)
+                      ? (int64_t)(int16_t)((uint16_t)addr - (uint16_t)base)
+                      : (it->ptr_bytes == 4u)
                       ? (int64_t)(int32_t)((uint32_t)addr - (uint32_t)base)
                       : (int64_t)(addr - base);
-        if (rel >= -2048 && rel <= (int64_t)a->size + 2048) {
+        if (rel >= -half_guard && rel <= (int64_t)a->size + half_guard) {
             res.alloc_id = i;
             res.offset   = rel;
             return res;
@@ -163,7 +170,7 @@ bool pir_interp_check_access(PirInterp *it, PirPtr p, size_t size,
                         p.offset, size, a->size);
         return false;
     }
-    if (align > 1u) {
+    if (align > 1u && !(it->target && it->target->arch == PIR_ARCH_AVR)) {
         uint64_t addr = a->base_addr + (uint64_t)p.offset;
         if ((addr % (uint64_t)align) != 0u) {
             pir_interp_fail(it, PIR_INTERP_UB,
@@ -615,6 +622,8 @@ typedef struct {
     const PirCallArgMeta   *vararg_meta;
     uint32_t                vararg_count;
     bool                    has_setjmp;
+    bool                    setjmp_has_out;
+    PirPtr                  setjmp_out;
     PirPtr                  setjmp_jb;
     PirBlockId              setjmp_blk;
     uint32_t                setjmp_j;
@@ -878,7 +887,17 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                     PirVal a = eval_operand(it, &fr, &inst->operands[0]);
                     PirVal b = eval_operand(it, &fr, &inst->operands[1]);
                     uint64_t lo = 0u, hi = 0u;
-                    if (inst->ty.u.scalar == PIR_SCALAR_I32) {
+                    if (inst->ty.u.scalar == PIR_SCALAR_I16) {
+                        if (inst->op == PIR_OP_MUL_WIDE_U) {
+                            uint32_t p = (uint32_t)(uint16_t)pir_val_get_u64(&a) *
+                                         (uint32_t)(uint16_t)pir_val_get_u64(&b);
+                            lo = (uint16_t)p; hi = (uint16_t)(p >> 16u);
+                        } else {
+                            int32_t p = (int32_t)(int16_t)pir_val_get_u64(&a) *
+                                        (int32_t)(int16_t)pir_val_get_u64(&b);
+                            lo = (uint16_t)(uint32_t)p; hi = (uint16_t)((uint32_t)p >> 16u);
+                        }
+                    } else if (inst->ty.u.scalar == PIR_SCALAR_I32) {
                         if (inst->op == PIR_OP_MUL_WIDE_U) {
                             uint64_t p = (uint64_t)(uint32_t)pir_val_get_u64(&a) *
                                          (uint64_t)(uint32_t)pir_val_get_u64(&b);
@@ -1271,7 +1290,9 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                         }
                         uint64_t raw = pir_interp_ptr_to_int(it, base.ptr) + (uint64_t)delta;
                         r0.ptr.alloc_id = 0u;
-                        r0.ptr.offset   = (it->ptr_bytes == 4u)
+                        r0.ptr.offset   = (it->ptr_bytes == 2u)
+                                          ? (int64_t)(int16_t)(uint16_t)raw
+                                          : (it->ptr_bytes == 4u)
                                           ? (int64_t)(int32_t)(uint32_t)raw
                                           : (int64_t)raw;
                         break;
@@ -1300,6 +1321,8 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                                 break;
                             }
                         }
+                    } else if (it->ptr_bytes == 2u) {
+                        next_off = (int64_t)(int16_t)((uint16_t)base.ptr.offset + (uint16_t)delta);
                     } else if (it->ptr_bytes == 4u) {
                         next_off = (int64_t)(int32_t)((uint32_t)base.ptr.offset + (uint32_t)delta);
                     }
@@ -1647,7 +1670,10 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                         uint32_t gp_used = 0u, fp_used = 0u;
                         for (uint32_t k = 0u; k < fn->param_count; ++k) {
                             if (k == 0u && fn->cabi_ret.kind == PIR_CABI_RET_MULTI_REG) continue;
-                            if (fn->params[k].abi_force_stack) continue;
+                            if (fn->params[k].abi_force_stack) {
+                                if (!pir_type_is_float(fn->params[k].type)) gp_used = 8u;
+                                continue;
+                            }
                             PirType pt = fn->params[k].type;
                             if (pir_type_is_float(pt)) {
                                 if (fp_used < 8u) fp_used++;
@@ -1750,9 +1776,9 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                         pir_interp_mem_write_ptr(it, p4, oaa_ptr, 1u);
                         pir_interp_mem_write_ptr(it, p8, rsa_ptr, 1u);
                     } else {
-                        size_t slot_sz = (it->ptr_bytes == 4u) ? 4u : 8u;
-                        size_t cap = 32u + (size_t)fr.vararg_count * 64u;
-                        uint32_t va_aid = pir_interp_alloc_new(it, cap, 16u, false, false, false, true);
+                        size_t slot_sz = (it->ptr_bytes == 2u) ? 2u : (it->ptr_bytes == 4u) ? 4u : 8u;
+                        size_t cap = (it->ptr_bytes == 2u ? 8u : 32u) + (size_t)fr.vararg_count * (it->ptr_bytes == 2u ? 16u : 64u);
+                        uint32_t va_aid = pir_interp_alloc_new(it, cap, it->ptr_bytes == 2u ? 2u : 16u, false, false, false, true);
                         if (va_aid == 0u) break;
                         PIR_VEC_PUSH(&fr.stack_allocs, va_aid);
                         size_t off = 0u;
@@ -1814,11 +1840,21 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                         strcmp(it->mod->funcs.data[cid].name, "__pir_setjmp") == 0 &&
                         nargs >= 1u) {
                         fr.has_setjmp = true;
-                        fr.setjmp_jb  = cargs[0].ptr;
+                        bool sj_sret = (inst->ty.kind == PIR_TYPE_SCALAR &&
+                                        inst->ty.u.scalar == PIR_SCALAR_VOID && nargs == 2u);
+                        fr.setjmp_has_out = sj_sret;
+                        if (sj_sret) {
+                            fr.setjmp_out = cargs[0].ptr;
+                            fr.setjmp_jb  = cargs[1].ptr;
+                            uint32_t z32 = 0u;
+                            pir_interp_mem_write(it, fr.setjmp_out, &z32, 4u, 1u);
+                        } else {
+                            fr.setjmp_jb  = cargs[0].ptr;
+                            pir_val_set_u64(&r0, inst->ty, 0u);
+                        }
                         fr.setjmp_blk = cur_blk;
                         fr.setjmp_j   = j;
                         fr.setjmp_res = inst->results[0];
-                        pir_val_set_u64(&r0, inst->ty, 0u);
                     } else {
                         exec_call_target(it, cid, cargs, cmeta, nargs, &r0);
                     }
@@ -1953,7 +1989,11 @@ static bool exec_function(PirInterp *it, PirFuncId func_id,
                     fr.setjmp_jb.alloc_id == it->unwind_target_jb.alloc_id &&
                     fr.setjmp_jb.offset   == it->unwind_target_jb.offset) {
                     it->unwinding = false;
-                    if (fr.setjmp_res != PIR_INVALID_ID) {
+                    if (fr.setjmp_has_out) {
+                        uint32_t one32 = 1u;
+                        if (interp_is_be(it)) bswap_inplace((uint8_t *)&one32, 4u);
+                        pir_interp_mem_write(it, fr.setjmp_out, &one32, 4u, 1u);
+                    } else if (fr.setjmp_res != PIR_INVALID_ID) {
                         pir_val_set_u64(&fr.vals[fr.setjmp_res], pir_type_scalar(PIR_SCALAR_I32), 1u);
                     }
                     cur_blk = fr.setjmp_blk;
@@ -2221,7 +2261,7 @@ PirInterpStatus pir_interp_run(const PirModule *mod, const PirTargetSpec *target
     it.mod       = mod;
     it.target    = target;
     it.ptr_bytes = target ? target->ptr_bytes : 8u;
-    it.next_addr = 0x10000000ULL;
+    it.next_addr = (it.ptr_bytes == 2u) ? 0x0200ULL : 0x10000000ULL;
     it.status    = PIR_INTERP_OK;
 
     PirFuncId main_id = PIR_INVALID_ID;
@@ -2239,16 +2279,42 @@ PirInterpStatus pir_interp_run(const PirModule *mod, const PirTargetSpec *target
     if (init_globals(&it)) {
         PirVal ret_val;
         memset(&ret_val, 0, sizeof(ret_val));
-        exec_function(&it, main_id, NULL, NULL, 0u, &ret_val);
-        if (it.unwinding && it.status == PIR_INTERP_OK) {
-            pir_interp_fail(&it, PIR_INTERP_TRAP, "unhandled exception escaped @main");
-        }
-        if (it.status == PIR_INTERP_OK && !it.exited) {
-            const PirFunction *mfn = &mod->funcs.data[main_id];
-            if (mfn->ret_type.kind == PIR_TYPE_SCALAR && mfn->ret_type.u.scalar != PIR_SCALAR_VOID) {
-                it.exit_code = (int)(int32_t)pir_val_get_u64(&ret_val);
-            } else {
-                it.exit_code = 0;
+        const PirFunction *mfn = &mod->funcs.data[main_id];
+        bool main_hidden_ret = (mfn->cabi_ret.kind == PIR_CABI_RET_MULTI_REG && mfn->param_count >= 1u) ||
+                               (mfn->ret_type.kind == PIR_TYPE_SCALAR &&
+                                mfn->ret_type.u.scalar == PIR_SCALAR_VOID &&
+                                mfn->param_count == 1u &&
+                                mfn->params[0].type.kind == PIR_TYPE_SCALAR &&
+                                mfn->params[0].type.u.scalar == PIR_SCALAR_PTR);
+        if (main_hidden_ret) {
+            uint32_t rbuf_aid = pir_interp_alloc_new(&it, 8u, 2u, false, false, false, true);
+            PirVal arg0;
+            memset(&arg0, 0, sizeof(arg0));
+            arg0.ty = pir_type_scalar(PIR_SCALAR_PTR);
+            arg0.ptr.alloc_id = rbuf_aid;
+            arg0.ptr.offset   = 0;
+            exec_function(&it, main_id, &arg0, NULL, 1u, &ret_val);
+            if (it.unwinding && it.status == PIR_INTERP_OK) {
+                pir_interp_fail(&it, PIR_INTERP_TRAP, "unhandled exception escaped @main");
+            }
+            if (it.status == PIR_INTERP_OK && !it.exited) {
+                uint32_t ec32 = 0u;
+                PirPtr rp = { rbuf_aid, 0 };
+                pir_interp_mem_read(&it, rp, &ec32, 4u, 1u);
+                if (target && target->is_big_endian) bswap_inplace((uint8_t *)&ec32, 4u);
+                it.exit_code = (int)(int32_t)ec32;
+            }
+        } else {
+            exec_function(&it, main_id, NULL, NULL, 0u, &ret_val);
+            if (it.unwinding && it.status == PIR_INTERP_OK) {
+                pir_interp_fail(&it, PIR_INTERP_TRAP, "unhandled exception escaped @main");
+            }
+            if (it.status == PIR_INTERP_OK && !it.exited) {
+                if (mfn->ret_type.kind == PIR_TYPE_SCALAR && mfn->ret_type.u.scalar != PIR_SCALAR_VOID) {
+                    it.exit_code = (int)(int32_t)pir_val_get_u64(&ret_val);
+                } else {
+                    it.exit_code = 0;
+                }
             }
         }
     }

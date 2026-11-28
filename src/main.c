@@ -161,6 +161,18 @@ static bool assemble_to_obj(const char *asm_path, const char *obj_path,
             snprintf(target_flag, sizeof(target_flag), "--target=%s", target->triple);
             execlp(ppc_cc, ppc_cc, target_flag,
                    "-x", "assembler", "-c", asm_path, "-o", obj_path, (char *)NULL);
+        } else if (target && target->arch == PIR_ARCH_AVR) {
+            const char *avr_cc = getenv("PIRC_AVR_CC");
+            if (!avr_cc || !avr_cc[0]) {
+                if (access("/opt/homebrew/opt/llvm/bin/clang", X_OK) == 0)
+                    avr_cc = "/opt/homebrew/opt/llvm/bin/clang";
+                else if (access("/usr/local/opt/llvm/bin/clang", X_OK) == 0)
+                    avr_cc = "/usr/local/opt/llvm/bin/clang";
+                else
+                    avr_cc = "clang";
+            }
+            execlp(avr_cc, avr_cc, "--target=avr", "-mmcu=atmega1280",
+                   "-x", "assembler", "-c", asm_path, "-o", obj_path, (char *)NULL);
         } else if (target && target->triple) {
             char target_flag[128];
             snprintf(target_flag, sizeof(target_flag), "--target=%s", target->triple);

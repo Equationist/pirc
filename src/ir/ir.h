@@ -182,6 +182,7 @@ typedef struct {
     uint64_t        abi_byval_size;  /* SysV x64 MEMORY-class inline stack byval size (0 = none) */
     uint32_t        abi_byval_align; /* SysV x64 MEMORY-class inline stack byval alignment */
     bool            abi_force_stack; /* Force parameter onto stack (e.g., SysV i128 spill) */
+    uint8_t         abi_group_words; /* AVR multi-word C ABI arg group count on first word (0/1 = single) */
 } PirParamDecl;
 
 typedef enum {
@@ -195,6 +196,8 @@ typedef struct {
     PirCabiRetKind kind;
     uint32_t       reg_count;   /* 2..4 for MULTI_REG */
     PirType        regs[4];     /* Machine register types for MULTI_REG */
+    bool           has_reg_offsets;
+    uint64_t       reg_offsets[4]; /* Exact byte offsets for MULTI_REG (when has_reg_offsets) */
     uint64_t       agg_size;    /* Exact byte size of aggregate */
     uint32_t       agg_align;   /* Natural alignment of aggregate */
 } PirCabiRetInfo;
@@ -419,6 +422,7 @@ typedef struct {
     uint32_t        call_stack_align; /* Call-site outgoing stack alignment override (0 = default) */
     bool            call_force_stack; /* Force variadic arg onto stack (e.g. SysV i128 at gp==5) */
     bool            call_no_f32_promote; /* Suppress variadic f32->f64 promotion (e.g. unpacked HFA) */
+    uint8_t         call_group_words; /* AVR multi-word C ABI arg group count on first word (0/1 = single) */
     union {
         PirValueId val;
         struct {
@@ -592,6 +596,7 @@ typedef enum {
     PIR_ARCH_ARM64,
     PIR_ARCH_RV32,
     PIR_ARCH_PPC32,
+    PIR_ARCH_AVR,
     PIR_ARCH_CUSTOM
 } PirArch;
 
@@ -605,24 +610,44 @@ typedef enum {
 
 typedef struct {
     uint16_t max_simd_bits;   /* 0, 128, or 256 */
-    uint8_t  max_int_bits;    /* 32 or 64 (0 treated as 64) */
+    uint8_t  max_int_bits;    /* 16, 32, or 64 (0 treated as 64) */
     bool     has_mul_wide;
     bool     has_add_carry;
     bool     has_ovf_ops;
     bool     has_bitops;
     bool     has_switch;
+    bool     has_hw_fp;       /* false -> soft-float legalization (f32->i32, f64->i64) */
+    bool     has_hw_div;      /* false -> libcall div/rem on native int width */
 } PirBackendCaps;
 
 typedef struct {
     const char    *triple;
     PirArch        arch;
     PirOs          os;
-    uint8_t        ptr_bytes;     /* 4 or 8 */
+    uint8_t        ptr_bytes;     /* 2, 4, or 8 */
     bool           is_big_endian;
     uint32_t       va_list_size;
     uint32_t       va_list_align;
     PirBackendCaps caps;
 } PirTargetSpec;
+
+static inline PirScalarType pir_ptr_int_scalar(uint8_t ptr_bytes) {
+    if (ptr_bytes == 2u) return PIR_SCALAR_I16;
+    if (ptr_bytes == 4u) return PIR_SCALAR_I32;
+    return PIR_SCALAR_I64;
+}
+
+static inline uint64_t pir_ptr_int_mask(uint8_t ptr_bytes) {
+    if (ptr_bytes == 2u) return UINT16_MAX;
+    if (ptr_bytes == 4u) return UINT32_MAX;
+    return UINT64_MAX;
+}
+
+static inline uint64_t pir_max_alloc_bytes(uint8_t ptr_bytes) {
+    if (ptr_bytes == 2u) return UINT64_C(1) << 15;
+    if (ptr_bytes == 4u) return UINT64_C(1) << 31;
+    return UINT64_C(1) << 40;
+}
 
 /* =========================================================================
  * 7. Module Lifecycle & Verifier API (Implemented across M0-M1)

@@ -22,6 +22,8 @@ bool pir_target_from_triple(const char *triple, PirTargetSpec *out) {
     out->caps.has_ovf_ops   = true;
     out->caps.has_bitops    = true;
     out->caps.has_switch    = true;
+    out->caps.has_hw_fp     = true;
+    out->caps.has_hw_div    = true;
 
     if (strcmp(triple, "x86_64-unknown-linux-gnu") == 0 ||
         strcmp(triple, "x86_64-linux-gnu") == 0 ||
@@ -102,6 +104,26 @@ bool pir_target_from_triple(const char *triple, PirTargetSpec *out) {
         out->caps.has_ovf_ops   = false;
         out->caps.has_bitops    = false;
         out->caps.has_switch    = true;
+        return true;
+    }
+    if (strcmp(triple, "avr-unknown-elf") == 0 ||
+        strcmp(triple, "avr-none-elf") == 0 ||
+        strcmp(triple, "avr") == 0) {
+        out->arch               = PIR_ARCH_AVR;
+        out->os                 = PIR_OS_BAREMETAL;
+        out->ptr_bytes          = 2u;
+        out->is_big_endian      = false;
+        out->va_list_size       = 2u;
+        out->va_list_align      = 1u;
+        out->caps.max_simd_bits = 0u;
+        out->caps.max_int_bits  = 16u;
+        out->caps.has_mul_wide  = true;  /* Hardware 8x8->16 mul builds 16x16->32 mul_wide */
+        out->caps.has_add_carry = false;
+        out->caps.has_ovf_ops   = false;
+        out->caps.has_bitops    = false;
+        out->caps.has_switch    = true;
+        out->caps.has_hw_fp     = false; /* Soft-float legalization (f32->i32, f64->i64) */
+        out->caps.has_hw_div    = false; /* Software 16-bit division helpers */
         return true;
     }
     if (strcmp(triple, "wasm32-unknown-unknown") == 0 ||
@@ -427,6 +449,9 @@ bool pir_abi_classify_param(const PirModule *mod, const PirTargetSpec *target,
     if (target->arch == PIR_ARCH_PPC32) {
         return pir_abi_ppc32_param(mod, target, pd, st, out);
     }
+    if (target->arch == PIR_ARCH_AVR) {
+        return pir_abi_avr_param(mod, target, pd, st, out);
+    }
     return false;
 }
 
@@ -447,6 +472,9 @@ bool pir_abi_classify_retbuf(const PirModule *mod, const PirTargetSpec *target,
     }
     if (target->arch == PIR_ARCH_PPC32) {
         return pir_abi_ppc32_retbuf(mod, target, agg_ty, out);
+    }
+    if (target->arch == PIR_ARCH_AVR) {
+        return pir_abi_avr_retbuf(mod, target, agg_ty, out);
     }
     return false;
 }
@@ -517,12 +545,12 @@ void pir_abi_plan_va_arg(const PirModule *mod, const PirTargetSpec *target,
                       pir_vec_bits(out->load_ty.u.vec) > target->caps.max_simd_bits &&
                       !out->is_indirect && !out->force_mem);
 
-    uint64_t slot_sz = (target->ptr_bytes == 4u) ? 4u : 8u;
+    uint64_t slot_sz = (target->ptr_bytes == 2u) ? 2u : (target->ptr_bytes == 4u) ? 4u : 8u;
     out->mem_step = out->is_indirect
                     ? slot_sz
                     : abi_align_up_u64(out->size > 0u ? out->size : slot_sz, slot_sz);
 
-    out->mem_align = slot_sz;
+    out->mem_align = (target->arch == PIR_ARCH_AVR) ? 1u : slot_sz;
     if (is_sysv_x64) {
         if (is_buf && out->abi_valid && out->abi.kind == PIR_ABI_INDIRECT &&
             out->abi.stack_byval_align > 0u) {

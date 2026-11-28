@@ -58,6 +58,9 @@ static PirTypeLayout pir_type_layout_rec(const PirModule *mod, const PirTargetSp
                     res.align = target->va_list_align;
                     break;
             }
+            if (target->arch == PIR_ARCH_AVR) {
+                res.align = 1u;
+            }
             return res;
         case PIR_TYPE_VECTOR: {
             uint32_t b = (uint32_t)(pir_vec_bits(ty.u.vec) / 8u);
@@ -152,7 +155,7 @@ static PirTypeLayout pir_type_layout_rec(const PirModule *mod, const PirTargetSp
                 res.align = agg->min_align;
                 res.size  = align_up_u64_chk(res.size, res.align, &res.overflow);
             }
-            uint64_t max_sz = (target->ptr_bytes == 4u) ? (UINT64_C(1) << 31) : (UINT64_C(1) << 40);
+            uint64_t max_sz = pir_max_alloc_bytes(target->ptr_bytes);
             if (res.size > max_sz || res.stride > max_sz) {
                 res.overflow = true;
             }
@@ -241,7 +244,7 @@ static bool lower_mem_intrinsic(PirModule *mod, const PirTargetSpec *target,
                                 PirFuncId fi, PirBlockId blk_id, PirInstIdVec *out,
                                 const PirInst *inst, PirDiag *diag) {
     PirFunction *fn = &mod->funcs.data[fi];
-    PirType idx_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
+    PirType idx_ty = pir_type_scalar(pir_ptr_int_scalar(target->ptr_bytes));
     PirOperand dst = inst->operands[0];
     PirOperand src = inst->operands[1];
     PirOperand len = inst->operands[2];
@@ -729,7 +732,7 @@ static void flatten_agg_global(PirModule *mod, const PirTargetSpec *target, PirT
 }
 
 bool pir_lower_aggregates(PirModule *mod, const PirTargetSpec *target, PirDiag *diag) {
-    PirType ptr_int_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
+    PirType ptr_int_ty = pir_type_scalar(pir_ptr_int_scalar(target->ptr_bytes));
 
     /* Validate aggregate type layouts for 64-bit size overflow before lowering. */
     for (uint32_t ti = 0u; ti < mod->agg_types.len; ++ti) {
@@ -775,9 +778,7 @@ bool pir_lower_aggregates(PirModule *mod, const PirTargetSpec *target, PirDiag *
                 } else if (copy.op == PIR_OP_FIELD_PTR) {
                     uint64_t off = pir_field_offset(mod, target, copy.aux_type.u.agg_id,
                                                     (uint32_t)copy.imm_u64);
-                    if (target->ptr_bytes == 4u) {
-                        off &= UINT32_MAX;
-                    }
+                    off &= pir_ptr_int_mask(target->ptr_bytes);
                     if (off == 0u && copy.operands[0].kind == PIR_OPER_VAL &&
                         copy.results[0] != copy.operands[0].u.val) {
                         pir_fn_replace_val_uses(fn, copy.results[0], copy.operands[0].u.val);
@@ -818,7 +819,11 @@ bool pir_lower_aggregates(PirModule *mod, const PirTargetSpec *target, PirDiag *
                             k = neg ? (UINT64_C(0) - (uint64_t)sv) : (uint64_t)sv;
                         }
                         uint64_t off = k * stride;
-                        if (target->ptr_bytes == 4u) {
+                        if (target->ptr_bytes == 2u) {
+                            uint16_t u16 = neg ? (uint16_t)(0u - (uint16_t)off) : (uint16_t)off;
+                            off = (uint64_t)u16;
+                            neg = false;
+                        } else if (target->ptr_bytes == 4u) {
                             uint32_t u32 = neg ? (0u - (uint32_t)off) : (uint32_t)off;
                             off = (uint64_t)u32;
                             neg = false;
@@ -844,8 +849,9 @@ bool pir_lower_aggregates(PirModule *mod, const PirTargetSpec *target, PirDiag *
                         }
                     } else {
                         PirOperand wide_idx = idx;
-                        if (idx.type.kind == PIR_TYPE_SCALAR && idx.type.u.scalar == PIR_SCALAR_I32 &&
-                            ptr_int_ty.u.scalar == PIR_SCALAR_I64) {
+                        uint32_t src_bits = pir_scalar_bits(idx.type.u.scalar, target->ptr_bytes);
+                        uint32_t dst_bits = (uint32_t)target->ptr_bytes * 8u;
+                        if (idx.type.kind == PIR_TYPE_SCALAR && src_bits < dst_bits) {
                             PirInst sx = pir_make_inst(PIR_OP_SEXT, ptr_int_ty, copy.src_line, copy.loc_idx);
                             sx.operand_count = 1u;
                             sx.operands      = pir_alloc_ops(mod, 1u);
@@ -853,8 +859,7 @@ bool pir_lower_aggregates(PirModule *mod, const PirTargetSpec *target, PirDiag *
                             sx.results[0]    = pir_fn_new_val(mod, fn, "eidx", ptr_int_ty, b, PIR_INVALID_ID, 0u);
                             pir_fn_append_inst(fn, &new_insts, sx);
                             wide_idx = pir_op_val(sx.results[0], ptr_int_ty);
-                        } else if (idx.type.kind == PIR_TYPE_SCALAR && idx.type.u.scalar == PIR_SCALAR_I64 &&
-                                   ptr_int_ty.u.scalar == PIR_SCALAR_I32) {
+                        } else if (idx.type.kind == PIR_TYPE_SCALAR && src_bits > dst_bits) {
                             PirInst tr = pir_make_inst(PIR_OP_TRUNC, ptr_int_ty, copy.src_line, copy.loc_idx);
                             tr.operand_count = 1u;
                             tr.operands      = pir_alloc_ops(mod, 1u);
@@ -865,8 +870,8 @@ bool pir_lower_aggregates(PirModule *mod, const PirTargetSpec *target, PirDiag *
                         }
                         PirOperand byte_off = wide_idx;
                         uint32_t sh = 0u;
-                        uint64_t eff_stride = (target->ptr_bytes == 4u) ? (stride & UINT32_MAX) : stride;
-                        uint32_t max_sh = (target->ptr_bytes == 4u) ? 32u : 64u;
+                        uint64_t eff_stride = stride & pir_ptr_int_mask(target->ptr_bytes);
+                        uint32_t max_sh = (uint32_t)target->ptr_bytes * 8u;
                         if (eff_stride == 0u) {
                             byte_off = pir_op_imm_i(0u, false, idx_ty);
                         } else if (eff_stride == 1u) {

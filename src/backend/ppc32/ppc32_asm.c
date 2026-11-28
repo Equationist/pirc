@@ -646,6 +646,19 @@ static void emit_inst(PpcAsmCtx *ctx, const MFunc *mf, const MInst *ins) {
         case MI_RV32_FCVT_W_F: case MI_RV32_FCVT_WU_F:
         case MI_RV32_J: case MI_RV32_BCC: case MI_RV32_CALL: case MI_RV32_CALL_IND:
         case MI_RV32_SWITCH_TBL: case MI_RV32_RET: case MI_RV32_UNIMP:
+        case MI_AVR_LI: case MI_AVR_MOV: case MI_AVR_SYM_ADDR:
+        case MI_AVR_LD: case MI_AVR_ST: case MI_AVR_PUSH: case MI_AVR_POP:
+        case MI_AVR_IN_SP: case MI_AVR_OUT_SP: case MI_AVR_ADJ_SP:
+        case MI_AVR_ADD: case MI_AVR_ADDI: case MI_AVR_SUB:
+        case MI_AVR_MUL: case MI_AVR_MUL_WIDE:
+        case MI_AVR_AND: case MI_AVR_ANDI: case MI_AVR_OR: case MI_AVR_ORI:
+        case MI_AVR_XOR: case MI_AVR_XORI:
+        case MI_AVR_SHL: case MI_AVR_SHLI: case MI_AVR_SHR: case MI_AVR_SHRI:
+        case MI_AVR_SAR: case MI_AVR_SARI: case MI_AVR_SEXT8: case MI_AVR_ZEXT8:
+        case MI_AVR_CMP_SET: case MI_AVR_SELECT:
+        case MI_AVR_ATOMIC_LD: case MI_AVR_ATOMIC_ST: case MI_AVR_ATOMIC_RMW: case MI_AVR_ATOMIC_CAS:
+        case MI_AVR_JMP: case MI_AVR_BR_NZ: case MI_AVR_BR_Z: case MI_AVR_BR_CMP:
+        case MI_AVR_CALL: case MI_AVR_ICALL: case MI_AVR_SWITCH_TBL: case MI_AVR_RET: case MI_AVR_TRAP:
             fprintf(stderr, "pirc: PPC32 asm emitter encountered non-PPC32 opcode %u\n", (unsigned)ins->op);
             abort();
     }

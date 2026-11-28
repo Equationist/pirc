@@ -32,8 +32,8 @@ static void emit_va_arg_materialize(PirModule *mod, const PirTargetSpec *target,
                                     PirValueId slot_ptr) {
     PirType tptr   = pir_type_scalar(PIR_SCALAR_PTR);
     PirType tvoid  = pir_type_scalar(PIR_SCALAR_VOID);
-    PirType idx_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
-    uint32_t ptr_al = target->ptr_bytes > 0u ? (uint32_t)target->ptr_bytes : 8u;
+    PirType idx_ty = pir_type_scalar(pir_ptr_int_scalar(target->ptr_bytes));
+    uint32_t ptr_al = (target->arch == PIR_ARCH_AVR) ? 1u : (target->ptr_bytes > 0u ? (uint32_t)target->ptr_bytes : 8u);
     uint32_t ln = orig->src_line, lc = orig->loc_idx;
 
     PirValueId src_ptr = slot_ptr;
@@ -689,8 +689,8 @@ static void lower_va_arg_ptr_cursor(PirModule *mod, const PirTargetSpec *target,
                                     const PirInst *inst) {
     /* Darwin ARM64, Win64, & 32-bit pointer-cursor targets: va_list is a flat char * cursor. */
     PirType tptr   = pir_type_scalar(PIR_SCALAR_PTR);
-    PirType idx_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
-    uint32_t ptr_al = target->ptr_bytes > 0u ? (uint32_t)target->ptr_bytes : 8u;
+    PirType idx_ty = pir_type_scalar(pir_ptr_int_scalar(target->ptr_bytes));
+    uint32_t ptr_al = (target->arch == PIR_ARCH_AVR) ? 1u : (target->ptr_bytes > 0u ? (uint32_t)target->ptr_bytes : 8u);
     uint32_t ln = inst->src_line, lc = inst->loc_idx;
 
     bool is_buf = (inst->op == PIR_OP_VA_ARG_BUF);
@@ -997,9 +997,9 @@ bool pir_lower_varargs(PirModule *mod, const PirTargetSpec *target, PirDiag *dia
     bool is_sysv_ppc32   = (target->arch == PIR_ARCH_PPC32);
     bool is_ptr_cursor   = !is_sysv_x64 && !is_aapcs64_lin && !is_sysv_ppc32; /* Darwin ARM64, Win64, RV32 */
     PirType tptr   = pir_type_scalar(PIR_SCALAR_PTR);
-    PirType idx_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
+    PirType idx_ty = pir_type_scalar(pir_ptr_int_scalar(target->ptr_bytes));
     PirType tvoid  = pir_type_scalar(PIR_SCALAR_VOID);
-    uint32_t ptr_al = target->ptr_bytes > 0u ? (uint32_t)target->ptr_bytes : 8u;
+    uint32_t ptr_al = (target->arch == PIR_ARCH_AVR) ? 1u : (target->ptr_bytes > 0u ? (uint32_t)target->ptr_bytes : 8u);
 
     /* 1. Rewrite byval(va_list) on call / call_indirect sites (Darwin/Win64 load the 8B char* cursor)
      *    and on function/sig declarations BEFORE cabi runs. */

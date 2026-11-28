@@ -204,8 +204,10 @@ static bool elf_sec_is_prefix(const char *sec, const char *pfx) {
 }
 
 static void emit_elf_section_directive(FILE *out, const PirModule *mod,
+                                       const PirTargetSpec *target,
                                        const char *custom_sec, PirGlobalSeg seg,
                                        bool has_reloc, bool is_zero, bool is_func) {
+    bool no_elf_tls = (target && target->arch == PIR_ARCH_AVR);
     if (!custom_sec || custom_sec[0] == '\0') {
         if (is_func) {
             fputs("\t.text\n", out);
@@ -220,8 +222,12 @@ static void emit_elf_section_directive(FILE *out, const PirModule *mod,
                 fputs(is_zero ? "\t.bss\n" : "\t.data\n", out);
                 break;
             case PIR_GSEG_TLS:
-                fputs(is_zero ? "\t.section .tbss,\"awT\",@nobits\n"
-                              : "\t.section .tdata,\"awT\",@progbits\n", out);
+                if (no_elf_tls) {
+                    fputs(is_zero ? "\t.bss\n" : "\t.data\n", out);
+                } else {
+                    fputs(is_zero ? "\t.section .tbss,\"awT\",@nobits\n"
+                                  : "\t.section .tdata,\"awT\",@progbits\n", out);
+                }
                 break;
         }
         return;
@@ -278,7 +284,7 @@ static void emit_elf_section_directive(FILE *out, const PirModule *mod,
     flags[fl++] = 'a';
     if (eff_write) flags[fl++] = 'w';
     if (eff_exec)  flags[fl++] = 'x';
-    if (eff_tls)   flags[fl++] = 'T';
+    if (eff_tls && !no_elf_tls) flags[fl++] = 'T';
     flags[fl] = '\0';
     fputs("\t.section ", out);
     emit_elf_section_name(out, custom_sec);
@@ -339,7 +345,7 @@ void pir_asm_emit_section_directive(FILE *out, const PirModule *mod, const PirTa
             break;
         case PIR_OBJ_ELF:
         case PIR_OBJ_COFF:
-            emit_elf_section_directive(out, mod, custom_sec, seg, has_reloc, is_zero, is_func);
+            emit_elf_section_directive(out, mod, target, custom_sec, seg, has_reloc, is_zero, is_func);
             break;
     }
 }
@@ -499,9 +505,29 @@ static uint64_t compute_global_bytes(const PirModule *mod, const PirTargetSpec *
     return tot > 0u ? tot : 1u;
 }
 
-static void emit_reloc_ptr(FILE *out, const PirTargetSpec *target,
+static bool sym_is_func_in_mod(const PirModule *mod, const char *name) {
+    if (!mod || !name) return false;
+    for (uint32_t i = 0u; i < mod->funcs.len; ++i) {
+        if (mod->funcs.data[i].name && strcmp(mod->funcs.data[i].name, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void emit_reloc_ptr(FILE *out, const PirModule *mod, const PirTargetSpec *target,
                            const PirGlobalItem *gi, PirAsmNeedsQuoteFn arch_needs_quote) {
-    fputs(target->ptr_bytes == 4u ? "\t.long " : "\t.quad ", out);
+    if (target->ptr_bytes == 2u) {
+        if (target->arch == PIR_ARCH_AVR && sym_is_func_in_mod(mod, gi->sym_name)) {
+            fputs("\t.short pm(", out);
+            pir_asm_emit_sym(out, target, gi->sym_name, NULL, arch_needs_quote);
+            fputs(")\n", out);
+            return;
+        }
+        fputs("\t.short ", out);
+    } else {
+        fputs(target->ptr_bytes == 4u ? "\t.long " : "\t.quad ", out);
+    }
     pir_asm_emit_sym(out, target, gi->sym_name, NULL, arch_needs_quote);
     if (gi->sym_offset != 0) {
         fprintf(out, " + %" PRId64 "\n", gi->sym_offset);
@@ -510,8 +536,8 @@ static void emit_reloc_ptr(FILE *out, const PirTargetSpec *target,
     }
 }
 
-static void emit_scalar_gitem(FILE *out, const PirTargetSpec *target, PirScalarType sc,
-                              uint64_t sz, const PirGlobalItem *gi,
+static void emit_scalar_gitem(FILE *out, const PirModule *mod, const PirTargetSpec *target,
+                              PirScalarType sc, uint64_t sz, const PirGlobalItem *gi,
                               PirAsmNeedsQuoteFn arch_needs_quote) {
     if (gi->kind == PIR_GITEM_INT) {
         if (sc == PIR_SCALAR_F32) {
@@ -535,7 +561,7 @@ static void emit_scalar_gitem(FILE *out, const PirTargetSpec *target, PirScalarT
         if (sz == 4u) fprintf(out, "\t.long %" PRIu64 "\n", gi->float_bits & 0xFFFFFFFFu);
         else          fprintf(out, "\t.quad %" PRIu64 "\n", gi->float_bits);
     } else if (gi->kind == PIR_GITEM_RELOC) {
-        emit_reloc_ptr(out, target, gi, arch_needs_quote);
+        emit_reloc_ptr(out, mod, target, gi, arch_needs_quote);
     } else if (gi->kind == PIR_GITEM_ZERO) {
         fprintf(out, "\t.zero %" PRIu64 "\n", gi->len > 0u ? gi->len : sz);
     }
@@ -559,7 +585,7 @@ static void emit_global_data_items(FILE *out, const PirModule *mod, const PirTar
         uint64_t esz = pir_scalar_bits(elem, target->ptr_bytes) / 8u;
         for (uint32_t l = 0u; l < lanes; ++l) {
             if (l < g->item_count) {
-                emit_scalar_gitem(out, target, elem, esz, &g->items[l], arch_needs_quote);
+                emit_scalar_gitem(out, mod, target, elem, esz, &g->items[l], arch_needs_quote);
             } else {
                 fprintf(out, "\t.zero %" PRIu64 "\n", esz);
             }
@@ -568,7 +594,7 @@ static void emit_global_data_items(FILE *out, const PirModule *mod, const PirTar
     }
     if (g->has_type && g->type.kind == PIR_TYPE_SCALAR && g->item_count == 1u) {
         PirTypeLayout ly = pir_type_layout(mod, target, g->type);
-        emit_scalar_gitem(out, target, g->type.u.scalar, ly.size, &g->items[0], arch_needs_quote);
+        emit_scalar_gitem(out, mod, target, g->type.u.scalar, ly.size, &g->items[0], arch_needs_quote);
         return;
     }
 
@@ -592,7 +618,7 @@ static void emit_global_data_items(FILE *out, const PirModule *mod, const PirTar
                 fprintf(out, "\t.quad %" PRIu64 "\n", gi->float_bits);
                 break;
             case PIR_GITEM_RELOC:
-                emit_reloc_ptr(out, target, gi, arch_needs_quote);
+                emit_reloc_ptr(out, mod, target, gi, arch_needs_quote);
                 break;
         }
     }

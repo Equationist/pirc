@@ -125,6 +125,17 @@ static bool check_lir_type(Verifier *v, PirType ty, uint32_t line, const char *c
                                (unsigned)v->target->caps.max_int_bits, ctx);
                 return false;
             }
+            if (ty.u.scalar == PIR_SCALAR_I32 && v->target &&
+                v->target->caps.max_int_bits > 0u && v->target->caps.max_int_bits < 32u) {
+                pir_diag_error(v->diag, line, 0u, "LIR forbids 'i32' on %u-bit target in %s",
+                               (unsigned)v->target->caps.max_int_bits, ctx);
+                return false;
+            }
+            if ((ty.u.scalar == PIR_SCALAR_F32 || ty.u.scalar == PIR_SCALAR_F64) &&
+                v->target && !v->target->caps.has_hw_fp) {
+                pir_diag_error(v->diag, line, 0u, "LIR forbids float scalar on soft-float target in %s", ctx);
+                return false;
+            }
             if (ty.u.scalar == PIR_SCALAR_VALIST) {
                 pir_diag_error(v->diag, line, 0u, "LIR forbids 'va_list' in %s", ctx);
                 return false;
@@ -220,7 +231,7 @@ static bool align_valid_u32(uint32_t al) {
 }
 
 static uint64_t max_obj_bytes(const PirTargetSpec *target) {
-    return (target && target->ptr_bytes == 4u) ? (UINT64_C(1) << 31) : (UINT64_C(1) << 40);
+    return pir_max_alloc_bytes(target ? target->ptr_bytes : 8u);
 }
 
 static bool is_pad_agg_type(const PirModule *mod, PirType t) {
@@ -421,24 +432,50 @@ static void verify_params_and_ret(Verifier *v, const char *owner, uint32_t line,
                     if (r + 1u == cabi_ret->reg_count) prev_sz = total_sz;
                     total_sz += rly.size;
                 }
-                PirType last_rt = cabi_ret->regs[cabi_ret->reg_count - 1u];
-                uint64_t max_agg_sz = total_sz;
-                if (pad_regs && align_valid_u32(cabi_ret->agg_align)) {
-                    uint64_t m = (uint64_t)cabi_ret->agg_align - 1u;
-                    max_agg_sz = (total_sz + m) & ~m;
-                } else if (v->target && v->target->arch == PIR_ARCH_X86_64 &&
-                           last_rt.kind == PIR_TYPE_SCALAR && last_rt.u.scalar == PIR_SCALAR_F32) {
-                    /* SysV packed struct { <8B>, f32, pad 1..3 }: trailing pad bytes after f32. */
-                    max_agg_sz = prev_sz + 8u;
-                }
-                if (cabi_ret->agg_size == 0u || cabi_ret->agg_size > max_agg_sz ||
-                    cabi_ret->agg_size <= prev_sz) {
-                    pir_diag_error(v->diag, line, 0u, "'%s': multi_ret size %" PRIu64 " is invalid for register capacity %" PRIu64,
-                                   owner, cabi_ret->agg_size, max_agg_sz);
-                } else if (cabi_ret->agg_size < total_sz &&
-                           (last_rt.kind == PIR_TYPE_VECTOR || pir_type_is_float(last_rt))) {
-                    pir_diag_error(v->diag, line, 0u, "'%s': multi_ret partial size %" PRIu64 " invalid for non-integer final register",
-                                   owner, cabi_ret->agg_size);
+                if (cabi_ret->has_reg_offsets) {
+                    if (cabi_ret->agg_size == 0u) {
+                        pir_diag_error(v->diag, line, 0u, "'%s': multi_ret size 0 is invalid", owner);
+                    }
+                    for (uint32_t r = 0u; r < cabi_ret->reg_count; ++r) {
+                        PirType rt = cabi_ret->regs[r];
+                        PirTypeLayout rly;
+                        if (v->target) {
+                            rly = pir_type_layout(v->mod, v->target, rt);
+                        } else {
+                            rly.size  = (uint64_t)(pir_type_bits(rt, ptr_b) / 8u);
+                            rly.align = (uint32_t)(rly.size > 0u ? rly.size : 1u);
+                        }
+                        uint64_t roff = cabi_ret->reg_offsets[r];
+                        bool is_final_int = (r + 1u == cabi_ret->reg_count) &&
+                                            !(rt.kind == PIR_TYPE_VECTOR || pir_type_is_float(rt));
+                        bool bad_off = (roff >= cabi_ret->agg_size) ||
+                                       (!is_final_int && rly.size > cabi_ret->agg_size - roff);
+                        if (bad_off) {
+                            pir_diag_error(v->diag, line, 0u,
+                                           "'%s': multi_ret register %u at offset %" PRIu64 " (size %" PRIu64 ") exceeds aggregate size %" PRIu64,
+                                           owner, r, roff, rly.size, cabi_ret->agg_size);
+                        }
+                    }
+                } else {
+                    PirType last_rt = cabi_ret->regs[cabi_ret->reg_count - 1u];
+                    uint64_t max_agg_sz = total_sz;
+                    if (pad_regs && align_valid_u32(cabi_ret->agg_align)) {
+                        uint64_t m = (uint64_t)cabi_ret->agg_align - 1u;
+                        max_agg_sz = (total_sz + m) & ~m;
+                    } else if (v->target && v->target->arch == PIR_ARCH_X86_64 &&
+                               last_rt.kind == PIR_TYPE_SCALAR && last_rt.u.scalar == PIR_SCALAR_F32) {
+                        /* SysV packed struct { <8B>, f32, pad 1..3 }: trailing pad bytes after f32. */
+                        max_agg_sz = prev_sz + 8u;
+                    }
+                    if (cabi_ret->agg_size == 0u || cabi_ret->agg_size > max_agg_sz ||
+                        cabi_ret->agg_size <= prev_sz) {
+                        pir_diag_error(v->diag, line, 0u, "'%s': multi_ret size %" PRIu64 " is invalid for register capacity %" PRIu64,
+                                       owner, cabi_ret->agg_size, max_agg_sz);
+                    } else if (cabi_ret->agg_size < total_sz &&
+                               (last_rt.kind == PIR_TYPE_VECTOR || pir_type_is_float(last_rt))) {
+                        pir_diag_error(v->diag, line, 0u, "'%s': multi_ret partial size %" PRIu64 " invalid for non-integer final register",
+                                       owner, cabi_ret->agg_size);
+                    }
                 }
             }
             if (!align_valid_u32(cabi_ret->agg_align)) {
@@ -473,6 +510,12 @@ static bool is_i8_type(PirType t) {
 static bool is_i32_or_i64(PirType t) {
     return t.kind == PIR_TYPE_SCALAR &&
            (t.u.scalar == PIR_SCALAR_I32 || t.u.scalar == PIR_SCALAR_I64);
+}
+
+static bool is_idx_int(const PirTargetSpec *target, PirType t) {
+    if (is_i32_or_i64(t)) return true;
+    return target && (target->ptr_bytes == 2u || target->caps.max_int_bits == 16u) &&
+           t.kind == PIR_TYPE_SCALAR && t.u.scalar == PIR_SCALAR_I16;
 }
 
 static uint32_t popcount_u32(uint32_t x) {
@@ -1030,8 +1073,8 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
             }
             check_result_count(v, inst, 2u);
             check_op_count(v, inst, 2u);
-            if (!is_i32_or_i64(inst->ty)) {
-                pir_diag_error(v->diag, inst->src_line, 0u, "mul_wide_* requires i32 or i64");
+            if (!is_idx_int(v->target, inst->ty)) {
+                pir_diag_error(v->diag, inst->src_line, 0u, "mul_wide_* requires i32 or i64 (or i16 on 16-bit targets)");
             }
             if (inst->operand_count == 2u) {
                 check_operand_kind_and_type(v, fn, &inst->operands[0], inst->ty, inst->src_line, "mul_wide_*");
@@ -1269,7 +1312,7 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
         case PIR_OP_PTRTOINT:
             check_result_count(v, inst, 1u);
             check_op_count(v, inst, 1u);
-            if (!is_i32_or_i64(inst->ty)) {
+            if (!is_idx_int(v->target, inst->ty)) {
                 pir_diag_error(v->diag, inst->src_line, 0u, "ptrtoint dst must be i32 or i64");
             }
             if (inst->operand_count == 1u) {
@@ -1285,7 +1328,7 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
                 pir_diag_error(v->diag, inst->src_line, 0u, "inttoptr dst must be ptr");
             }
             if (inst->operand_count == 1u) {
-                if (!is_i32_or_i64(inst->operands[0].type)) {
+                if (!is_idx_int(v->target, inst->operands[0].type)) {
                     pir_diag_error(v->diag, inst->src_line, 0u, "inttoptr src must be i32 or i64");
                 } else {
                     check_lir_type(v, inst->operands[0].type, inst->src_line, "inttoptr");
@@ -1459,7 +1502,7 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
             check_result_count(v, inst, 1u);
             check_op_count(v, inst, 1u);
             if (inst->operand_count == 1u) {
-                if (!is_i32_or_i64(inst->operands[0].type)) {
+                if (!is_idx_int(v->target, inst->operands[0].type)) {
                     pir_diag_error(v->diag, inst->src_line, 0u, "alloca_dyn size must be i32 or i64");
                 } else {
                     check_lir_type(v, inst->operands[0].type, inst->src_line, "alloca_dyn");
@@ -1470,11 +1513,6 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
             if (!align_valid_u32(inst->align)) {
                 pir_diag_error(v->diag, inst->src_line, 0u,
                                "alignment %u is not a valid power of two", inst->align);
-            } else if (inst->op == PIR_OP_ALLOCA_PTR && inst->align > 16u &&
-                       inst->imm_u64 > max_obj_bytes(v->target) - (uint64_t)(inst->align - 16u)) {
-                pir_diag_error(v->diag, inst->src_line, 0u,
-                               "overaligned alloca.ptr size %" PRIu64 " (align %u) exceeds maximum",
-                               inst->imm_u64, inst->align);
             }
             break;
 
@@ -1534,7 +1572,7 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
             if (inst->operand_count == 2u) {
                 check_operand_kind_and_type(v, fn, &inst->operands[0], pir_type_scalar(PIR_SCALAR_PTR),
                                             inst->src_line, "elem_ptr");
-                if (!is_i32_or_i64(inst->operands[1].type)) {
+                if (!is_idx_int(v->target, inst->operands[1].type)) {
                     pir_diag_error(v->diag, inst->src_line, 0u, "elem_ptr requires (ptr, i32|i64)");
                 } else {
                     check_operand_kind_and_type(v, fn, &inst->operands[1], inst->operands[1].type,
@@ -1546,7 +1584,7 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
         case PIR_OP_PTR_ADD:
             check_result_count(v, inst, 1u);
             check_op_count(v, inst, 2u);
-            if (!is_i32_or_i64(inst->ty)) {
+            if (!is_idx_int(v->target, inst->ty)) {
                 pir_diag_error(v->diag, inst->src_line, 0u, "ptr_add index type must be i32 or i64");
             } else {
                 check_lir_type(v, inst->ty, inst->src_line, "ptr_add");
@@ -1569,11 +1607,6 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
             if (!align_valid_u32(inst->align)) {
                 pir_diag_error(v->diag, inst->src_line, 0u,
                                "alignment %u is not a valid power of two", inst->align);
-            } else if (inst->op == PIR_OP_ALLOCA_PTR && inst->align > 16u &&
-                       inst->imm_u64 > max_obj_bytes(v->target) - (uint64_t)(inst->align - 16u)) {
-                pir_diag_error(v->diag, inst->src_line, 0u,
-                               "overaligned alloca.ptr size %" PRIu64 " (align %u) exceeds maximum",
-                               inst->imm_u64, inst->align);
             }
             break;
 
@@ -1611,7 +1644,7 @@ static void verify_inst(Verifier *v, const PirFunction *fn, const PirInst *inst)
                                             inst->op == PIR_OP_MEMSET ? pir_type_scalar(PIR_SCALAR_I8)
                                                                       : pir_type_scalar(PIR_SCALAR_PTR),
                                             inst->src_line, "mem*");
-                if (!is_i32_or_i64(inst->operands[2].type)) {
+                if (!is_idx_int(v->target, inst->operands[2].type)) {
                     pir_diag_error(v->diag, inst->src_line, 0u, "mem* operand type mismatch");
                 } else {
                     check_operand_kind_and_type(v, fn, &inst->operands[2], inst->operands[2].type,

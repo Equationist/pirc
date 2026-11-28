@@ -108,6 +108,16 @@ static const MPReg PPC_FP_REGS[] = {
 };
 #define NUM_PPC_FP_REGS ((uint32_t)(sizeof(PPC_FP_REGS) / sizeof(PPC_FP_REGS[0])))
 
+static const MPReg AVR_GP_REGS[] = {
+    /* Caller-saved first: r24:r25, r22:r23, r20:r21, r18:r19
+     * (r0:r1 reserved, X=r26:r27 scratch0, Y=r28:r29 fp, Z=r30:r31 scratch1, r16:r17 scratch2) */
+    AVR_R24R25, AVR_R22R23, AVR_R20R21, AVR_R18R19,
+    /* Callee-saved: r2:r3 .. r14:r15 */
+    AVR_PAIR(1), AVR_PAIR(2), AVR_PAIR(3), AVR_PAIR(4),
+    AVR_PAIR(5), AVR_PAIR(6), AVR_PAIR(7)
+};
+#define NUM_AVR_GP_REGS ((uint32_t)(sizeof(AVR_GP_REGS) / sizeof(AVR_GP_REGS[0])))
+
 static bool is_callee_saved_gp(PirArch arch, MPReg p) {
     if (arch == PIR_ARCH_X86_64) {
         return p == X64_RBX || p == X64_R12 || p == X64_R13 || p == X64_R14 || p == X64_R15;
@@ -118,12 +128,15 @@ static bool is_callee_saved_gp(PirArch arch, MPReg p) {
     if (arch == PIR_ARCH_PPC32) {
         return p >= PPC_GP(14) && p <= PPC_GP(30);
     }
+    if (arch == PIR_ARCH_AVR) {
+        return p >= AVR_PAIR(1) && p <= AVR_PAIR(8);
+    }
     return p >= A64_GP(19) && p <= A64_GP(28);
 }
 
 static bool is_callee_saved_fp(PirArch arch, MPReg p) {
-    if (arch == PIR_ARCH_X86_64) {
-        return false; /* SysV AMD64 has no callee-saved XMM registers */
+    if (arch == PIR_ARCH_X86_64 || arch == PIR_ARCH_AVR) {
+        return false;
     }
     if (arch == PIR_ARCH_RV32) {
         return p == RV32_FP(8) || p == RV32_FP(9) ||
@@ -145,6 +158,9 @@ static void get_reg_pool(PirArch arch, MRegClass rc, const MPReg **out_pool, uin
     } else if (arch == PIR_ARCH_PPC32) {
         *out_pool = (rc == MREG_CLASS_GP) ? PPC_GP_REGS : PPC_FP_REGS;
         *out_len  = (rc == MREG_CLASS_GP) ? NUM_PPC_GP_REGS : NUM_PPC_FP_REGS;
+    } else if (arch == PIR_ARCH_AVR) {
+        *out_pool = (rc == MREG_CLASS_GP) ? AVR_GP_REGS : NULL;
+        *out_len  = (rc == MREG_CLASS_GP) ? NUM_AVR_GP_REGS : 0u;
     } else {
         *out_pool = (rc == MREG_CLASS_GP) ? A64_GP_REGS : A64_FP_REGS;
         *out_len  = (rc == MREG_CLASS_GP) ? NUM_A64_GP_REGS : NUM_A64_FP_REGS;
@@ -500,6 +516,21 @@ static void compute_intervals(const MFunc *mf, LiveInterval *v_ivs,
                             iv_add_range(&fixed_ivs[p], pos, pos + 1u);
                         }
                     }
+                } else if (mf->target->arch == PIR_ARCH_AVR) {
+                    static const MPReg AVR_CALL_CLOB_GP[] = {
+                        AVR_R0R1, AVR_R18R19, AVR_R20R21, AVR_R22R23, AVR_R24R25,
+                        AVR_X, AVR_Z
+                    };
+                    for (uint32_t ci = 0u; ci < sizeof(AVR_CALL_CLOB_GP) / sizeof(AVR_CALL_CLOB_GP[0]); ++ci) {
+                        MPReg p = AVR_CALL_CLOB_GP[ci];
+                        if ((preg_live & (UINT64_C(1) << p)) != 0u) {
+                            uint32_t end_p = preg_use_end[p] > pos ? preg_use_end[p] : (pos + 1u);
+                            iv_add_range(&fixed_ivs[p], pos, end_p);
+                            preg_live &= ~(UINT64_C(1) << p);
+                        } else {
+                            iv_add_range(&fixed_ivs[p], pos, pos + 1u);
+                        }
+                    }
                 } else {
                     for (uint32_t r = 0u; r <= 15u; ++r) {
                         MPReg p = A64_GP(r);
@@ -637,6 +668,7 @@ static void run_linear_scan_class(MFunc *mf, MRegClass rc, LiveInterval *v_ivs,
     const MPReg *pool = NULL;
     uint32_t pool_len = 0u;
     get_reg_pool(arch, rc, &pool, &pool_len);
+    if (pool_len == 0u) return;
     uint32_t nv = mf->vregs.len;
 
     uint32_t *order = (uint32_t *)malloc(((size_t)nv + 1u) * sizeof(uint32_t));
@@ -850,6 +882,14 @@ static void emit_mov_imm64(PirArch arch, MInstVec *out, MPReg dst, uint64_t val,
         PIR_VEC_PUSH(out, m);
         return;
     }
+    if (arch == PIR_ARCH_AVR) {
+        MInst m = minst_make(MI_AVR_LI, 2u, loc);
+        m.op_count = 2u;
+        m.ops[0]   = mop_preg_def(dst);
+        m.ops[1]   = mop_imm((int64_t)(uint16_t)(val & 0xFFFFu));
+        PIR_VEC_PUSH(out, m);
+        return;
+    }
     if (width <= 4u) {
         val &= 0xFFFFFFFFu;
         uint16_t lo = (uint16_t)(val & 0xFFFFu);
@@ -960,10 +1000,12 @@ static void lower_pcopy_bundle(const MFunc *mf, const MPCopyBundle *pc,
     PirArch arch = mf->target->arch;
     MPReg cyc_gp  = (arch == PIR_ARCH_X86_64) ? X64_SCRATCH_GP1
                   : (arch == PIR_ARCH_RV32)   ? RV32_SCRATCH_GP0
-                  : (arch == PIR_ARCH_PPC32)  ? PPC_SCRATCH_GP0 : A64_SCRATCH_GP0;
+                  : (arch == PIR_ARCH_PPC32)  ? PPC_SCRATCH_GP0
+                  : (arch == PIR_ARCH_AVR)    ? AVR_SCRATCH_GP0 : A64_SCRATCH_GP0;
     MPReg slot_gp = (arch == PIR_ARCH_X86_64) ? X64_SCRATCH_GP0
                   : (arch == PIR_ARCH_RV32)   ? RV32_SCRATCH_GP2
-                  : (arch == PIR_ARCH_PPC32)  ? PPC_SCRATCH_GP1 : A64_SCRATCH_GP2;
+                  : (arch == PIR_ARCH_PPC32)  ? PPC_SCRATCH_GP1
+                  : (arch == PIR_ARCH_AVR)    ? AVR_SCRATCH_GP1 : A64_SCRATCH_GP2;
     MPReg cyc_fp  = (arch == PIR_ARCH_X86_64) ? X64_SCRATCH_FP2
                   : (arch == PIR_ARCH_RV32)   ? RV32_SCRATCH_FP2
                   : (arch == PIR_ARCH_PPC32)  ? PPC_SCRATCH_FP2 : A64_SCRATCH_FP2;
@@ -1083,12 +1125,22 @@ static bool rewrite_blocks(MFunc *mf, PirDiag *diag) {
     static const MPReg RV32_FP_SCRATCH[3] = { RV32_SCRATCH_FP0, RV32_SCRATCH_FP1, RV32_SCRATCH_FP2 };
     static const MPReg PPC_GP_SCRATCH[3]  = { PPC_SCRATCH_GP0,  PPC_SCRATCH_GP1,  PPC_SCRATCH_GP2  };
     static const MPReg PPC_FP_SCRATCH[3]  = { PPC_SCRATCH_FP0,  PPC_SCRATCH_FP1,  PPC_SCRATCH_FP2  };
+    static const MPReg AVR_GP_SCRATCH[3]  = { AVR_SCRATCH_GP0,  AVR_SCRATCH_GP1,  AVR_SCRATCH_GP2  };
     bool is_x64   = (mf->target->arch == PIR_ARCH_X86_64);
     bool is_rv32  = (mf->target->arch == PIR_ARCH_RV32);
     bool is_ppc32 = (mf->target->arch == PIR_ARCH_PPC32);
-    const MPReg *GP_SCRATCH = is_x64 ? X64_GP_SCRATCH : (is_rv32 ? RV32_GP_SCRATCH : (is_ppc32 ? PPC_GP_SCRATCH : A64_GP_SCRATCH));
-    const MPReg *FP_SCRATCH = is_x64 ? X64_FP_SCRATCH : (is_rv32 ? RV32_FP_SCRATCH : (is_ppc32 ? PPC_FP_SCRATCH : A64_FP_SCRATCH));
-    MPReg addr_tmp_gp = is_x64 ? X64_SCRATCH_GP1 : (is_rv32 ? RV32_SCRATCH_GP1 : (is_ppc32 ? PPC_SCRATCH_GP1 : A64_SCRATCH_GP1));
+    bool is_avr   = (mf->target->arch == PIR_ARCH_AVR);
+    const MPReg *GP_SCRATCH = is_x64 ? X64_GP_SCRATCH
+                            : is_rv32 ? RV32_GP_SCRATCH
+                            : is_ppc32 ? PPC_GP_SCRATCH
+                            : is_avr ? AVR_GP_SCRATCH : A64_GP_SCRATCH;
+    const MPReg *FP_SCRATCH = is_x64 ? X64_FP_SCRATCH
+                            : is_rv32 ? RV32_FP_SCRATCH
+                            : is_ppc32 ? PPC_FP_SCRATCH : A64_FP_SCRATCH;
+    MPReg addr_tmp_gp = is_x64 ? X64_SCRATCH_GP1
+                      : is_rv32 ? RV32_SCRATCH_GP1
+                      : is_ppc32 ? PPC_SCRATCH_GP1
+                      : is_avr ? AVR_SCRATCH_GP1 : A64_SCRATCH_GP1;
 
     for (uint32_t b = 0u; b < mf->blocks.len; ++b) {
         MBlock *blk = &mf->blocks.data[b];
@@ -1176,7 +1228,7 @@ static bool rewrite_blocks(MFunc *mf, PirDiag *diag) {
                         *def_mask |= (1u << sidx);
                     }
                     mapped_p[m] = pool[sidx];
-                    if ((is_x64 || is_ppc32) && is_gp && sidx == 2u) {
+                    if ((is_x64 || is_ppc32 || is_avr) && is_gp && sidx == 2u) {
                         mf->used_callee_gp_mask |= (1u << mreg_num(mapped_p[m]));
                     }
                 }
@@ -1342,7 +1394,8 @@ static bool verify_mir_common(const MFunc *mf, bool post_ra, PirDiag *diag) {
                     case MOP_PREG:
                         if (op->u.preg >= 64u ||
                             (mf->target && mf->target->arch == PIR_ARCH_X86_64 &&
-                             ((op->u.preg >= 16u && op->u.preg < 32u) || op->u.preg >= 48u))) {
+                             ((op->u.preg >= 16u && op->u.preg < 32u) || op->u.preg >= 48u)) ||
+                            (mf->target && mf->target->arch == PIR_ARCH_AVR && op->u.preg >= 16u)) {
                             pir_diag_error(diag, 0u, 0u, "MIR verifier: preg %u out of range", (unsigned)op->u.preg);
                             return false;
                         }
@@ -1424,12 +1477,15 @@ bool pir_regalloc_run(MFunc *mf, PirDiag *diag) {
     /* Commit assignments & allocate unique spill slots per spilled vreg (safe for setjmp/longjmp). */
     mf->used_callee_gp_mask = 0u;
     mf->used_callee_fp_mask = 0u;
+    bool is_avr_arch = (mf->target && mf->target->arch == PIR_ARCH_AVR);
     for (uint32_t v = 0u; v < nv; ++v) {
         MVRegInfo *vi = &mf->vregs.data[v];
         if (v_ivs[v].spilled || v_ivs[v].assigned == MREG_NONE) {
             vi->assigned_preg = MREG_NONE;
-            uint32_t sz = vi->byte_size >= 4u ? vi->byte_size : 4u;
-            vi->spill_slot = (int32_t)mfunc_add_slot(mf, sz, sz, true);
+            uint32_t min_sz = is_avr_arch ? 2u : 4u;
+            uint32_t sz = vi->byte_size >= min_sz ? vi->byte_size : min_sz;
+            uint32_t al = is_avr_arch ? 1u : sz;
+            vi->spill_slot = (int32_t)mfunc_add_slot(mf, sz, al, true);
         } else {
             vi->assigned_preg = v_ivs[v].assigned;
             vi->spill_slot    = -1;
@@ -1442,6 +1498,23 @@ bool pir_regalloc_run(MFunc *mf, PirDiag *diag) {
     }
 
     bool ok = rewrite_blocks(mf, diag);
+
+    /* Ensure any explicit callee-saved physical register defs (e.g. AVR call args in r8..r17)
+     * are recorded in used_callee_gp_mask so the frame pass preserves them. */
+    if (ok && is_avr_arch) {
+        for (uint32_t b = 0u; b < mf->blocks.len; ++b) {
+            const MBlock *blk = &mf->blocks.data[b];
+            for (uint32_t j = 0u; j < blk->insts.len; ++j) {
+                const MInst *ins = &blk->insts.data[j];
+                for (uint8_t k = 0u; k < ins->op_count; ++k) {
+                    if (ins->ops[k].kind == MOP_PREG && ins->ops[k].is_def &&
+                        is_callee_saved_gp(PIR_ARCH_AVR, ins->ops[k].u.preg)) {
+                        mf->used_callee_gp_mask |= (1u << mreg_num(ins->ops[k].u.preg));
+                    }
+                }
+            }
+        }
+    }
 
     for (uint32_t v = 0u; v < nv; ++v) free(v_ivs[v].ranges);
     for (uint32_t r = 0u; r < 64u; ++r) free(fixed_ivs[r].ranges);

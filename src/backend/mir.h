@@ -187,6 +187,43 @@ static inline uint32_t ppc_reg_num(MPReg r) {
     return (r >= 32u) ? (uint32_t)(r - 32u) : (uint32_t)r;
 }
 
+/* AVR 8-bit / 16-bit-pair physical register numbering:
+ *   0..15  : 16-bit register pairs r(2p):r(2p+1)
+ *            pair 0  = r0:r1   (RESERVED: __tmp_reg__ / __zero_reg__ == 0)
+ *            pair 1..7 = r2:r3 .. r14:r15 (callee-saved allocatable)
+ *            pair 8  = r16:r17 (callee-saved scratch2 / ABI arg pair #4)
+ *            pair 9..12 = r18:r19 .. r24:r25 (caller-saved allocatable / arg pairs #3..#0)
+ *            pair 13 = r26:r27 (X: caller-saved scratch0)
+ *            pair 14 = r28:r29 (Y: callee-saved frame pointer)
+ *            pair 15 = r30:r31 (Z: caller-saved scratch1 / icall / lpm)
+ */
+#define AVR_PAIR(p)     ((MPReg)(p))
+#define AVR_R0R1        AVR_PAIR(0u)
+#define AVR_R8R9        AVR_PAIR(4u)
+#define AVR_R10R11      AVR_PAIR(5u)
+#define AVR_R12R13      AVR_PAIR(6u)
+#define AVR_R14R15      AVR_PAIR(7u)
+#define AVR_R16R17      AVR_PAIR(8u)
+#define AVR_R18R19      AVR_PAIR(9u)
+#define AVR_R20R21      AVR_PAIR(10u)
+#define AVR_R22R23      AVR_PAIR(11u)
+#define AVR_R24R25      AVR_PAIR(12u)
+#define AVR_X           AVR_PAIR(13u)
+#define AVR_Y           AVR_PAIR(14u)
+#define AVR_Z           AVR_PAIR(15u)
+#define AVR_FP_REG      AVR_Y
+#define AVR_SCRATCH_GP0 AVR_X
+#define AVR_SCRATCH_GP1 AVR_Z
+#define AVR_SCRATCH_GP2 AVR_R16R17
+
+static inline uint32_t avr_lo_reg(MPReg p) {
+    return (uint32_t)p * 2u;
+}
+
+static inline uint32_t avr_hi_reg(MPReg p) {
+    return (uint32_t)p * 2u + 1u;
+}
+
 static inline uint32_t mreg_num(MPReg r) {
     return (r >= 32u) ? (uint32_t)(r - 32u) : (uint32_t)r;
 }
@@ -678,7 +715,59 @@ typedef enum {
     MI_PPC_CALL_IND,        /* mtctr rs; bctrl (aux_id=1 emits creqv 6,6,6) */
     MI_PPC_SWITCH_TBL,      /* jump table dispatch */
     MI_PPC_RET,             /* blr (epilogue marker before frame pass) */
-    MI_PPC_TRAP             /* trap (tw 31,0,0) */
+    MI_PPC_TRAP,            /* trap (tw 31,0,0) */
+
+    /* AVR 16-bit Register-Pair Data Movement, Memory & Stack */
+    MI_AVR_LI,              /* dst = imm16 */
+    MI_AVR_MOV,             /* dst = src (movw) */
+    MI_AVR_SYM_ADDR,        /* dst = data lo8/hi8 or func pm_lo8/pm_hi8 */
+    MI_AVR_LD,              /* dst = *(T*)(base + disp) (width=1/2, is_signed) */
+    MI_AVR_ST,              /* *(T*)(base + disp) = src (width=1/2) */
+    MI_AVR_PUSH,            /* push lo; push hi */
+    MI_AVR_POP,             /* pop hi; pop lo */
+    MI_AVR_IN_SP,           /* dst = SP (SPL/SPH) */
+    MI_AVR_OUT_SP,          /* SP = src (interrupt-safe SREG/cli) */
+    MI_AVR_ADJ_SP,          /* SP += signed imm16 (interrupt-safe) */
+
+    /* AVR Integer ALU (16-bit pairs, width 1 or 2) */
+    MI_AVR_ADD,
+    MI_AVR_ADDI,
+    MI_AVR_SUB,
+    MI_AVR_MUL,             /* 8x8->8 or 16x16->16 low product (restores r1=0) */
+    MI_AVR_MUL_WIDE,        /* 16x16->32 (dst_lo, dst_hi, lhs, rhs; is_signed) */
+    MI_AVR_AND,
+    MI_AVR_ANDI,
+    MI_AVR_OR,
+    MI_AVR_ORI,
+    MI_AVR_XOR,
+    MI_AVR_XORI,
+    MI_AVR_SHL,
+    MI_AVR_SHLI,
+    MI_AVR_SHR,
+    MI_AVR_SHRI,
+    MI_AVR_SAR,
+    MI_AVR_SARI,
+    MI_AVR_SEXT8,
+    MI_AVR_ZEXT8,
+    MI_AVR_CMP_SET,         /* dst = (lhs <cond> rhs) ? 1 : 0 (width=1/2) */
+    MI_AVR_SELECT,          /* dst = (cond != 0) ? tv : fv */
+
+    /* AVR Single-Core Interrupt-Masked Atomics */
+    MI_AVR_ATOMIC_LD,       /* dst = atomic_load(ptr) (width=1/2) */
+    MI_AVR_ATOMIC_ST,       /* atomic_store(val, ptr) (width=1/2) */
+    MI_AVR_ATOMIC_RMW,      /* dst_old, ptr, val (width=1/2, aux_id=PirRmwOp) */
+    MI_AVR_ATOMIC_CAS,      /* dst_old, dst_ok, ptr, exp, des (width=1/2) */
+
+    /* AVR Control Flow */
+    MI_AVR_JMP,             /* jmp target_blk */
+    MI_AVR_BR_NZ,           /* if (reg != 0) jmp target_blk */
+    MI_AVR_BR_Z,            /* if (reg == 0) jmp target_blk */
+    MI_AVR_BR_CMP,          /* if (lhs <cond> rhs) jmp target_blk (width=1/2) */
+    MI_AVR_CALL,            /* call sym */
+    MI_AVR_ICALL,           /* movw Z, fn; icall */
+    MI_AVR_SWITCH_TBL,      /* Flash jump table dispatch */
+    MI_AVR_RET,             /* ret (epilogue marker before frame pass) */
+    MI_AVR_TRAP             /* call __pir_avr_trap (exits with code 132) */
 } MOpcode;
 
 /* =========================================================================

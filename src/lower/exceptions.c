@@ -87,7 +87,7 @@ static bool lower_exceptions_shadow_stack(PirModule *mod, const PirTargetSpec *t
     PirType ti32   = pir_type_scalar(PIR_SCALAR_I32);
     PirType ti8    = pir_type_scalar(PIR_SCALAR_I8);
     PirType tvoid  = pir_type_scalar(PIR_SCALAR_VOID);
-    PirType idx_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
+    PirType idx_ty = pir_type_scalar(pir_ptr_int_scalar(target->ptr_bytes));
     uint32_t pb    = target->ptr_bytes;
 
     /* Scan whether any throwing invoke or resume exists. */
@@ -148,10 +148,11 @@ static bool lower_exceptions_shadow_stack(PirModule *mod, const PirTargetSpec *t
 
         PirValueId exc_frame = PIR_INVALID_ID;
         if (fn_needs_frame) {
-            /* Prepend one frame slot { prev: ptr, exn: ptr, jmp_buf: 384B } to blocks[0]. */
+            /* Prepend one frame slot { prev: ptr, exn: ptr, jmp_buf } to blocks[0]. */
+            uint64_t jb_sz = (target->arch == PIR_ARCH_AVR) ? 32u : 384u;
             PirInst al = pir_make_inst(PIR_OP_ALLOCA_PTR, tptr, fn->src_line, 0u);
-            al.imm_u64    = 2u * pb + 384u;
-            al.align      = 16u;
+            al.imm_u64    = 2u * pb + jb_sz;
+            al.align      = (target->arch == PIR_ARCH_AVR) ? 1u : 16u;
             al.results[0] = pir_fn_new_val(mod, fn, "exc_fr", tptr, 0u, PIR_INVALID_ID, 0u);
             PirInstId aid = pir_fn_append_inst(fn, NULL, al);
             exc_frame     = al.results[0];

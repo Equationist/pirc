@@ -213,6 +213,7 @@ void pir_op_strip_call_meta(PirOperand *op) {
     op->call_stack_align    = 0u;
     op->call_force_stack    = false;
     op->call_no_f32_promote = false;
+    op->call_group_words    = 0u;
 }
 
 PirFuncId pir_ensure_verified_extern_func(PirModule *mod, const char *name,
@@ -286,7 +287,7 @@ PirValueId pir_emit_ptr_add_const(PirModule *mod, PirFunction *fn, PirBlockId b,
                                   const PirTargetSpec *target, uint32_t ln, uint32_t lc) {
     if (off == 0u) return base;
     PirType tptr   = pir_type_scalar(PIR_SCALAR_PTR);
-    PirType idx_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
+    PirType idx_ty = pir_type_scalar(pir_ptr_int_scalar(target->ptr_bytes));
     PirInst pa = pir_make_inst(PIR_OP_PTR_ADD, idx_ty, ln, lc);
     pa.operand_count = 2u;
     pa.operands      = pir_alloc_ops(mod, 2u);
@@ -302,8 +303,8 @@ PirValueId pir_emit_align_ptr(PirModule *mod, PirFunction *fn, PirBlockId b,
                               const PirTargetSpec *target, uint32_t ln, uint32_t lc) {
     if (align <= 1u) return ptr_val;
     PirType tptr   = pir_type_scalar(PIR_SCALAR_PTR);
-    PirType idx_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
-    uint64_t idx_mask = (target->ptr_bytes == 4u) ? UINT32_MAX : UINT64_MAX;
+    PirType idx_ty = pir_type_scalar(pir_ptr_int_scalar(target->ptr_bytes));
+    uint64_t idx_mask = pir_ptr_int_mask(target->ptr_bytes);
 
     PirInst p2i = pir_make_inst(PIR_OP_PTRTOINT, idx_ty, ln, lc);
     p2i.operand_count = 1u; p2i.operands = pir_alloc_ops(mod, 1u);
@@ -351,8 +352,8 @@ static bool maybe_verify_hir(const PirModule *mod, const PirTargetSpec *target, 
 static bool pir_legalize_overaligned_allocas(PirModule *mod, const PirTargetSpec *target,
                                              PirDiag *diag) {
     PirType tptr   = pir_type_scalar(PIR_SCALAR_PTR);
-    PirType idx_ty = pir_type_scalar(target->ptr_bytes == 4u ? PIR_SCALAR_I32 : PIR_SCALAR_I64);
-    uint64_t idx_mask = (target->ptr_bytes == 4u) ? UINT32_MAX : UINT64_MAX;
+    PirType idx_ty = pir_type_scalar(pir_ptr_int_scalar(target->ptr_bytes));
+    uint64_t idx_mask = pir_ptr_int_mask(target->ptr_bytes);
 
     for (uint32_t fi = 0u; fi < mod->funcs.len; ++fi) {
         PirFunction *fn = &mod->funcs.data[fi];
@@ -376,8 +377,9 @@ static bool pir_legalize_overaligned_allocas(PirModule *mod, const PirTargetSpec
                 if (copy.op == PIR_OP_ALLOCA_PTR && copy.align > 16u &&
                     copy.results[0] != PIR_INVALID_ID) {
                     uint64_t al = (uint64_t)copy.align;
-                    uint64_t max_sz = (target->ptr_bytes == 4u) ? (UINT64_C(1) << 31) : (UINT64_C(1) << 40);
-                    if (al - 16u > max_sz || copy.imm_u64 > max_sz - (al - 16u)) {
+                    uint64_t base_al = (target->arch == PIR_ARCH_AVR) ? 1u : 16u;
+                    uint64_t max_sz = pir_max_alloc_bytes(target->ptr_bytes);
+                    if (al - base_al > max_sz || copy.imm_u64 > max_sz - (al - base_al)) {
                         pir_diag_error(diag, copy.src_line, 0u,
                                        "overaligned alloca.ptr size overflow");
                         PIR_VEC_FREE(&out);
@@ -387,8 +389,8 @@ static bool pir_legalize_overaligned_allocas(PirModule *mod, const PirTargetSpec
                     PirValueId orig_res = copy.results[0];
 
                     PirValueId raw_v = pir_fn_new_val(mod, fn, "oa_raw", tptr, b, iid, 0u);
-                    fn->insts.data[iid].imm_u64    = copy.imm_u64 + (al - 16u);
-                    fn->insts.data[iid].align      = 16u;
+                    fn->insts.data[iid].imm_u64    = copy.imm_u64 + (al - base_al);
+                    fn->insts.data[iid].align      = (uint32_t)base_al;
                     fn->insts.data[iid].results[0] = raw_v;
                     PIR_VEC_PUSH(&out, iid);
 
@@ -462,7 +464,21 @@ bool pir_lower_module(PirModule *mod, const PirTargetSpec *target, PirDiag *diag
     if (!maybe_verify_hir(mod, target, diag))          return false;
 #endif
 
+    if (!pir_legalize_soft_float(mod, target, diag))   return false;
+#ifdef PIR_VERIFY_ALL
+    if (!maybe_verify_hir(mod, target, diag))          return false;
+#endif
+
     if (!pir_legalize_i64(mod, target, diag))          return false;
+#ifdef PIR_VERIFY_ALL
+    if (target->caps.max_int_bits >= 32u || target->caps.max_int_bits == 0u) {
+        if (!pir_verify_module(mod, PIR_VERIFY_LIR, target, diag)) return false;
+    } else {
+        if (!maybe_verify_hir(mod, target, diag)) return false;
+    }
+#endif
+
+    if (!pir_legalize_i32(mod, target, diag))          return false;
 #ifdef PIR_VERIFY_ALL
     if (!pir_verify_module(mod, PIR_VERIFY_LIR, target, diag)) return false;
 #endif

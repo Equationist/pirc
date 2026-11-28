@@ -90,7 +90,9 @@ PirPtrInfo pir_alias_decompose(const PirFunction *fn, PirOperand op, uint8_t ptr
             info.kind         = PIR_PTR_GLOBAL;
             info.global_name  = op.u.sym.name;
             info.all_inbounds = all_inbounds;
-            int64_t so = (ptr_bytes == 4u)
+            int64_t so = (ptr_bytes == 2u)
+                         ? (int64_t)(int16_t)(uint16_t)op.u.sym.offset
+                         : (ptr_bytes == 4u)
                          ? (int64_t)(int32_t)(uint32_t)op.u.sym.offset
                          : op.u.sym.offset;
             if ((so > 0 && info.offset > INT64_MAX - so) ||
@@ -100,8 +102,10 @@ PirPtrInfo pir_alias_decompose(const PirFunction *fn, PirOperand op, uint8_t ptr
             } else {
                 info.offset += so;
             }
-            if (ptr_bytes == 4u && !all_inbounds && info.has_offset) {
-                info.offset = (int64_t)(int32_t)(uint32_t)info.offset;
+            if (ptr_bytes < 8u && !all_inbounds && info.has_offset) {
+                info.offset = (ptr_bytes == 2u)
+                              ? (int64_t)(int16_t)(uint16_t)info.offset
+                              : (int64_t)(int32_t)(uint32_t)info.offset;
             }
             return info;
         }
@@ -117,8 +121,10 @@ PirPtrInfo pir_alias_decompose(const PirFunction *fn, PirOperand op, uint8_t ptr
             info.all_inbounds = all_inbounds;
             info.kind         = (pi < fn->param_count && (fn->params[pi].attrs & PIR_PATTR_NOALIAS))
                                 ? PIR_PTR_PARAM_NOALIAS : PIR_PTR_PARAM;
-            if (ptr_bytes == 4u && !all_inbounds && info.has_offset) {
-                info.offset = (int64_t)(int32_t)(uint32_t)info.offset;
+            if (ptr_bytes < 8u && !all_inbounds && info.has_offset) {
+                info.offset = (ptr_bytes == 2u)
+                              ? (int64_t)(int16_t)(uint16_t)info.offset
+                              : (int64_t)(int32_t)(uint32_t)info.offset;
             }
             return info;
         }
@@ -131,8 +137,10 @@ PirPtrInfo pir_alias_decompose(const PirFunction *fn, PirOperand op, uint8_t ptr
             info.kind         = PIR_PTR_ALLOCA;
             info.obj_id       = vd->def_inst;
             info.all_inbounds = all_inbounds;
-            if (ptr_bytes == 4u && !all_inbounds && info.has_offset) {
-                info.offset = (int64_t)(int32_t)(uint32_t)info.offset;
+            if (ptr_bytes < 8u && !all_inbounds && info.has_offset) {
+                info.offset = (ptr_bytes == 2u)
+                              ? (int64_t)(int16_t)(uint16_t)info.offset
+                              : (int64_t)(int32_t)(uint32_t)info.offset;
             }
             return info;
         }
@@ -149,8 +157,10 @@ PirPtrInfo pir_alias_decompose(const PirFunction *fn, PirOperand op, uint8_t ptr
             }
             int64_t d = 0;
             if (get_const_i64(fn, ins->operands[1], &d)) {
-                if (ptr_bytes == 4u && !all_inbounds) {
-                    info.offset = (int64_t)(int32_t)((uint32_t)info.offset + (uint32_t)d);
+                if (ptr_bytes < 8u && !all_inbounds) {
+                    info.offset = (ptr_bytes == 2u)
+                                  ? (int64_t)(int16_t)((uint16_t)info.offset + (uint16_t)d)
+                                  : (int64_t)(int32_t)((uint32_t)info.offset + (uint32_t)d);
                 } else if ((d > 0 && info.offset > INT64_MAX - d) ||
                            (d < 0 && info.offset < INT64_MIN - d)) {
                     info.has_offset = false;
@@ -195,6 +205,15 @@ PirAliasResult pir_alias_query(const PirFunction *fn,
 
     if (same_base(&a, &b)) {
         if (a.has_offset && b.has_offset) {
+            if (ptr_bytes == 2u && (!a.all_inbounds || !b.all_inbounds)) {
+                uint16_t oa = (uint16_t)a.offset;
+                uint16_t ob = (uint16_t)b.offset;
+                if (oa == ob && sz1 == sz2) return PIR_ALIAS_MUST;
+                uint16_t d1 = (uint16_t)(ob - oa);
+                uint16_t d2 = (uint16_t)(oa - ob);
+                if ((uint32_t)d1 >= sz1 && (uint32_t)d2 >= sz2) return PIR_ALIAS_NO;
+                return PIR_ALIAS_MAY;
+            }
             if (ptr_bytes == 4u && (!a.all_inbounds || !b.all_inbounds)) {
                 uint32_t oa = (uint32_t)a.offset;
                 uint32_t ob = (uint32_t)b.offset;
